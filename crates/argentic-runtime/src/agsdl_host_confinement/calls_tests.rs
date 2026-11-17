@@ -14,13 +14,13 @@ pub(crate) struct TestHost {
     pub(crate) human_delay: Duration,
 }
 impl TestHost {
-    pub(crate) fn new(grant: LaunchGrant) -> Self {
+    pub(crate) fn new(grant: impl Into<Option<LaunchGrant>>) -> Self {
         Self {
             gate: Arc::new(Mutex::new(())),
             claimed: AtomicBool::new(false),
             launches: AtomicUsize::new(0),
             finished: Mutex::new(vec![]),
-            grant: Mutex::new(Some(grant)),
+            grant: Mutex::new(grant.into()),
             control: control(),
             fail_finish: false,
             human_open: AtomicUsize::new(0),
@@ -109,8 +109,7 @@ pub(crate) fn grant(root: &std::path::Path) -> CommandGrant {
 
 #[tokio::test]
 async fn stopped_claim_never_authorizes_io_and_lost_receipt_never_replays() {
-    let root = tempfile::tempdir().unwrap();
-    let host = Arc::new(TestHost::new(LaunchGrant::Command(grant(root.path()))));
+    let host = Arc::new(TestHost::new(None));
     host.control.stop.cancel();
     let request = CallRequest {
         identity: identity(),
@@ -284,10 +283,10 @@ async fn service_keeps_effect_owner_when_waiters_are_cancelled() {
 
 #[tokio::test]
 async fn service_reports_failed_durable_finish_after_caller_has_gone() {
-    let root = tempfile::tempdir().unwrap();
-    let mut host = TestHost::new(LaunchGrant::Command(grant(root.path())));
+    let mut host = TestHost::new(None);
     host.fail_finish = true;
     host.control.stop.cancel();
+    let host = Arc::new(host);
     let service = HostCallService::new();
     let request = CallRequest {
         identity: identity(),
@@ -298,12 +297,13 @@ async fn service_reports_failed_durable_finish_after_caller_has_gone() {
     };
     assert_eq!(
         service
-            .execute(Arc::new(host), request)
+            .execute(host.clone(), request)
             .await
             .unwrap_err()
             .code,
         "UNCERTAIN"
     );
+    assert_eq!(host.launches.load(Ordering::SeqCst), 0);
     assert_eq!(
         service.close_and_join().await.unwrap_err().code,
         "UNCERTAIN"

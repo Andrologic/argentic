@@ -303,6 +303,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(all(target_os = "macos", target_arch = "aarch64")),
+        ignore = "Confined completion checks require macOS ARM64 Seatbelt"
+    )]
     async fn native_check_timeout_output_bounds_stop_and_write_ask_ceiling() {
         let root = tempfile::tempdir().unwrap();
         let root = root.path().canonicalize().unwrap();
@@ -392,7 +396,12 @@ mod tests {
         assert!(error.is_none());
         assert_ne!(receipt.unwrap().exit_code_json, "0");
         assert!(!root.join("marker").exists());
-        let readonly = policy(&root, json!("read-only"));
+    }
+
+    #[test]
+    fn completion_check_requires_shell_permission() {
+        let root = tempfile::tempdir().unwrap();
+        let readonly = policy(&root.path().canonicalize().unwrap(), json!("read-only"));
         assert!(super::grant(&readonly, "true").is_err());
     }
 }

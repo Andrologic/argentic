@@ -246,6 +246,10 @@ fn executor_access(
 }
 
 #[tokio::test]
+#[cfg_attr(
+    not(all(target_os = "macos", target_arch = "aarch64")),
+    ignore = "Confined completion checks require macOS ARM64 Seatbelt"
+)]
 async fn completion_check_runs_before_acceptance_and_corrects_on_the_same_thread() {
     let document = json!({"contract":"agsdl-0.3.0","id":"check-corrections","agents":{
         "worker":{"harness":"codex","permissions":"workspace","maxCorrections":1,
@@ -292,6 +296,10 @@ async fn completion_check_runs_before_acceptance_and_corrects_on_the_same_thread
 }
 
 #[tokio::test]
+#[cfg_attr(
+    not(all(target_os = "macos", target_arch = "aarch64")),
+    ignore = "Confined completion checks require macOS ARM64 Seatbelt"
+)]
 async fn completion_check_failure_budget_and_exempt_choice_are_independent() {
     for exempt in [false, true] {
         let document = json!({"contract":"agsdl-0.3.0","id":"check-budget","agents":{
@@ -426,6 +434,10 @@ impl RuntimeClock030 for CheckClock {
 }
 
 #[tokio::test]
+#[cfg_attr(
+    not(all(target_os = "macos", target_arch = "aarch64")),
+    ignore = "Confined completion checks require macOS ARM64 Seatbelt"
+)]
 async fn completion_check_stop_and_machine_deadline_join_the_actual_command() {
     for timeout in [false, true] {
         let document = json!({"contract":"agsdl-0.3.0","id":"check-cancel","agents":{"worker":{"harness":"codex","permissions":"workspace",
