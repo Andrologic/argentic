@@ -1,0 +1,43 @@
+# Audit de conformité Argentic à AgSDL 0.3.0
+
+Argentic `15d4b47` passe les 144 cas de validation statique publiés. L’hôte autonome implémente un sous-ensemble d’AgSDL. Le principal défaut d’exécution relevé est un blocage durable quand deux jointures attendent le même chemin de fan-out et que l’une l’annule. La suite de scénarios embarquée inclut deux attentes corrigées localement. [Spécification AgSDL au commit de publication `bd9f8a5`](https://github.com/Andrologic/AgSDL/tree/bd9f8a5b16923476fd20ac2650bd1729ee151917/spec)
+
+## Écarts à traiter
+
+### P1 · Deux jointures peuvent bloquer le flux
+
+Lorsqu’une jointure avec `remaining: "stop"` ferme un groupe et qu’un chemin à annuler est encore attendu par une autre jointure ouverte hors de ce groupe, le réducteur renvoie `UNSPECIFIED_SHARED_CANCELLATION`. Le moteur enregistre le diagnostic dans SQLite, puis refuse les transitions ordinaires. L’opérateur peut arrêter l’exécution. Le test du dépôt reproduit le blocage avec des éléments de fan-out en attente. Le validateur Python publié accepte les documents des deux plans de test et émet uniquement le code `HARNESS_UNVERIFIED` pour leur harnais fictif. [Réducteur](../crates/argentic-core/src/flow/mod.rs#L1854) · [Persistance](../crates/argentic-runtime/src/persistence/flow_store030.rs#L133) · [Test](../crates/argentic-runtime/src/persistence/flow_store030_tests.rs#L353)
+
+La spec prescrit l’arrêt des travaux visés et la poursuite de l’exécution après leur arrêt. Le sort du chemin dans l’autre jointure demande une clarification. Il faut fixer cette règle dans AgSDL et la traduire en scénario de conformité. Un refus au préflight éviterait le blocage si le profil choisit d’exclure ces graphes entre-temps. [Règles des jointures](https://github.com/Andrologic/AgSDL/blob/bd9f8a5b16923476fd20ac2650bd1729ee151917/spec/flow.md#waiting-modes)
+
+### P2 · Une contrainte de version satisfaite bloque le lancement
+
+AgSDL permet de restreindre la version du harnais avec `harnessVersion`. Le compilateur Argentic exige une preuve native de satisfaction de la plage. Le registre Codex de l’hôte autonome produit uniquement des preuves de capacité du type `native-codex`. Un test du registre et du compilateur avec une observation synthétique de Codex `0.167.0` reproduit le refus `HARNESS_VERSION_UNVERIFIED` pour la plage `>=0.167.0 <0.168.0`. Le même document est accepté une fois le champ retiré. La vérification doit porter sur la version observée et distinguer une incompatibilité réelle d’une plage impossible à évaluer. [Contrat de version](https://github.com/Andrologic/AgSDL/blob/bd9f8a5b16923476fd20ac2650bd1729ee151917/spec/harnesses.md#modules-and-versions) · [Registre](../crates/argentic-runtime/src/capture.rs#L36) · [Vérification de plage](../crates/argentic-core/src/compile/configuration.rs#L415) · [Appel du compilateur](../crates/argentic-core/src/compile/configuration.rs#L745)
+
+### P2 · L’hôte autonome ne résout pas les URI relatives
+
+La spec demande de résoudre les références relatives depuis l’emplacement où le document a été lu. L’hôte autonome conserve le chemin du fichier source, mais la qualification Codex refuse les URI relatives faute d’origine exploitable. Le validateur officiel accepte un agent dont les instructions référencent un fichier voisin `mission.md`. Avec le même fichier, `argentic-host` renvoie `CONTENT_SOURCE_UNSUPPORTED` sur `/agents/worker/instructions/0/uri` au préflight. [Règle des URI](https://github.com/Andrologic/AgSDL/blob/bd9f8a5b16923476fd20ac2650bd1729ee151917/spec/document.md#uris) · [Ouverture du fichier](../crates/argentic-runtime/src/standalone.rs#L282) · [Qualification des sources](../crates/argentic-runtime/src/agsdl_host_work_admission030.rs#L293)
+
+### P2 · Deux scénarios embarqués divergent du corpus publié
+
+Sur les 37 scénarios publiés, 35 sont identiques octet par octet. Au rejeu des deux autres avec leurs attentes originales, seul `expect.starts` diverge. Argentic compte `legal: 2` pour `approval-comments` et `review: 1` pour `compose-body-failure`. Le chapitre Flow traite une étape `compose` comme un travail et le corpus compte déjà l’étape extérieure dans le scénario `composition`. Les deux omissions ressemblent donc à des défauts du corpus amont. Les fixtures originales et les corrections locales doivent rester traçables, avec des résultats distincts pour chaque version. [Projection](../crates/argentic-runtime/src/agsdl_host_conformance030_projection.rs#L130) · [Règle des attentes](https://github.com/Andrologic/AgSDL/blob/bd9f8a5b16923476fd20ac2650bd1729ee151917/conformance/README.md#expectations) · [Règle d’exécution](https://github.com/Andrologic/AgSDL/blob/bd9f8a5b16923476fd20ac2650bd1729ee151917/spec/flow.md#execution-model)
+
+Pour ces deux fichiers, `provenance.json` associe les chemins amont aux empreintes des versions modifiées. Les 144 cas statiques et leurs attentes sont absents des suites Cargo d’Argentic. La CI autonome ne peut donc pas détecter un écart sur l’ensemble du corpus statique. [Provenance](../crates/argentic-runtime/tests/fixtures/conformance/provenance.json#L762) · [Cas de validation](https://github.com/Andrologic/AgSDL/blob/bd9f8a5b16923476fd20ac2650bd1729ee151917/conformance/README.md#cases) · [CI](../.github/workflows/ci.yml#L47)
+
+### P3 · Le rapport statique normalisé reste interne
+
+Le lecteur sait sérialiser `contract`, `valid`, `diagnostics` avec `path`, et `joins`, comme le prévoit AgSDL. Dans l’API publique, le résultat de compilation expose un champ `static` au format Argentic, avec `pointer` et sans `contract` ni `joins`. Une application qui attend le rapport AgSDL a besoin d’une entrée de validation pure dédiée. [Format normalisé](https://github.com/Andrologic/AgSDL/blob/bd9f8a5b16923476fd20ac2650bd1729ee151917/spec/validation.md#report) · [Sérialiseur interne](../crates/argentic-core/src/validate/mod.rs#L228) · [Rapport du compilateur](../crates/argentic-core/src/compile/plan.rs#L33) · [API publique](../crates/argentic-core/src/calculation.rs#L42)
+
+## Périmètre de l’hôte autonome
+
+L’hôte accepte Codex sur ses profils qualifiés et les étapes d’approbation sur macOS ARM64. Il refuse les étapes `call`, y compris les commandes et MCP locaux, les autres harnais, MCP distant et la lecture de contenu réseau. Il limite également les permissions et fonctionnalités du harnais réellement disponibles, notamment les écritures sur approbation et les variantes de `planFirst`. La spec autorise le refus d’une capacité que l’hôte ne sait pas garantir. Ces restrictions limitent les documents exécutables par l’hôte, même quand leur validation statique réussit. [Limites de l’hôte](../crates/argentic-runtime/HOST.md#storage-api-and-limits) · [Préflight](../crates/argentic-runtime/src/standalone.rs#L347) · [Qualification Codex](../crates/argentic-runtime/src/agsdl_host_work_admission030.rs#L223) · [Diagnostic AgSDL](https://github.com/Andrologic/AgSDL/blob/bd9f8a5b16923476fd20ac2650bd1729ee151917/spec/harnesses.md#diagnostic-policy)
+
+Le superviseur utilisé dans les tests exécute les 37 scénarios embarqués avec des réponses synthétiques. Le classement 33 + 4 applique un filtre interne de capacité après substitution du nom du harnais fictif. Il ne correspond pas à 33 validations de bout en bout de l’hôte autonome. Les quatre cas hors filtre sont `answer-timeout-ask` et `timeout-pauses-for-person` pour les formes de `ask` utilisées, `answer-timeout-plan` pour `planFirst: "ask"`, et `call-answer-timeout` pour MCP distant. [Chargement du harnais de test](../crates/argentic-runtime/src/agsdl_host_conformance030_tests.rs#L252) · [Filtre de capacité](../crates/argentic-runtime/src/agsdl_host_conformance030_tests.rs#L1040) · [Contrôle des projections](../crates/argentic-runtime/src/agsdl_host_conformance030_tests.rs#L1187)
+
+## Vérifications
+
+- Les deux schémas, les quatre modules de harnais embarqués et le module fictif `example` sont identiques aux fichiers publiés.
+- Le lecteur Rust produit les ensembles d’erreurs et d’avertissements attendus pour les 144 cas du corpus avec les deux modules fictifs officiels.
+- Le superviseur a passé les 37 scénarios embarqués sur SQLite fichier et mémoire, avec 33 cas dans son filtre de capacité et 4 hors filtre pour chaque stockage.
+- Sur Linux ARM64, 42 tests du cœur, 326 tests unitaires du runtime et 3 tests d’intégration ont réussi. Onze tests unitaires du runtime étaient ignorés. Cinq tests HTTP synthétiques ont réussi au rejeu après avoir obtenu l’accès à la boucle locale que le bac à sable bloquait. Le binaire `argentic-host` a compilé.
+- La qualification réelle de Codex, l’exécution macOS ARM64 et l’oracle TypeScript restent hors des vérifications de cet audit.
