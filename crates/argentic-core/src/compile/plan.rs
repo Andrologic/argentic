@@ -348,7 +348,11 @@ pub(crate) fn finish(mut state: Prepared) -> Value {
             ("snapshot", s("2")),
             ("contract", s("agsdl-0.3.0")),
             ("compiler", s(COMPILER)),
-            ("runtime", s(RUNTIME)),
+            ("runtime", s(if graph.has_shared_stop() {
+                crate::flow::SHARED_STOP_RUNTIME
+            } else {
+                RUNTIME
+            })),
             ("registry", registry.get("version").clone()),
             ("profile", s(PROFILE)),
         ]);

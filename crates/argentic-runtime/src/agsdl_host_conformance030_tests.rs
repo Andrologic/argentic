@@ -1060,6 +1060,81 @@ async fn agsdl030_conformance_all_37_scenarios() {
     }
 }
 
+#[tokio::test]
+async fn shared_stop_scenarios_resume_other_groups_after_termination() {
+    for memory in [false, true] {
+        for (name, raw) in scenarios::SHARED_STOP_SCENARIOS {
+            let f = Fixture::new_mode(raw, memory).await;
+            let fields: BTreeMap<String, Box<serde_json::value::RawValue>> =
+                serde_json::from_str(raw).unwrap();
+            let scenario = scenarios::PinnedScenario030::from_capture(
+                fields["document"].get(),
+                fields["entry"].get(),
+            )
+            .unwrap();
+            let (wake, receiver) = watch::channel(0);
+            let view = native_timeline(&f, scenario, wake, receiver).await.unwrap();
+            let observed = projection::project(&f, &view).await;
+            let expected = serde_json::from_str(fields["expect"].get()).unwrap();
+            let differences = projection::compare(&expected, &observed);
+            assert!(differences.is_empty(), "{name}: {differences:?}");
+
+            if *name == "shared-stop-active-and-pending" {
+                let mut state = FlowState030::new(f.identity.clone());
+                let mut stop_sent = false;
+                for row in &view.events {
+                    let event = crate::persistence::replay_verify030::read_test_event(
+                        row["event"].clone(),
+                    );
+                    let transition = reduce(&f.plan, &state, &event).unwrap();
+                    state = transition.state;
+                    for effect in transition.effects {
+                        let FlowEffectKind030::StopWork {
+                            work,
+                            include_descendants,
+                        } = effect.kind
+                        else {
+                            continue;
+                        };
+                        assert!(!stop_sent, "shared work stopped more than once");
+                        stop_sent = true;
+                        assert!(include_descendants);
+                        let sibling = state
+                            .groups
+                            .iter()
+                            .find(|group| group.join == ["j2"])
+                            .unwrap();
+                        assert!(sibling.decision.is_none());
+                        assert!(!sibling.released);
+                        assert_eq!(state.visits_at(&["after".into()]), "0");
+
+                        let late = FlowEvent030 {
+                            identity: f.identity.clone(),
+                            event_id: "late-vote".into(),
+                            expected_revision: state.revision.clone(),
+                            kind: FlowEventKind030::WorkResult {
+                                work,
+                                result: WorkResult030::Completed {
+                                    output_json: json!({"choice":"two","results":{}}).to_string(),
+                                    route_key: Some("two".into()),
+                                },
+                                physical: None,
+                            },
+                        };
+                        assert!(matches!(
+                            reduce(&f.plan, &state, &late),
+                            Err(FlowInputError030::StaleReference)
+                        ));
+                    }
+                }
+                assert!(stop_sent);
+                assert_eq!(state, view.state);
+            }
+            f.pool.close().await;
+        }
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn agsdl030_conformance_runs_with_only_bun_removed_from_path() {
