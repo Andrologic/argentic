@@ -409,7 +409,7 @@ impl Host {
             None => Value::Null,
         };
         let mut registry = json!({"format":"macro-agsdl-registry/030", "modules":[{"harness":"codex","moduleJson":api::codex_module()}],
-            "harnesses":harnesses,"agents":agents,"hostCapabilities": if cfg!(all(target_os="macos",target_arch="aarch64")) {
+            "harnesses":harnesses,"agents":agents,"hostCapabilities": if !uses_codex || cfg!(all(target_os="macos",target_arch="aarch64")) {
                 json!([{"name":"approval","support":"native","evidenceJson":"{\"runtime\":\"flow-human-clock\"}"}])
             } else { json!([]) }});
         registry["version"] = json!(format!(
@@ -769,7 +769,9 @@ mod tests {
         let directory = f.workspace.join("plans");
         std::fs::create_dir(&directory).unwrap();
         let source = directory.join("source with spaces.json");
+        let mission = directory.join("mission.md");
         std::fs::rename(&f.source, &source).unwrap();
+        std::fs::write(&mission, "Mission").unwrap();
         f.source = source;
         let host = f.open().await.unwrap();
         {
@@ -778,12 +780,15 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert_eq!(
-                location.to_file_path().unwrap(),
+                location.to_file_path().unwrap().canonicalize().unwrap(),
                 f.source.canonicalize().unwrap()
             );
             assert_eq!(
-                crate::content::local_file_path("mission.md", Some(&location)).unwrap(),
-                directory.canonicalize().unwrap().join("mission.md")
+                crate::content::local_file_path("mission.md", Some(&location))
+                    .unwrap()
+                    .canonicalize()
+                    .unwrap(),
+                mission.canonicalize().unwrap()
             );
         }
         host.shutdown(&[]).await.unwrap();
@@ -871,11 +876,12 @@ mod tests {
             host.close().await.unwrap();
         }
     }
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[tokio::test]
     async fn standalone_real_start_human_submission_stop_and_reopen() {
         let f = Fixture::new(WAIT);
         let host = f.open().await.unwrap();
+        let result = host.preflight(entry().as_ref(), false).await.unwrap();
+        assert_eq!(result["runtime"]["supported"], true);
         let started = host.start("start".into(), entry(), false).await.unwrap();
         let replay = host.start("start".into(), entry(), false).await.unwrap();
         assert_eq!(started.receipt, replay.receipt);
@@ -959,7 +965,6 @@ mod tests {
         reopened.shutdown(&[]).await.unwrap();
         reopened.close().await.unwrap();
     }
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[tokio::test]
     async fn restart_marks_unfinished_run_interrupted_without_adoption() {
         const CHILD: &str = "ARGENTIC_SYNTHETIC_CRASH_ROOT";
@@ -1010,7 +1015,6 @@ mod tests {
         host.close().await.unwrap();
     }
 
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[tokio::test]
     async fn failed_retirement_keeps_host_inspectable_but_cannot_close_or_restart() {
         let f = Fixture::new(WAIT);
@@ -1097,7 +1101,6 @@ mod tests {
         host.close().await.unwrap();
     }
 
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[tokio::test]
     async fn standalone_retry_retains_stop_and_requires_consent() {
         let f = Fixture::new(WAIT);

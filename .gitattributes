@@ -1,0 +1,2 @@
+# AgSDL conformance tests verify fixture bytes against upstream hashes.
+crates/**/tests/fixtures/** text=auto eol=lf

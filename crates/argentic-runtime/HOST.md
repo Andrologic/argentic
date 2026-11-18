@@ -39,9 +39,10 @@ shasum -a 256 examples/fixtures/policy.json
 ```
 
 Omit `--codex` and use `human-only.json` for a provider-free human-flow exercise
-on macOS ARM64. `--stop-on-exit` explicitly consents to Stop/drain of this process's
-admitted runs on EOF, Ctrl-C or output disconnection. Keep the process alive for
-all commands and human answers. A separate invocation never adopts a live run.
+on Linux, Windows or macOS. `--stop-on-exit` explicitly consents to Stop/drain of
+this process's admitted runs on EOF, Ctrl-C or output disconnection. Keep the
+process alive for all commands and human answers. A separate invocation never
+adopts a live run.
 
 The official private Codex profile is rooted at the explicit `--data` directory:
 `native-engines/codex-v1`, with the isolated context in `native-contexts/codex-v1`.
@@ -134,9 +135,10 @@ payload fields encoded as strings where specified; do not round them through
 JavaScript numbers. Start uses the existing immediate transaction, generation
 checks, correlation, idempotency barrier and post-commit readback.
 
-Codex remains limited to qualified 0.167.x/macOS ARM64 or Linux ARM64. Human flow
-support here follows the current macOS ARM64 gate. Local host calls, other
-harnesses, network content fetches and remote MCP are unavailable in this host.
+Codex remains limited to qualified 0.167.x on macOS ARM64 or Linux ARM64.
+Documents combining Codex and approval steps require macOS ARM64. Local host
+calls, other harnesses, network content fetches and remote MCP are unavailable
+in this host.
 On the qualified macOS ARM64 content reader, local relative content URIs resolve
 from the source file's directory. The resolved files must be readable under the
 approved workspace and agent policies.

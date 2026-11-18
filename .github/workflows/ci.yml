@@ -19,6 +19,9 @@ jobs:
     name: Cargo (${{ matrix.platform }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 35
+    defaults:
+      run:
+        shell: bash
     strategy:
       fail-fast: false
       matrix:
@@ -27,6 +30,8 @@ jobs:
             runner: ubuntu-24.04-arm
           - platform: macOS ARM64
             runner: macos-15
+          - platform: Windows x64
+            runner: windows-2025
     env:
       RUSTUP_TOOLCHAIN: '1.97.1'
       CARGO_INCREMENTAL: '0'
