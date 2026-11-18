@@ -1013,7 +1013,10 @@ impl Engine<'_> {
                                 .filter(|id| self.membership(self.pi(id), &g).failed)
                                 .count()
                                 + 1;
+                            // A stop can defer the decision after the first
+                            // failure has already crossed this join's threshold.
                             if join.mode == "all"
+                                && self.state.groups[gi].error.is_none()
                                 && (join.failures == "fail"
                                     || number::exceeds(
                                         &failures.to_string(),
@@ -2333,6 +2336,86 @@ mod decision_ordinal_tests {
             epoch: "capture".into(),
         }
     }
+    #[test]
+    fn shared_stop_preserves_the_failure_that_crosses_the_join_threshold() {
+        for (failures, limit, triggering_branch) in
+            [("fail", None, "b"), ("keep", Some("1"), "c")]
+        {
+            let mut plan = plan();
+            plan.versions.runtime = SHARED_STOP_RUNTIME.into();
+            plan.joins.push(Join030 {
+                address: vec!["join".into()],
+                scope: vec![],
+                origin: vec![],
+                branches: vec![],
+                mode: "all".into(),
+                failures: failures.into(),
+                max_failures_json: limit.map(str::to_owned),
+                quorum_count_json: None,
+                accept: vec![],
+                remaining: "finish".into(),
+            });
+            let mut engine = Engine {
+                plan: &plan,
+                state: FlowState030::new(identity()),
+                event_id: "event",
+                ordinal: 0,
+                effects: vec![],
+            };
+            let mut waiting = group("waiting");
+            waiting.join = vec!["join".into()];
+            let join_activation = engine.allocate(None, vec![], "{}".into(), None, None, None);
+            waiting.activation_id = engine.state.activations[join_activation].id.clone();
+            let mut failed = Vec::new();
+            for branch in ["cancelling", "b", "c", "d"] {
+                let is_cancelling = branch == "cancelling";
+                let phase = if is_cancelling { "cancelling" } else { "live" };
+                let context = vec![Frame030::Path {
+                    path_id: branch.into(),
+                    departed_groups: vec![],
+                }];
+                engine.state.paths.push(Path030 {
+                    id: branch.into(),
+                    memberships: vec![Membership030 {
+                        group_id: waiting.id.clone(),
+                        branch: branch.into(),
+                        phase: phase.into(),
+                        result_json: None,
+                        producer: None,
+                        accepted: false,
+                        failed: false,
+                    }],
+                    batch_id: None,
+                    item_json: None,
+                    context: context.clone(),
+                    phase: phase.into(),
+                });
+                waiting.branches.push(GroupBranch030 {
+                    name: branch.into(),
+                    fanout: false,
+                    path_ids: vec![branch.into()],
+                });
+                if !is_cancelling {
+                    failed.push(engine.allocate(None, context, "{}".into(), None, None, None));
+                }
+            }
+            engine.state.groups.push(waiting);
+            for activation in failed {
+                engine
+                    .fail(activation, Failure030::new("AGENT_FAILED"))
+                    .unwrap();
+                assert!(engine.state.groups[0].decision.is_none());
+            }
+            engine.finish_shared_stops();
+            engine.evaluate(0).unwrap();
+            let join = &engine.state.groups[0];
+            assert_eq!(join.decision.as_deref(), Some("failed"));
+            let error = join.error.as_ref().unwrap();
+            assert_eq!(error.code, "BRANCH_FAILED");
+            assert_eq!(error.details[0]["branch"], triggering_branch);
+        }
+    }
+
     #[test]
     fn decision_ordinals_follow_decision_order_not_group_order() {
         let plan = plan();
