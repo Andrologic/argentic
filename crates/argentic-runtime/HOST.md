@@ -20,7 +20,7 @@ the runtime target's `debug/examples/argentic-host`, or in `CARGO_TARGET_DIR` wh
 set. On macOS the runtime build requires the Swift toolchain. The example calls
 `content_io::file_helper::initialize` before Tokio. Downstream host packages must
 also preserve `-Wl,-weak_framework,LightweightCodeRequirements` for deployment
-before macOS 14.4. Local native content has its existing macOS 14.4+ qualification.
+before macOS 14.4.
 
 Choose a disposable workspace containing an existing regular `sentinel.txt` with
 `before` and a newline. Keep the private data directory outside that workspace,
@@ -139,9 +139,10 @@ Codex remains limited to qualified 0.167.x on macOS ARM64 or Linux ARM64.
 Documents combining Codex and approval steps require macOS ARM64. Local host
 calls, other harnesses, network content fetches and remote MCP are unavailable
 in this host.
-On the qualified macOS ARM64 content reader, local relative content URIs resolve
-from the source file's directory. The resolved files must be readable under the
-approved workspace and agent policies.
+Local relative content URIs resolve from the source file's directory. The
+content reader supports Linux, Windows and macOS ARM64 14.4 or later. Files
+must be readable under the approved workspace and agent policies. On Windows,
+the reader is available to runtime embedders.
 Model reviewers, broader write grants and unsupported capabilities remain
 refused. An accepted version string, a synthetic scenario or a successful build
 does not qualify a new provider version or platform. Use the bounded

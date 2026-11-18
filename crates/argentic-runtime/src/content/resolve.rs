@@ -58,7 +58,12 @@ pub(crate) fn local_file_path(
     document_location: Option<&Url>,
 ) -> ContentResult<std::path::PathBuf> {
     let url = resolve_uri_at(uri, document_location)?;
+    path_from_local_uri(&url)
+}
+
+fn path_from_local_uri(url: &Url) -> ContentResult<std::path::PathBuf> {
     if url.scheme() != "file"
+        || url.has_host()
         || !url.username().is_empty()
         || url.password().is_some()
         || url.query().is_some()
@@ -324,12 +329,7 @@ async fn read_uri(
     };
     match uri.scheme() {
         "file" => {
-            let path = uri.to_file_path().map_err(|_| {
-                error(
-                    "CONTENT_URI",
-                    "File URI cannot be converted to a local path.",
-                )
-            })?;
+            let path = path_from_local_uri(uri)?;
             let logical = path
                 .to_str()
                 .ok_or_else(|| error("CONTENT_URI", "Non-UTF-8 file path."))?

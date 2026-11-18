@@ -31,14 +31,16 @@ resolves real paths and links. Its TypeScript wire mirrors remain in Macro.
 
 ## Native content reader
 
-The runtime builds the existing Swift content bridge into a static archive on
-macOS. The host executable calls `content_io::file_helper::initialize` before
-its normal startup so that reader subprocesses dispatch before application
-initialization. It must preserve the weak link to LightweightCodeRequirements
-(`-Wl,-weak_framework,LightweightCodeRequirements`) when targeting macOS before
-14.4; Macro does this in its build script. This is the same native bridge and
-qualification gate, not a second reader or a new qualification. Debug QA hooks
-remain behind the explicit `agsdl-content-qa` feature.
+The reader opens regular files relative to an admitted directory handle on
+Linux, Windows and macOS ARM64 14.4 or later. Linux relaunches the running image
+through procfs. macOS uses the Swift launcher to check the helper's code identity.
+On both systems the host calls `content_io::file_helper::initialize` before
+normal startup so the child can dispatch. On Windows the runtime opens the file
+without following reparse points and waits for its I/O thread to exit on Stop.
+
+macOS builds must preserve the weak link to LightweightCodeRequirements
+(`-Wl,-weak_framework,LightweightCodeRequirements`) when targeting versions
+before 14.4. The explicit `agsdl-content-qa` feature enables debug QA hooks.
 
 ## Host and test boundaries
 

@@ -5,6 +5,8 @@ mod macos_launcher;
 #[cfg(all(target_os = "macos", feature = "agsdl-content-qa"))]
 #[doc(hidden)]
 pub mod macos_launcher;
+#[cfg(windows)]
+mod windows_reader;
 
 use std::sync::Arc;
 pub type ContentResourceOwner =
