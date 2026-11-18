@@ -137,6 +137,9 @@ checks, correlation, idempotency barrier and post-commit readback.
 Codex remains limited to qualified 0.167.x/macOS ARM64 or Linux ARM64. Human flow
 support here follows the current macOS ARM64 gate. Local host calls, other
 harnesses, network content fetches and remote MCP are unavailable in this host.
+On the qualified macOS ARM64 content reader, local relative content URIs resolve
+from the source file's directory. The resolved files must be readable under the
+approved workspace and agent policies.
 Model reviewers, broader write grants and unsupported capabilities remain
 refused. An accepted version string, a synthetic scenario or a successful build
 does not qualify a new provider version or platform. Use the bounded

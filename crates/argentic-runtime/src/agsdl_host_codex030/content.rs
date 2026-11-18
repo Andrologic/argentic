@@ -72,11 +72,12 @@ impl Sources030 {
         let current = normalize_requested(ceiling.permissions().clone(), paths)
             .map_err(|_| missing("contentPolicy"))?;
         let ceiling_digest = ceiling.fingerprint().to_owned();
+        let location = crate::capture::captured_document_location(capture)?;
         let context = ContentContext::capture(
             capture.identity.snapshot_id.clone(),
             capture.source.source_sha256.clone(),
             capture.authored_source.clone(),
-            None,
+            location.as_ref().map(url::Url::as_str),
             agent.into(),
             policy.with_current(current),
             ExecutionPurpose::Agent,
@@ -290,7 +291,7 @@ impl Sources030 {
         } else {
             None
         };
-        qualify_skill_folders(&self.document, &self.root)?;
+        qualify_skill_folders(&self.document, &self.root, self.context.document_location())?;
         for key in self.document["agents"][self.context.binding().map_err(content_error)?.agent]
             ["skills"]
             .as_array()
@@ -342,8 +343,8 @@ impl Sources030 {
 
     fn allowed_file(&self, source: &Value, pointer: &str) -> HostResult<()> {
         if let Some(uri) = source.get("uri").and_then(Value::as_str) {
-            let path=url::Url::parse(uri).ok().filter(|uri| uri.scheme()=="file" && uri.query().is_none() && uri.fragment().is_none()).and_then(|uri| uri.to_file_path().ok())
-                .ok_or_else(|| failure("CONTENT_SOURCE_UNSUPPORTED",pointer,"Only absolute local file sources are represented; no document origin is available for relative URIs"))?;
+            let path = crate::content::local_file_path(uri, self.context.document_location())
+                .map_err(|error| failure("CONTENT_SOURCE_UNSUPPORTED", pointer, &error.message))?;
             let path = path.canonicalize().map_err(|_| {
                 failure(
                     "CONTENT_UNAVAILABLE",
@@ -422,7 +423,11 @@ fn private_project_path(root: &Path, path: &Path) -> bool {
 
 /// Only inspect selected folders within the native project scope. Other skill
 /// shapes remain explicit refusals before launch as well as at work admission.
-pub(crate) fn qualify_skill_folders(document: &Value, root: &Path) -> HostResult<()> {
+pub(crate) fn qualify_skill_folders(
+    document: &Value,
+    root: &Path,
+    document_location: Option<&url::Url>,
+) -> HostResult<()> {
     for (agent_name, agent) in document["agents"].as_object().into_iter().flatten() {
         if agent["skills"]
             .as_array()
@@ -440,16 +445,14 @@ pub(crate) fn qualify_skill_folders(document: &Value, root: &Path) -> HostResult
             let uri = document["skills"][name]["uri"]
                 .as_str()
                 .ok_or_else(|| missing("skills"))?;
-            let path = url::Url::parse(uri)
+            let path = crate::content::local_file_path(uri, document_location)
                 .ok()
-                .filter(|uri| uri.scheme() == "file")
-                .and_then(|uri| uri.to_file_path().ok())
                 .and_then(|path| path.canonicalize().ok())
                 .ok_or_else(|| {
                     failure(
                         "CONTENT_SOURCE_UNSUPPORTED",
                         &pointer,
-                        "Selected skill requires an available absolute local SKILL.md file",
+                        "Selected skill requires an available local SKILL.md file",
                     )
                 })?;
             if !path.starts_with(root)
@@ -484,9 +487,10 @@ mod tests {
 
     #[tokio::test]
     async fn recipient_read_scope_is_rechecked_at_content_admission() {
-        for folder in [".macro", "private"] {
+        for folder in [".macro", "private", "../outside"] {
             let temp = tempfile::tempdir().unwrap();
-            let root = temp.path().canonicalize().unwrap();
+            let root = temp.path().canonicalize().unwrap().join("workspace");
+            std::fs::create_dir(&root).unwrap();
             let file = root.join("data.txt");
             std::fs::write(&file, "Public fixture").unwrap();
             let private = root.join(folder);
@@ -495,6 +499,7 @@ mod tests {
             std::fs::write(&destination, "Private fixture").unwrap();
             let document = json!({"agents":{"worker":{}}});
             let document_json = document.to_string();
+            let origin = url::Url::from_file_path(root.join("document.json")).unwrap();
             let policy = normalize_requested(
                 RequestedPermissions::Preset(crate::permissions::Preset::ReadOnly),
                 PathContext {
@@ -507,7 +512,7 @@ mod tests {
                 "capture".into(),
                 format!("{:x}", Sha256::digest(document_json.as_bytes())),
                 document_json,
-                None,
+                Some(origin.as_str()),
                 "worker".into(),
                 EffectivePolicy::new(policy.clone(), policy.clone(), policy),
                 ExecutionPurpose::Agent,
@@ -520,10 +525,18 @@ mod tests {
             let sources =
                 Sources030::from_context(context, document, root.clone(), root.join("private"))
                     .unwrap();
-            let source = json!({"uri":url::Url::from_file_path(&file).unwrap().to_string(),"mediaType":"text/plain"});
+            let absolute = url::Url::from_file_path(&file).unwrap();
+            let source = json!({"uri":"data.txt","mediaType":"text/plain"});
+            sources
+                .allowed_file(&json!({"uri":absolute.as_str()}), "/resource")
+                .unwrap();
             sources.allowed_file(&source, "/resource").unwrap();
             std::fs::remove_file(&file).unwrap();
             std::os::unix::fs::symlink(&destination, &file).unwrap();
+            assert_eq!(
+                sources.allowed_file(&source, "/resource").unwrap_err().code,
+                "PERMISSION"
+            );
             // Continue through the same native resolver used after preflight.
             // The recipient scope must be enforced before starting its reader.
             let result = resolve_content(

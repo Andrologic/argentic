@@ -272,7 +272,7 @@ pub fn codex_read_only(policy: &crate::permissions::EffectivePolicy) -> Result<b
     crate::agsdl_host_work_admission030::codex_read_only030(policy)
 }
 pub fn qualify_skill_folders(document: &Value, root: &std::path::Path) -> Result<()> {
-    crate::agsdl_host_codex030::content::qualify_skill_folders(document, root)
+    crate::agsdl_host_codex030::content::qualify_skill_folders(document, root, None)
 }
 pub fn declared_steps(document: &Value) -> impl Iterator<Item = (String, &Value)> {
     crate::agsdl_host_qualification030::declared_steps030(document)

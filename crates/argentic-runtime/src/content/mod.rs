@@ -102,6 +102,10 @@ pub enum ContentEffectPhase {
 }
 
 impl ContentContext {
+    pub(crate) fn document_location(&self) -> Option<&url::Url> {
+        self.document_location.as_ref()
+    }
+
     pub fn with_network(
         mut self,
         network: Arc<dyn crate::content_network::ContentNetwork>,

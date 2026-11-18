@@ -4,6 +4,30 @@ use semver::{Version, VersionReq};
 use serde_json::{json, Value};
 use std::{collections::BTreeSet, path::Path, sync::OnceLock};
 
+pub(crate) fn document_location(scope: &Value) -> Result<Option<url::Url>> {
+    scope
+        .get("documentLocation")
+        .map(|location| {
+            let invalid = || failure("CORRELATION", "scope", "Invalid captured document location");
+            let uri = location.as_str().ok_or_else(invalid)?;
+            crate::content::local_file_path(uri, None).map_err(|_| invalid())?;
+            url::Url::parse(uri).map_err(|_| invalid())
+        })
+        .transpose()
+}
+
+pub(crate) fn captured_document_location(
+    capture: &crate::persistence::start030::StartCapture030,
+) -> Result<Option<url::Url>> {
+    let private: Value = serde_json::from_str(&capture.private_capture_json)?;
+    private
+        .get("callScopeJson")
+        .and_then(Value::as_str)
+        .map(|raw_scope| document_location(&serde_json::from_str(raw_scope)?))
+        .transpose()
+        .map(Option::flatten)
+}
+
 fn version_requirement(range: &str) -> std::result::Result<VersionReq, semver::Error> {
     static SEPARATORS: OnceLock<regex::Regex> = OnceLock::new();
     range.parse().or_else(|error| {
@@ -27,7 +51,11 @@ pub fn codex_registry(
     scope: &Value,
     observed: &crate::api::CodexObservation,
 ) -> Result<(Value, Vec<Value>)> {
-    crate::agsdl_host_work_admission030::validate_codex_document030(document)?;
+    let document_location = document_location(scope)?;
+    crate::agsdl_host_work_admission030::validate_codex_document_at030(
+        document,
+        document_location.as_ref(),
+    )?;
     if document["agents"].as_object().is_some_and(|agents| {
         agents.values().any(|agent| {
             agent["skills"]
@@ -35,11 +63,12 @@ pub fn codex_registry(
                 .is_some_and(|skills| !skills.is_empty())
         })
     }) {
-        crate::api::qualify_skill_folders(
+        crate::agsdl_host_codex030::content::qualify_skill_folders(
             document,
             Path::new(scope["root"].as_str().ok_or_else(|| {
                 failure("CORRELATION", "skills", "Native project scope is absent")
             })?),
+            document_location.as_ref(),
         )?;
     }
     if !crate::api::qualified_codex_version(&observed.version) || observed.models.is_empty() {

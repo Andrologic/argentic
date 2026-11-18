@@ -221,6 +221,13 @@ pub(crate) fn codex_read_only030(policy: &crate::permissions::EffectivePolicy) -
 /// Shared native preflight/admission restriction. Inline values are payloads,
 /// so data containing keys such as uri or timeoutMs is never treated as code.
 pub(crate) fn validate_codex_document030(document: &serde_json::Value) -> Result<()> {
+    validate_codex_document_at030(document, None)
+}
+
+pub(crate) fn validate_codex_document_at030(
+    document: &serde_json::Value,
+    document_location: Option<&url::Url>,
+) -> Result<()> {
     use serde_json::Value;
     let agents = document.get("agents").and_then(Value::as_object);
     if !agents.is_some_and(|agents| agents.values().any(|agent| agent["harness"] == "codex")) {
@@ -290,7 +297,7 @@ pub(crate) fn validate_codex_document030(document: &serde_json::Value) -> Result
             }
         }
     }
-    fn visit(value: &Value, pointer: &str) -> Result<()> {
+    fn visit(value: &Value, pointer: &str, document_location: Option<&url::Url>) -> Result<()> {
         if let Some(object) = value.as_object() {
             if object.get("uri").is_some_and(Value::is_string)
                 && object
@@ -298,22 +305,15 @@ pub(crate) fn validate_codex_document030(document: &serde_json::Value) -> Result
                     .all(|key| matches!(key.as_str(), "uri" | "mediaType"))
             {
                 let uri = object["uri"].as_str().unwrap();
-                let parsed = url::Url::parse(uri).map_err(|_| {
+                crate::content::local_file_path(uri, document_location).map_err(|error| {
                     failure(
                         "CONTENT_SOURCE_UNSUPPORTED",
                         &format!("{pointer}/uri"),
-                        "Relative content requires a native document origin; this source has none",
+                        &error.message,
                     )
                 })?;
-                if !crate::content::file_helper::qualified_platform()
-                    || parsed.scheme() != "file"
-                    || parsed.to_file_path().is_err()
-                    || !parsed.username().is_empty()
-                    || parsed.password().is_some()
-                    || parsed.query().is_some()
-                    || parsed.fragment().is_some()
-                {
-                    return Err(failure("CONTENT_SOURCE_UNSUPPORTED",&format!("{pointer}/uri"),"Only absolute local file content on the qualified macOS ARM64 reader, macOS 14.4 or later, is supported"));
+                if !crate::content::file_helper::qualified_platform() {
+                    return Err(failure("CONTENT_SOURCE_UNSUPPORTED",&format!("{pointer}/uri"),"Local file content requires the qualified macOS ARM64 reader, macOS 14.4 or later"));
                 }
             }
             if (object.contains_key("uri") || object.contains_key("value"))
@@ -360,16 +360,16 @@ pub(crate) fn validate_codex_document030(document: &serde_json::Value) -> Result
                     continue;
                 }
                 let location = format!("{pointer}/{}", pointer_token030(key));
-                visit(child, &location)?;
+                visit(child, &location, document_location)?;
             }
         } else if let Some(array) = value.as_array() {
             for (index, child) in array.iter().enumerate() {
-                visit(child, &format!("{pointer}/{index}"))?;
+                visit(child, &format!("{pointer}/{index}"), document_location)?;
             }
         }
         Ok(())
     }
-    visit(document, "")
+    visit(document, "", document_location)
 }
 
 #[cfg(test)]
@@ -472,7 +472,10 @@ pub(crate) async fn admit_agent_work_tx(
     }
     if prepared.agent_harness == "codex" {
         let document: serde_json::Value = serde_json::from_str(&capture.authored_source)?;
-        validate_codex_document030(&document)?;
+        validate_codex_document_at030(
+            &document,
+            crate::capture::captured_document_location(&capture)?.as_ref(),
+        )?;
         validate_codex_registry030(
             &serde_json::from_str(&capture.registry_json)?,
             &prepared.agent,
@@ -869,7 +872,10 @@ fn agent_inputs(
     validate_json(&capture.authored_source)?;
     let document: serde_json::Value = serde_json::from_str(&capture.authored_source)?;
     if document["agents"][agent]["harness"] == "codex" {
-        validate_codex_document030(&document)?;
+        validate_codex_document_at030(
+            &document,
+            crate::capture::captured_document_location(capture)?.as_ref(),
+        )?;
     }
     let value = document
         .get("agents")
