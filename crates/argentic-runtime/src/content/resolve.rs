@@ -334,6 +334,8 @@ async fn read_uri(
                 .to_str()
                 .ok_or_else(|| error("CONTENT_URI", "Non-UTF-8 file path."))?
                 .to_owned();
+            #[cfg(windows)]
+            let logical = logical.replace('\\', "/");
             let root_path = root
                 .map(|r| {
                     r.uri

@@ -187,18 +187,8 @@ impl NormalizedRule {
             return Ok(true);
         };
         if let Some(physical_pattern) = &self.physical {
-            let a = glob(
-                self.logical.as_ref().unwrap(),
-                &subject.logical,
-                true,
-                false,
-            )?;
-            let b = glob(
-                physical_pattern,
-                &text(subject.physical.as_ref().unwrap())?,
-                true,
-                false,
-            )?;
+            let a = path_glob(self.logical.as_ref().unwrap(), &subject.logical)?;
+            let b = path_glob(physical_pattern, &text(subject.physical.as_ref().unwrap())?)?;
             return Ok(if self.effect == Effect::Allow {
                 a && b
             } else {
@@ -232,6 +222,32 @@ impl NormalizedRule {
             Some(p) => !p.is_empty() && p.chars().all(|c| c == '*'),
         }
     }
+}
+
+fn path_glob(pattern: &str, subject: &str) -> Result<bool> {
+    #[cfg(windows)]
+    {
+        return glob(
+            &windows_path_spelling(pattern),
+            &windows_path_spelling(subject),
+            true,
+            false,
+        );
+    }
+    #[cfg(not(windows))]
+    glob(pattern, subject, true, false)
+}
+
+#[cfg(windows)]
+fn windows_path_spelling(path: &str) -> String {
+    let volume_path = matches!(
+        Path::new(path).components().next(),
+        Some(Component::Prefix(prefix)) if matches!(prefix.kind(), std::path::Prefix::VerbatimDisk(_))
+    );
+    // Compare a DOS drive path and its canonical verbatim form in the same
+    // spelling. Only the separator counts as a path boundary for globs.
+    let path = if volume_path { &path[4..] } else { path };
+    path.replace('\\', "/")
 }
 pub(super) struct Subject {
     pub logical: String,

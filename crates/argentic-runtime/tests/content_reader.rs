@@ -4,8 +4,7 @@ use argentic_runtime::content::{
 };
 use argentic_runtime::content_io::file_helper::{self, MAX_BYTES};
 use argentic_runtime::permissions::{
-    normalize_requested, EffectivePolicy, ExecutionPurpose, PathContext, Preset,
-    RequestedPermissions,
+    normalize_requested, EffectivePolicy, ExecutionPurpose, PathContext,
 };
 use cap_std::{ambient_authority, fs::Dir};
 use serde_json::json;
@@ -41,11 +40,15 @@ async fn exercise_reader() {
     let plans = root.join("plans");
     let source = plans.join("document with spaces.json");
     let instructions = plans.join("mission text.txt");
+    let nested = plans.join("nested");
     let skill = plans.join("review");
     let document = r#"{"agents":{"worker":{"skills":["review"]}},"skills":{"review":{"uri":"review/SKILL.md"}}}"#;
     fs::create_dir_all(&skill).unwrap();
+    fs::create_dir(&nested).unwrap();
     fs::write(&source, document).unwrap();
     fs::write(&instructions, "Read the mission.\n").unwrap();
+    fs::write(nested.join("draft-private.txt"), "Nested draft.\n").unwrap();
+    fs::write(plans.join("draft-private.txt"), "Denied draft.\n").unwrap();
     fs::write(
         skill.join("SKILL.md"),
         "---\nname: review\ndescription: Review a draft\n---\nReview the draft.\n",
@@ -53,7 +56,10 @@ async fn exercise_reader() {
     .unwrap();
 
     let policy = normalize_requested(
-        RequestedPermissions::Preset(Preset::ReadOnly),
+        serde_json::from_value(json!({"preset":"read-only","rules":[
+            {"action":"read","effect":"deny","match":"plans/*-private.txt"}
+        ]}))
+        .unwrap(),
         PathContext {
             workspace: root.clone(),
             home: root.clone(),
@@ -76,9 +82,26 @@ async fn exercise_reader() {
     .unwrap();
 
     let absolute = Url::from_file_path(&instructions).unwrap();
-    for (uri, usage) in [
-        ("mission%20text.txt", ContentUsage::Instructions),
-        (absolute.as_str(), ContentUsage::Resource),
+    let nested_uri = Url::from_file_path(nested.join("draft-private.txt")).unwrap();
+    for (uri, usage, expected_uri, expected_text) in [
+        (
+            "mission%20text.txt",
+            ContentUsage::Instructions,
+            &absolute,
+            "Read the mission.\n",
+        ),
+        (
+            absolute.as_str(),
+            ContentUsage::Resource,
+            &absolute,
+            "Read the mission.\n",
+        ),
+        (
+            "nested/draft-private.txt",
+            ContentUsage::Resource,
+            &nested_uri,
+            "Nested draft.\n",
+        ),
     ] {
         let receipt = resolve_content(
             &context,
@@ -90,26 +113,29 @@ async fn exercise_reader() {
         )
         .await
         .unwrap();
-        assert!(
-            matches!(receipt.payload, ContentPayload::Text { text } if text == "Read the mission.\n")
-        );
+        assert!(matches!(receipt.payload, ContentPayload::Text { text } if text == expected_text));
         assert_eq!(
             receipt.provenance.final_uri.as_deref(),
-            Some(absolute.as_str())
+            Some(expected_uri.as_str())
         );
         assert!(receipt.provenance.file_parent_identity.is_some());
     }
-    let remote = resolve_content(
-        &context,
-        ContentUse {
-            source_json: json!({"uri":"file://example.invalid/share/mission.txt"}).to_string(),
-            usage: ContentUsage::Resource,
-            pointer: "/file".into(),
-        },
-    )
-    .await
-    .unwrap_err();
-    assert_eq!(remote.code, "CONTENT_URI");
+    for (uri, error_code) in [
+        ("draft-private.txt", "PERMISSION"),
+        ("file://example.invalid/share/mission.txt", "CONTENT_URI"),
+    ] {
+        let error = resolve_content(
+            &context,
+            ContentUse {
+                source_json: json!({"uri":uri,"mediaType":"text/plain"}).to_string(),
+                usage: ContentUsage::Resource,
+                pointer: "/file".into(),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, error_code);
+    }
 
     let skills = discover_skills(&context).await.unwrap();
     assert_eq!(skills.len(), 1);
