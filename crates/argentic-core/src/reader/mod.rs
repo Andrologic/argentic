@@ -12,6 +12,7 @@
 //! declares support for a property qualifies no adapter; it only feeds the
 //! static diagnostics.
 use super::{
+    calculation::Failure,
     exact::{
         scan::{parse_shared, parse_v030, Span},
         stringify, Value,
@@ -45,6 +46,7 @@ pub(crate) const PINNED_MODULES: [(&str, &str); 4] = [
 pub(crate) enum Modules<'m> {
     Pinned,
     Explicit(&'m ModuleMap),
+    Encoded(&'m [&'m [u8]]),
 }
 
 /// `readWithSpans(bytes, options)`.
@@ -122,6 +124,21 @@ pub(crate) fn registry(modules: Modules<'_>) -> Result<ModuleMap, ReadError> {
             .iter()
             .map(|(name, module)| (name.as_str(), module))
             .collect(),
+        Modules::Encoded(sources) => {
+            let mut modules = ModuleMap::new();
+            for source in sources {
+                let module = load_harness_module(source)?;
+                let name = module_name(&module)?.to_owned();
+                if modules.get(&name).is_some() {
+                    return Err(ModuleError {
+                        message: format!("Duplicate harness module '{name}'."),
+                    }
+                    .into());
+                }
+                modules.set(name, module);
+            }
+            return Ok(modules);
+        }
     };
     let mut detached = ModuleMap::new();
     for (name, value) in source {
@@ -166,6 +183,30 @@ pub(crate) fn read_with_spans(bytes: &[u8], modules: Modules<'_>) -> Result<Read
 /// `read(bytes, options)`.
 pub(crate) fn read(bytes: &[u8], modules: Modules<'_>) -> Result<Report, ReadError> {
     read_with_spans(bytes, modules).map(|output| output.report)
+}
+
+/// Validate authored AgSDL 0.3.0 bytes and return the standard JSON report.
+///
+/// `None` selects the bundled modules. `Some` uses only the supplied module
+/// documents, including when the slice is empty. Invalid authored documents
+/// yield a report with `valid: false`. Configuration and internal errors
+/// return a [`Failure`]. Validation does not fetch content or observe a harness.
+pub fn validate_document_json(bytes: &[u8], modules: Option<&[&[u8]]>) -> Result<String, Failure> {
+    let modules = modules.map_or(Modules::Pinned, Modules::Encoded);
+    read(bytes, modules)
+        .map(|report| report.to_json())
+        .map_err(|error| match error {
+            ReadError::Module(error) => Failure {
+                code: "HARNESS_MODULE".into(),
+                pointer: "/modules".into(),
+                message: error.message,
+            },
+            ReadError::Internal(error) => Failure {
+                code: "VALIDATION".into(),
+                pointer: String::new(),
+                message: error.message,
+            },
+        })
 }
 
 /// `validateExact(document, options)`: the registry first, then the exact
