@@ -330,12 +330,8 @@ async fn read_uri(
     match uri.scheme() {
         "file" => {
             let path = path_from_local_uri(uri)?;
-            let logical = path
-                .to_str()
-                .ok_or_else(|| error("CONTENT_URI", "Non-UTF-8 file path."))?
-                .to_owned();
-            #[cfg(windows)]
-            let logical = logical.replace('\\', "/");
+            let logical = crate::permissions::native_request_path(&path)
+                .ok_or_else(|| error("CONTENT_URI", "Unsupported local file path."))?;
             let root_path = root
                 .map(|r| {
                     r.uri

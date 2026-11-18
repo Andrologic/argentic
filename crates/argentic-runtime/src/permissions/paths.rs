@@ -28,6 +28,22 @@ pub(super) fn text(path: &Path) -> Result<String> {
         .map(str::to_owned)
         .ok_or_else(|| invalid("Non-UTF-8 paths require an explicit native adapter"))
 }
+
+/// Adapt a native local path to the slash-separated policy request syntax.
+pub(crate) fn native_request_path(path: &Path) -> Option<String> {
+    let value = path.to_str()?;
+    #[cfg(windows)]
+    {
+        if !matches!(path.components().next(), Some(Component::Prefix(prefix))
+            if matches!(prefix.kind(), std::path::Prefix::Disk(_) | std::path::Prefix::VerbatimDisk(_)))
+        {
+            return None;
+        }
+        Some(windows_path_spelling(value))
+    }
+    #[cfg(not(windows))]
+    Some(value.to_owned())
+}
 pub(super) fn contains(root: &Path, path: &Path) -> bool {
     path.starts_with(root)
 }

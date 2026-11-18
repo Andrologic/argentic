@@ -262,26 +262,28 @@ pub(crate) fn grant(
         ));
     }
     let _ = prepared;
-    let mut read = vec![
-        PathScope::Literal(PathBuf::from("/")),
-        PathScope::Subtree(root.clone()),
-    ];
+    let mut read = vec![PathScope::Subtree(root.clone())];
+    let mut write = vec![PathScope::Subtree(root.clone())];
     // Explicit native runtime dependencies. User home and application profiles
     // are outside these roots; the environment inherits no credentials.
-    for path in [
-        "/bin",
-        "/usr/bin",
-        "/usr/lib",
-        "/System/Library",
-        "/private/var/select",
-    ] {
-        if Path::new(path).exists() {
-            read.push(PathScope::Subtree(Path::new(path).canonicalize().map_err(
-                |_| failure("PERMISSION", "call", "Runtime directory unavailable"),
-            )?));
+    if cfg!(unix) {
+        read.insert(0, PathScope::Literal(PathBuf::from("/")));
+        for path in [
+            "/bin",
+            "/usr/bin",
+            "/usr/lib",
+            "/System/Library",
+            "/private/var/select",
+        ] {
+            if Path::new(path).exists() {
+                read.push(PathScope::Subtree(Path::new(path).canonicalize().map_err(
+                    |_| failure("PERMISSION", "call", "Runtime directory unavailable"),
+                )?));
+            }
         }
+        read.push(PathScope::Literal(PathBuf::from("/dev/null")));
+        write.push(PathScope::Literal(PathBuf::from("/dev/null")));
     }
-    read.push(PathScope::Literal(PathBuf::from("/dev/null")));
     let sandbox = SandboxPolicy::from_authorized_ceilings(
         capture.source.source_sha256.clone(),
         &[OsCeiling {
@@ -290,10 +292,7 @@ pub(crate) fn grant(
                 block: vec![],
             },
             write: FileAccess {
-                allow: vec![
-                    PathScope::Subtree(root.clone()),
-                    PathScope::Literal(PathBuf::from("/dev/null")),
-                ],
+                allow: write,
                 block: vec![],
             },
             network: false,

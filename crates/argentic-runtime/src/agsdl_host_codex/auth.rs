@@ -74,20 +74,15 @@ pub(super) async fn read(source: &Path) -> Result<Credentials> {
 }
 #[cfg(unix)]
 async fn read_file(source: &Path) -> Result<Credentials> {
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-    let unavailable = || error("CODEX_AUTH_SOURCE_UNAVAILABLE");
-    if !source.is_absolute() || source.canonicalize().map_err(|_| unavailable())? != source {
-        return Err(unavailable());
+    use std::os::unix::fs::MetadataExt;
+
+    let (mut file, mut meta) = open_private_candidate(source).await?;
+    // An atomic refresh can unlink the inode after open. Reopen the same
+    // approved path once and apply the full checks to the replacement.
+    if meta.nlink() == 0 {
+        (file, meta) = open_private_candidate(source).await?;
     }
-    let mut options = std::fs::OpenOptions::new();
-    options
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-    let mut file = tokio::fs::OpenOptions::from(options)
-        .open(source)
-        .await
-        .map_err(|_| unavailable())?;
-    let meta = file.metadata().await.map_err(|_| unavailable())?;
+    let unavailable = || error("CODEX_AUTH_SOURCE_UNAVAILABLE");
     if !meta.is_file()
         || meta.uid() != unsafe { libc::geteuid() }
         || meta.mode() & 0o077 != 0
@@ -149,6 +144,26 @@ async fn read_file(source: &Path) -> Result<Credentials> {
         access_token: tokens.access_token,
         account_id: tokens.account_id,
     })
+}
+
+#[cfg(unix)]
+async fn open_private_candidate(source: &Path) -> Result<(tokio::fs::File, std::fs::Metadata)> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let unavailable = || error("CODEX_AUTH_SOURCE_UNAVAILABLE");
+    if !source.is_absolute() || source.canonicalize().map_err(|_| unavailable())? != source {
+        return Err(unavailable());
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    let file = tokio::fs::OpenOptions::from(options)
+        .open(source)
+        .await
+        .map_err(|_| unavailable())?;
+    let metadata = file.metadata().await.map_err(|_| unavailable())?;
+    Ok((file, metadata))
 }
 #[cfg(not(unix))]
 async fn read_file(_: &Path) -> Result<Credentials> {

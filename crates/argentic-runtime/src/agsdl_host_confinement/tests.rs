@@ -52,8 +52,17 @@ fn lowering_intersects_ceilings_and_rejects_injection_or_aliases() {
     assert!(!policy.profile.contains("allow network"));
     assert!(SandboxPolicy::from_authorized_ceilings("".into(), &[]).is_err());
     assert!(scope(&PathScope::Literal("relative".into())).is_err());
-    assert!(quoted(Path::new("/tmp/a\n(allow default)")).is_err());
-    assert_eq!(quoted(Path::new("/tmp/a\"b")).unwrap(), "\"/tmp/a\\\"b\"");
+    let (control, quote, escaped) = if cfg!(windows) {
+        (
+            "C:\\tmp\\a\n(allow default)",
+            r#"C:\tmp\a"b"#,
+            r#""C:\\tmp\\a\"b""#,
+        )
+    } else {
+        ("/tmp/a\n(allow default)", r#"/tmp/a"b"#, r#""/tmp/a\"b""#)
+    };
+    assert!(quoted(Path::new(control)).is_err());
+    assert_eq!(quoted(Path::new(quote)).unwrap(), escaped);
     #[cfg(unix)]
     {
         let link = path.join("alias");
