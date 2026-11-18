@@ -172,7 +172,7 @@ const SCENARIO_PINS: &[(&str, &str)] = &[
     ),
     (
         "approval-comments",
-        "bca5a84096e1c65545dfe358e3ad12695de75cd1b7187de47b9b63459a858d56",
+        "3d8f6655d0ed9f567b7a6770f3a7899bb5b279a653a7661b951c0bfac437acf2",
     ),
     (
         "call-answer-timeout",
@@ -180,7 +180,7 @@ const SCENARIO_PINS: &[(&str, &str)] = &[
     ),
     (
         "compose-body-failure",
-        "343e688b307fa98144b2b19f7e418fbdc5f34c943f121401f1c933e761748a5c",
+        "910709be5053ce395f0c85a8b94e9e3e7157e7290da3a2d357699fd470506fb4",
     ),
     (
         "timeout-pauses-for-person",

@@ -1142,10 +1142,31 @@ async fn run_all_37(compare_ts: bool, memory: bool) {
         pinned, discovered,
         "Every scenario must be explicitly covered"
     );
+    let provenance: Value =
+        serde_json::from_str(include_str!("../tests/fixtures/conformance/provenance.json"))
+            .unwrap();
+    let upstream_hashes: BTreeMap<_, _> = provenance["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|record| {
+            let name = record["upstream"]
+                .as_str()?
+                .strip_prefix("conformance/runs/")?
+                .strip_suffix(".json")?;
+            Some((name, record["sha256"].as_str().unwrap()))
+        })
+        .collect();
+    assert_eq!(upstream_hashes.len(), pinned.len());
     let (mut native, mut scripted, mut failures) = (0, 0, Vec::new());
     let mut capture_manifest = Vec::new();
     let mut route_capture_manifest = Vec::new();
     for (name, raw) in scenarios::SCENARIOS {
+        assert_eq!(
+            format!("{:x}", Sha256::digest(raw.as_bytes())),
+            upstream_hashes[name],
+            "published fixture {name}"
+        );
         let prepared = std::panic::AssertUnwindSafe(async { Fixture::new_mode(raw, memory).await })
             .catch_unwind()
             .await;
@@ -1185,7 +1206,7 @@ async fn run_all_37(compare_ts: bool, memory: bool) {
                 native_timeline(&f, scenario, wake, receiver).await?
             };
             let observed = projection::project(&f, &view).await;
-            let expected: Value = serde_json::from_str(fields["expect"].get()).unwrap();
+            let mut expected: Value = serde_json::from_str(fields["expect"].get()).unwrap();
             if let Some(directory) = std::env::var_os("ARGENTIC_PROJECTION_DIR") {
                 std::fs::create_dir_all(&directory).unwrap();
                 std::fs::write(
@@ -1201,6 +1222,23 @@ async fn run_all_37(compare_ts: bool, memory: bool) {
                 observed, reference["observations"][*name],
                 "complete TS base projection {name}"
             );
+            // Published 0.3.0 omits these two compose work counts. Compare
+            // the originals first, then require the complete corrected output.
+            let compose_start = match *name {
+                "approval-comments" => Some(("legal", 2)),
+                "compose-body-failure" => Some(("review", 1)),
+                _ => None,
+            };
+            if let Some((step, count)) = compose_start {
+                let published_errors = projection::compare(&expected, &observed);
+                assert!(
+                    matches!(published_errors.as_slice(), [error] if error.starts_with("starts: ")),
+                    "{name}: published expectations differ beyond the compose start count: {published_errors:?}"
+                );
+                let starts = expected["starts"].as_object_mut().unwrap();
+                assert!(starts.insert(step.into(), json!(count)).is_none());
+                eprintln!("CONFORMANCE {name}: published starts omit {step}={count}");
+            }
             let errors = projection::compare(&expected, &observed);
             if !errors.is_empty() {
                 return Err(crate::persistence::failure(

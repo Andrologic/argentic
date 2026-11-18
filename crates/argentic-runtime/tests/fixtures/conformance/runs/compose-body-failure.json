@@ -88,7 +88,6 @@
     "run": "succeeded",
     "starts": {
       "write": 1,
-      "review": 1,
       "review/check": 1,
       "triage": 1
     },

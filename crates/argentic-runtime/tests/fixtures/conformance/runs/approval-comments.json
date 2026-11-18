@@ -138,7 +138,6 @@
     "run": "succeeded",
     "starts": {
       "write": 2,
-      "legal": 2,
       "legal/check": 2,
       "editor": 2,
       "release": 2
