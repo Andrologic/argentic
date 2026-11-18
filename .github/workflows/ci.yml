@@ -6,18 +6,32 @@ on:
   push:
     branches: [main, develop]
   workflow_dispatch:
+    inputs:
+      platform:
+        description: Platform to test
+        type: choice
+        default: Linux ARM64
+        options: [Linux ARM64, Windows x64, macOS ARM64, all]
+      suite:
+        description: Test suite to run
+        type: choice
+        default: reader
+        options: [reader, full]
 
 permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
 
 jobs:
   cargo:
     name: Cargo (${{ matrix.platform }})
-    runs-on: ${{ matrix.runner }}
+    runs-on: >-
+      ${{ matrix.platform == 'Linux ARM64' && 'ubuntu-24.04-arm'
+          || matrix.platform == 'macOS ARM64' && 'macos-15'
+          || 'windows-2025' }}
     timeout-minutes: 35
     defaults:
       run:
@@ -25,13 +39,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - platform: Linux ARM64
-            runner: ubuntu-24.04-arm
-          - platform: macOS ARM64
-            runner: macos-15
-          - platform: Windows x64
-            runner: windows-2025
+        platform: >-
+          ${{ fromJSON((!inputs.platform || inputs.platform == 'all')
+              && '["Linux ARM64", "macOS ARM64", "Windows x64"]'
+              || format('["{0}"]', inputs.platform)) }}
     env:
       RUSTUP_TOOLCHAIN: '1.97.1'
       CARGO_INCREMENTAL: '0'
@@ -52,25 +63,35 @@ jobs:
         run: swiftc --version
 
       - name: Test argentic-core
+        if: inputs.suite != 'reader'
         working-directory: crates/argentic-core
         run: |
           cargo test --locked --all-targets -- --test-threads=1
           cargo test --locked --doc
 
       - name: Test native content reader
+        if: inputs.suite == 'reader'
         working-directory: crates/argentic-runtime
         run: cargo test --locked --test content_reader
 
       - name: Test argentic-runtime
+        if: inputs.suite != 'reader'
         working-directory: crates/argentic-runtime
         run: |
-          cargo test --locked --all-targets -- --test-threads=1
+          test_args=(--test-threads=1)
+          if [[ "$RUNNER_OS" != Windows ]]; then
+            # The no-Bun test already runs all 37 scenarios in both storage modes.
+            test_args+=(--skip agsdl030_conformance_all_37_scenarios)
+          fi
+          cargo test --locked --all-targets -- "${test_args[@]}"
           cargo test --locked --doc
 
       - name: Build standalone host
+        if: inputs.suite != 'reader'
         working-directory: crates/argentic-runtime
         run: cargo build --locked --example argentic-host
 
       - name: Test approval boundary
+        if: inputs.suite != 'reader'
         working-directory: crates/argentic-runtime
         run: cargo test --locked --features dev-support --test approval_boundary -- --test-threads=1
