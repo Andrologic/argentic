@@ -11,6 +11,9 @@ use std::cmp::Ordering;
 use std::collections::BTreeSet;
 pub use types::*;
 
+// The captured plan selects the reducer rule during execution and replay.
+pub(crate) const SHARED_STOP_RUNTIME: &str = "macro-agsdl-runtime/030.1";
+
 type Result<T> = std::result::Result<T, FlowInputError030>;
 fn invalid(message: &str) -> FlowInputError030 {
     FlowInputError030::InvalidEvent(message.into())
@@ -1010,7 +1013,10 @@ impl Engine<'_> {
                                 .filter(|id| self.membership(self.pi(id), &g).failed)
                                 .count()
                                 + 1;
+                            // A stop can defer the decision after the first
+                            // failure has already crossed this join's threshold.
                             if join.mode == "all"
+                                && self.state.groups[gi].error.is_none()
                                 && (join.failures == "fail"
                                     || number::exceeds(
                                         &failures.to_string(),
@@ -1721,7 +1727,7 @@ impl Engine<'_> {
     }
     fn evaluate(&mut self, gi: usize) -> Result<()> {
         let g = self.state.groups[gi].clone();
-        if g.decision.is_some() {
+        if g.decision.is_some() || self.waits_for_shared_stop(&g) {
             return Ok(());
         }
         let j = self.join(&g.join).clone();
@@ -1851,9 +1857,11 @@ impl Engine<'_> {
         }
         Ok(())
     }
-    fn shared_stop_error(&self, group: &Group030) -> Option<FlowInputError030> {
+    fn cancel_shared_paths(&mut self, group: &Group030) -> Result<()> {
+        let legacy = self.plan.versions.runtime != SHARED_STOP_RUNTIME;
         let mut affected = BTreeSet::new();
-        for path in &self.state.paths {
+        for pi in 0..self.state.paths.len() {
+            let path = &self.state.paths[pi];
             if !self.belongs(&path.context, &group.id) {
                 continue;
             }
@@ -1871,33 +1879,86 @@ impl Engine<'_> {
             // A descendant group is cancelled by this same stop. Only an
             // open group outside that cancellation subtree can still need
             // the shared occurrence independently.
-            for membership in &path.memberships {
-                if membership.group_id != group.id
-                    && matches!(membership.phase.as_str(), "pending" | "live")
-                {
-                    let other = &self.state.groups[self.gi(&membership.group_id)];
-                    if other.decision.is_none() && !self.belongs(&other.context, &group.id) {
-                        affected.insert(other.join.clone());
+            let shared: Vec<_> = path
+                .memberships
+                .iter()
+                .enumerate()
+                .filter_map(|(mi, membership)| {
+                    if membership.group_id == group.id
+                        || !matches!(membership.phase.as_str(), "pending" | "live")
+                    {
+                        return None;
                     }
-                }
+                    let other = &self.state.groups[self.gi(&membership.group_id)];
+                    (other.decision.is_none() && !self.belongs(&other.context, &group.id))
+                        .then_some((mi, other))
+                })
+                .collect();
+            if shared.is_empty() {
+                continue;
+            }
+            if legacy {
+                affected.extend(shared.iter().map(|(_, other)| other.join.clone()));
+                continue;
+            }
+            let memberships: Vec<_> = shared.into_iter().map(|(mi, _)| mi).collect();
+            let phase = if withdraws_pending {
+                "withdrawn"
+            } else {
+                "cancelling"
+            };
+            let path = &mut self.state.paths[pi];
+            path.phase = phase.into();
+            for mi in memberships {
+                let membership = &mut path.memberships[mi];
+                membership.phase = phase.into();
+                membership.accepted = false;
+                membership.failed = false;
+                membership.producer = None;
+                membership.result_json = None;
             }
         }
-        if affected.is_empty() {
-            None
-        } else {
-            Some(FlowInputError030::UnspecifiedSharedCancellation {
+        if !affected.is_empty() {
+            return Err(FlowInputError030::UnspecifiedSharedCancellation {
                 closing_join: group.join.clone(),
                 affected_joins: affected.into_iter().collect(),
-            })
+            });
+        }
+        Ok(())
+    }
+    fn waits_for_shared_stop(&self, group: &Group030) -> bool {
+        self.plan.versions.runtime == SHARED_STOP_RUNTIME
+            && group
+                .branches
+                .iter()
+                .flat_map(|branch| &branch.path_ids)
+                .any(|id| self.membership(self.pi(id), &group.id).phase == "cancelling")
+    }
+    fn finish_shared_stops(&mut self) {
+        for path in &mut self.state.paths {
+            if path.phase != "cancelling"
+                || self.state.activations.iter().any(|a| {
+                    a.physical && a.stop_effect_id.is_some() && a.context.iter().any(|frame| {
+                        matches!(frame, Frame030::Path { path_id, .. } if *path_id == path.id)
+                    })
+                })
+            {
+                continue;
+            }
+            path.phase = "ended".into();
+            for membership in &mut path.memberships {
+                if membership.phase == "cancelling" {
+                    membership.phase = "ended".into();
+                    membership.result_json = Some(encoded(&json!({"ended":"without-result"})));
+                }
+            }
         }
     }
     fn exclude(&mut self, gi: usize, refresh: bool) -> Result<()> {
         let g = self.state.groups[gi].clone();
         let remaining = self.join(&g.join).remaining.clone();
         if remaining == "stop" {
-            if let Some(error) = self.shared_stop_error(&g) {
-                return Err(error);
-            }
+            self.cancel_shared_paths(&g)?;
         }
         let path_ids = self
             .state
@@ -2013,7 +2074,7 @@ impl Engine<'_> {
     }
     fn release(&mut self, gi: usize) -> Result<()> {
         let g = self.state.groups[gi].clone();
-        if g.decision.is_none() || g.released {
+        if g.decision.is_none() || g.released || self.waits_for_shared_stop(&g) {
             return Ok(());
         }
         if self.join(&g.join).remaining != "finish" && self.group_busy(&g) {
@@ -2050,6 +2111,9 @@ impl Engine<'_> {
     fn settle(&mut self) -> Result<()> {
         loop {
             let mut changed = false;
+            if self.plan.versions.runtime == SHARED_STOP_RUNTIME {
+                self.finish_shared_stops();
+            }
             // A mailbox offer is still a message waiting for delivery. Completion
             // and group decisions may overtake it before the native claim. Keep
             // its path alive and re-admit it FIFO instead of absorbing or losing it.
@@ -2272,6 +2336,86 @@ mod decision_ordinal_tests {
             epoch: "capture".into(),
         }
     }
+    #[test]
+    fn shared_stop_preserves_the_failure_that_crosses_the_join_threshold() {
+        for (failures, limit, triggering_branch) in
+            [("fail", None, "b"), ("keep", Some("1"), "c")]
+        {
+            let mut plan = plan();
+            plan.versions.runtime = SHARED_STOP_RUNTIME.into();
+            plan.joins.push(Join030 {
+                address: vec!["join".into()],
+                scope: vec![],
+                origin: vec![],
+                branches: vec![],
+                mode: "all".into(),
+                failures: failures.into(),
+                max_failures_json: limit.map(str::to_owned),
+                quorum_count_json: None,
+                accept: vec![],
+                remaining: "finish".into(),
+            });
+            let mut engine = Engine {
+                plan: &plan,
+                state: FlowState030::new(identity()),
+                event_id: "event",
+                ordinal: 0,
+                effects: vec![],
+            };
+            let mut waiting = group("waiting");
+            waiting.join = vec!["join".into()];
+            let join_activation = engine.allocate(None, vec![], "{}".into(), None, None, None);
+            waiting.activation_id = engine.state.activations[join_activation].id.clone();
+            let mut failed = Vec::new();
+            for branch in ["cancelling", "b", "c", "d"] {
+                let is_cancelling = branch == "cancelling";
+                let phase = if is_cancelling { "cancelling" } else { "live" };
+                let context = vec![Frame030::Path {
+                    path_id: branch.into(),
+                    departed_groups: vec![],
+                }];
+                engine.state.paths.push(Path030 {
+                    id: branch.into(),
+                    memberships: vec![Membership030 {
+                        group_id: waiting.id.clone(),
+                        branch: branch.into(),
+                        phase: phase.into(),
+                        result_json: None,
+                        producer: None,
+                        accepted: false,
+                        failed: false,
+                    }],
+                    batch_id: None,
+                    item_json: None,
+                    context: context.clone(),
+                    phase: phase.into(),
+                });
+                waiting.branches.push(GroupBranch030 {
+                    name: branch.into(),
+                    fanout: false,
+                    path_ids: vec![branch.into()],
+                });
+                if !is_cancelling {
+                    failed.push(engine.allocate(None, context, "{}".into(), None, None, None));
+                }
+            }
+            engine.state.groups.push(waiting);
+            for activation in failed {
+                engine
+                    .fail(activation, Failure030::new("AGENT_FAILED"))
+                    .unwrap();
+                assert!(engine.state.groups[0].decision.is_none());
+            }
+            engine.finish_shared_stops();
+            engine.evaluate(0).unwrap();
+            let join = &engine.state.groups[0];
+            assert_eq!(join.decision.as_deref(), Some("failed"));
+            let error = join.error.as_ref().unwrap();
+            assert_eq!(error.code, "BRANCH_FAILED");
+            assert_eq!(error.details[0]["branch"], triggering_branch);
+        }
+    }
+
     #[test]
     fn decision_ordinals_follow_decision_order_not_group_order() {
         let plan = plan();

@@ -157,6 +157,25 @@ pub(crate) const SCENARIOS: &[(&str, &str)] = &[
     ),
 ];
 
+pub(crate) const SHARED_STOP_SCENARIOS: &[(&str, &str)] = &[
+    (
+        "shared-stop-pending",
+        include_str!("../tests/fixtures/shared-stop/shared-stop-pending.json"),
+    ),
+    (
+        "shared-stop-active-and-pending",
+        include_str!("../tests/fixtures/shared-stop/shared-stop-active-and-pending.json"),
+    ),
+    (
+        "shared-stop-all",
+        include_str!("../tests/fixtures/shared-stop/shared-stop-all.json"),
+    ),
+    (
+        "shared-stop-queued",
+        include_str!("../tests/fixtures/shared-stop/shared-stop-queued.json"),
+    ),
+];
+
 const SCENARIO_PINS: &[(&str, &str)] = &[
     (
         "answer-timeout-ask",
@@ -476,7 +495,7 @@ fn parse_timeline(raw: &RawValue) -> Result<TimelineEvent030> {
 
 impl PinnedScenario030 {
     pub(crate) fn recognizes_document(document_json: &str) -> Result<bool> {
-        for &(name, raw) in SCENARIOS {
+        for &(name, raw) in SCENARIOS.iter().chain(SHARED_STOP_SCENARIOS) {
             verify_fixture_pin(name, raw)?;
             crate::persistence::validate_json(raw)?;
             let fixture: Fixture030 = serde_json::from_str(raw)?;
@@ -490,7 +509,7 @@ impl PinnedScenario030 {
     /// Accept only an exact fixture document and entry from the native capture.
     pub(crate) fn from_capture(document_json: &str, entry_json: &str) -> Result<Self> {
         let mut found = None;
-        for &(name, raw) in SCENARIOS {
+        for &(name, raw) in SCENARIOS.iter().chain(SHARED_STOP_SCENARIOS) {
             verify_fixture_pin(name, raw)?;
             crate::persistence::validate_json(raw)?;
             let fixture: Fixture030 = serde_json::from_str(raw)?;
