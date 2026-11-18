@@ -47,6 +47,7 @@ jobs:
       RUSTUP_TOOLCHAIN: '1.97.1'
       CARGO_INCREMENTAL: '0'
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      ARGENTIC_REQUIRE_NATIVE_READER: '1'
 
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0

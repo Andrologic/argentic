@@ -18,20 +18,26 @@ fn main() {
     if let Some(status) = file_helper::initialize().unwrap() {
         std::process::exit(status);
     }
-    if file_helper::qualified_platform() {
-        #[cfg(all(target_os = "macos", feature = "agsdl-content-qa", debug_assertions))]
-        file_helper::enable_qa_chain().unwrap();
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(async {
-                tokio::time::timeout(Duration::from_secs(15), exercise_reader())
-                    .await
-                    .expect("content-reader integration test timed out");
-            });
-        println!("Native content reads passed on {}", std::env::consts::OS);
+    if !file_helper::qualified_platform() {
+        assert!(
+            std::env::var_os("ARGENTIC_REQUIRE_NATIVE_READER").is_none(),
+            "The native content reader is required on this runner"
+        );
+        println!("Native content reader unavailable on this platform");
+        return;
     }
+    #[cfg(all(target_os = "macos", feature = "agsdl-content-qa", debug_assertions))]
+    file_helper::enable_qa_chain().unwrap();
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            tokio::time::timeout(Duration::from_secs(15), exercise_reader())
+                .await
+                .expect("content-reader integration test timed out");
+        });
+    println!("Native content reads passed on {}", std::env::consts::OS);
 }
 
 async fn exercise_reader() {
