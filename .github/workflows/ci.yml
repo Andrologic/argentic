@@ -1,0 +1,67 @@
+name: Argentic CI
+
+on:
+  pull_request:
+    branches: [main, develop]
+  push:
+    branches: [main, develop]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cargo:
+    name: Cargo (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: Linux ARM64
+            runner: ubuntu-24.04-arm
+          - platform: macOS ARM64
+            runner: macos-15
+    env:
+      RUSTUP_TOOLCHAIN: '1.97.1'
+      CARGO_INCREMENTAL: '0'
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Rust
+        run: |
+          rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+          rustc -Vv
+
+      - name: Check Swift toolchain
+        if: runner.os == 'macOS'
+        run: swiftc --version
+
+      - name: Test argentic-core
+        working-directory: crates/argentic-core
+        run: |
+          cargo test --locked --all-targets -- --test-threads=1
+          cargo test --locked --doc
+
+      - name: Test argentic-runtime
+        working-directory: crates/argentic-runtime
+        run: |
+          cargo test --locked --all-targets -- --test-threads=1
+          cargo test --locked --doc
+
+      - name: Build standalone host
+        working-directory: crates/argentic-runtime
+        run: cargo build --locked --example argentic-host
+
+      - name: Test approval boundary
+        working-directory: crates/argentic-runtime
+        run: cargo test --locked --features dev-support --test approval_boundary -- --test-threads=1
