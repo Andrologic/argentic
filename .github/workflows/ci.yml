@@ -57,6 +57,10 @@ jobs:
           cargo test --locked --all-targets -- --test-threads=1
           cargo test --locked --doc
 
+      - name: Test native content reader
+        working-directory: crates/argentic-runtime
+        run: cargo test --locked --test content_reader
+
       - name: Test argentic-runtime
         working-directory: crates/argentic-runtime
         run: |
