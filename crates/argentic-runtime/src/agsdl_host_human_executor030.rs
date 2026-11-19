@@ -24,7 +24,7 @@ impl HostExecutor030 for HumanExecutor030 {
     fn start(
         &self,
         app: HostState,
-        _inspection: NativeFlowInspection030,
+        inspection: NativeFlowInspection030,
         effect: FlowEffect030,
         _cancel: CancellationToken,
     ) -> BoxFuture<'static, Result<Option<crate::agsdl_host_call_executor030::StartedCall030>>>
@@ -45,8 +45,26 @@ impl HostExecutor030 for HumanExecutor030 {
                 .broker(&host, &pool, &effect.identity)
                 .await?;
             let _operation = broker.operation.lock().await;
-            broker.admit_host_work(&host, &effect.id).await?;
-            broker.pump(&host, &CancellationToken::new()).await?;
+            let admitted = async {
+                broker.admit_host_work(&host, &effect.id).await?;
+                broker.pump(&host, &CancellationToken::new()).await?;
+                Ok::<_, crate::persistence::dto::EngineFailure>(())
+            }
+            .await;
+            if let Err(error) = admitted {
+                // Stop can win after the handoff, including after the approval
+                // becomes visible. Keep the owned wait registered for StopWork.
+                if error.code != "CORRELATION"
+                    || error.pointer != "humanClock"
+                    || !flow::inspect_run(host.flow030(), &host, &pool, &inspection.owner)
+                        .await?
+                        .flow
+                        .state
+                        .stopping
+                {
+                    return Err(error);
+                }
+            }
             Ok(None)
         })
     }
