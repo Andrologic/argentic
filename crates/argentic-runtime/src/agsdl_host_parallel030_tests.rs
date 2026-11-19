@@ -185,6 +185,24 @@ async fn quorum_remaining_obeys_physical_ownership() {
                 quiet(&mut rx).await;
                 right.finish();
             } else if remaining == "wait" {
+                // The winner's physical end and route must settle before the
+                // loser's submission reserves a work-protocol ticket.
+                tokio::time::timeout(std::time::Duration::from_secs(8), async {
+                    loop {
+                        let inspection =
+                            flow::inspect_run(f.host.flow030(), &f.host, &f.pool, &f.owner)
+                                .await
+                                .unwrap();
+                        let group = &inspection.flow.state.groups[0];
+                        if group.decision.as_deref() == Some("reached") {
+                            assert!(!group.released);
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .expect("quorum did not reach a decision after the winner ended");
                 quiet(&mut rx).await;
                 assert!(!right.cancel.is_cancelled());
                 right.submit(json!({"choice":"yes"})).await;
@@ -196,9 +214,11 @@ async fn quorum_remaining_obeys_physical_ownership() {
             if remaining == "finish" {
                 assert!(!right.cancel.is_cancelled());
                 right.submit(json!({"choice":"yes"})).await;
-                right.finish();
             }
             after.submit(json!({})).await;
+            if remaining == "finish" {
+                right.finish();
+            }
             after.finish();
             quiet(&mut rx).await;
         })
