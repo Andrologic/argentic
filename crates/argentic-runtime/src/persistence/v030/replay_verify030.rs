@@ -207,6 +207,11 @@ struct EventRead {
 #[derive(Deserialize)]
 struct ReadEvent(#[serde(with = "EventRead")] FlowEvent030);
 
+#[cfg(test)]
+pub(crate) fn read_test_event(raw: Value) -> FlowEvent030 {
+    serde_json::from_value::<ReadEvent>(raw).unwrap().0
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CaptureRead {

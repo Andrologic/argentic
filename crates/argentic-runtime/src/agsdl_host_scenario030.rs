@@ -157,6 +157,25 @@ pub(crate) const SCENARIOS: &[(&str, &str)] = &[
     ),
 ];
 
+pub(crate) const SHARED_STOP_SCENARIOS: &[(&str, &str)] = &[
+    (
+        "shared-stop-pending",
+        include_str!("../tests/fixtures/shared-stop/shared-stop-pending.json"),
+    ),
+    (
+        "shared-stop-active-and-pending",
+        include_str!("../tests/fixtures/shared-stop/shared-stop-active-and-pending.json"),
+    ),
+    (
+        "shared-stop-all",
+        include_str!("../tests/fixtures/shared-stop/shared-stop-all.json"),
+    ),
+    (
+        "shared-stop-queued",
+        include_str!("../tests/fixtures/shared-stop/shared-stop-queued.json"),
+    ),
+];
+
 const SCENARIO_PINS: &[(&str, &str)] = &[
     (
         "answer-timeout-ask",
@@ -172,7 +191,7 @@ const SCENARIO_PINS: &[(&str, &str)] = &[
     ),
     (
         "approval-comments",
-        "bca5a84096e1c65545dfe358e3ad12695de75cd1b7187de47b9b63459a858d56",
+        "3d8f6655d0ed9f567b7a6770f3a7899bb5b279a653a7661b951c0bfac437acf2",
     ),
     (
         "call-answer-timeout",
@@ -180,7 +199,7 @@ const SCENARIO_PINS: &[(&str, &str)] = &[
     ),
     (
         "compose-body-failure",
-        "343e688b307fa98144b2b19f7e418fbdc5f34c943f121401f1c933e761748a5c",
+        "910709be5053ce395f0c85a8b94e9e3e7157e7290da3a2d357699fd470506fb4",
     ),
     (
         "timeout-pauses-for-person",
@@ -476,7 +495,7 @@ fn parse_timeline(raw: &RawValue) -> Result<TimelineEvent030> {
 
 impl PinnedScenario030 {
     pub(crate) fn recognizes_document(document_json: &str) -> Result<bool> {
-        for &(name, raw) in SCENARIOS {
+        for &(name, raw) in SCENARIOS.iter().chain(SHARED_STOP_SCENARIOS) {
             verify_fixture_pin(name, raw)?;
             crate::persistence::validate_json(raw)?;
             let fixture: Fixture030 = serde_json::from_str(raw)?;
@@ -490,7 +509,7 @@ impl PinnedScenario030 {
     /// Accept only an exact fixture document and entry from the native capture.
     pub(crate) fn from_capture(document_json: &str, entry_json: &str) -> Result<Self> {
         let mut found = None;
-        for &(name, raw) in SCENARIOS {
+        for &(name, raw) in SCENARIOS.iter().chain(SHARED_STOP_SCENARIOS) {
             verify_fixture_pin(name, raw)?;
             crate::persistence::validate_json(raw)?;
             let fixture: Fixture030 = serde_json::from_str(raw)?;

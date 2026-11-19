@@ -13,6 +13,10 @@ conversion, or `argentic-runtime::standalone::Host` for actual execution.
 `flow` contains the shared pure state/reducer contracts. A calculated plan or a
 module's descriptive capability is never permission to execute it.
 
+`validate_document_json` validates document bytes and returns the AgSDL 0.3.0
+report. The caller can use the bundled harness modules or supply its own
+module bytes. The Cargo suite checks the published corpus through this API.
+
 ```sh
 cargo test --offline --locked --manifest-path argentic-core/Cargo.toml
 cargo test --offline --locked --manifest-path argentic-core/Cargo.toml --doc

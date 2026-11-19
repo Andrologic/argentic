@@ -1060,6 +1060,81 @@ async fn agsdl030_conformance_all_37_scenarios() {
     }
 }
 
+#[tokio::test]
+async fn shared_stop_scenarios_resume_other_groups_after_termination() {
+    for memory in [false, true] {
+        for (name, raw) in scenarios::SHARED_STOP_SCENARIOS {
+            let f = Fixture::new_mode(raw, memory).await;
+            let fields: BTreeMap<String, Box<serde_json::value::RawValue>> =
+                serde_json::from_str(raw).unwrap();
+            let scenario = scenarios::PinnedScenario030::from_capture(
+                fields["document"].get(),
+                fields["entry"].get(),
+            )
+            .unwrap();
+            let (wake, receiver) = watch::channel(0);
+            let view = native_timeline(&f, scenario, wake, receiver).await.unwrap();
+            let observed = projection::project(&f, &view).await;
+            let expected = serde_json::from_str(fields["expect"].get()).unwrap();
+            let differences = projection::compare(&expected, &observed);
+            assert!(differences.is_empty(), "{name}: {differences:?}");
+
+            if *name == "shared-stop-active-and-pending" {
+                let mut state = FlowState030::new(f.identity.clone());
+                let mut stop_sent = false;
+                for row in &view.events {
+                    let event = crate::persistence::replay_verify030::read_test_event(
+                        row["event"].clone(),
+                    );
+                    let transition = reduce(&f.plan, &state, &event).unwrap();
+                    state = transition.state;
+                    for effect in transition.effects {
+                        let FlowEffectKind030::StopWork {
+                            work,
+                            include_descendants,
+                        } = effect.kind
+                        else {
+                            continue;
+                        };
+                        assert!(!stop_sent, "shared work stopped more than once");
+                        stop_sent = true;
+                        assert!(include_descendants);
+                        let sibling = state
+                            .groups
+                            .iter()
+                            .find(|group| group.join == ["j2"])
+                            .unwrap();
+                        assert!(sibling.decision.is_none());
+                        assert!(!sibling.released);
+                        assert_eq!(state.visits_at(&["after".into()]), "0");
+
+                        let late = FlowEvent030 {
+                            identity: f.identity.clone(),
+                            event_id: "late-vote".into(),
+                            expected_revision: state.revision.clone(),
+                            kind: FlowEventKind030::WorkResult {
+                                work,
+                                result: WorkResult030::Completed {
+                                    output_json: json!({"choice":"two","results":{}}).to_string(),
+                                    route_key: Some("two".into()),
+                                },
+                                physical: None,
+                            },
+                        };
+                        assert!(matches!(
+                            reduce(&f.plan, &state, &late),
+                            Err(FlowInputError030::StaleReference)
+                        ));
+                    }
+                }
+                assert!(stop_sent);
+                assert_eq!(state, view.state);
+            }
+            f.pool.close().await;
+        }
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn agsdl030_conformance_runs_with_only_bun_removed_from_path() {
@@ -1142,10 +1217,31 @@ async fn run_all_37(compare_ts: bool, memory: bool) {
         pinned, discovered,
         "Every scenario must be explicitly covered"
     );
+    let provenance: Value =
+        serde_json::from_str(include_str!("../tests/fixtures/conformance/provenance.json"))
+            .unwrap();
+    let upstream_hashes: BTreeMap<_, _> = provenance["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|record| {
+            let name = record["upstream"]
+                .as_str()?
+                .strip_prefix("conformance/runs/")?
+                .strip_suffix(".json")?;
+            Some((name, record["sha256"].as_str().unwrap()))
+        })
+        .collect();
+    assert_eq!(upstream_hashes.len(), pinned.len());
     let (mut native, mut scripted, mut failures) = (0, 0, Vec::new());
     let mut capture_manifest = Vec::new();
     let mut route_capture_manifest = Vec::new();
     for (name, raw) in scenarios::SCENARIOS {
+        assert_eq!(
+            format!("{:x}", Sha256::digest(raw.as_bytes())),
+            upstream_hashes[name],
+            "published fixture {name}"
+        );
         let prepared = std::panic::AssertUnwindSafe(async { Fixture::new_mode(raw, memory).await })
             .catch_unwind()
             .await;
@@ -1185,7 +1281,7 @@ async fn run_all_37(compare_ts: bool, memory: bool) {
                 native_timeline(&f, scenario, wake, receiver).await?
             };
             let observed = projection::project(&f, &view).await;
-            let expected: Value = serde_json::from_str(fields["expect"].get()).unwrap();
+            let mut expected: Value = serde_json::from_str(fields["expect"].get()).unwrap();
             if let Some(directory) = std::env::var_os("ARGENTIC_PROJECTION_DIR") {
                 std::fs::create_dir_all(&directory).unwrap();
                 std::fs::write(
@@ -1201,6 +1297,23 @@ async fn run_all_37(compare_ts: bool, memory: bool) {
                 observed, reference["observations"][*name],
                 "complete TS base projection {name}"
             );
+            // Published 0.3.0 omits these two compose work counts. Compare
+            // the originals first, then require the complete corrected output.
+            let compose_start = match *name {
+                "approval-comments" => Some(("legal", 2)),
+                "compose-body-failure" => Some(("review", 1)),
+                _ => None,
+            };
+            if let Some((step, count)) = compose_start {
+                let published_errors = projection::compare(&expected, &observed);
+                assert!(
+                    matches!(published_errors.as_slice(), [error] if error.starts_with("starts: ")),
+                    "{name}: published expectations differ beyond the compose start count: {published_errors:?}"
+                );
+                let starts = expected["starts"].as_object_mut().unwrap();
+                assert!(starts.insert(step.into(), json!(count)).is_none());
+                eprintln!("CONFORMANCE {name}: published starts omit {step}={count}");
+            }
             let errors = projection::compare(&expected, &observed);
             if !errors.is_empty() {
                 return Err(crate::persistence::failure(

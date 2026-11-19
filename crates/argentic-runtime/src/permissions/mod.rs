@@ -6,6 +6,7 @@ mod paths;
 mod tests;
 
 pub use enforcement::*;
+pub(crate) use paths::native_request_path;
 pub use paths::{DirectoryGrant, NormalizedRule, PathContext};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};

@@ -22,6 +22,21 @@ pub(crate) struct CompiledGraph {
     pub(crate) graphless: Value,
 }
 impl CompiledGraph {
+    pub(crate) fn has_shared_stop(&self) -> bool {
+        let mut targets = std::collections::BTreeMap::new();
+        for join in &self.joins {
+            let origin = join.get("origin").stringify();
+            let stops = join.get("remaining").eq_str("stop");
+            for branch in join.get("branches").array().unwrap() {
+                let target = (origin.clone(), branch.get("target").stringify());
+                if targets.insert(target, stops).is_some_and(|previous| previous || stops) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     pub(crate) fn value(self) -> Value {
         o([
             ("entry", self.entry),

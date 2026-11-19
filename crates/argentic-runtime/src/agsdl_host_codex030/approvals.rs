@@ -114,7 +114,9 @@ pub(super) fn bounded_file(
     .ok()?;
     let write = evaluate_effective(
         policy,
-        &ActionRequest::Write { path: file.into() },
+        &ActionRequest::Write {
+            path: native_request_path(path)?,
+        },
         ExecutionPurpose::Agent,
     )
     .ok()?;

@@ -750,191 +750,187 @@
     },
     {
       "upstream": "conformance/runs/answer-timeout-ask.json",
-      "path": "dev/agsdl/fixtures/v0.3/conformance/runs/answer-timeout-ask.json",
+      "path": "crates/argentic-runtime/tests/fixtures/conformance/runs/answer-timeout-ask.json",
       "sha256": "e64965fd480db2de6593b47661da7d4f12b8457b176b420a39503909e0a9ce77"
     },
     {
       "upstream": "conformance/runs/answer-timeout-plan.json",
-      "path": "dev/agsdl/fixtures/v0.3/conformance/runs/answer-timeout-plan.json",
+      "path": "crates/argentic-runtime/tests/fixtures/conformance/runs/answer-timeout-plan.json",
       "sha256": "c9460d0675eecaa9edbc1eb9b82076ba35425522c69ac4a47f53ae2c42af802f"
     },
     {
       "upstream": "conformance/runs/approval-comments.json",
-      "path": "dev/agsdl/fixtures/v0.3/conformance/runs/approval-comments.json",
-      "sha256": "bca5a84096e1c65545dfe358e3ad12695de75cd1b7187de47b9b63459a858d56",
-      "commit": "f5551b8af9e099787a85e391b3ce458927f3ccd2",
-      "reason": "Correct compose visit starts under spec/flow.md execution model rule 1; v0.3.0 fixtures omit the compose work."
+      "path": "crates/argentic-runtime/tests/fixtures/conformance/runs/approval-comments.json",
+      "sha256": "3d8f6655d0ed9f567b7a6770f3a7899bb5b279a653a7661b951c0bfac437acf2"
     },
     {
       "upstream": "conformance/runs/approval.json",
-      "path": "dev/agsdl/fixtures/v0.3/conformance/runs/approval.json",
+      "path": "crates/argentic-runtime/tests/fixtures/conformance/runs/approval.json",
       "sha256": "a5594faf1ec7552958091bdcf3af3b47d2e4562750513d68ce11659e48f2db2a"
     },
     {
       "upstream": "conformance/runs/call-answer-timeout.json",
-      "path": "dev/agsdl/fixtures/v0.3/conformance/runs/call-answer-timeout.json",
+      "path": "crates/argentic-runtime/tests/fixtures/conformance/runs/call-answer-timeout.json",
       "sha256": "fa7726bbbc65df75eeaec7df5c94d2a5f2a71dfab492d6bb94911642076b512a"
     },
     {
       "upstream": "conformance/runs/command-json-invalid.json",
-      "path": "dev/agsdl/fixtures/v0.3/conformance/runs/command-json-invalid.json",
+      "path": "crates/argentic-runtime/tests/fixtures/conformance/runs/command-json-invalid.json",
       "sha256": "c4b29ec6d9809bcae401b54748eb8482ca662186fd23bc15eb8db5c568cefb47"
     },
     {
       "upstream": "conformance/runs/command-lines.json",
-      "path": "dev/agsdl/fixtures/v0.3/conformance/runs/command-lines.json",
+      "path": "crates/argentic-runtime/tests/fixtures/conformance/runs/command-lines.json",
       "sha256": "34433121b4940af3ed94355b0446514c9ad5bee61de7e2daac0669ab5ea541f7"
     },
     {
       "upstream": "conformance/runs/command-outcome.json",
-      "path": "dev/agsdl/fixtures/v0.3/conformance/runs/command-outcome.json",
+      "path": "crates/argentic-runtime/tests/fixtures/conformance/runs/command-outcome.json",
       "sha256": "ceab028542ef93ceed4c567eab27f72103b2568ab9568796917dd58a46878984"
     },
     {
       "upstream": "conformance/runs/compose-body-failure.json",
-      "path": "dev/agsdl/fixtures/v0.3/conformance/runs/compose-body-failure.json",
-      "sha256": "343e688b307fa98144b2b19f7e418fbdc5f34c943f121401f1c933e761748a5c",
-      "commit": "f5551b8af9e099787a85e391b3ce458927f3ccd2",
-      "reason": "Correct compose visit starts under spec/flow.md execution model rule 1; v0.3.0 fixtures omit the compose work."
+      "path": "crates/argentic-runtime/tests/fixtures/conformance/runs/compose-body-failure.json",
+      "sha256": "910709be5053ce395f0c85a8b94e9e3e7157e7290da3a2d357699fd470506fb4"
     },
     {
       "upstream": "conformance/runs/composition.json",
-      "path": "dev/agsdl/fixtures/v0.3/conformance/runs/composition.json",
+      "path": "crates/argentic-runtime/tests/fixtures/conformance/runs/composition.json",
       "sha256": "92a9cf5728f38de3176426c833972fd2c6bf103e2f0a8a314d65d0b3d4cfad3d"
     },
     {
       "upstream": "conformance/runs/delivery-queue.json",
-      "path": "dev/agsdl/fixtures/v0.3/conformance/runs/delivery-queue.json",
+      "path": "crates/argentic-runtime/tests/fixtures/conformance/runs/delivery-queue.json",
       "sha256": "b562c8cdd9954ee183adc3e624ee3bbf292be8cfa18f327db506b2de221b1d2a"
     },
     {
       "upstream": "conformance/runs/delivery-steer.json",
-      "path": "dev/agsdl/fixtures/v0.3/conformance/runs/delivery-steer.json",
+      "path": "crates/argentic-runtime/tests/fixtures/conformance/runs/delivery-steer.json",
       "sha256": "5b364684f9dea58a020b8801fa0534869afaeeb9b0a59d40b253072f9b2db2fe"
     },
     {
       "upstream": "conformance/runs/error-route.json",
-      "path": "dev/agsdl/fixtures/v0.3/conformance/runs/error-route.json",
+      "path": "crates/argentic-runtime/tests/fixtures/conformance/runs/error-route.json",
       "sha256": "a1ce326c8829ba6ce153aa37470b7fe0415c8121265b7231dffb9b2830c4bb83"
     },
     {
       "upstream": "conformance/runs/fanout-empty.json",
-      "path": "dev/agsdl/fixtures/v0.3/conformance/runs/fanout-empty.json",
+      "path": "crates/argentic-runtime/tests/fixtures/conformance/runs/fanout-empty.json",
       "sha256": "51a6233d38c93226b637ae429369828f8a78ecc3ecd61b4a0837178122b4172f"
     },
     {
       "upstream": "conformance/runs/fanout-keep.json",
-      "path": "dev/agsdl/fixtures/v0.3/conformance/runs/fanout-keep.json",
+      "path": "crates/argentic-runtime/tests/fixtures/conformance/runs/fanout-keep.json",
       "sha256": "444a5e4dc9baec1f82f8e6788f1ae7dad66a1db04086398471836a2ba2b26cbc"
     },
     {
       "upstream": "conformance/runs/fanout-limit.json",
-      "path": "dev/agsdl/fixtures/v0.3/conformance/runs/fanout-limit.json",
+      "path": "crates/argentic-runtime/tests/fixtures/conformance/runs/fanout-limit.json",
       "sha256": "3c45b90f38ba7cf0458abeb15fff0ca092be2308fc092eeaa1169146caa68b7e"
     },
     {
       "upstream": "conformance/runs/fanout-max-failures.json",
-      "path": "dev/agsdl/fixtures/v0.3/conformance/runs/fanout-max-failures.json",
+      "path": "crates/argentic-runtime/tests/fixtures/conformance/runs/fanout-max-failures.json",
       "sha256": "a81a7e0279b3d8f7efda141bec9e9338f872960fbb914cf6cabfe3df6294b047"
     },
     {
       "upstream": "conformance/runs/fanout-missions.json",
-      "path": "dev/agsdl/fixtures/v0.3/conformance/runs/fanout-missions.json",
+      "path": "crates/argentic-runtime/tests/fixtures/conformance/runs/fanout-missions.json",
       "sha256": "ecdbd7c9c5c9dc3f6aa6ad2671a40c00fee1cf211cd099206b8ee47efe13e54c"
     },
     {
       "upstream": "conformance/runs/fanout-one-at-a-time.json",
-      "path": "dev/agsdl/fixtures/v0.3/conformance/runs/fanout-one-at-a-time.json",
+      "path": "crates/argentic-runtime/tests/fixtures/conformance/runs/fanout-one-at-a-time.json",
       "sha256": "cc44042eef2b15e8e60ecbab84a6bbadccd23a6d1a7c3c4b15f68f6a5f5c1348"
     },
     {
       "upstream": "conformance/runs/fanout-operand.json",
-      "path": "dev/agsdl/fixtures/v0.3/conformance/runs/fanout-operand.json",
+      "path": "crates/argentic-runtime/tests/fixtures/conformance/runs/fanout-operand.json",
       "sha256": "4f897247c05dbe3372a87812d0689ab8e03ba37a0f7c2a704a1cd6d58abdbe9f"
     },
     {
       "upstream": "conformance/runs/finish-branch-goes-on.json",
-      "path": "dev/agsdl/fixtures/v0.3/conformance/runs/finish-branch-goes-on.json",
+      "path": "crates/argentic-runtime/tests/fixtures/conformance/runs/finish-branch-goes-on.json",
       "sha256": "d09dbb6ba3e4eb7268a0d84fbe935c37ac2ea5d0faa236d99a7eb3cf487c8779"
     },
     {
       "upstream": "conformance/runs/flow-error.json",
-      "path": "dev/agsdl/fixtures/v0.3/conformance/runs/flow-error.json",
+      "path": "crates/argentic-runtime/tests/fixtures/conformance/runs/flow-error.json",
       "sha256": "512b767c866eb2ac299eb8b364e3f860de89f04dd01a212b6f9de72b6ae8b7ad"
     },
     {
       "upstream": "conformance/runs/join-all.json",
-      "path": "dev/agsdl/fixtures/v0.3/conformance/runs/join-all.json",
+      "path": "crates/argentic-runtime/tests/fixtures/conformance/runs/join-all.json",
       "sha256": "51ca76e1ced2c0d8c747ba23495616bad32d069637b94691a2d1770a8959ae2a"
     },
     {
       "upstream": "conformance/runs/join-branch-failed.json",
-      "path": "dev/agsdl/fixtures/v0.3/conformance/runs/join-branch-failed.json",
+      "path": "crates/argentic-runtime/tests/fixtures/conformance/runs/join-branch-failed.json",
       "sha256": "43fcd7aff38cec494d9268b80c94a1e3065f9ed1909eac07951ec276922c2abf"
     },
     {
       "upstream": "conformance/runs/join-branch-steer.json",
-      "path": "dev/agsdl/fixtures/v0.3/conformance/runs/join-branch-steer.json",
+      "path": "crates/argentic-runtime/tests/fixtures/conformance/runs/join-branch-steer.json",
       "sha256": "c66096b2d8a6a4b50bd6457827914f8b6aa2bbe67399aaba50b4f50c71261ca9"
     },
     {
       "upstream": "conformance/runs/join-group-closes.json",
-      "path": "dev/agsdl/fixtures/v0.3/conformance/runs/join-group-closes.json",
+      "path": "crates/argentic-runtime/tests/fixtures/conformance/runs/join-group-closes.json",
       "sha256": "21ae34a4cfe24d25b42c6d935af5ed0891b334ee7513c573407f8452204ee200"
     },
     {
       "upstream": "conformance/runs/mission-priority.json",
-      "path": "dev/agsdl/fixtures/v0.3/conformance/runs/mission-priority.json",
+      "path": "crates/argentic-runtime/tests/fixtures/conformance/runs/mission-priority.json",
       "sha256": "efbd2fa71dda02ce2c73ea99af67f40e0bfadfbe1c770c82baab57f35b5e26e8"
     },
     {
       "upstream": "conformance/runs/parallel-no-join.json",
-      "path": "dev/agsdl/fixtures/v0.3/conformance/runs/parallel-no-join.json",
+      "path": "crates/argentic-runtime/tests/fixtures/conformance/runs/parallel-no-join.json",
       "sha256": "def7ffc77fa5bed808b7a4697a29baec4eeddd29a6765f9493018bb9737bd96c"
     },
     {
       "upstream": "conformance/runs/quorum-finish.json",
-      "path": "dev/agsdl/fixtures/v0.3/conformance/runs/quorum-finish.json",
+      "path": "crates/argentic-runtime/tests/fixtures/conformance/runs/quorum-finish.json",
       "sha256": "49ae35767301569041700883370fc6ada49717200348103a5bd2025114e4f6eb"
     },
     {
       "upstream": "conformance/runs/quorum-missed.json",
-      "path": "dev/agsdl/fixtures/v0.3/conformance/runs/quorum-missed.json",
+      "path": "crates/argentic-runtime/tests/fixtures/conformance/runs/quorum-missed.json",
       "sha256": "6c476d29ae9a21abe555c4c20aee29593fd31006174412dd3f8c81bb21272c82"
     },
     {
       "upstream": "conformance/runs/quorum-reached.json",
-      "path": "dev/agsdl/fixtures/v0.3/conformance/runs/quorum-reached.json",
+      "path": "crates/argentic-runtime/tests/fixtures/conformance/runs/quorum-reached.json",
       "sha256": "3ebf931fd00937d07ceb80d709f179bb07a8add1fa93a20e6b77a2c7fe402116"
     },
     {
       "upstream": "conformance/runs/quorum-unreachable.json",
-      "path": "dev/agsdl/fixtures/v0.3/conformance/runs/quorum-unreachable.json",
+      "path": "crates/argentic-runtime/tests/fixtures/conformance/runs/quorum-unreachable.json",
       "sha256": "b01ed57ae25c2ebbbd1039ad45b682e47eecfa689bdb197dad4b9faf8c7c52fc"
     },
     {
       "upstream": "conformance/runs/quorum-wait.json",
-      "path": "dev/agsdl/fixtures/v0.3/conformance/runs/quorum-wait.json",
+      "path": "crates/argentic-runtime/tests/fixtures/conformance/runs/quorum-wait.json",
       "sha256": "1da961c08147ec8bc62fe28f03971935943bfc0bad24b6acf3abf5a7fae681ab"
     },
     {
       "upstream": "conformance/runs/sequence-loop.json",
-      "path": "dev/agsdl/fixtures/v0.3/conformance/runs/sequence-loop.json",
+      "path": "crates/argentic-runtime/tests/fixtures/conformance/runs/sequence-loop.json",
       "sha256": "0be291e5e08a2c8014e7a79a3a61e94886473a99fec75f8d1708737c62853492"
     },
     {
       "upstream": "conformance/runs/timeout-pauses-for-person.json",
-      "path": "dev/agsdl/fixtures/v0.3/conformance/runs/timeout-pauses-for-person.json",
+      "path": "crates/argentic-runtime/tests/fixtures/conformance/runs/timeout-pauses-for-person.json",
       "sha256": "7b7ebdb7b021b230cbb7163050a60fe222b522d404541ccd8c77f4f0eaeaeab5"
     },
     {
       "upstream": "conformance/runs/visit-limit.json",
-      "path": "dev/agsdl/fixtures/v0.3/conformance/runs/visit-limit.json",
+      "path": "crates/argentic-runtime/tests/fixtures/conformance/runs/visit-limit.json",
       "sha256": "df6c0886c92931692ba095f851793b4003021fa9605f3f23bdc9718082ff495c"
     },
     {
       "upstream": "conformance/runs/wait-group-closes.json",
-      "path": "dev/agsdl/fixtures/v0.3/conformance/runs/wait-group-closes.json",
+      "path": "crates/argentic-runtime/tests/fixtures/conformance/runs/wait-group-closes.json",
       "sha256": "2f3fbe87c1f64cea9236c29a2c88ee4df1dbc9bb99375b2d61012915792fb6cb"
     },
     {

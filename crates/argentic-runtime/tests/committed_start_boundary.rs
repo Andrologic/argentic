@@ -8,7 +8,7 @@ use argentic_runtime::{
     persistence::{
         self,
         dto::EngineStartRequest,
-        flow030::{FlowEffect030, FlowIdentity030},
+        flow030::{FlowEffect030, FlowIdentity030, FlowState030},
         flow_store030::{Authority030, CheckFuture, StoreError030},
         start030::{StartAuthority030, StartCapture030},
     },
@@ -279,6 +279,20 @@ async fn exercise(pool: SqlitePool, root: &std::path::Path) {
     .await
     .unwrap()
     .unwrap();
+    let state: String = sqlx::query_scalar(
+        "SELECT state_json FROM engine_flow030_runs WHERE system_id=? AND invocation_id=?",
+    )
+    .bind(&id.system_start_id)
+    .bind(&id.flow_invocation_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let state: FlowState030 = serde_json::from_str(&state).unwrap();
+    assert_eq!(state.verdict.as_deref(), Some("cancelled"));
+    assert!(state
+        .activations
+        .iter()
+        .all(|activation| !activation.physical));
     drop(cloned_session);
     drop(foreign);
     drop(session);

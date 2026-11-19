@@ -1,5 +1,4 @@
-//! Entry point for a separate, unprivileged content-reader process.
-//! The host has already authorized the action and passes a pinned parent fd.
+//! Confined reading from a directory handle after native admission.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -11,7 +10,15 @@ pub fn qualified_platform() -> bool {
     {
         return super::macos_launcher::available();
     }
-    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    #[cfg(any(target_os = "linux", windows))]
+    {
+        true
+    }
+    #[cfg(not(any(
+        all(target_os = "macos", target_arch = "aarch64"),
+        target_os = "linux",
+        windows
+    )))]
     {
         false
     }
@@ -112,99 +119,167 @@ pub async fn read_confined(
     parent: &cap_std::fs::Dir,
     name: &Path,
     cancel: &tokio_util::sync::CancellationToken,
-    _owner: Option<super::ContentResourceOwner>,
+    owner: Option<super::ContentResourceOwner>,
 ) -> std::io::Result<Vec<u8>> {
-    use crate::process::{background_contained_tokio_command, ContainedBackgroundProcess};
+    if !content_chain_enabled() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "Native content helper is not registered",
+        ));
+    }
+    let parent = parent.try_clone()?;
+    let name = name.to_owned();
+    supervise_read(cancel, owner, move |cancel| {
+        read_linux(parent, name, cancel)
+    })
+    .await
+}
+
+#[cfg(target_os = "linux")]
+async fn read_linux(
+    parent: cap_std::fs::Dir,
+    name: PathBuf,
+    cancel: tokio_util::sync::CancellationToken,
+) -> std::io::Result<Vec<u8>> {
     use std::os::fd::AsRawFd;
     use std::os::unix::process::CommandExt;
     use std::process::Stdio;
     use tokio::io::AsyncReadExt;
 
-    // A path check does not bind the image that the OS subsequently executes.
-    // Keep the reader unavailable until the native launcher enforces identity
-    // at launch and preserves the cancellation and containment guarantees.
-    if !content_chain_enabled() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "Native content helper launch identity is not enforced",
-        ));
-    }
-    let executable = HOST_EXECUTABLE
-        .get()
-        .ok_or_else(|| std::io::Error::other("Native content helper is not registered"))?;
     if cancel.is_cancelled() {
-        return Err(std::io::Error::other("Content read cancelled"));
+        return Err(cancelled());
     }
+    validate_file_name(&name)?;
     let fd = parent.as_raw_fd();
-    let mut command = background_contained_tokio_command(executable);
+    let owner_pid = unsafe { libc::getpid() };
+    let zero: libc::c_ulong = 0;
+    // This procfs link identifies the forked child's inherited image until
+    // exec. Replacing the executable's installation path cannot change it.
+    let mut command = crate::process::background_tokio_command("/proc/self/exe");
     command
         .env_clear()
+        .kill_on_drop(true)
         .arg(HELPER_ARGUMENT)
         .arg(fd.to_string())
         .arg(name.as_os_str())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    // Only clear CLOEXEC in the child. The pinned directory stays owned by the host.
     unsafe {
         command.as_std_mut().pre_exec(move || {
-            if libc::fcntl(fd, libc::F_SETFD, 0) < 0 {
+            if libc::prctl(
+                libc::PR_SET_PDEATHSIG,
+                libc::SIGKILL as libc::c_ulong,
+                zero,
+                zero,
+                zero,
+            ) < 0
+                || libc::prctl(
+                    libc::PR_SET_NO_NEW_PRIVS,
+                    1 as libc::c_ulong,
+                    zero,
+                    zero,
+                    zero,
+                ) < 0
+                || libc::fcntl(fd, libc::F_SETFD, 0) < 0
+            {
                 return Err(std::io::Error::last_os_error());
+            }
+            if libc::getppid() != owner_pid {
+                return Err(std::io::Error::from_raw_os_error(libc::ECANCELED));
             }
             Ok(())
         });
     }
-    let mut process = ContainedBackgroundProcess::spawn(command)?;
-    let stdout = process
-        .take_stdout()
-        .ok_or_else(|| std::io::Error::other("Missing helper output"))?;
-    let mut output = tokio::spawn(async move {
-        let mut bytes = Vec::new();
-        stdout.take(MAX_BYTES + 1).read_to_end(&mut bytes).await?;
-        if bytes.len() as u64 > MAX_BYTES {
-            return Err(std::io::Error::other("Content exceeds limit"));
-        }
-        Ok::<_, std::io::Error>(bytes)
-    });
-    let wait = tokio::select! {
+    let mut child = command.spawn()?;
+    let result = tokio::select! {
         biased;
-        _ = cancel.cancelled() => None,
-        result = tokio::time::timeout(std::time::Duration::from_secs(30), process.wait()) => Some(result),
+        _ = cancel.cancelled() => Err(cancelled()),
+        result = async {
+            let stdout = child.stdout.take().expect("piped reader output");
+            let mut bytes = Vec::new();
+            stdout.take(MAX_BYTES + 1).read_to_end(&mut bytes).await?;
+            if bytes.len() as u64 > MAX_BYTES {
+                return Err(std::io::Error::other("Content exceeds limit"));
+            }
+            let status = child.wait().await?;
+            match status.code() {
+                Some(0) => Ok(bytes),
+                Some(3) => Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "Content helper refused the file",
+                )),
+                _ => Err(std::io::Error::other("Content helper failed")),
+            }
+        } => result,
     };
-    // Reap the whole contained tree even after a successful parent exit.
-    let stopped = process.terminate_bounded().await;
-    let output = match tokio::time::timeout(std::time::Duration::from_secs(5), &mut output).await {
-        Ok(result) => result,
-        Err(_) => {
-            output.abort();
-            let _ = output.await;
-            return Err(std::io::Error::other("Content helper output did not close"));
-        }
-    };
-    stopped?;
-    let status = match wait {
-        Some(Ok(Ok(status))) => status,
-        Some(Ok(Err(error))) => return Err(error),
-        Some(Err(_)) => return Err(std::io::Error::other("Content helper timed out")),
-        None => return Err(std::io::Error::other("Content read cancelled")),
-    };
-    if !status.success() {
-        return Err(match status.code() {
-            Some(2) => std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "Content helper could not enforce its file-type guard",
-            ),
-            Some(3) => std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "Content helper refused the file",
-            ),
-            _ => std::io::Error::other("Content helper failed"),
-        });
+    if result.is_err() {
+        let _ = child.start_kill();
+        child.wait().await?;
     }
+    result
+}
+
+#[cfg(windows)]
+pub use super::windows_reader::read_confined;
+
+/// Attach cleanup before starting I/O. If the caller times out or is dropped,
+/// the worker receives cancellation and the work owner still joins it.
+#[cfg(any(target_os = "linux", windows))]
+pub(super) async fn supervise_read<F>(
+    cancel: &tokio_util::sync::CancellationToken,
+    owner: Option<super::ContentResourceOwner>,
+    read: impl FnOnce(tokio_util::sync::CancellationToken) -> F + Send + 'static,
+) -> std::io::Result<Vec<u8>>
+where
+    F: std::future::Future<Output = std::io::Result<Vec<u8>>> + Send + 'static,
+{
+    use std::time::Duration;
+    use tokio::sync::oneshot;
+
     if cancel.is_cancelled() {
-        return Err(std::io::Error::other("Content read cancelled"));
+        return Err(cancelled());
     }
-    output.map_err(|_| std::io::Error::other("Content helper output task failed"))?
+    let cancel = cancel.child_token();
+    let _cancel_on_drop = cancel.clone().drop_guard();
+    let (start, admitted) = oneshot::channel();
+    let (done, result) = oneshot::channel();
+    let worker_cancel = cancel.clone();
+    let worker = tokio::spawn(async move {
+        if admitted.await.is_ok() {
+            let _ = done.send(read(worker_cancel).await);
+        }
+        Ok(())
+    });
+    if let Some(owner) = owner {
+        owner(worker).map_err(std::io::Error::other)?;
+    }
+    start
+        .send(())
+        .map_err(|_| std::io::Error::other("Content reader stopped"))?;
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Err(cancelled()),
+        result = tokio::time::timeout(Duration::from_secs(30), result) => {
+            result
+                .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "Content read timed out"))?
+                .map_err(|_| std::io::Error::other("Content reader stopped"))?
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", windows))]
+pub(super) fn cancelled() -> std::io::Error {
+    std::io::Error::other("Content read cancelled")
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+pub(super) fn validate_file_name(name: &Path) -> std::io::Result<()> {
+    if name.file_name() == Some(name.as_os_str()) {
+        Ok(())
+    } else {
+        Err(std::io::Error::other("Invalid path component"))
+    }
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -219,7 +294,7 @@ fn content_chain_enabled() -> bool {
     }
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 pub async fn read_confined(
     _parent: &cap_std::fs::Dir,
     _name: &Path,
@@ -305,7 +380,6 @@ fn read(args: &[OsString]) -> std::io::Result<()> {
     use std::io::{Read, Write};
     use std::os::fd::{FromRawFd, OwnedFd};
     use std::os::unix::ffi::OsStrExt;
-    use std::path::{Component, Path};
 
     if args.len() != 3 {
         return Err(std::io::Error::other("Invalid helper arguments"));
@@ -317,18 +391,14 @@ fn read(args: &[OsString]) -> std::io::Result<()> {
         // stdin; other launchers may inherit a descriptor numbered 3 or above.
         .filter(|fd| *fd == 0 || *fd >= 3)
         .ok_or_else(|| std::io::Error::other("Invalid parent descriptor"))?;
-    let path = Path::new(&args[2]);
-    if !matches!(
-        (path.components().next(), path.components().nth(1)),
-        (Some(Component::Normal(_)), None)
-    ) {
-        return Err(std::io::Error::other("Invalid path component"));
-    }
+    validate_file_name(Path::new(&args[2]))?;
     let name = CString::new(args[2].as_os_str().as_bytes())
         .map_err(|_| std::io::Error::other("Invalid path component"))?;
     #[cfg(target_os = "macos")]
-    start_control_monitor()?;
-    install_guard()?;
+    {
+        start_control_monitor()?;
+        install_guard()?;
+    }
 
     #[cfg(target_os = "macos")]
     let fd = unsafe {
@@ -483,11 +553,6 @@ fn install_guard() -> std::io::Result<()> {
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
-fn install_guard() -> std::io::Result<()> {
-    Ok(())
-}
-
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn read(_args: &[OsString]) -> std::io::Result<()> {
     Err(std::io::Error::new(
@@ -527,5 +592,43 @@ mod tests {
                 Some(1)
             );
         }
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    #[tokio::test]
+    async fn cancelled_read_keeps_its_worker_attached_until_it_stops() {
+        use std::sync::{Arc, Mutex};
+        use tokio::sync::oneshot;
+        use tokio_util::sync::CancellationToken;
+
+        let worker = Arc::new(Mutex::new(None));
+        let attached = Arc::clone(&worker);
+        let caller_cancel = CancellationToken::new();
+        let cancel = caller_cancel.clone();
+        let (started, running) = oneshot::channel();
+        let (release, stopping) = oneshot::channel();
+        let request = tokio::spawn(async move {
+            super::supervise_read(
+                &cancel,
+                Some(Arc::new(move |cleanup| {
+                    *attached.lock().unwrap() = Some(cleanup);
+                    Ok(())
+                })),
+                move |cancel| async move {
+                    started.send(()).unwrap();
+                    cancel.cancelled().await;
+                    stopping.await.unwrap();
+                    Err(super::cancelled())
+                },
+            )
+            .await
+        });
+        running.await.unwrap();
+        caller_cancel.cancel();
+        assert!(request.await.unwrap().is_err());
+        let cleanup = worker.lock().unwrap().take().unwrap();
+        assert!(!cleanup.is_finished());
+        release.send(()).unwrap();
+        cleanup.await.unwrap().unwrap();
     }
 }

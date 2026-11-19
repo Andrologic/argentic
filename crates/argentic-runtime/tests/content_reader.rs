@@ -1,0 +1,193 @@
+use argentic_runtime::content::{
+    discover_skills, load_skill, resolve_content, ContentContext, ContentPayload, ContentUsage,
+    ContentUse,
+};
+use argentic_runtime::content_io::file_helper::{self, MAX_BYTES};
+use argentic_runtime::permissions::{
+    normalize_requested, EffectivePolicy, ExecutionPurpose, PathContext,
+};
+use cap_std::{ambient_authority, fs::Dir};
+use serde_json::json;
+use sha2::{Digest, Sha256};
+use std::{fs, path::Path, sync::Arc, time::Duration};
+use tokio_util::sync::CancellationToken;
+use url::Url;
+
+fn main() {
+    // The Linux and macOS backends launch this test executable as the reader.
+    if let Some(status) = file_helper::initialize().unwrap() {
+        std::process::exit(status);
+    }
+    if !file_helper::qualified_platform() {
+        assert!(
+            std::env::var_os("ARGENTIC_REQUIRE_NATIVE_READER").is_none(),
+            "The native content reader is required on this runner"
+        );
+        println!("Native content reader unavailable on this platform");
+        return;
+    }
+    #[cfg(all(target_os = "macos", feature = "agsdl-content-qa", debug_assertions))]
+    file_helper::enable_qa_chain().unwrap();
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            tokio::time::timeout(Duration::from_secs(15), exercise_reader())
+                .await
+                .expect("content-reader integration test timed out");
+        });
+    println!("Native content reads passed on {}", std::env::consts::OS);
+}
+
+async fn exercise_reader() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let plans = root.join("plans");
+    let source = plans.join("document with spaces.json");
+    let instructions = plans.join("mission text.txt");
+    let nested = plans.join("nested");
+    let skill = plans.join("review");
+    let document = r#"{"agents":{"worker":{"skills":["review"]}},"skills":{"review":{"uri":"review/SKILL.md"}}}"#;
+    fs::create_dir_all(&skill).unwrap();
+    fs::create_dir(&nested).unwrap();
+    fs::write(&source, document).unwrap();
+    fs::write(&instructions, "Read the mission.\n").unwrap();
+    fs::write(nested.join("draft-privé.txt"), "Nested draft.\n").unwrap();
+    let (denied_file, denied_uri) = if cfg!(windows) {
+        ("draft-PRIVÉ.txt", "draft-PRIV%C3%89.txt")
+    } else {
+        ("draft-privé.txt", "draft-priv%C3%A9.txt")
+    };
+    fs::write(plans.join(denied_file), "Denied draft.\n").unwrap();
+    fs::write(
+        skill.join("SKILL.md"),
+        "---\nname: review\ndescription: Review a draft\n---\nReview the draft.\n",
+    )
+    .unwrap();
+
+    let policy = normalize_requested(
+        serde_json::from_value(json!({"preset":"read-only","rules":[
+            {"action":"read","effect":"deny","match":"plans/*-privé.txt"}
+        ]}))
+        .unwrap(),
+        PathContext {
+            workspace: root.clone(),
+            home: root.clone(),
+        },
+    )
+    .unwrap();
+    let cancel = CancellationToken::new();
+    let origin = Url::from_file_path(&source).unwrap();
+    let context = ContentContext::capture(
+        "content-integration".into(),
+        format!("{:x}", Sha256::digest(document.as_bytes())),
+        document.into(),
+        Some(origin.as_str()),
+        "worker".into(),
+        EffectivePolicy::new(policy.clone(), policy.clone(), policy),
+        ExecutionPurpose::Agent,
+        cancel.clone(),
+        Arc::new(|_| Box::pin(async { panic!("read-only content must not require approval") })),
+    )
+    .unwrap();
+
+    let absolute = Url::from_file_path(&instructions).unwrap();
+    let nested_uri = Url::from_file_path(nested.join("draft-privé.txt")).unwrap();
+    for (uri, usage, expected_uri, expected_text) in [
+        (
+            "mission%20text.txt",
+            ContentUsage::Instructions,
+            &absolute,
+            "Read the mission.\n",
+        ),
+        (
+            absolute.as_str(),
+            ContentUsage::Resource,
+            &absolute,
+            "Read the mission.\n",
+        ),
+        (
+            "nested/draft-priv%C3%A9.txt",
+            ContentUsage::Resource,
+            &nested_uri,
+            "Nested draft.\n",
+        ),
+    ] {
+        let receipt = resolve_content(
+            &context,
+            ContentUse {
+                source_json: json!({"uri":uri,"mediaType":"text/plain"}).to_string(),
+                usage,
+                pointer: "/file".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(receipt.payload, ContentPayload::Text { text } if text == expected_text));
+        assert_eq!(
+            receipt.provenance.final_uri.as_deref(),
+            Some(expected_uri.as_str())
+        );
+        assert!(receipt.provenance.file_parent_identity.is_some());
+    }
+    for (uri, error_code) in [
+        (denied_uri, "PERMISSION"),
+        ("file://example.invalid/share/mission.txt", "CONTENT_URI"),
+    ] {
+        let error = resolve_content(
+            &context,
+            ContentUse {
+                source_json: json!({"uri":uri,"mediaType":"text/plain"}).to_string(),
+                usage: ContentUsage::Resource,
+                pointer: "/file".into(),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, error_code);
+    }
+
+    let skills = discover_skills(&context).await.unwrap();
+    assert_eq!(skills.len(), 1);
+    let loaded = load_skill(&context, &skills[0].handle).await.unwrap();
+    assert_eq!(loaded.instructions.trim(), "Review the draft.");
+
+    let directory = Dir::open_ambient_dir(&plans, ambient_authority()).unwrap();
+    fs::File::create(plans.join("oversized.txt"))
+        .unwrap()
+        .set_len(MAX_BYTES + 1)
+        .unwrap();
+    assert!(
+        file_helper::read_confined(&directory, Path::new("oversized.txt"), &cancel, None)
+            .await
+            .is_err()
+    );
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(&instructions, plans.join("link")).unwrap();
+        assert!(
+            file_helper::read_confined(&directory, Path::new("link"), &cancel, None)
+                .await
+                .is_err()
+        );
+    }
+    #[cfg(windows)]
+    {
+        let error = file_helper::read_confined(
+            &directory,
+            Path::new("mission text.txt:stream"),
+            &cancel,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    }
+    cancel.cancel();
+    assert!(
+        file_helper::read_confined(&directory, Path::new("mission text.txt"), &cancel, None)
+            .await
+            .is_err()
+    );
+}

@@ -1347,8 +1347,11 @@ async fn dispatch_stop_waits_for_registered_cleanup_and_rejects_late_result() {
         assert_eq!(status, "pending");
     }
     let (started, received) = tokio::sync::oneshot::channel();
+    let work_cancelled = tokio_util::sync::CancellationToken::new();
+    let cancelled_on_drop = work_cancelled.clone().drop_guard();
     tasks
         .start_agent030(request_id.clone(), &attempt, async move {
+            let _cancelled_on_drop = cancelled_on_drop;
             started.send(()).unwrap();
             std::future::pending::<()>().await;
         })
@@ -1364,26 +1367,14 @@ async fn dispatch_stop_waits_for_registered_cleanup_and_rejects_late_result() {
         &host, &pool, &tasks, &owner, &effect, &attempt,
     );
     tokio::pin!(stop_future);
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        loop {
-            tokio::select! {
-                result = &mut stop_future => panic!("dispatch returned before cleanup: {result:?}"),
-                _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
-            }
-            let status: String =
-                sqlx::query_scalar("SELECT status FROM engine_flow030_outbox WHERE effect_id=?")
-                    .bind(&stop_id)
-                    .fetch_one(&pool)
-                    .await
-                    .unwrap();
-            if status == "uncertain" {
-                break;
-            }
-            assert_eq!(status, "pending");
+    // The claim is visible in SQLite before dispatch releases admission.
+    // The owned work is cancelled only after dispatch releases that lock.
+    tokio::select! {
+        result = &mut stop_future => panic!("dispatch returned before cleanup: {result:?}"),
+        cancelled = tokio::time::timeout(std::time::Duration::from_secs(5), work_cancelled.cancelled()) => {
+            cancelled.expect("dispatch did not cancel the owned work");
         }
-    })
-    .await
-    .expect("dispatch did not claim StopWork");
+    }
     let waiting = control.read(&pool).await.unwrap().state;
     assert!(waiting
         .activations
@@ -1413,7 +1404,13 @@ async fn dispatch_stop_waits_for_registered_cleanup_and_rejects_late_result() {
         kind: FlowEventKind030::Stop,
     };
     assert!(matches!(
-        control.apply(&pool, &concurrent_stop).await.unwrap(),
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            control.apply(&pool, &concurrent_stop),
+        )
+        .await
+        .expect("concurrent Stop could not finish while cleanup was blocked")
+        .unwrap(),
         Apply030::Applied(_)
     ));
     assert!(control.read(&pool).await.unwrap().state.stopping);

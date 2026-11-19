@@ -28,6 +28,22 @@ pub(super) fn text(path: &Path) -> Result<String> {
         .map(str::to_owned)
         .ok_or_else(|| invalid("Non-UTF-8 paths require an explicit native adapter"))
 }
+
+/// Adapt a native local path to the slash-separated policy request syntax.
+pub(crate) fn native_request_path(path: &Path) -> Option<String> {
+    let value = path.to_str()?;
+    #[cfg(windows)]
+    {
+        if !matches!(path.components().next(), Some(Component::Prefix(prefix))
+            if matches!(prefix.kind(), std::path::Prefix::Disk(_) | std::path::Prefix::VerbatimDisk(_)))
+        {
+            return None;
+        }
+        Some(windows_path_spelling(value))
+    }
+    #[cfg(not(windows))]
+    Some(value.to_owned())
+}
 pub(super) fn contains(root: &Path, path: &Path) -> bool {
     path.starts_with(root)
 }
@@ -187,17 +203,12 @@ impl NormalizedRule {
             return Ok(true);
         };
         if let Some(physical_pattern) = &self.physical {
-            let a = glob(
-                self.logical.as_ref().unwrap(),
-                &subject.logical,
-                true,
-                false,
-            )?;
-            let b = glob(
+            let deny = self.effect == Effect::Deny;
+            let a = path_glob(self.logical.as_ref().unwrap(), &subject.logical, deny)?;
+            let b = path_glob(
                 physical_pattern,
                 &text(subject.physical.as_ref().unwrap())?,
-                true,
-                false,
+                deny,
             )?;
             return Ok(if self.effect == Effect::Allow {
                 a && b
@@ -217,7 +228,7 @@ impl NormalizedRule {
         };
         glob(pattern, subject, false, action == Action::Shell)
     }
-    /// Identical scopes give the same match set for asks and denies, including
+    /// A deny with the same scope covers every match of the ask, including
     /// both logical and physical path patterns captured under their contexts.
     pub(super) fn same_scope(&self, other: &Self) -> bool {
         self.action == other.action
@@ -232,6 +243,51 @@ impl NormalizedRule {
             Some(p) => !p.is_empty() && p.chars().all(|c| c == '*'),
         }
     }
+}
+
+fn path_glob(pattern: &str, subject: &str, _deny: bool) -> Result<bool> {
+    #[cfg(windows)]
+    {
+        let pattern = windows_path_spelling(pattern);
+        let subject = windows_path_spelling(subject);
+        if _deny {
+            // Windows paths may resolve regardless of case. Fold only denies
+            // because an allow or ask can grant access to a distinct file.
+            return glob(
+                &windows_upcase(&pattern)?,
+                &windows_upcase(&subject)?,
+                true,
+                false,
+            );
+        }
+        return glob(&pattern, &subject, true, false);
+    }
+    #[cfg(not(windows))]
+    glob(pattern, subject, true, false)
+}
+
+#[cfg(windows)]
+fn windows_upcase(path: &str) -> Result<String> {
+    use windows_sys::Wdk::System::SystemServices::RtlUpcaseUnicodeChar;
+
+    let upper: Vec<_> = path
+        .encode_utf16()
+        // SAFETY: The system function takes and returns one UTF-16 code unit.
+        .map(|unit| unsafe { RtlUpcaseUnicodeChar(unit) })
+        .collect();
+    String::from_utf16(&upper).map_err(|_| invalid("Invalid uppercase Windows path"))
+}
+
+#[cfg(windows)]
+fn windows_path_spelling(path: &str) -> String {
+    let volume_path = matches!(
+        Path::new(path).components().next(),
+        Some(Component::Prefix(prefix)) if matches!(prefix.kind(), std::path::Prefix::VerbatimDisk(_))
+    );
+    // Compare a DOS drive path and its canonical verbatim form in the same
+    // spelling. Only the separator counts as a path boundary for globs.
+    let path = if volume_path { &path[4..] } else { path };
+    path.replace('\\', "/")
 }
 pub(super) struct Subject {
     pub logical: String,

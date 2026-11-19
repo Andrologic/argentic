@@ -86,7 +86,7 @@ impl Inputs {
     fn verify(&self) -> Result<()> {
         if read(&self.source_path)? != self.authored.as_bytes()
             || read(&self.policy_path)? != self.policy_bytes
-            || scope(&self.workspace, &self.policy.owner)? != self.scope
+            || scope(&self.workspace, &self.policy.owner, &self.source_path)? != self.scope
         {
             return Err(failure(
                 "CAPTURE_CHANGED",
@@ -103,7 +103,7 @@ impl Inputs {
             "allowedToolIds":[], "riskLevel":"strict", "agsdlHostPermissions":self.policy.permissions})
     }
 }
-fn scope(root: &Path, owner: &EngineSourceOwner) -> Result<Value> {
+fn scope(root: &Path, owner: &EngineSourceOwner, source: &Path) -> Result<Value> {
     let root = root.canonicalize().map_err(io_error)?;
     let identity = crate::content_io::admitted::workspace_root_identity(&root)
         .map_err(|_| {
@@ -115,9 +115,10 @@ fn scope(root: &Path, owner: &EngineSourceOwner) -> Result<Value> {
         })?
         .observation_key()
         .ok_or_else(|| failure("UNSUPPORTED", "scope", "Workspace identity is unqualified"))?;
-    Ok(
-        json!({"projectId":owner.project_id,"root":root,"rootIdentity":identity,"sourceOwner":owner}),
-    )
+    let document_location = url::Url::from_file_path(source.canonicalize().map_err(io_error)?)
+        .map_err(|_| failure("SOURCE_UNAVAILABLE", "source", "Cannot capture document location"))?;
+    Ok(json!({"projectId":owner.project_id,"root":root,"rootIdentity":identity,
+        "sourceOwner":owner,"documentLocation":document_location.as_str()}))
 }
 #[derive(Clone)]
 struct Policies(Arc<RwLock<Inputs>>);
@@ -279,15 +280,16 @@ impl Host {
             persistence::opaque(id)?;
         }
         persistence::decimal(&policy_value.source_revision)?;
-        let bytes = read(source)?;
+        let source_path = std::path::absolute(source).map_err(io_error)?;
+        let bytes = read(&source_path)?;
         let source_sha256 = digest(&bytes);
         let authored = String::from_utf8(bytes)
             .map_err(|_| failure("PARSE", "source", "Source must be UTF-8"))?;
         persistence::validate_json(&authored)?;
         let inputs = Inputs {
-            scope: scope(&workspace, &policy_value.owner)?,
+            scope: scope(&workspace, &policy_value.owner, &source_path)?,
             workspace,
-            source_path: source.to_owned(),
+            source_path,
             authored,
             source: EngineSourceRevision {
                 owner: policy_value.owner.clone(),
@@ -373,7 +375,10 @@ impl Host {
             ));
         }
         let observed = if uses_codex {
-            api::validate_codex_document(&doc)?;
+            crate::agsdl_host_work_admission030::validate_codex_document_at030(
+                &doc,
+                crate::capture::document_location(&inputs.scope)?.as_ref(),
+            )?;
             let observed =
                 api::observe_codex(&self.context, &inputs.scope, inputs.policy.read_only).await?;
             match observed {
@@ -404,7 +409,7 @@ impl Host {
             None => Value::Null,
         };
         let mut registry = json!({"format":"macro-agsdl-registry/030", "modules":[{"harness":"codex","moduleJson":api::codex_module()}],
-            "harnesses":harnesses,"agents":agents,"hostCapabilities": if cfg!(all(target_os="macos",target_arch="aarch64")) {
+            "harnesses":harnesses,"agents":agents,"hostCapabilities": if !uses_codex || cfg!(all(target_os="macos",target_arch="aarch64")) {
                 json!([{"name":"approval","support":"native","evidenceJson":"{\"runtime\":\"flow-human-clock\"}"}])
             } else { json!([]) }});
         registry["version"] = json!(format!(
@@ -758,6 +763,38 @@ mod tests {
         }
     }
     const WAIT: &str = r#"{"contract":"agsdl-0.3.0","id":"standalone","agents":{},"flow":{"entry":"wait","steps":{"wait":{"type":"approval","title":"Continue?","timeoutMs":86400000,"next":{"yes":[],"no":[]}}}}}"#;
+    #[tokio::test]
+    async fn captures_the_source_location_independently_of_the_workspace() {
+        let mut f = Fixture::new(WAIT);
+        let directory = f.workspace.join("plans");
+        std::fs::create_dir(&directory).unwrap();
+        let source = directory.join("source with spaces.json");
+        let mission = directory.join("mission.md");
+        std::fs::rename(&f.source, &source).unwrap();
+        std::fs::write(&mission, "Mission").unwrap();
+        f.source = source;
+        let host = f.open().await.unwrap();
+        {
+            let guard = host.policies.acquire().await.unwrap();
+            let location = crate::capture::document_location(&guard.scope)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                location.to_file_path().unwrap().canonicalize().unwrap(),
+                f.source.canonicalize().unwrap()
+            );
+            assert_eq!(
+                crate::content::local_file_path("mission.md", Some(&location))
+                    .unwrap()
+                    .canonicalize()
+                    .unwrap(),
+                mission.canonicalize().unwrap()
+            );
+        }
+        host.shutdown(&[]).await.unwrap();
+        host.close().await.unwrap();
+    }
+
     fn entry() -> Option<EngineEntry> {
         Some(EngineEntry {
             delivery_id: "entry".into(),
@@ -839,11 +876,12 @@ mod tests {
             host.close().await.unwrap();
         }
     }
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[tokio::test]
     async fn standalone_real_start_human_submission_stop_and_reopen() {
         let f = Fixture::new(WAIT);
         let host = f.open().await.unwrap();
+        let result = host.preflight(entry().as_ref(), false).await.unwrap();
+        assert_eq!(result["runtime"]["supported"], true);
         let started = host.start("start".into(), entry(), false).await.unwrap();
         let replay = host.start("start".into(), entry(), false).await.unwrap();
         assert_eq!(started.receipt, replay.receipt);
@@ -927,7 +965,6 @@ mod tests {
         reopened.shutdown(&[]).await.unwrap();
         reopened.close().await.unwrap();
     }
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[tokio::test]
     async fn restart_marks_unfinished_run_interrupted_without_adoption() {
         const CHILD: &str = "ARGENTIC_SYNTHETIC_CRASH_ROOT";
@@ -978,7 +1015,6 @@ mod tests {
         host.close().await.unwrap();
     }
 
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[tokio::test]
     async fn failed_retirement_keeps_host_inspectable_but_cannot_close_or_restart() {
         let f = Fixture::new(WAIT);
@@ -1065,7 +1101,6 @@ mod tests {
         host.close().await.unwrap();
     }
 
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[tokio::test]
     async fn standalone_retry_retains_stop_and_requires_consent() {
         let f = Fixture::new(WAIT);

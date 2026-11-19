@@ -33,12 +33,14 @@ pub(super) fn absolute_uri(value: &str) -> ContentResult<Url> {
 }
 
 pub(super) fn resolved_uri(context: &ContentContext, value: &str) -> ContentResult<Url> {
+    resolve_uri_at(value, context.document_location())
+}
+
+pub(crate) fn resolve_uri_at(value: &str, document_location: Option<&Url>) -> ContentResult<Url> {
     uri_text(value)?;
     match Url::parse(value) {
         Ok(url) => Ok(url),
-        Err(url::ParseError::RelativeUrlWithoutBase) => context
-            .document_location
-            .as_ref()
+        Err(url::ParseError::RelativeUrlWithoutBase) => document_location
             .ok_or_else(|| {
                 error(
                     "CONTENT_ORIGIN",
@@ -49,6 +51,28 @@ pub(super) fn resolved_uri(context: &ContentContext, value: &str) -> ContentResu
             .map_err(|e| error("CONTENT_URI", e)),
         Err(e) => Err(error("CONTENT_URI", e)),
     }
+}
+
+pub(crate) fn local_file_path(
+    uri: &str,
+    document_location: Option<&Url>,
+) -> ContentResult<std::path::PathBuf> {
+    let url = resolve_uri_at(uri, document_location)?;
+    path_from_local_uri(&url)
+}
+
+fn path_from_local_uri(url: &Url) -> ContentResult<std::path::PathBuf> {
+    if url.scheme() != "file"
+        || url.has_host()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(error("CONTENT_URI", "Expected a local file URI."));
+    }
+    url.to_file_path()
+        .map_err(|_| error("CONTENT_URI", "Expected a local file path."))
 }
 
 fn raw_object(json: &str) -> ContentResult<BTreeMap<String, Box<RawValue>>> {
@@ -305,16 +329,9 @@ async fn read_uri(
     };
     match uri.scheme() {
         "file" => {
-            let path = uri.to_file_path().map_err(|_| {
-                error(
-                    "CONTENT_URI",
-                    "File URI cannot be converted to a local path.",
-                )
-            })?;
-            let logical = path
-                .to_str()
-                .ok_or_else(|| error("CONTENT_URI", "Non-UTF-8 file path."))?
-                .to_owned();
+            let path = path_from_local_uri(uri)?;
+            let logical = crate::permissions::native_request_path(&path)
+                .ok_or_else(|| error("CONTENT_URI", "Unsupported local file path."))?;
             let root_path = root
                 .map(|r| {
                     r.uri

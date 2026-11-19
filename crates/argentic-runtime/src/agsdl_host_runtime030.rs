@@ -942,15 +942,29 @@ impl EffectDriver030 for NativeDriver030<'_> {
                 return Ok(());
             }
             if self.executors.humans.is_some() && work.agent_instance_id.is_none() {
-                let claim = flow::claim_expected(
+                let Some(claim) = flow::claim_expected(
                     self.host.flow030(),
                     self.host,
                     self.pool,
                     &effect.identity,
                     &effect.id,
                 )
-                .await?
-                .ok_or_else(|| failure("STALE_REFERENCE", "approval", "Approval stop changed"))?;
+                .await? else {
+                    // Retirement can settle a Start that never reached the
+                    // approval executor between Stop selection and claim.
+                    let inspection =
+                        flow::inspect_run(self.host.flow030(), self.host, self.pool, self.owner)
+                            .await?;
+                    if inspection.flow.state.activations.iter().any(|activation| {
+                        activation.id == work.activation_id
+                            && activation.start_effect_id.as_ref() == Some(&work.start_effect_id)
+                            && activation.instance_id == work.agent_instance_id
+                            && !activation.physical
+                    }) {
+                        return Ok(());
+                    }
+                    return Err(failure("STALE_REFERENCE", "approval", "Approval stop changed"));
+                };
                 let request = claim.request_id();
                 claim.handoff_host(self.tasks, async {}).await?;
                 self.tasks
