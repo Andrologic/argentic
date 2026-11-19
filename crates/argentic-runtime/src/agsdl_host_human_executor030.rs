@@ -24,7 +24,7 @@ impl HostExecutor030 for HumanExecutor030 {
     fn start(
         &self,
         app: HostState,
-        _inspection: NativeFlowInspection030,
+        inspection: NativeFlowInspection030,
         effect: FlowEffect030,
         _cancel: CancellationToken,
     ) -> BoxFuture<'static, Result<Option<crate::agsdl_host_call_executor030::StartedCall030>>>
@@ -39,14 +39,33 @@ impl HostExecutor030 for HumanExecutor030 {
                         failure("STALE_REFERENCE", "approval", "Approval start changed")
                     })?;
             claim.handoff_host(&tasks, std::future::pending()).await?;
-            let broker = host
-                .flow030()
-                .humans
-                .broker(&host, &pool, &effect.identity)
-                .await?;
-            let _operation = broker.operation.lock().await;
-            broker.admit_host_work(&host, &effect.id).await?;
-            broker.pump(&host, &CancellationToken::new()).await?;
+            let admission = async {
+                let broker = host
+                    .flow030()
+                    .humans
+                    .broker(&host, &pool, &effect.identity)
+                    .await?;
+                let _operation = broker.operation.lock().await;
+                broker.admit_host_work(&host, &effect.id).await?;
+                broker.pump(&host, &CancellationToken::new()).await?;
+                Ok::<_, crate::persistence::dto::EngineFailure>(())
+            }
+            .await;
+            if let Err(error) = admission {
+                // Stop may commit after the native task is registered but before
+                // the clock publishes the approval. Leave the task registered so
+                // StopWork can join it and persist the physical receipt.
+                if error.code != "CORRELATION"
+                    || error.pointer != "humanClock"
+                    || !flow::inspect_run(host.flow030(), &host, &pool, &inspection.owner)
+                        .await?
+                        .flow
+                        .state
+                        .stopping
+                {
+                    return Err(error);
+                }
+            }
             Ok(None)
         })
     }
