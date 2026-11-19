@@ -1254,6 +1254,10 @@ pub(crate) fn analyse_joins(
     let Some(root) = &graph.root else {
         return Ok((infos, problems));
     };
+    // Dominator sets grow quadratically and only joins use them.
+    if !graph.nodes.iter().any(|(_, node)| node.kind == "join") {
+        return Ok((infos, problems));
+    }
     let idom = graph.immediate_dominators()?;
     let reach = graph.reachable(root, &OrderedSet::new())?;
     let mut origins: OrderedMap<String, String> = OrderedMap::new();
