@@ -53,8 +53,13 @@ async fn exercise_reader() {
     fs::create_dir(&nested).unwrap();
     fs::write(&source, document).unwrap();
     fs::write(&instructions, "Read the mission.\n").unwrap();
-    fs::write(nested.join("draft-private.txt"), "Nested draft.\n").unwrap();
-    fs::write(plans.join("draft-private.txt"), "Denied draft.\n").unwrap();
+    fs::write(nested.join("draft-privé.txt"), "Nested draft.\n").unwrap();
+    let (denied_file, denied_uri) = if cfg!(windows) {
+        ("draft-PRIVÉ.txt", "draft-PRIV%C3%89.txt")
+    } else {
+        ("draft-privé.txt", "draft-priv%C3%A9.txt")
+    };
+    fs::write(plans.join(denied_file), "Denied draft.\n").unwrap();
     fs::write(
         skill.join("SKILL.md"),
         "---\nname: review\ndescription: Review a draft\n---\nReview the draft.\n",
@@ -63,7 +68,7 @@ async fn exercise_reader() {
 
     let policy = normalize_requested(
         serde_json::from_value(json!({"preset":"read-only","rules":[
-            {"action":"read","effect":"deny","match":"plans/*-private.txt"}
+            {"action":"read","effect":"deny","match":"plans/*-privé.txt"}
         ]}))
         .unwrap(),
         PathContext {
@@ -88,7 +93,7 @@ async fn exercise_reader() {
     .unwrap();
 
     let absolute = Url::from_file_path(&instructions).unwrap();
-    let nested_uri = Url::from_file_path(nested.join("draft-private.txt")).unwrap();
+    let nested_uri = Url::from_file_path(nested.join("draft-privé.txt")).unwrap();
     for (uri, usage, expected_uri, expected_text) in [
         (
             "mission%20text.txt",
@@ -103,7 +108,7 @@ async fn exercise_reader() {
             "Read the mission.\n",
         ),
         (
-            "nested/draft-private.txt",
+            "nested/draft-priv%C3%A9.txt",
             ContentUsage::Resource,
             &nested_uri,
             "Nested draft.\n",
@@ -127,7 +132,7 @@ async fn exercise_reader() {
         assert!(receipt.provenance.file_parent_identity.is_some());
     }
     for (uri, error_code) in [
-        ("draft-private.txt", "PERMISSION"),
+        (denied_uri, "PERMISSION"),
         ("file://example.invalid/share/mission.txt", "CONTENT_URI"),
     ] {
         let error = resolve_content(
