@@ -332,9 +332,10 @@ impl SteerDelivery030 {
         F: std::future::Future<Output = Result<Option<bool>>> + Send + 'static,
     {
         let request = self.verify_consumer(tasks, attempt)?;
+        let cleanup_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
         let deadline = self
             .deadline()
-            .unwrap_or_else(|| tokio::time::Instant::now() + std::time::Duration::from_secs(2));
+            .map_or(cleanup_deadline, |deadline| deadline.min(cleanup_deadline));
         let cleanup = tokio::spawn(async move {
             let observed = tokio::select! {
                 result = tokio::time::timeout_at(deadline, observation) => result,

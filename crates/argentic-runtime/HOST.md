@@ -134,6 +134,10 @@ Codex notifications identify a turn and message. An observed turn end while
 the recipient still counts can establish the timing of a later confirmation.
 When the first usable evidence comes after a committed exclusion, the
 identifiers alone leave receipt timing uncertain.
+After the turn ends, the runtime gives the app-server up to two seconds to
+report a pending receipt, within the steer deadline. This observation uses
+none of an accepted result's machine-time budget. The runtime still joins
+the process and its descendants before routing the recipient's result.
 
 ## Storage, API and limits
 

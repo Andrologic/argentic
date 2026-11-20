@@ -396,6 +396,129 @@ struct CheckClock {
     pool: sqlx::SqlitePool,
     identity: FlowIdentity030,
 }
+
+#[tokio::test]
+async fn accepted_040_result_survives_deadline_during_physical_cleanup() {
+    struct PendingCleanup {
+        accepted: Arc<Notify>,
+        finish: Arc<Notify>,
+    }
+    impl AgentExecutor030 for PendingCleanup {
+        fn prepare(
+            &self,
+            work: PreparedEffectiveAgentWork030,
+        ) -> HostResult<AttestedWorkPolicy030> {
+            AttestedWorkPolicy030::from_codex(work)
+        }
+
+        fn run(
+            &self,
+            work: AgentWork030,
+            events: WorkEventSink030,
+            cancel: CancellationToken,
+        ) -> BoxFuture<'static, HostResult<()>> {
+            let accepted = self.accepted.clone();
+            let finish = self.finish.clone();
+            Box::pin(async move {
+                let decision = events
+                    .emit(json!({"kind":"submit","callId":"submit","argumentsJson":"{\"results\":{}}"}), &cancel)
+                    .await?;
+                assert_eq!(
+                    serde_json::from_str::<Value>(&decision.receipt_json)?["decision"]["kind"],
+                    "accepted"
+                );
+                let parent = format!(
+                    "flow030:{}:{}",
+                    work.attempt.identity().system_start_id,
+                    work.attempt.start_effect_id()
+                );
+                work.tasks
+                    .attach_cleanup030(
+                        &parent,
+                        tokio::spawn(async move {
+                            finish.notified().await;
+                            Ok(())
+                        }),
+                    )
+                    .unwrap();
+                accepted.notify_one();
+                Ok(())
+            })
+        }
+    }
+
+    let f = Fixture::with_document(json!({
+        "contract": argentic_core::AGSDL_040, "id":"clock-after-result",
+        "agents":{"worker":{"harness":"codex","permissions":"read-only"}},
+        "flow":{"entry":"work","steps":{"work":{"type":"agent","agent":"worker","timeoutMs":1}}}
+    }))
+    .await;
+    let clock = f.host.flow030().humans.virtual_clock().await.unwrap();
+    let accepted = Arc::new(Notify::new());
+    let finish = Arc::new(Notify::new());
+    let tasks = StreamTasks::default();
+    let executors = Executors030 {
+        agents: Arc::new(PendingCleanup {
+            accepted: accepted.clone(),
+            finish: finish.clone(),
+        }),
+        humans: None,
+        calls: None,
+        clock: Some(Arc::new(CheckClock {
+            host: f.host.clone(),
+            pool: f.pool.clone(),
+            identity: f.identity.clone(),
+        })),
+    };
+    let (_wake, receiver) = watch::channel(0);
+    let cancel = CancellationToken::new();
+    let run = supervise_with_emitter030(
+        None,
+        &f.host,
+        &f.pool,
+        &f.config,
+        &tasks,
+        &f.owner,
+        &executors,
+        receiver,
+        &cancel,
+        f.emitter(&tasks),
+    );
+    let expire_after_result = async {
+        accepted.notified().await;
+        let broker = f
+            .host
+            .flow030()
+            .humans
+            .broker(&f.host, &f.pool, &f.identity)
+            .await
+            .unwrap();
+        let _clock_operation = broker.operation.lock().await;
+        clock.advance_to(1).unwrap();
+        broker.tick(&f.host).await.unwrap();
+        let observed = broker.pump(&f.host, &cancel).await.unwrap().unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&observed.receipt_json).unwrap()["expiredWorkIds"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(broker.timeout_controls().await.unwrap().is_empty());
+        finish.notify_one();
+    };
+    let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        tokio::join!(run, expire_after_result)
+    })
+    .await
+    .unwrap();
+    result.unwrap();
+    let view = flow::inspect_run(f.host.flow030(), &f.host, &f.pool, &f.owner)
+        .await
+        .unwrap();
+    assert_eq!(view.flow.state.verdict.as_deref(), Some("succeeded"));
+}
+
 impl RuntimeClock030 for CheckClock {
     fn tracks_humans(&self) -> bool {
         true

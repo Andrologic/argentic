@@ -839,8 +839,9 @@ impl HumanBroker030 {
         let _gate = host.admission_lock().lock_owned().await;
         let mut connection = self.durable_connection().await?;
         let mut tx = connection.begin_with("BEGIN IMMEDIATE").await?;
-        self.guard(&mut tx, &lease).await?;
-        self.commit(&mut tx, &input, &output).await?;
+        let capture = self.guard(&mut tx, &lease).await?;
+        self.commit(&mut tx, &input, &output, &capture.versions.contract)
+            .await?;
         lease.ensure_live()?;
         tx.commit().await?;
         Ok(Some(output))
@@ -850,6 +851,7 @@ impl HumanBroker030 {
         db: &mut SqliteConnection,
         input: &HostClockInput030,
         output: &HostClockOutput030,
+        contract: &str,
     ) -> Result<()> {
         let stored: Option<String> = sqlx::query_scalar("SELECT output_json FROM engine_flow030_clock_events WHERE system_id=? AND invocation_id=? AND event_id=? AND ticket_json=?")
             .bind(&self.identity.system_start_id).bind(&self.identity.flow_invocation_id).bind(&input.event_id).bind(serde_json::to_string(input)?).fetch_one(&mut *db).await?;
@@ -946,6 +948,27 @@ impl HumanBroker030 {
             .as_array()
             .ok_or_else(|| failure("CORRELATION", "clock", "Missing expirations"))?
         {
+            if contract == argentic_core::AGSDL_040 {
+                // A committed acceptance ends the agent's work budget. The
+                // registry may still be joining its process and reading proof
+                // of a steer. Both decisions arbitrate under the admission lock.
+                let finished: bool = sqlx::query_scalar(
+                    "SELECT EXISTS (
+                        SELECT 1 FROM engine_flow030_work_events
+                        WHERE system_id=? AND invocation_id=? AND activation_id=?
+                          AND json_extract(decision_json ->> '$.receiptJson', '$.decision.kind')
+                              IN ('accepted', 'stopping', 'finished')
+                    )",
+                )
+                .bind(&self.identity.system_start_id)
+                .bind(&self.identity.flow_invocation_id)
+                .bind(work_id.as_str())
+                .fetch_one(&mut *db)
+                .await?;
+                if finished {
+                    continue;
+                }
+            }
             sqlx::query("INSERT INTO engine_flow030_clock_controls(system_id,invocation_id,activation_id,receipt_id,reason,observed_ms) VALUES(?,?,?,?,'TIMEOUT',?) ON CONFLICT DO NOTHING")
                 .bind(&self.identity.system_start_id).bind(&self.identity.flow_invocation_id).bind(work_id.as_str()).bind(uuid()).bind(event["nowMs"].as_str()).execute(&mut *db).await?;
         }
