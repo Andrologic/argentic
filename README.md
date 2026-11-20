@@ -19,9 +19,18 @@ Le chantier Macro a rapporté 42 tests du cœur, 346 du runtime, les contrôles 
 
 Le profil autonome est plus étroit que le langage. La recette Codex utilise le binaire officiel 0.167.0. La documentation borne Codex aux profils qualifiés macOS ARM64 et Linux ARM64 et le flux humain autonome à macOS ARM64. Les appels locaux de l’hôte, les autres harnais, le contenu réseau et MCP distant sont indisponibles dans cet hôte. Garder leurs refus explicites. [Contrat et limites de l’hôte](https://github.com/Andrologic/Macro/blob/82762f8d9e6a775198c90a1736a5d69edadf34d6/crates/argentic-runtime/HOST.md)
 
+## Contribution avec GitHub Flow
+
+`main` est la branche de référence. Pour chaque changement, créer une branche
+courte à partir de `origin/main` et ouvrir une pull request vers `main`. La CI
+teste la pull request et le résultat de la fusion sur `main`. Fusionner une fois
+la revue terminée et la CI au vert, puis supprimer la branche de travail.
+
 ## Plan pour la première livraison
 
-Exécuter les lots dans l’ordre. Pour chaque lot, partir du dernier lot intégré sur `develop`, travailler dans un worktree `feature/*` et commiter après vérification du résultat indiqué. Les profils Terra proposés correspondent au travail de chaque lot.
+Exécuter les lots dans l’ordre. Pour chaque lot, partir du dernier lot intégré sur
+`main` et commiter après vérification du résultat indiqué. Les profils Terra
+proposés correspondent au travail de chaque lot.
 
 | N° | Travail | Résultat attendu avant de passer au lot suivant | Difficulté et profil conseillé |
 | --- | --- | --- | --- |
