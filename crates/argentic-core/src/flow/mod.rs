@@ -90,7 +90,8 @@ pub fn steer_effect_eligible030(state: &FlowState030, effect: &FlowEffect030) ->
         return false;
     };
     effect.identity == state.identity
-        && accepts_steer030(state, work)
+        && !state.stopping
+        && state.verdict.is_none()
         && state.steer_deliveries.iter().any(|delivery| {
             delivery.effect_id == effect.id
                 && delivery.work == *work
@@ -99,7 +100,7 @@ pub fn steer_effect_eligible030(state: &FlowState030, effect: &FlowEffect030) ->
         })
         && state.activations.iter().any(|delivery| {
             delivery.id == *delivery_activation_id
-                && delivery.phase == "steering"
+                && matches!(delivery.phase.as_str(), "steering" | "withdrawingSteer")
                 && delivery.instance_id == work.agent_instance_id
                 && delivery.message_json.as_deref().unwrap_or("{}") == message_json
                 && delivery.occurrence == *occurrence
@@ -191,7 +192,7 @@ fn validate_plan(plan: &FlowPlan030) -> Result<()> {
     let bad = |s: &str| FlowInputError030::InvalidPlan(s.into());
     if plan.format != "macro-agsdl-compiled-plan/2"
         || plan.versions.snapshot != "2"
-        || plan.versions.contract != "agsdl-0.3.0"
+        || !crate::supports_contract(&plan.versions.contract)
         || plan.versions.profile != "macro-agsdl-030-v1"
     {
         return Err(bad("Unsupported plan version"));
@@ -596,18 +597,31 @@ impl Engine<'_> {
                         delivery.effect_id == *effect_id
                             && delivery.work == *work
                             && delivery.delivery_activation_id == *delivery_activation_id
-                            && delivery.status == "pending"
+                            && (delivery.status == "pending"
+                                || (self.plan.versions.contract == crate::AGSDL_040
+                                    && self.state.stopping
+                                    && delivery.status == "withdrawn"))
                     })
                     .ok_or(FlowInputError030::StaleReference)?;
-                if !accepts_steer030(&self.state, work) {
+                if self.state.steer_deliveries[pending].status == "withdrawn" {
+                    return Ok(());
+                }
+                if self.plan.versions.contract != crate::AGSDL_040
+                    && !accepts_steer030(&self.state, work)
+                {
                     return Err(FlowInputError030::StaleReference);
                 }
                 let i = self.ai(delivery_activation_id)?;
-                if self.state.activations[i].phase != "steering" {
+                let phase = self.state.activations[i].phase.as_str();
+                if !matches!(phase, "steering" | "withdrawingSteer") {
                     return Err(FlowInputError030::StaleReference);
                 }
+                let withdrawing = phase == "withdrawingSteer";
                 self.state.steer_deliveries[pending].status = "consumed".into();
                 self.state.steer_deliveries[pending].resolved_event_id = Some(self.event_id.into());
+                if withdrawing {
+                    return self.end(i, None);
+                }
                 let c = self.checked_work(work)?;
                 let by = self.state.activations[c]
                     .step
@@ -615,6 +629,77 @@ impl Engine<'_> {
                     .map(|step| step.join("/"))
                     .unwrap_or_else(|| work.activation_id.clone());
                 self.end(i, Some(encoded(&json!({"ended":"absorbed","by":by}))))?;
+            }
+            FlowEventKind030::SteerFailed {
+                effect_id,
+                work,
+                delivery_activation_id,
+                code,
+            } => {
+                if self.plan.versions.contract != crate::AGSDL_040 {
+                    return Err(FlowInputError030::StaleReference);
+                }
+                let pending = self
+                    .state
+                    .steer_deliveries
+                    .iter()
+                    .position(|delivery| {
+                        delivery.effect_id == *effect_id
+                            && delivery.work == *work
+                            && delivery.delivery_activation_id == *delivery_activation_id
+                            && (delivery.status == "pending"
+                                || (self.state.stopping && delivery.status == "withdrawn"))
+                    })
+                    .ok_or(FlowInputError030::StaleReference)?;
+                if self.state.steer_deliveries[pending].status == "withdrawn" {
+                    return Ok(());
+                }
+                let i = self.ai(delivery_activation_id)?;
+                // The native executor attests that this attempt cannot deliver.
+                // The logical end of its recipient can commit just after that proof.
+                let withdrawing = self.state.activations[i].phase == "withdrawingSteer";
+                let fallback = !withdrawing && code == "not-received";
+                let record = &mut self.state.steer_deliveries[pending];
+                record.status = if withdrawing && code == "not-received" {
+                    "withdrawn"
+                } else if fallback {
+                    "fallback"
+                } else {
+                    "failed"
+                }
+                .into();
+                record.resolved_event_id = Some(self.event_id.into());
+                record.reason = Some(code.clone());
+                if withdrawing {
+                    if code != "not-received" {
+                        let a = &self.state.activations[i];
+                        self.effect(FlowEffectKind030::Failure {
+                            activation_id: a.id.clone(),
+                            step: a.step.clone(),
+                            error: Failure030::new(code),
+                            counted: false,
+                        });
+                    }
+                    self.end(i, None)?;
+                } else if fallback {
+                    self.state.activations[i].phase = "ready".into();
+                    self.admit_delivery(i, false)?;
+                    // Activations are allocated in message arrival order.
+                    if let Some(instance) = self.state.instances.iter_mut().find(|instance| {
+                        instance.queue.iter().any(|id| id == delivery_activation_id)
+                    }) {
+                        let activations = &self.state.activations;
+                        instance
+                            .queue
+                            .sort_by_cached_key(|id| activations.iter().position(|a| a.id == *id));
+                    }
+                } else {
+                    let reason = match code.as_str() {
+                        "STEER_UNCERTAIN" | "CONTENT_UNAVAILABLE" => code.as_str(),
+                        _ => "HARNESS_REFUSED",
+                    };
+                    self.fail(i, Failure030::new(reason))?;
+                }
             }
             FlowEventKind030::PhysicalEnded {
                 work,
@@ -645,6 +730,16 @@ impl Engine<'_> {
                 for p in &mut self.state.paths {
                     if p.phase == "pending" {
                         p.phase = "withdrawn".into();
+                    } else if self.plan.versions.contract == crate::AGSDL_040 && p.phase == "live" {
+                        p.phase = "cancelling".into();
+                    }
+                    if self.plan.versions.contract == crate::AGSDL_040 {
+                        for membership in &mut p.memberships {
+                            if matches!(membership.phase.as_str(), "pending" | "live") {
+                                membership.phase = p.phase.clone();
+                                membership.accepted = false;
+                            }
+                        }
                     }
                 }
                 for g in &mut self.state.groups {
@@ -1848,6 +1943,14 @@ impl Engine<'_> {
             if self.state.activations[i].phase != "done" {
                 self.state.activations[i].phase = "stopping".into();
             }
+        } else if !self.state.stopping
+            && self.plan.versions.contract == crate::AGSDL_040
+            && matches!(
+                self.state.activations[i].phase.as_str(),
+                "steering" | "withdrawingSteer"
+            )
+        {
+            self.state.activations[i].phase = "withdrawingSteer".into();
         } else {
             self.state.activations[i].phase = "done".into();
         }
@@ -1938,7 +2041,8 @@ impl Engine<'_> {
         for path in &mut self.state.paths {
             if path.phase != "cancelling"
                 || self.state.activations.iter().any(|a| {
-                    a.physical && a.stop_effect_id.is_some() && a.context.iter().any(|frame| {
+                    ((a.physical && a.stop_effect_id.is_some()) || a.phase == "withdrawingSteer")
+                        && a.context.iter().any(|frame| {
                         matches!(frame, Frame030::Path { path_id, .. } if *path_id == path.id)
                     })
                 })
@@ -2111,7 +2215,9 @@ impl Engine<'_> {
     fn settle(&mut self) -> Result<()> {
         loop {
             let mut changed = false;
-            if self.plan.versions.runtime == SHARED_STOP_RUNTIME {
+            if self.plan.versions.runtime == SHARED_STOP_RUNTIME
+                || (self.state.stopping && self.plan.versions.contract == crate::AGSDL_040)
+            {
                 self.finish_shared_stops();
             }
             // A mailbox offer is still a message waiting for delivery. Completion
@@ -2123,12 +2229,17 @@ impl Engine<'_> {
                     continue;
                 }
                 let i = self.ai(&pending.delivery_activation_id)?;
-                if self.state.activations[i].phase != "steering" {
+                if !matches!(
+                    self.state.activations[i].phase.as_str(),
+                    "steering" | "withdrawingSteer"
+                ) {
                     self.state.steer_deliveries[n].status = "withdrawn".into();
                     self.state.steer_deliveries[n].resolved_event_id = Some(self.event_id.into());
                     self.state.steer_deliveries[n].reason = Some("delivery-cancelled".into());
                     changed = true;
-                } else if !accepts_steer030(&self.state, &pending.work) {
+                } else if self.plan.versions.contract != crate::AGSDL_040
+                    && !accepts_steer030(&self.state, &pending.work)
+                {
                     let still_running = self
                         .state
                         .activations
@@ -2338,8 +2449,7 @@ mod decision_ordinal_tests {
     }
     #[test]
     fn shared_stop_preserves_the_failure_that_crosses_the_join_threshold() {
-        for (failures, limit, triggering_branch) in
-            [("fail", None, "b"), ("keep", Some("1"), "c")]
+        for (failures, limit, triggering_branch) in [("fail", None, "b"), ("keep", Some("1"), "c")]
         {
             let mut plan = plan();
             plan.versions.runtime = SHARED_STOP_RUNTIME.into();

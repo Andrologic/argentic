@@ -116,9 +116,17 @@ fn scope(root: &Path, owner: &EngineSourceOwner, source: &Path) -> Result<Value>
         .observation_key()
         .ok_or_else(|| failure("UNSUPPORTED", "scope", "Workspace identity is unqualified"))?;
     let document_location = url::Url::from_file_path(source.canonicalize().map_err(io_error)?)
-        .map_err(|_| failure("SOURCE_UNAVAILABLE", "source", "Cannot capture document location"))?;
-    Ok(json!({"projectId":owner.project_id,"root":root,"rootIdentity":identity,
-        "sourceOwner":owner,"documentLocation":document_location.as_str()}))
+        .map_err(|_| {
+            failure(
+                "SOURCE_UNAVAILABLE",
+                "source",
+                "Cannot capture document location",
+            )
+        })?;
+    Ok(
+        json!({"projectId":owner.project_id,"root":root,"rootIdentity":identity,
+        "sourceOwner":owner,"documentLocation":document_location.as_str()}),
+    )
 }
 #[derive(Clone)]
 struct Policies(Arc<RwLock<Inputs>>);
@@ -240,7 +248,7 @@ impl Host {
     }
     /// Opens only this runtime's standalone schema. The data directory must be
     /// outside the workspace. One process owns it; a second open is refused.
-    /// An existing run becomes interrupted, never adopted or restarted.
+    /// Fences previous runs and reconciles any persisted whole-run stop.
     pub async fn open(
         data: &Path,
         workspace: &Path,
@@ -330,10 +338,12 @@ impl Host {
             crate::sqlite::create_file(&database).await?
         };
         api::interrupt_previous_runs(&pool).await?;
+        let engine = Engine::new();
+        crate::agsdl_host_flow030::recover_pending_stops030(&engine, &pool).await?;
         let policies = Policies(Arc::new(RwLock::new(inputs)));
         let context = HostContext::new(data, Arc::new(policies.clone()));
         Ok(Self {
-            engine: Engine::new(),
+            engine,
             pool,
             tasks: StreamTasks::default(),
             policies,
@@ -352,11 +362,14 @@ impl Host {
         if let Some(d) = api::product_slice(&inputs.authored, None) {
             return Err(failure(&d.code, &d.pointer, &d.message));
         }
-        if doc["contract"] != "agsdl-0.3.0" {
+        if !doc["contract"]
+            .as_str()
+            .is_some_and(argentic_core::supports_contract)
+        {
             return Err(failure(
                 "UNSUPPORTED_EDITION",
                 "/contract",
-                "Standalone host requires AgSDL 0.3",
+                "Standalone host requires AgSDL 0.3.0 or 0.4.0",
             ));
         }
         if doc["agents"]
@@ -966,6 +979,215 @@ mod tests {
         reopened.close().await.unwrap();
     }
     #[tokio::test]
+    async fn standalone_040_stop_waits_for_physical_end_and_reopens() {
+        let f = Fixture::new(&WAIT.replace("agsdl-0.3.0", argentic_core::AGSDL_040));
+        let host = f.open().await.unwrap();
+        let started = host
+            .start("start-040".into(), entry(), false)
+            .await
+            .unwrap();
+        assert_eq!(started.capture.versions.contract, argentic_core::AGSDL_040);
+        let id = started.receipt.identity.system_start_id;
+        let source = started.capture.source;
+        let scope = persistence::public030::HumanScope030 {
+            system_start_id: id.clone(),
+            source: source.clone(),
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while host
+                .humans(scope.clone(), None)
+                .await
+                .unwrap()
+                .requests
+                .is_empty()
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let stop = host
+            .stop(EngineStopRequest {
+                request_id: "stop-040".into(),
+                system_start_id: id.clone(),
+                activation_id: None,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            stop,
+            persistence::public::PublicStopState::Requested { .. }
+        ));
+        let query = api::RuntimeProjectionQuery030 {
+            system_start_id: id,
+            source,
+            snapshot_id: None,
+        };
+        let cancelled = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let page = host.projection(query.clone(), None).await.unwrap();
+                if let Some(verdict) = page.verdict {
+                    break verdict;
+                }
+                assert!(page.stopping);
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(cancelled, "cancelled");
+        host.shutdown(&[]).await.unwrap();
+        host.close().await.unwrap();
+        drop(host);
+        let host = f.open().await.unwrap();
+        assert_eq!(
+            host.projection(query, None)
+                .await
+                .unwrap()
+                .verdict
+                .as_deref(),
+            Some("cancelled")
+        );
+        host.shutdown(&[]).await.unwrap();
+        host.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reopening_finishes_a_committed_stop_of_a_local_approval() {
+        const CHILD: &str = "ARGENTIC_TEST_STOPPED_APPROVAL_ROOT";
+        if let Some(root) = std::env::var_os(CHILD) {
+            let root = PathBuf::from(root);
+            let policy = root.join("policy.json");
+            let host = Host::open(
+                &root.join("data"),
+                &root.join("workspace"),
+                &root.join("source.json"),
+                &policy,
+                &digest(std::fs::read(&policy).unwrap()),
+            )
+            .await
+            .unwrap();
+            // Stop can commit after the approval ticket is reserved while
+            // evaluation of its clock output is still in flight.
+            let lease = host.engine.start_lease().await.unwrap();
+            lease.clock_jobs030().approval_check_probe(Arc::new(|job, _| {
+                let job: Value = serde_json::from_str(job).unwrap();
+                let input: Value = serde_json::from_str(job["inputJson"].as_str().unwrap()).unwrap();
+                if input["operation"] != "humanClock" {
+                    return;
+                }
+                let event: Value =
+                    serde_json::from_str(input["input"]["eventJson"].as_str().unwrap()).unwrap();
+                if event["event"]["kind"] == "approval" {
+                    loop {
+                        std::thread::park();
+                    }
+                }
+            }));
+            drop(lease);
+            let started = host.start("start".into(), entry(), false).await.unwrap();
+            let scope = persistence::public030::HumanScope030 {
+                system_start_id: started.receipt.identity.system_start_id,
+                source: started.capture.source,
+            };
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while host.humans(scope.clone(), None).await.unwrap().requests.is_empty() {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            }).await.unwrap();
+            let hook = host.engine.flow030().install_system_stop_commit_hook("stop");
+            tokio::select! {
+                _ = hook.reached() => std::process::exit(0),
+                result = host.stop(EngineStopRequest {
+                    request_id: "stop".into(),
+                    system_start_id: scope.system_start_id,
+                    activation_id: None,
+                }) => panic!("Stop reached its reply before the commit hook: {result:?}"),
+            }
+        }
+        let f = Fixture::new(&WAIT.replace("agsdl-0.3.0", argentic_core::AGSDL_040));
+        let child = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            tokio::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "standalone::tests::reopening_finishes_a_committed_stop_of_a_local_approval"])
+                .env(CHILD, f._temp.path())
+                .kill_on_drop(true)
+                .output(),
+        ).await.unwrap().unwrap();
+        assert!(child.status.success(), "{child:?}");
+        for reopening in 0..2 {
+            let host = f.open().await.unwrap();
+            let runs = host.runs().await.unwrap();
+            let query = api::RuntimeProjectionQuery030 {
+                system_start_id: runs[0]["receipt"]["identity"]["systemStartId"]
+                    .as_str().unwrap().into(),
+                source: host.source().await,
+                snapshot_id: None,
+            };
+            let page = host.projection(query.clone(), None).await.unwrap();
+            assert_eq!(page.verdict.as_deref(), Some("cancelled"));
+            assert!(!page.stopping && !page.termination_uncertain);
+            let pending: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM engine_flow030_clock_events WHERE output_json IS NULL",
+            ).fetch_one(&host.pool).await.unwrap();
+            assert_eq!(pending, 1);
+            host.shutdown(&[]).await.unwrap();
+            host.close().await.unwrap();
+            let replay = persistence::replay_verify030::verify_path030(
+                &f.data.join("engine.sqlite"),
+                &query.system_start_id,
+                &page.flow_invocation_id,
+            ).await;
+            assert!(replay.ok, "{replay:?}");
+            if reopening == 1 {
+                for (index, (mutation, expected)) in [
+                    ("UPDATE engine_flow030_outbox
+                      SET settlement_json=json_set(settlement_json,'$.kind','nativeJoinedGroupStop030')
+                      WHERE settlement_json ->> '$.kind'='nativeReopenedApprovalStop030'",
+                     "joinedStop.workAttempt"),
+                    ("UPDATE engine_flow030_clock_events SET ticket_json=json_remove(ticket_json,'$.optionsJson')",
+                     "human.readback"),
+                    ("UPDATE engine_flow030_clock_events SET ticket_json=json_set(ticket_json,'$.eventJson',
+                       json_set(ticket_json ->> '$.eventJson','$.event.choices',json('[\"other\"]')) || '')",
+                     "human.readback"),
+                    ("UPDATE engine_flow030_clock SET receipt_json='{\"unexpected\":true}'",
+                     "human.readback"),
+                    ("UPDATE engine_flow030_clock SET observed_ms=(SELECT
+                       CAST(json_extract(ticket_json ->> '$.eventJson','$.nowMs') AS INTEGER) + 1
+                       FROM engine_flow030_clock_events)",
+                     "human.readback"),
+                    ("UPDATE engine_flow030_clock SET observed_ms=X'FF'",
+                     "human.readback"),
+                ].into_iter().enumerate() {
+                    let copy = f.data.join(format!("wrong-replay-{index}.sqlite"));
+                    std::fs::copy(f.data.join("engine.sqlite"), &copy).unwrap();
+                    let pool = crate::sqlite::open_file(&copy).await.unwrap();
+                    let mut tx = pool.begin().await.unwrap();
+                    let edits_ticket = mutation.starts_with("UPDATE engine_flow030_clock_events");
+                    if edits_ticket {
+                        sqlx::query("DROP TRIGGER engine_flow030_clock_ticket_immutable")
+                            .execute(&mut *tx).await.unwrap();
+                    }
+                    let changed = sqlx::query(mutation).execute(&mut *tx).await.unwrap().rows_affected();
+                    assert_eq!(changed, 1);
+                    if edits_ticket {
+                        sqlx::query(
+                            "CREATE TRIGGER engine_flow030_clock_ticket_immutable BEFORE UPDATE OF ticket_json ON engine_flow030_clock_events
+                             BEGIN SELECT RAISE(ABORT,'immutable clock ticket'); END",
+                        ).execute(&mut *tx).await.unwrap();
+                    }
+                    tx.commit().await.unwrap();
+                    pool.close().await;
+                    let replay = persistence::replay_verify030::verify_path030(
+                        &copy, &query.system_start_id, &page.flow_invocation_id,
+                    ).await;
+                    assert_eq!(replay.divergence.unwrap().field, expected, "{mutation}");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn restart_marks_unfinished_run_interrupted_without_adoption() {
         const CHILD: &str = "ARGENTIC_SYNTHETIC_CRASH_ROOT";
         if let Some(root) = std::env::var_os(CHILD) {
@@ -985,34 +1207,53 @@ mod tests {
                 .unwrap();
             std::process::exit(0);
         }
-        let f = Fixture::new(WAIT);
-        let child = tokio::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "standalone::tests::restart_marks_unfinished_run_interrupted_without_adoption",
-                "--nocapture",
-            ])
-            .env(CHILD, f._temp.path())
-            .output()
-            .await
-            .unwrap();
-        assert!(
-            child.status.success(),
-            "{}",
-            String::from_utf8_lossy(&child.stderr)
-        );
-        let host = f.open().await.unwrap();
-        let runs = host.runs().await.unwrap();
-        assert_eq!(runs.len(), 1);
-        assert_eq!(runs[0]["interrupted"], true);
-        assert!(host.active_runs().await.unwrap().is_empty());
-        assert!(host
-            .start("before-crash".into(), entry(), false)
-            .await
-            .is_err());
-        assert_eq!(host.runs().await.unwrap().len(), 1);
-        host.shutdown(&[]).await.unwrap();
-        host.close().await.unwrap();
+        for contract in ["agsdl-0.3.0", argentic_core::AGSDL_040] {
+            let f = Fixture::new(&WAIT.replace("agsdl-0.3.0", contract));
+            let child = tokio::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "standalone::tests::restart_marks_unfinished_run_interrupted_without_adoption",
+                    "--nocapture",
+                ])
+                .env(CHILD, f._temp.path())
+                .output()
+                .await
+                .unwrap();
+            assert!(
+                child.status.success(),
+                "{}",
+                String::from_utf8_lossy(&child.stderr)
+            );
+            let host = f.open().await.unwrap();
+            let runs = host.runs().await.unwrap();
+            assert_eq!(runs.len(), 1);
+            assert_eq!(runs[0]["interrupted"], true);
+            if contract == argentic_core::AGSDL_040 {
+                let page = host
+                    .projection(
+                        api::RuntimeProjectionQuery030 {
+                            system_start_id: runs[0]["receipt"]["identity"]["systemStartId"]
+                                .as_str()
+                                .unwrap()
+                                .into(),
+                            source: host.source().await,
+                            snapshot_id: None,
+                        },
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(page.verdict.as_deref(), Some("interrupted"));
+            }
+            assert!(host.active_runs().await.unwrap().is_empty());
+            assert!(host
+                .start("before-crash".into(), entry(), false)
+                .await
+                .is_err());
+            assert_eq!(host.runs().await.unwrap().len(), 1);
+            host.shutdown(&[]).await.unwrap();
+            host.close().await.unwrap();
+        }
     }
 
     #[tokio::test]

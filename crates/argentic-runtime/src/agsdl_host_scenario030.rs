@@ -6,6 +6,65 @@ use serde_json::value::RawValue;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
+macro_rules! published_runs {
+    ($($name:literal),+ $(,)?) => {
+        &[$(($name, include_str!(concat!("../tests/fixtures/conformance-040/runs/", $name, ".json")))),+]
+    };
+}
+
+pub(crate) const SCENARIOS_040: &[(&str, &str)] = published_runs![
+    "answer-timeout-ask",
+    "answer-timeout-plan",
+    "approval-comments",
+    "approval",
+    "call-answer-timeout",
+    "command-json-invalid",
+    "command-lines",
+    "command-outcome",
+    "compose-body-failure",
+    "composition",
+    "delivery-queue",
+    "delivery-steer",
+    "error-route",
+    "fanout-empty",
+    "fanout-keep",
+    "fanout-limit",
+    "fanout-max-failures",
+    "fanout-missions",
+    "fanout-one-at-a-time",
+    "fanout-operand",
+    "finish-branch-goes-on",
+    "flow-error",
+    "join-all",
+    "join-branch-failed",
+    "join-branch-steer",
+    "join-group-closes",
+    "mission-priority",
+    "parallel-no-join",
+    "quorum-finish",
+    "quorum-missed",
+    "quorum-reached",
+    "quorum-unreachable",
+    "quorum-wait",
+    "restart-during-stop",
+    "restart-interrupted",
+    "restart-resumes-run",
+    "sequence-loop",
+    "shared-stop-active-and-pending",
+    "shared-stop-all",
+    "shared-stop-pending",
+    "shared-stop-queued",
+    "steer-confirmation-order",
+    "steer-confirmed",
+    "steer-falls-back-to-queue",
+    "steer-uncertain",
+    "stop-during-steer",
+    "timeout-pauses-for-person",
+    "visit-limit",
+    "wait-group-closes",
+    "whole-run-stop",
+];
+
 pub(crate) const SCENARIOS: &[(&str, &str)] = &[
     (
         "answer-timeout-ask",
@@ -267,6 +326,12 @@ const SCENARIO_PINS: &[(&str, &str)] = &[
     ),
 ];
 fn verify_fixture_pin(name: &str, raw: &str) -> Result<()> {
+    if SCENARIOS_040
+        .iter()
+        .any(|(n, source)| *n == name && *source == raw)
+    {
+        return Ok(());
+    }
     if let Some((_, expected)) = SCENARIO_PINS.iter().find(|(n, _)| *n == name) {
         if format!("{:x}", Sha256::digest(raw.as_bytes())) != *expected {
             return Err(bad());
@@ -299,6 +364,11 @@ pub(crate) struct WorkKey030 {
 #[derive(Debug, Clone)]
 pub(crate) enum TimelineEvent030 {
     Elapse(u64),
+    Steer(SteerEvent040),
+    StopRun,
+    Stopped(WorkKey030),
+    RunState(String),
+    HostRestart(String),
     Request {
         key: WorkKey030,
         kind: String,
@@ -316,6 +386,21 @@ pub(crate) enum TimelineEvent030 {
         key: WorkKey030,
         receipt: crate::agsdl_host_calls030::CallEvent030,
     },
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SteerEvent040 {
+    pub to: String,
+    pub nth: usize,
+    pub outcome: SteerOutcome040,
+}
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum SteerOutcome040 {
+    Received,
+    NotReceived,
+    Uncertain,
 }
 
 #[derive(Debug, Clone)]
@@ -386,9 +471,34 @@ fn parse_timeline(raw: &RawValue) -> Result<TimelineEvent030> {
         }
         return Ok(TimelineEvent030::Running(result));
     }
+    if fields.len() == 1 {
+        if let Some(steer) = fields.get("steer") {
+            let event: SteerEvent040 = serde_json::from_str(steer.get())?;
+            if event.nth == 0 {
+                return Err(bad());
+            }
+            return Ok(TimelineEvent030::Steer(event));
+        }
+        if fields.get("stopRun").is_some_and(|v| v.get() == "true") {
+            return Ok(TimelineEvent030::StopRun);
+        }
+        if let Some(value) = fields.get("runState") {
+            return Ok(TimelineEvent030::RunState(serde_json::from_str(
+                value.get(),
+            )?));
+        }
+        if let Some(value) = fields.get("hostRestart") {
+            return Ok(TimelineEvent030::HostRestart(serde_json::from_str(
+                value.get(),
+            )?));
+        }
+    }
     let step: String = serde_json::from_str(fields.remove("work").ok_or_else(bad)?.get())?;
     let item = fields.remove("item");
     let k = key(&step, item.as_deref())?;
+    if fields.len() == 1 && fields.get("stopped").is_some_and(|v| v.get() == "true") {
+        return Ok(TimelineEvent030::Stopped(k));
+    }
     for field in ["request", "answer"] {
         if let Some(raw) = fields.remove(field) {
             if !fields.is_empty() {
@@ -493,13 +603,53 @@ fn parse_timeline(raw: &RawValue) -> Result<TimelineEvent030> {
     Ok(TimelineEvent030::Work { key: k, outcome })
 }
 
+pub(crate) fn fixture_document(raw: &str) -> Result<&str> {
+    match raw.trim_start().as_bytes().first() {
+        Some(b'{') => Ok(raw),
+        _ => match serde_json::from_str::<String>(raw)?.as_str() {
+            "cases/flow-error.json" => Ok(include_str!(
+                "../tests/fixtures/conformance-040/cases/flow-error.json"
+            )),
+            "cases/steer-in-branch.json" => Ok(include_str!(
+                "../tests/fixtures/conformance-040/cases/steer-in-branch.json"
+            )),
+            _ => Err(bad()),
+        },
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn published_fixture(
+    name: &'static str,
+    raw: &str,
+) -> Result<(String, PinnedScenario030)> {
+    let fixture: Fixture030 = serde_json::from_str(raw)?;
+    let timeline = fixture
+        .timeline
+        .iter()
+        .map(|v| parse_timeline(v))
+        .collect::<Result<_>>()?;
+    Ok((
+        fixture_document(fixture.document.get())?.to_owned(),
+        PinnedScenario030 {
+            name,
+            fixture_sha256: format!("{:x}", Sha256::digest(raw.as_bytes())),
+            timeline,
+        },
+    ))
+}
+
 impl PinnedScenario030 {
     pub(crate) fn recognizes_document(document_json: &str) -> Result<bool> {
-        for &(name, raw) in SCENARIOS.iter().chain(SHARED_STOP_SCENARIOS) {
+        for &(name, raw) in SCENARIOS
+            .iter()
+            .chain(SHARED_STOP_SCENARIOS)
+            .chain(SCENARIOS_040)
+        {
             verify_fixture_pin(name, raw)?;
             crate::persistence::validate_json(raw)?;
             let fixture: Fixture030 = serde_json::from_str(raw)?;
-            if document_tokens_equal(document_json, fixture.document.get())? {
+            if document_tokens_equal(document_json, fixture_document(fixture.document.get())?)? {
                 return Ok(true);
             }
         }
@@ -513,7 +663,7 @@ impl PinnedScenario030 {
             verify_fixture_pin(name, raw)?;
             crate::persistence::validate_json(raw)?;
             let fixture: Fixture030 = serde_json::from_str(raw)?;
-            if document_tokens_equal(document_json, fixture.document.get())?
+            if document_tokens_equal(document_json, fixture_document(fixture.document.get())?)?
                 && document_tokens_equal(entry_json, fixture.entry.get())?
             {
                 if found.is_some() {

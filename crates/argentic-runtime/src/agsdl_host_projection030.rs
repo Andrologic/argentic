@@ -57,6 +57,8 @@ pub struct RuntimeProjectionPage030 {
     pub flow_invocation_id: String,
     pub revision: String,
     pub stopping: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub termination_uncertain: bool,
     pub verdict: Option<String>,
     pub total: String,
     pub items: Vec<RuntimeProjectionItem030>,
@@ -134,6 +136,7 @@ fn page(
         flow_invocation_id: view.flow_invocation_id,
         revision: view.revision,
         stopping: view.stopping,
+        termination_uncertain: false,
         verdict: view.verdict,
         total: total.to_string(),
         items,
@@ -149,7 +152,12 @@ pub(crate) async fn read(
 ) -> Result<RuntimeProjectionPage030> {
     // Observation does not require a live executor or grant authority to resume.
     // Read capture and state together so a page describes one committed revision.
-    let row = sqlx::query("SELECT s.capture_json,r.plan_json,r.state_json,r.source_json,r.snapshot_id,r.epoch FROM engine_start030_requests s JOIN engine_flow030_runs r ON r.system_id=s.system_id AND r.invocation_id=s.invocation_id WHERE s.system_id=?")
+    let row = sqlx::query("SELECT s.capture_json,r.plan_json,r.state_json,r.source_json,r.snapshot_id,r.epoch,
+        (SELECT json_group_array(h.effect_id) FROM engine_flow030_handoffs h
+          WHERE h.system_id=r.system_id AND h.invocation_id=r.invocation_id
+          AND h.receipt_json ->> '$.kind'='nativeOwnedHandoff030') AS handoffs,
+        EXISTS(SELECT 1 FROM engine_flow030_interruptions i WHERE i.system_id=r.system_id) AS interrupted,
+        EXISTS(SELECT 1 FROM engine_flow030_owners o WHERE o.system_id=r.system_id AND o.status='revoked') AS revoked FROM engine_start030_requests s JOIN engine_flow030_runs r ON r.system_id=s.system_id AND r.invocation_id=s.invocation_id WHERE s.system_id=?")
         .bind(&query.system_start_id).fetch_optional(pool).await?
         .ok_or_else(|| failure("NOT_FOUND", "systemStartId", "Native flow capture is absent"))?;
     let capture: crate::persistence::start030::StartCapture030 =
@@ -181,14 +189,31 @@ pub(crate) async fn read(
         snapshot_id: capture.identity.snapshot_id,
     };
     let plan: FlowPlan030 = serde_json::from_str(&capture.compiled_plan_json)?;
-    let projection = runtime_projection030::project_runtime030(&plan, &state).map_err(|_| {
-        failure(
-            "CORRELATION",
-            "projection",
-            "Captured flow projection is invalid",
-        )
-    })?;
-    page(scope, continuation, projection)
+    let handoffs = serde_json::from_str(row.try_get("handoffs")?)?;
+    let projection =
+        runtime_projection030::project_runtime030(&plan, &state, &handoffs).map_err(|_| {
+            failure(
+                "CORRELATION",
+                "projection",
+                "Captured flow projection is invalid",
+            )
+        })?;
+    let mut page = page(scope, continuation, projection)?;
+    if plan.versions.contract == argentic_core::AGSDL_040 {
+        let interrupted: bool = row.try_get("interrupted")?;
+        let revoked: bool = row.try_get("revoked")?;
+        if interrupted {
+            page.verdict = Some("interrupted".into());
+            page.stopping = false;
+        }
+        page.stopping &= page.verdict.is_none();
+        page.termination_uncertain = (interrupted || (revoked && page.verdict.is_none()))
+            && state
+                .activations
+                .iter()
+                .any(|activation| activation.physical);
+    }
+    Ok(page)
 }
 
 #[cfg(test)]
@@ -234,6 +259,18 @@ mod tests {
         };
         let first = page(scope.clone(), None, view.clone()).unwrap();
         assert_eq!(first.items.len(), 100);
+        let legacy = serde_json::to_value(&first).unwrap();
+        assert!(legacy.get("terminationUncertain").is_none());
+        assert_eq!(
+            serde_json::from_value::<RuntimeProjectionPage030>(legacy).unwrap(),
+            first
+        );
+        let mut uncertain = first.clone();
+        uncertain.termination_uncertain = true;
+        assert_eq!(
+            serde_json::to_value(uncertain).unwrap()["terminationUncertain"],
+            true
+        );
         let next = first.next_page.unwrap();
         assert_eq!(
             page(scope.clone(), Some(next.clone()), view.clone())

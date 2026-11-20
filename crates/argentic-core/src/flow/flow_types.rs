@@ -185,6 +185,12 @@ pub enum FlowEventKind030 {
         work: WorkRef030,
         delivery_activation_id: String,
     },
+    SteerFailed {
+        effect_id: String,
+        work: WorkRef030,
+        delivery_activation_id: String,
+        code: String,
+    },
     PhysicalEnded {
         work: WorkRef030,
         stop_effect_id: Option<String>,

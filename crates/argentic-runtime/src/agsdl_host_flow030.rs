@@ -1241,7 +1241,9 @@ pub(crate) async fn apply_native_event(
     // Prepared has a dedicated atomic path with its occurrence witnesses.
     if matches!(
         &event.kind,
-        FlowEventKind030::Prepared { .. } | FlowEventKind030::SteerConsumed { .. }
+        FlowEventKind030::Prepared { .. }
+            | FlowEventKind030::SteerConsumed { .. }
+            | FlowEventKind030::SteerFailed { .. }
     ) {
         return Err(refused());
     }
@@ -1996,6 +1998,16 @@ impl DispatchLease030<'_> {
         attempt: &FlowWorkAttempt030,
         sender: &crate::agsdl_host_steer030::SteerSender030,
     ) -> Result<bool> {
+        self.resolve_steer030(Some((attempt, sender))).await
+    }
+
+    pub(crate) async fn resolve_steer030(
+        self,
+        recipient: Option<(
+            &FlowWorkAttempt030,
+            &crate::agsdl_host_steer030::SteerSender030,
+        )>,
+    ) -> Result<bool> {
         self.runtime.available(&self.effect.identity)?;
         self.lease.ensure_live()?;
         let FlowEffectKind030::Steer {
@@ -2007,31 +2019,81 @@ impl DispatchLease030<'_> {
         else {
             return Err(refused());
         };
-        if attempt.identity() != &self.effect.identity
-            || attempt.owner() != &self.owner
-            || attempt.generation() != self.lease.generation()
+        let (raw, current): (String, bool) = sqlx::query_as(
+            "SELECT state_json, json_extract(plan_json,'$.versions.contract')='agsdl-0.4.0' FROM engine_flow030_runs WHERE system_id=? AND invocation_id=?"
+        ).bind(&self.effect.identity.system_start_id).bind(&self.effect.identity.flow_invocation_id)
+            .fetch_one(&self.pool).await?;
+        let state: FlowState030 = serde_json::from_str(&raw)?;
+        if let Some((attempt, _)) = recipient {
+            if attempt.identity() != &self.effect.identity
+                || attempt.owner() != &self.owner
+                || attempt.generation() != self.lease.generation()
+            {
+                return Err(refused());
+            }
+            let handoff: String = sqlx::query_scalar("SELECT receipt_json FROM engine_flow030_handoffs WHERE system_id=? AND invocation_id=? AND effect_id=? AND owner_epoch=? AND generation=?")
+                .bind(&self.effect.identity.system_start_id).bind(&self.effect.identity.flow_invocation_id)
+                .bind(&work.start_effect_id).bind(&self.owner.owner_epoch).bind(self.lease.generation())
+                .fetch_optional(&self.pool).await?.ok_or_else(refused)?;
+            let handoff: Value = serde_json::from_str(&handoff)?;
+            if handoff.get("workAttempt") != Some(&serde_json::to_value(attempt)?) {
+                return Err(refused());
+            }
+        }
+        let gate = current.then(|| {
+            crate::agsdl_host_steer030::SteerGate030::new(
+                OwnedMutexGuard::mutex(&self._admission).clone(),
+                self.pool.clone(),
+                tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+            )
+        });
+        let _admission = if current {
+            drop(self._admission);
+            None
+        } else {
+            Some(self._admission)
+        };
+        let withdrawing = current
+            && state.activations.iter().any(|activation| {
+                activation.id == *delivery_activation_id && activation.phase == "withdrawingSteer"
+            });
+        let (consumed, mut code) = match recipient
+            .filter(|_| !withdrawing && crate::persistence::flow030::accepts_steer030(&state, work))
         {
-            return Err(refused());
-        }
-        // The exact native Start handoff binds this mailbox to the admitted
-        // provider attempt, not merely to an instance name or a caller's ID.
-        let handoff: String = sqlx::query_scalar("SELECT receipt_json FROM engine_flow030_handoffs WHERE system_id=? AND invocation_id=? AND effect_id=? AND owner_epoch=? AND generation=?")
-            .bind(&self.effect.identity.system_start_id).bind(&self.effect.identity.flow_invocation_id)
-            .bind(&work.start_effect_id).bind(&self.owner.owner_epoch).bind(self.lease.generation())
-            .fetch_optional(&self.pool).await?.ok_or_else(refused)?;
-        let handoff: Value = serde_json::from_str(&handoff)?;
-        if handoff.get("workAttempt") != Some(&serde_json::to_value(attempt)?) {
-            return Err(refused());
-        }
-        let consumed = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            sender.deliver(&self.effect, attempt),
-        )
-        .await
-        .map_err(|_| uncertain())??;
-        if !consumed.verifies(&self.effect, attempt) {
-            return Err(refused());
-        }
+            Some((attempt, sender)) => {
+                let delivery = sender.deliver_with_gate(&self.effect, attempt, gate.clone());
+                let receipt = if current {
+                    delivery.await
+                } else {
+                    tokio::time::timeout(std::time::Duration::from_secs(30), delivery)
+                        .await
+                        .map_err(|_| uncertain())?
+                };
+                match receipt {
+                    Ok(receipt) if receipt.verifies(&self.effect, attempt) => {
+                        (receipt.consumed(), "not-received")
+                    }
+                    Err(error) if !current => return Err(error),
+                    Err(error) if error.code == "CORRELATION" => (false, "HARNESS_REFUSED"),
+                    Err(error) if error.code == "CONTENT_UNAVAILABLE" => {
+                        (false, "CONTENT_UNAVAILABLE")
+                    }
+                    Err(error) if error.code == "STEER_NOT_SENT" => (false, "unsent-at-deadline"),
+                    _ => (false, "STEER_UNCERTAIN"),
+                }
+            }
+            None if !withdrawing
+                && recipient.is_none()
+                && crate::persistence::flow030::accepts_steer030(&state, work) =>
+            {
+                (false, "STEER_UNCERTAIN")
+            }
+            None => (false, "not-received"),
+        };
+        let _resolution_admission = match gate {
+            Some(gate) => Some(gate.admission.lock_owned().await),
+            None => None,
+        };
         self.lease.ensure_live().map_err(|_| uncertain())?;
         let authority = Authority {
             runtime: self.runtime,
@@ -2043,11 +2105,37 @@ impl DispatchLease030<'_> {
             .execute(&mut *db)
             .await?;
         let mut tx = db.begin_with("BEGIN IMMEDIATE").await?;
-        authority
-            .effect(&mut tx, &self.effect)
-            .await
-            .map_err(store_error)?;
-        if !consumed.consumed() {
+        let withdrawn = if current {
+            let state: String = sqlx::query_scalar(
+                "SELECT state_json FROM engine_flow030_runs WHERE system_id=? AND invocation_id=?",
+            )
+            .bind(&self.effect.identity.system_start_id)
+            .bind(&self.effect.identity.flow_invocation_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            let state: FlowState030 = serde_json::from_str(&state)?;
+            if code == "unsent-at-deadline" {
+                code = if crate::persistence::flow030::accepts_steer030(&state, work) {
+                    "HARNESS_REFUSED"
+                } else {
+                    "not-received"
+                };
+            }
+            let closed = state.steer_deliveries.iter().any(|delivery| {
+                delivery.effect_id == self.effect.id && delivery.status == "withdrawn"
+            });
+            if closed && !state.stopping {
+                return Ok(true);
+            }
+            closed
+        } else {
+            authority
+                .effect(&mut tx, &self.effect)
+                .await
+                .map_err(store_error)?;
+            false
+        };
+        if !current && !consumed {
             // The owned adapter established that no provider input was accepted.
             // Release only this claim so the recipient's pending terminal event
             // can perform the reducer's ordinary queue fallback. Never retry it.
@@ -2066,14 +2154,24 @@ impl DispatchLease030<'_> {
         let event = FlowEvent030 {
             identity: self.effect.identity.clone(),
             event_id: format!(
-                "steer030:consumed:{:x}",
+                "steer030:{}:{:x}",
+                if current { "resolved" } else { "consumed" },
                 Sha256::digest(self.effect.id.as_bytes())
             ),
             expected_revision: revision,
-            kind: FlowEventKind030::SteerConsumed {
-                effect_id: self.effect.id.clone(),
-                work: work.clone(),
-                delivery_activation_id: delivery_activation_id.clone(),
+            kind: if consumed {
+                FlowEventKind030::SteerConsumed {
+                    effect_id: self.effect.id.clone(),
+                    work: work.clone(),
+                    delivery_activation_id: delivery_activation_id.clone(),
+                }
+            } else {
+                FlowEventKind030::SteerFailed {
+                    effect_id: self.effect.id.clone(),
+                    work: work.clone(),
+                    delivery_activation_id: delivery_activation_id.clone(),
+                    code: code.into(),
+                }
             },
         };
         let applied = flow_store030::apply_tx(&mut tx, &authority, &event)
@@ -2082,22 +2180,24 @@ impl DispatchLease030<'_> {
         if !matches!(applied, Apply030::Applied(_)) {
             return Err(uncertain());
         }
-        let receipt = json!({"kind":"nativeSteerConsumed030", "effectId":self.effect.id,
+        if consumed && !withdrawn {
+            let receipt = json!({"kind":"nativeSteerConsumed030", "effectId":self.effect.id,
             "identity":self.effect.identity, "ownerEpoch":self.owner.owner_epoch, "generation":self.lease.generation(),
             "work":work, "deliveryActivationId":delivery_activation_id, "messageJson":message_json,
             "consumedAfterEventId":head, "consumedEventId":event.event_id});
-        sqlx::query("INSERT INTO engine_flow030_handoffs(system_id,invocation_id,effect_id,owner_epoch,generation,receipt_json) VALUES(?,?,?,?,?,?)")
+            sqlx::query("INSERT INTO engine_flow030_handoffs(system_id,invocation_id,effect_id,owner_epoch,generation,receipt_json) VALUES(?,?,?,?,?,?)")
             .bind(&self.effect.identity.system_start_id).bind(&self.effect.identity.flow_invocation_id).bind(&self.effect.id)
             .bind(&self.owner.owner_epoch).bind(self.lease.generation()).bind(receipt.to_string()).execute(&mut *tx).await?;
-        flow_store030::settle_tx(
-            &mut tx,
-            &authority,
-            &self.effect.identity,
-            &self.effect.id,
-            &receipt,
-        )
-        .await
-        .map_err(store_error)?;
+            flow_store030::settle_tx(
+                &mut tx,
+                &authority,
+                &self.effect.identity,
+                &self.effect.id,
+                &receipt,
+            )
+            .await
+            .map_err(store_error)?;
+        }
         self.runtime.begin_event_commit(&event)?;
         tx.commit().await.map_err(|_| uncertain())?;
         self.lease.ensure_live().map_err(|_| uncertain())?;
@@ -2463,7 +2563,7 @@ async fn claim_selected<'a>(
 pub(crate) async fn revoke_generation(pool: &SqlitePool, generation: &str) -> Result<()> {
     let mut db = pool.acquire().await?;
     let mut tx = db.begin_with("BEGIN IMMEDIATE").await?;
-    mark_generation_interrupted_tx(&mut tx, generation, None).await?;
+    mark_interrupted_tx(&mut tx, Some(generation), None).await?;
     sqlx::query(
         "UPDATE engine_flow030_owners SET status='revoked' WHERE generation=? AND status='live'",
     )
@@ -2474,21 +2574,29 @@ pub(crate) async fn revoke_generation(pool: &SqlitePool, generation: &str) -> Re
     Ok(())
 }
 
-async fn mark_generation_interrupted_tx(
+async fn mark_interrupted_tx(
     db: &mut SqliteConnection,
-    generation: &str,
+    generation: Option<&str>,
     system: Option<&str>,
 ) -> Result<()> {
-    sqlx::query("INSERT OR IGNORE INTO engine_flow030_interruptions(system_id) SELECT o.system_id FROM engine_flow030_owners o JOIN engine_flow030_runs r ON r.system_id=o.system_id AND r.invocation_id=o.invocation_id WHERE o.generation=? AND (? IS NULL OR o.system_id=?) AND json_extract(r.state_json,'$.verdict') IS NULL")
-        .bind(generation).bind(system).bind(system).execute(db).await?;
+    sqlx::query(
+        "INSERT OR IGNORE INTO engine_flow030_interruptions(system_id)
+         SELECT o.system_id FROM engine_flow030_owners o
+         JOIN engine_flow030_runs r USING(system_id,invocation_id)
+         WHERE (? IS NULL OR o.generation=?) AND (? IS NULL OR o.system_id=?)
+         AND json_extract(r.state_json,'$.verdict') IS NULL
+         AND NOT (json_extract(r.plan_json,'$.versions.contract')='agsdl-0.4.0'
+             AND json_extract(r.state_json,'$.stopping')
+             AND EXISTS(SELECT 1 FROM engine_flow030_system_stop_requests s
+                 WHERE s.system_id=r.system_id AND s.invocation_id=r.invocation_id AND s.event_id IS NOT NULL))"
+    ).bind(generation).bind(generation).bind(system).bind(system).execute(db).await?;
     Ok(())
 }
 
 pub(crate) async fn interrupt_run030(pool: &SqlitePool, system: &str) -> Result<()> {
     let mut db = pool.acquire().await?;
     let mut tx = db.begin_with("BEGIN IMMEDIATE").await?;
-    sqlx::query("INSERT OR IGNORE INTO engine_flow030_interruptions(system_id) SELECT o.system_id FROM engine_flow030_owners o JOIN engine_flow030_runs r ON r.system_id=o.system_id AND r.invocation_id=o.invocation_id WHERE o.system_id=? AND json_extract(r.state_json,'$.verdict') IS NULL")
-        .bind(system).execute(&mut *tx).await?;
+    mark_interrupted_tx(&mut tx, None, Some(system)).await?;
     sqlx::query(
         "UPDATE engine_flow030_owners SET status='revoked' WHERE system_id=? AND status='live'",
     )
@@ -2503,12 +2611,75 @@ pub(crate) async fn interrupt_run030(pool: &SqlitePool, system: &str) -> Result<
 pub(crate) async fn interrupt_previous_runs030(pool: &SqlitePool) -> Result<()> {
     let mut db = pool.acquire().await?;
     let mut tx = db.begin_with("BEGIN IMMEDIATE").await?;
-    sqlx::query("INSERT OR IGNORE INTO engine_flow030_interruptions(system_id) SELECT o.system_id FROM engine_flow030_owners o JOIN engine_flow030_runs r ON r.system_id=o.system_id AND r.invocation_id=o.invocation_id WHERE json_extract(r.state_json,'$.verdict') IS NULL")
-        .execute(&mut *tx).await?;
+    mark_interrupted_tx(&mut tx, None, None).await?;
     sqlx::query("UPDATE engine_flow030_owners SET status='revoked' WHERE status='live'")
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
+    Ok(())
+}
+
+/// Recover cleanup authority after exclusive reopening of a stopped 0.4 run.
+pub(crate) async fn recover_pending_stops030(host: &HostState, pool: &SqlitePool) -> Result<()> {
+    let rows = sqlx::query(
+        "SELECT o.system_id,o.owner_epoch,o.generation,c.capture_json,s.request_json
+         FROM engine_flow030_owners o
+         JOIN engine_flow030_runs r USING(system_id,invocation_id)
+         JOIN engine_start030_requests c USING(system_id,invocation_id)
+         JOIN engine_flow030_system_stop_requests s USING(system_id,invocation_id)
+         WHERE o.status='revoked' AND json_extract(r.plan_json,'$.versions.contract')='agsdl-0.4.0'
+         AND json_extract(r.state_json,'$.stopping') AND json_extract(r.state_json,'$.verdict') IS NULL
+         AND s.event_id IS NOT NULL"
+    ).fetch_all(pool).await?;
+    for row in rows {
+        let capture: StartCapture030 = serde_json::from_str(row.get("capture_json"))?;
+        let plan: repository::flow030::FlowPlan030 =
+            serde_json::from_str(&capture.compiled_plan_json)?;
+        let owner = EngineOwner {
+            system_start_id: row.get("system_id"),
+            owner_epoch: row.get("owner_epoch"),
+        };
+        let control = Arc::new(FlowControl030 {
+            identity: capture.identity,
+            owner,
+            generation: row.get("generation"),
+            admission: host.admission_lock().clone(),
+        });
+        let request: EngineStopRequest = serde_json::from_str(row.get("request_json"))?;
+        let mut db = pool.acquire().await?;
+        stored_system_stop(&mut db, &control, &request)
+            .await?
+            .ok_or_else(refused)?;
+        drop(db);
+        let view = control.read(pool).await?;
+        host.flow030()
+            .controls
+            .lock()
+            .map_err(|_| unavailable())?
+            .insert(control.identity.system_start_id.clone(), control.clone());
+        for activation in view.state.activations.iter().filter(|a| a.physical) {
+            if let Some(start_effect_id) = &activation.start_effect_id {
+                let work = WorkRef030 {
+                    activation_id: activation.id.clone(),
+                    start_effect_id: start_effect_id.clone(),
+                    agent_instance_id: activation.instance_id.clone(),
+                };
+                if control.settle_unadmitted(host.flow030(), pool, &work).await?.is_some() {
+                    continue;
+                }
+                // The autonomous approval executor only owns an in-memory
+                // wait. It cannot outlive the previous exclusive host.
+                if let Some(stop) = activation.stop_effect_id.as_ref().filter(|_| {
+                    activation.agent.is_none() && activation.instance_id.is_none()
+                        && plan.steps.iter().any(|step| {
+                            step.r#type == "approval" && Some(&step.address) == activation.step.as_ref()
+                        })
+                }) {
+                    control.settle_reopened_approval(pool, work, stop).await?;
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -2734,6 +2905,86 @@ struct NoAdmissionReceipt030 {
 }
 
 impl FlowControl030 {
+    async fn settle_reopened_approval(
+        &self,
+        pool: &SqlitePool,
+        work: WorkRef030,
+        stop: &str,
+    ) -> Result<()> {
+        let _admission = self.admission.clone().lock_owned().await;
+        let mut db = pool.acquire().await?;
+        sqlx::query("PRAGMA synchronous=FULL").execute(&mut *db).await?;
+        let mut tx = db.begin_with("BEGIN IMMEDIATE").await?;
+        let view = flow_store030::read_tx(&mut tx, self, &self.identity)
+            .await.map_err(store_error)?;
+        let start: Option<String> = sqlx::query_scalar(
+            "SELECT receipt_json FROM engine_flow030_handoffs
+             WHERE system_id=? AND invocation_id=? AND effect_id=? AND owner_epoch=? AND generation=?",
+        )
+        .bind(&self.identity.system_start_id).bind(&self.identity.flow_invocation_id)
+        .bind(&work.start_effect_id).bind(&self.owner.owner_epoch).bind(&self.generation)
+        .fetch_optional(&mut *tx).await?;
+        let Some(start) = start else {
+            return Ok(());
+        };
+        let start: Value = serde_json::from_str(&start)?;
+        let expected_start = format!("flow030:{}:{}", self.identity.system_start_id, work.start_effect_id);
+        if start["kind"] != "nativeOwnedHandoff030" || start["requestId"] != expected_start
+            || start.get("workAttempt").is_some() || !view.state.stopping
+        {
+            return Err(refused());
+        }
+        let row = sqlx::query(
+            "SELECT status,effect_json FROM engine_flow030_outbox
+             WHERE system_id=? AND invocation_id=? AND effect_id=? AND owner_epoch=?",
+        )
+        .bind(&self.identity.system_start_id).bind(&self.identity.flow_invocation_id)
+        .bind(stop).bind(&self.owner.owner_epoch).fetch_one(&mut *tx).await?;
+        let effect: FlowEffect030 = serde_json::from_str(row.get("effect_json"))?;
+        if effect.id != stop || effect.identity != self.identity
+            || !matches!(&effect.kind, FlowEffectKind030::StopWork { work: target, include_descendants: true } if target == &work)
+        {
+            return Err(refused());
+        }
+        let event = FlowEvent030 {
+            identity: self.identity.clone(),
+            event_id: format!("reopened-approval-stop:{stop}"),
+            expected_revision: view.state.revision,
+            kind: FlowEventKind030::PhysicalEnded {
+                work: work.clone(),
+                stop_effect_id: Some(stop.into()),
+                evidence: PhysicalEvidence030 {
+                    native_receipt_id: expected_start,
+                    descendants_joined: true,
+                },
+            },
+        };
+        let result = flow_store030::apply_tx(&mut tx, self, &event).await.map_err(store_error)?;
+        if !matches!(result, Apply030::Applied(_)) {
+            return Err(refused());
+        }
+        if row.get::<&str, _>("status") != "settled" {
+            let receipt = json!({
+                "kind":"nativeReopenedApprovalStop030", "eventId":event.event_id,
+                "startEffectId":work.start_effect_id, "stopEffectId":stop,
+                "requestId":start["requestId"], "ownerEpoch":self.owner.owner_epoch,
+                "generation":self.generation
+            });
+            let changed = sqlx::query(
+                "UPDATE engine_flow030_outbox SET status='settled',settlement_json=?
+                 WHERE system_id=? AND invocation_id=? AND effect_id=? AND owner_epoch=?
+                 AND status IN ('pending','uncertain')",
+            )
+            .bind(receipt.to_string()).bind(&self.identity.system_start_id)
+            .bind(&self.identity.flow_invocation_id).bind(stop).bind(&self.owner.owner_epoch)
+            .execute(&mut *tx).await?.rows_affected();
+            if changed != 1 {
+                return Err(refused());
+            }
+        }
+        tx.commit().await.map_err(|_| uncertain())?;
+        Ok(())
+    }
     pub(crate) fn identity(&self) -> &FlowIdentity030 {
         &self.identity
     }
@@ -3255,9 +3506,9 @@ impl FlowControl030 {
             .await?;
         let mut tx = db.begin_with("BEGIN IMMEDIATE").await?;
         if interrupted {
-            mark_generation_interrupted_tx(
+            mark_interrupted_tx(
                 &mut tx,
-                &self.generation,
+                Some(&self.generation),
                 Some(&self.identity.system_start_id),
             )
             .await?;

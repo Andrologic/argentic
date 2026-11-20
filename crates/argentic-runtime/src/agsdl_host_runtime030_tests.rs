@@ -741,7 +741,11 @@ async fn stop_during_physical_controller_evaluation_retains_the_join() {
 
 #[tokio::test]
 async fn stop_before_the_first_handoff_settles_an_unadmitted_start() {
-    let f = Fixture::new(false).await;
+    let f = Fixture::with_document(json!({
+        "contract": argentic_core::AGSDL_040, "id": "unadmitted-stop",
+        "agents": {"worker": {"harness": "codex", "permissions": "workspace"}},
+        "flow": {"entry": "first", "steps": {"first": {"type": "agent", "agent": "worker"}}}
+    })).await;
     stop_fixture(&f, "stop-before-handoff").await;
     let tasks = StreamTasks::default();
     let starts = Arc::new(AtomicUsize::new(0));
@@ -782,6 +786,21 @@ async fn stop_before_the_first_handoff_settles_an_unadmitted_start() {
         .await
         .unwrap();
     assert_eq!(view.flow.state.verdict.as_deref(), Some("cancelled"));
+    let page = f.host.runtime_projection(
+        &f.pool,
+        crate::api::RuntimeProjectionQuery030 {
+            system_start_id: f.identity.system_start_id.clone(),
+            source: view.capture.source,
+            snapshot_id: None,
+        },
+        None,
+    ).await.unwrap();
+    let statuses = page.items.iter().find_map(|item| match item {
+        crate::agsdl_host_projection030::RuntimeProjectionItem030::Activation { value } =>
+            value.message.as_ref().map(|message| &message.statuses),
+        _ => None,
+    }).unwrap();
+    assert_eq!(statuses, &["sent"]);
 }
 
 struct StopBeforeClaimExecutor {

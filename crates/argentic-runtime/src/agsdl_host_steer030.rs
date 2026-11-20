@@ -9,11 +9,15 @@ use crate::{
     },
     tasks::StreamTasks,
 };
-use tokio::sync::{mpsc, oneshot};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+use tokio::sync::{mpsc, oneshot, Mutex, OwnedMutexGuard};
 
 #[derive(Clone)]
-pub(crate) struct SteerSender030(mpsc::Sender<SteerDelivery030>);
-pub(crate) struct SteerInbox030(mpsc::Receiver<SteerDelivery030>);
+pub(crate) struct SteerSender030(mpsc::Sender<QueuedSteer030>);
+pub(crate) struct SteerInbox030(mpsc::Receiver<QueuedSteer030>);
 
 pub(crate) fn channel030() -> (SteerSender030, SteerInbox030) {
     let (send, recv) = mpsc::channel(1);
@@ -43,10 +47,46 @@ fn matches_attempt(effect: &FlowEffect030, attempt: &FlowWorkAttempt030) -> bool
         && work.agent_instance_id == attempt.work().agent_instance_id)
 }
 
+#[derive(Clone)]
+pub(crate) struct SteerGate030 {
+    pub admission: Arc<Mutex<()>>,
+    pub pool: sqlx::SqlitePool,
+    pub deadline: tokio::time::Instant,
+    wire_admitted: Arc<AtomicBool>,
+}
+
+impl SteerGate030 {
+    pub(crate) fn new(
+        admission: Arc<Mutex<()>>,
+        pool: sqlx::SqlitePool,
+        deadline: tokio::time::Instant,
+    ) -> Self {
+        Self {
+            admission,
+            pool,
+            deadline,
+            wire_admitted: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn lost_evidence(&self) -> crate::persistence::dto::EngineFailure {
+        if self.wire_admitted.load(Ordering::SeqCst) {
+            uncertain()
+        } else {
+            failure(
+                "STEER_NOT_SENT",
+                "steer",
+                "The offer did not reach provider admission",
+            )
+        }
+    }
+}
+
 pub(crate) struct SteerDelivery030 {
     effect: FlowEffect030,
     attempt: FlowWorkAttempt030,
-    ack: oneshot::Sender<ConsumedSteer030>,
+    ack: oneshot::Sender<Result<ConsumedSteer030>>,
+    gate: Option<SteerGate030>,
 }
 
 /// Sealed evidence from the owned consumer, never deserialized from IPC.
@@ -71,32 +111,59 @@ impl SteerSender030 {
     pub(crate) fn is_closed(&self) -> bool {
         self.0.is_closed()
     }
+    #[cfg(test)]
     pub(crate) async fn deliver(
         &self,
         effect: &FlowEffect030,
         attempt: &FlowWorkAttempt030,
     ) -> Result<ConsumedSteer030> {
+        self.deliver_with_gate(effect, attempt, None).await
+    }
+
+    pub(crate) async fn deliver_with_gate(
+        &self,
+        effect: &FlowEffect030,
+        attempt: &FlowWorkAttempt030,
+        gate: Option<SteerGate030>,
+    ) -> Result<ConsumedSteer030> {
         if !matches_attempt(effect, attempt) {
             return Err(refused());
         }
-        let (ack, result) = oneshot::channel();
-        if self
-            .0
-            .send(SteerDelivery030 {
-                effect: effect.clone(),
-                attempt: attempt.clone(),
-                ack,
-            })
-            .await
-            .is_err()
-        {
+        let (ack, mut result) = oneshot::channel();
+        let offer = self.0.send(QueuedSteer030(Some(SteerDelivery030 {
+            effect: effect.clone(),
+            attempt: attempt.clone(),
+            ack,
+            gate: gate.clone(),
+        })));
+        let offered = match &gate {
+            Some(gate) => tokio::time::timeout_at(gate.deadline, offer)
+                .await
+                .map_err(|_| gate.lost_evidence())?,
+            None => offer.await,
+        };
+        if offered.is_err() {
             return Ok(ConsumedSteer030 {
                 effect: effect.clone(),
                 attempt: attempt.clone(),
                 consumed: false,
             });
         }
-        result.await.map_err(|_| uncertain())
+        if let Some(gate) = gate {
+            match tokio::time::timeout_at(gate.deadline, &mut result).await {
+                Ok(receipt) => receipt.map_err(|_| gate.lost_evidence())?,
+                Err(_) => {
+                    // Do not close the receiver while admission can authorize
+                    // a send. A write already admitted holds the same guard.
+                    let _admission = gate.admission.clone().lock_owned().await;
+                    let receipt = result.try_recv().map_err(|_| gate.lost_evidence());
+                    drop(result);
+                    receipt?
+                }
+            }
+        } else {
+            result.await.map_err(|_| uncertain())?
+        }
     }
 }
 impl SteerInbox030 {
@@ -104,12 +171,191 @@ impl SteerInbox030 {
         self.0.close();
     }
     pub(crate) async fn receive(&mut self) -> Option<SteerDelivery030> {
-        self.0.recv().await
+        self.0.recv().await.and_then(|mut offer| offer.0.take())
     }
 }
+/// The mailbox can prove non-receipt even if preparation fails before
+/// the executor starts polling its inbox.
+struct QueuedSteer030(Option<SteerDelivery030>);
+
+impl Drop for QueuedSteer030 {
+    fn drop(&mut self) {
+        if let Some(offer) = self.0.take().filter(|offer| offer.gate.is_some()) {
+            let _ = offer.ack.send(Ok(ConsumedSteer030 {
+                effect: offer.effect,
+                attempt: offer.attempt,
+                consumed: false,
+            }));
+        }
+    }
+}
+
 impl SteerDelivery030 {
     pub(crate) fn effect(&self) -> &FlowEffect030 {
         &self.effect
+    }
+
+    async fn current_state(
+        &self,
+    ) -> Result<
+        Option<(
+            OwnedMutexGuard<()>,
+            crate::persistence::flow030::FlowState030,
+        )>,
+    > {
+        let Some(gate) = &self.gate else {
+            return Ok(None);
+        };
+        let guard = gate.admission.clone().lock_owned().await;
+        let raw: String = sqlx::query_scalar(
+            "SELECT state_json FROM engine_flow030_runs WHERE system_id=? AND invocation_id=?",
+        )
+        .bind(&self.effect.identity.system_start_id)
+        .bind(&self.effect.identity.flow_invocation_id)
+        .fetch_one(&gate.pool)
+        .await?;
+        Ok(Some((guard, serde_json::from_str(&raw)?)))
+    }
+
+    /// Serialize the actual provider send with Stop and recipient completion.
+    /// The adapter releases the guard before awaiting a provider response.
+    pub(crate) async fn wire_admission(&self) -> Result<Option<OwnedMutexGuard<()>>> {
+        let Some((guard, state)) = self.current_state().await? else {
+            return Ok(None);
+        };
+        let FlowEffectKind030::Steer {
+            work,
+            delivery_activation_id,
+            ..
+        } = &self.effect.kind
+        else {
+            return Err(refused());
+        };
+        if self.ack.is_closed()
+            || self
+                .deadline()
+                .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+        {
+            return Err(uncertain());
+        }
+        if !crate::persistence::flow030::accepts_steer030(&state, work)
+            || !crate::persistence::flow030::steer_effect_eligible030(&state, &self.effect)
+            || state.activations.iter().any(|activation| {
+                activation.id == *delivery_activation_id && activation.phase == "withdrawingSteer"
+            })
+        {
+            return Err(failure(
+                "STALE_REFERENCE",
+                "steer",
+                "The targeted work can no longer receive a steer",
+            ));
+        }
+        self.gate
+            .as_ref()
+            .unwrap()
+            .wire_admitted
+            .store(true, Ordering::SeqCst);
+        Ok(Some(guard))
+    }
+
+    pub(crate) async fn observe_turn_end_while_counted(&self) -> Result<bool> {
+        let Some((_guard, state)) = self.current_state().await? else {
+            return Ok(false);
+        };
+        let FlowEffectKind030::Steer { work, .. } = &self.effect.kind else {
+            return Err(refused());
+        };
+        Ok(crate::persistence::flow030::accepts_steer030(&state, work))
+    }
+
+    pub(crate) fn deadline(&self) -> Option<tokio::time::Instant> {
+        self.gate.as_ref().map(|gate| gate.deadline)
+    }
+
+    pub(crate) fn unavailable_content(self) {
+        let _ = self.ack.send(Err(failure(
+            "CONTENT_UNAVAILABLE",
+            "steer",
+            "The steer message content could not be prepared",
+        )));
+    }
+
+    pub(crate) fn wrong_recipient(self) {
+        let _ = self.ack.send(Err(refused()));
+    }
+
+    /// A matching Codex notification identifies the work, but carries no
+    /// evidence that its input was received before a committed exclusion.
+    pub(crate) async fn acknowledge_from_provider(
+        delivery: &mut Option<Self>,
+        tasks: &StreamTasks,
+        attempt: &FlowWorkAttempt030,
+        turn_ended_while_counted: bool,
+    ) -> Result<()> {
+        let Some(offer) = delivery.as_ref() else {
+            return Ok(());
+        };
+        // Keep the proof and offer in their owner until the cancellable read
+        // returns. Stop can continue this same observation if it wins the race.
+        let observation = if turn_ended_while_counted {
+            None
+        } else {
+            offer.current_state().await?
+        };
+        let offer = delivery.take().unwrap();
+        if let Some((_guard, state)) = &observation {
+            let FlowEffectKind030::Steer { work, .. } = &offer.effect.kind else {
+                return Err(refused());
+            };
+            if !crate::persistence::flow030::accepts_steer030(state, work) {
+                return Ok(());
+            }
+        }
+        if offer
+            .deadline()
+            .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+        {
+            return Ok(());
+        }
+        offer.acknowledge(tasks, attempt)
+    }
+
+    /// Let the recipient return after submitting its result. Its registry
+    /// still joins the observer and the provider process before routing.
+    pub(crate) fn handoff_observation<F>(
+        mut self,
+        tasks: &StreamTasks,
+        attempt: &FlowWorkAttempt030,
+        observation: F,
+    ) -> Result<()>
+    where
+        F: std::future::Future<Output = Result<Option<bool>>> + Send + 'static,
+    {
+        let request = self.verify_consumer(tasks, attempt)?;
+        let cleanup_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        let deadline = self
+            .deadline()
+            .map_or(cleanup_deadline, |deadline| deadline.min(cleanup_deadline));
+        let cleanup = tokio::spawn(async move {
+            let observed = tokio::select! {
+                result = tokio::time::timeout_at(deadline, observation) => result,
+                _ = self.ack.closed() => return Ok(()),
+            };
+            let result = observed
+                .map_err(|_| uncertain())
+                .and_then(|result| result)
+                .and_then(|receipt| receipt.ok_or_else(uncertain))
+                .map(|consumed| ConsumedSteer030 {
+                    effect: self.effect,
+                    attempt: self.attempt,
+                    consumed,
+                });
+            let _ = self.ack.send(result);
+            Ok(())
+        });
+        tasks
+            .attach_cleanup030(&request, cleanup)
+            .map_err(|_| refused())
     }
 
     /// Call only after the transport has consumed the message and sender.
@@ -131,6 +377,45 @@ impl SteerDelivery030 {
         attempt: &FlowWorkAttempt030,
         consumed: bool,
     ) -> Result<()> {
+        let asynchronous = self.gate.is_some();
+        match self.evidence(tasks, attempt, consumed)?() {
+            Ok(()) => Ok(()),
+            // Argentic already settled the sender's attempt. A late report
+            // cannot affect the recipient's work.
+            Err(()) if asynchronous => Ok(()),
+            Err(()) => Err(uncertain()),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn simulation(
+        self,
+        tasks: &StreamTasks,
+        attempt: &FlowWorkAttempt030,
+        consumed: bool,
+    ) -> Result<impl FnOnce() -> std::result::Result<(), ()> + Send> {
+        self.evidence(tasks, attempt, consumed)
+    }
+
+    fn evidence(
+        self,
+        tasks: &StreamTasks,
+        attempt: &FlowWorkAttempt030,
+        consumed: bool,
+    ) -> Result<impl FnOnce() -> std::result::Result<(), ()> + Send> {
+        self.verify_consumer(tasks, attempt)?;
+        Ok(move || {
+            self.ack
+                .send(Ok(ConsumedSteer030 {
+                    effect: self.effect,
+                    attempt: self.attempt,
+                    consumed,
+                }))
+                .map_err(|_| ())
+        })
+    }
+
+    fn verify_consumer(&self, tasks: &StreamTasks, attempt: &FlowWorkAttempt030) -> Result<String> {
         if !matches_attempt(&self.effect, attempt)
             || self.attempt.provider_attempt_id() != attempt.provider_attempt_id()
             || self.attempt.owner() != attempt.owner()
@@ -146,13 +431,7 @@ impl SteerDelivery030 {
         tasks
             .verify_agent_scope030(&request, attempt)
             .map_err(|_| refused())?;
-        self.ack
-            .send(ConsumedSteer030 {
-                effect: self.effect,
-                attempt: self.attempt,
-                consumed,
-            })
-            .map_err(|_| uncertain())
+        Ok(request)
     }
 }
 
@@ -178,6 +457,165 @@ mod tests {
                 sender: None,
             },
         }
+    }
+
+    #[tokio::test]
+    async fn recipient_returns_before_observation_but_joins_it_before_routing() {
+        let attempt = FlowWorkAttempt030::registry_fixture030("attempt");
+        let target = attempt.clone();
+        let fx = effect(&attempt);
+        let tasks = StreamTasks::default();
+        let registry = tasks.clone();
+        let (send, mut inbox) = channel030();
+        let (finished, ended) = oneshot::channel();
+        let (confirm, receipt) = oneshot::channel();
+        tasks
+            .start_agent030(
+                format!(
+                    "flow030:{}:{}",
+                    attempt.identity().system_start_id,
+                    attempt.start_effect_id()
+                ),
+                &attempt,
+                async move {
+                    inbox
+                        .receive()
+                        .await
+                        .unwrap()
+                        .handoff_observation(&registry, &target, async {
+                            Ok(receipt.await.ok().map(|()| true))
+                        })
+                        .unwrap();
+                    finished.send(()).unwrap();
+                },
+            )
+            .unwrap();
+        let mut pending = Box::pin(send.deliver(&fx, &attempt));
+        tokio::select! {
+            _ = &mut pending => panic!("Steer settled before the receipt"),
+            result = ended => result.unwrap(),
+        }
+        let mut joined = Box::pin(tasks.join_agent030(&attempt, false));
+        tokio::select! {
+            biased;
+            _ = &mut joined => panic!("Work joined before its observer ended"),
+            _ = tokio::task::yield_now() => (),
+        }
+        confirm.send(()).unwrap();
+        assert!(pending.await.unwrap().consumed());
+        joined.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dropping_an_unpolled_040_mailbox_proves_non_receipt() {
+        let attempt = FlowWorkAttempt030::registry_fixture030("attempt");
+        let fx = effect(&attempt);
+        let (send, inbox) = channel030();
+        let mut result = Box::pin(send.deliver_with_gate(
+            &fx,
+            &attempt,
+            Some(SteerGate030::new(
+                Arc::new(Mutex::new(())),
+                crate::sqlite::memory().await.unwrap(),
+                tokio::time::Instant::now() + std::time::Duration::from_secs(2),
+            )),
+        ));
+        tokio::select! {
+            biased;
+            _ = &mut result => panic!("Mail was settled before closing"),
+            _ = tokio::task::yield_now() => (),
+        }
+        assert_eq!(send.0.capacity(), 0);
+        drop(inbox);
+        assert!(!result.await.unwrap().consumed());
+    }
+
+    #[tokio::test]
+    async fn expiration_while_waiting_for_admission_prevents_provider_send() {
+        let attempt = FlowWorkAttempt030::registry_fixture030("attempt");
+        let fx = effect(&attempt);
+        let id = attempt.identity();
+        let pool = crate::sqlite::memory().await.unwrap();
+        sqlx::query("INSERT INTO engine_flow030_runs VALUES(?,?,?,?,'{}','{}',?)")
+            .bind(&id.system_start_id)
+            .bind(&id.flow_invocation_id)
+            .bind(&id.snapshot_id)
+            .bind(&id.epoch)
+            .bind(
+                serde_json::to_string(&crate::persistence::flow030::FlowState030::new(id.clone()))
+                    .unwrap(),
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+        let gate = SteerGate030::new(
+            Arc::new(Mutex::new(())),
+            pool,
+            tokio::time::Instant::now() + std::time::Duration::from_millis(250),
+        );
+        let hold = gate.admission.clone().lock_owned().await;
+        let (send, mut inbox) = channel030();
+        let (receipt, ()) = tokio::join!(
+            send.deliver_with_gate(&fx, &attempt, Some(gate.clone())),
+            async {
+                let offer = inbox.receive().await.unwrap();
+                let (guard, ()) = tokio::join!(offer.wire_admission(), async {
+                    tokio::time::sleep_until(gate.deadline).await;
+                    drop(hold);
+                });
+                assert_eq!(guard.unwrap_err().code, "UNCERTAIN");
+            }
+        );
+        assert_eq!(receipt.err().unwrap().code, "STEER_NOT_SENT");
+    }
+
+    #[tokio::test]
+    async fn expired_040_confirmation_does_not_fail_the_recipient() {
+        let attempt = FlowWorkAttempt030::registry_fixture030("attempt");
+        let (send, mut inbox) = channel030();
+        let tasks = StreamTasks::default();
+        let owned_tasks = tasks.clone();
+        let target = attempt.clone();
+        let (received, receipt) = oneshot::channel();
+        let (expired, wait) = oneshot::channel();
+        let (completed, done) = oneshot::channel();
+        tasks
+            .start_agent030(
+                format!(
+                    "flow030:{}:{}",
+                    attempt.identity().system_start_id,
+                    attempt.start_effect_id()
+                ),
+                &attempt,
+                async move {
+                    let delivery = inbox.receive().await.unwrap();
+                    received.send(()).unwrap();
+                    wait.await.unwrap();
+                    completed
+                        .send(delivery.acknowledge(&owned_tasks, &target))
+                        .unwrap();
+                },
+            )
+            .unwrap();
+        let fx = effect(&attempt);
+        let pool = crate::sqlite::memory().await.unwrap();
+        let mut delivery = Box::pin(send.deliver_with_gate(
+            &fx,
+            &attempt,
+            Some(SteerGate030::new(
+                Arc::new(Mutex::new(())),
+                pool,
+                tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+            )),
+        ));
+        tokio::select! {
+            result = &mut delivery => panic!("Delivery resolved before expiry: {}", result.err().unwrap().code),
+            result = receipt => result.unwrap(),
+        }
+        drop(delivery);
+        expired.send(()).unwrap();
+        done.await.unwrap().unwrap();
+        tasks.join_agent030(&attempt, false).await.unwrap();
     }
 
     #[tokio::test]

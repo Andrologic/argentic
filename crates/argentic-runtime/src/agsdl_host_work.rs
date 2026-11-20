@@ -33,7 +33,7 @@ pub(crate) fn captured_work_contract030(
     if snapshot.system_start_id != work.system_start_id
         || plan.get("format").and_then(Value::as_str) != Some("macro-agsdl-compiled-plan/2")
         || snapshot.versions.snapshot != "2"
-        || snapshot.versions.contract != "agsdl-0.3.0"
+        || !argentic_core::supports_contract(&snapshot.versions.contract)
         || snapshot.versions.profile != "macro-agsdl-030-v1"
         || plan.get("versions") != Some(&serde_json::to_value(snapshot.versions)?)
         || plan.get("source") != Some(&serde_json::to_value(snapshot.source)?)

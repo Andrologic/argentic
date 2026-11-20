@@ -187,6 +187,12 @@ enum KindRead {
         work: WorkRef030,
         delivery_activation_id: String,
     },
+    SteerFailed {
+        effect_id: String,
+        work: WorkRef030,
+        delivery_activation_id: String,
+        code: String,
+    },
     PhysicalEnded {
         work: WorkRef030,
         stop_effect_id: Option<String>,
@@ -635,7 +641,7 @@ async fn verify(db: &mut SqliteConnection, system: &str, invocation: &str) -> Re
             })?;
     }
     for (event, stopping) in &physical_ends {
-        verify_physical_end(db, event, *stopping)
+        verify_physical_end(db, event, *stopping, &plan, &state)
             .await
             .map_err(|mut error| {
                 error.event_id = Some(event.event_id.clone());
@@ -649,6 +655,8 @@ async fn verify_physical_end(
     db: &mut SqliteConnection,
     event: &FlowEvent030,
     stopping: bool,
+    plan: &FlowPlan030,
+    state: &FlowState030,
 ) -> Result<()> {
     let FlowEventKind030::PhysicalEnded {
         work,
@@ -749,9 +757,57 @@ async fn verify_physical_end(
                 )
             })?,
         )?;
+        if event.event_id.starts_with("reopened-approval-stop:")
+            || receipt["kind"] == "nativeReopenedApprovalStop030"
+        {
+            if !matches!(
+                receipt["kind"].as_str(),
+                Some("nativeReopenedApprovalStop030" | "nativeOwnedHandoff030")
+            ) {
+                return Err(mismatch(
+                    "reopenedApproval.settlementKind",
+                    "reopened approval or existing native handoff",
+                    &receipt["kind"],
+                ));
+            }
+            let local_approval = plan.versions.contract == argentic_core::AGSDL_040
+                && work.agent_instance_id.is_none()
+                && state.activations.iter().any(|activation| {
+                    activation.id == work.activation_id
+                        && activation.agent.is_none()
+                        && plan.steps.iter().any(|step| {
+                            step.r#type == "approval"
+                                && Some(&step.address) == activation.step.as_ref()
+                        })
+                });
+            equal("reopenedApproval.local", &true, &local_approval)?;
+            equal("reopenedApproval.stopping", &true, &stopping)?;
+            equal("reopenedApproval.startHandoff", &1, &handoff)?;
+            equal(
+                "reopenedApproval.eventId",
+                &format!("reopened-approval-stop:{stop}"),
+                &event.event_id,
+            )?;
+            equal(
+                "reopenedApproval.nativeReceiptId",
+                &format!("flow030:{}:{}", id.system_start_id, work.start_effect_id),
+                &evidence.native_receipt_id,
+            )?;
+            let revoked_stopped: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM engine_flow030_owners o
+                  JOIN engine_flow030_system_stop_requests s USING(system_id,invocation_id)
+                  WHERE o.system_id=? AND o.invocation_id=? AND o.status='revoked'
+                  AND s.event_id IS NOT NULL)",
+            )
+            .bind(&id.system_start_id)
+            .bind(&id.flow_invocation_id)
+            .fetch_one(&mut *db).await.map_err(storage)?;
+            equal("reopenedApproval.revokedStopped", &true, &revoked_stopped)?;
+        }
         if matches!(
             receipt["kind"].as_str(),
-            Some("nativeJoinedGroupStop030" | "nativeJoinedDiagnosticStop030")
+            Some("nativeJoinedGroupStop030" | "nativeJoinedDiagnosticStop030"
+                | "nativeReopenedApprovalStop030")
         ) {
             equal(
                 "physicalEnded.stop.eventId",
@@ -940,7 +996,10 @@ async fn verify_settlement(
             .iter()
             .find(|d| d.effect_id == effect.id)
             .ok_or_else(|| mismatch("steer.record", "replayed delivery", Value::Null))?;
-        if matches!(delivery.status.as_str(), "fallback" | "withdrawn") {
+        if matches!(
+            delivery.status.as_str(),
+            "fallback" | "withdrawn" | "failed"
+        ) {
             let expected = json!({"kind":"nativeSteerSuperseded030", "effectId":effect.id,
                 "deliveryActivationId":delivery_activation_id, "work":work, "eventId":delivery.resolved_event_id,
                 "resolution":delivery.status, "reason":delivery.reason});
@@ -1095,7 +1154,8 @@ async fn verify_settlement(
         }
     } else if matches!(
         receipt["kind"].as_str(),
-        Some("nativeJoinedGroupStop030" | "nativeJoinedDiagnosticStop030")
+        Some("nativeJoinedGroupStop030" | "nativeJoinedDiagnosticStop030"
+            | "nativeReopenedApprovalStop030")
     ) {
         // Retained R6 group stops settled directly with the joined event and
         // the original Start handoff, without creating a second handoff row.
@@ -1151,6 +1211,15 @@ async fn verify_settlement(
                 )
             })?,
         )?;
+        if receipt["kind"] != "nativeReopenedApprovalStop030"
+            && !original["workAttempt"].is_object()
+        {
+            return Err(mismatch(
+                "joinedStop.workAttempt",
+                "native agent attempt",
+                &original["workAttempt"],
+            ));
+        }
         for key in ["workAttempt", "requestId", "ownerEpoch", "generation"] {
             equal(&format!("joinedStop.{key}"), &original[key], &receipt[key])?;
         }

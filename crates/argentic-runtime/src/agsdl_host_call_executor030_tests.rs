@@ -24,6 +24,9 @@ async fn host_fixture_with_entry(
         f.owner.clone(),
         Executors030 {
             agents: Arc::new(Executor {
+                whole_stop: Default::default(),
+                steer_script: Default::default(),
+                deferred: Default::default(),
                 plans: Default::default(),
                 running: Arc::new(Mutex::new(Vec::new())),
                 wake: watch::channel(0).0,

@@ -999,6 +999,40 @@ async fn transition_inner(
         receipt_json: output.receipt_json,
         check,
     };
+    let receipt: serde_json::Value = serde_json::from_str(&decision.receipt_json)?;
+    let decision_kind = receipt.pointer("/decision/kind").and_then(serde_json::Value::as_str);
+    let clock = if decision_kind == Some("accepted") {
+        let clocked_040: bool = sqlx::query_scalar(
+            "SELECT EXISTS (
+                SELECT 1 FROM engine_flow030_clock_works clock
+                JOIN engine_start030_requests start
+                  ON start.system_id=clock.system_id AND start.invocation_id=clock.invocation_id
+                WHERE clock.system_id=? AND clock.invocation_id=? AND clock.activation_id=?
+                  AND clock.kind='agent' AND clock.retired=0
+                  AND start.capture_json ->> '$.versions.contract' = ?
+            )",
+        )
+        .bind(&id.system_start_id)
+        .bind(&id.flow_invocation_id)
+        .bind(&input.context.work.activation_id)
+        .bind(argentic_core::AGSDL_040)
+        .fetch_one(pool)
+        .await?;
+        if clocked_040 {
+            Some(host.flow030().humans.broker(host, pool, id).await?)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let _clock_operation = if let Some(clock) = &clock {
+        let operation = clock.operation.lock().await;
+        clock.pump(host, cancelled).await?;
+        Some(operation)
+    } else {
+        None
+    };
     let lease = host.start_lease().await?;
     let _gate = host.admission_lock().lock_owned().await;
     host.flow030().available(id)?;
@@ -1018,12 +1052,7 @@ async fn transition_inner(
         verify_agent_attempt_tx(&mut tx, &lease, id, attempt, input).await?;
     }
     commit_tx(&mut tx, &lease, &ticket, &decision).await?;
-    let receipt: serde_json::Value = serde_json::from_str(&decision.receipt_json)?;
-    if receipt
-        .pointer("/decision/kind")
-        .and_then(serde_json::Value::as_str)
-        == Some("finished")
-    {
+    if decision_kind == Some("finished") {
         let terminal = accepted_terminal030(
             attempt.ok_or_else(|| denied("Terminal decision has no native attempt"))?,
             joined.ok_or_else(|| denied("Terminal decision has no physical join"))?,
@@ -1051,6 +1080,13 @@ async fn transition_inner(
     let decision_raw: &str = row
         .get::<Option<&str>, _>("decision_json")
         .ok_or_else(|| denied("Committed work decision missing"))?;
+    if let Some(clock) = &clock {
+        // Reserve under the same commit and timestamp as the result. Other
+        // clock operations must apply this ticket before submitting a tick.
+        clock
+            .reserve_agent_retirement_tx(&mut tx, &input.context.work.activation_id)
+            .await?;
+    }
     let marker =
         host.flow030()
             .begin_work_commit(id, &ticket.input.event_id, ticket_raw, decision_raw)?;
@@ -1060,6 +1096,9 @@ async fn transition_inner(
     lease
         .acknowledge_work_commit(host.flow030(), &marker)
         .map_err(|_| uncertain())?;
+    if clock.is_some() {
+        host.flow030().supervisors.wake(&id.system_start_id);
+    }
     Ok(decision)
 }
 

@@ -77,6 +77,7 @@ pub(crate) struct Client {
     stdin: ReplySender030,
     stdout: BufReader<ChildStdout>,
     next_id: u64,
+    asynchronous_steer: bool,
     pending: Vec<Value>,
     pending_bytes: usize,
     frame: Vec<u8>,
@@ -91,6 +92,7 @@ impl Client {
             stdin: ReplySender030(std::sync::Arc::new(tokio::sync::Mutex::new(stdin)), None),
             stdout: BufReader::new(stdout),
             next_id: 0,
+            asynchronous_steer: false,
             pending: Vec::new(),
             pending_bytes: 0,
             frame: Vec::new(),
@@ -190,6 +192,19 @@ impl Client {
         let id = self.begin_request(method, params).await?;
         self.response(id).await
     }
+    pub(crate) fn enable_asynchronous_steer(&mut self) {
+        self.asynchronous_steer = true;
+    }
+    /// Requests from the server always have a method. A delayed reply to one
+    /// of our issued IDs can be ignored once its consumer has retired.
+    pub(crate) fn is_reply(&self, frame: &Value) -> bool {
+        self.asynchronous_steer
+            && frame.get("method").is_none()
+            && frame["id"]
+                .as_u64()
+                .is_some_and(|id| id > 0 && id <= self.next_id)
+            && (frame.get("result").is_some() || frame.get("error").is_some())
+    }
     pub(crate) async fn notification(&mut self) -> Result<Value> {
         if !self.pending.is_empty() {
             let value = self.pending.remove(0);
@@ -210,6 +225,9 @@ impl Client {
             if value.get("method").is_none() && value.get("id").and_then(Value::as_u64) == Some(id)
             {
                 return self.response_value030(&value);
+            }
+            if self.is_reply(&value) {
+                continue;
             }
             // Server requests could ask for approval or run a client tool. This
             // profile has no client tools and never grants an escalation.

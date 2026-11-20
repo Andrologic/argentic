@@ -88,8 +88,10 @@ pub(crate) struct EventEmitter030 {
 pub(crate) type SteerDeliveryPort030 = Arc<
     dyn Fn(
             FlowEffect030,
-            FlowWorkAttempt030,
-            crate::agsdl_host_steer030::SteerSender030,
+            Option<(
+                FlowWorkAttempt030,
+                crate::agsdl_host_steer030::SteerSender030,
+            )>,
         ) -> BoxFuture<'static, Result<bool>>
         + Send
         + Sync,
@@ -202,8 +204,11 @@ pub(crate) fn native_event_emitter030(
 /// Native binding for the port, alongside the existing work-event binding.
 /// Delivery must continue independently while the supervisor reads or ticks:
 /// its admission lock is released only after the consumer acknowledgment.
-fn native_steer_port030(app: Option<HostState>, pool: SqlitePool) -> SteerDeliveryPort030 {
-    Arc::new(move |effect, attempt, sender| {
+pub(crate) fn native_steer_port030(
+    app: Option<HostState>,
+    pool: SqlitePool,
+) -> SteerDeliveryPort030 {
+    Arc::new(move |effect, recipient| {
         let (app, pool) = (app.clone(), pool.clone());
         let task = tokio::spawn(async move {
             let app = app.ok_or_else(|| {
@@ -216,7 +221,10 @@ fn native_steer_port030(app: Option<HostState>, pool: SqlitePool) -> SteerDelive
             else {
                 return Ok(true);
             };
-            claim.deliver_steer030(&attempt, &sender).await
+            match recipient.as_ref() {
+                Some((attempt, sender)) => claim.deliver_steer030(attempt, sender).await,
+                None => claim.resolve_steer030(None).await,
+            }
         });
         Box::pin(async move {
             task.await
@@ -259,6 +267,7 @@ pub(crate) async fn start_agent_work030(
     executor: Arc<dyn AgentExecutor030>,
     emitter: EventEmitter030,
     cancel: CancellationToken,
+    clock_ready: Option<tokio::sync::oneshot::Receiver<()>>,
 ) -> Result<StartedAgent030> {
     let inspection = flow::inspect_run(host.flow030(), host, pool, owner).await?;
     let prepared = prepare_effective_agent_work030(config, &inspection, effect).await?;
@@ -300,6 +309,12 @@ pub(crate) async fn start_agent_work030(
                 steer: inbox,
             };
             async move {
+                if let Some(ready) = clock_ready {
+                    if ready.await.is_err() {
+                        returned.send_replace(Some(Ok(())));
+                        return;
+                    }
+                }
                 let running = executor.run(work, events.clone(), work_cancel.clone());
                 tokio::pin!(running);
                 let result = tokio::select! {
@@ -320,9 +335,14 @@ pub(crate) async fn start_agent_work030(
                         // closed failure enum. No raw provider fields are emitted.
                         use std::io::Write;
                         let _ = writeln!(std::io::stderr().lock(), "{}", crate::agsdl_host_codex::diagnostics::entry(&events.attempt, error));
+                        let reason = if error.code == "TIMEOUT" && error.pointer == "clock" {
+                            "TIMEOUT"
+                        } else {
+                            "AGENT_FAILED"
+                        };
                         let failure = events
                             .emit(
-                                serde_json::json!({"kind":"stop","reason":"AGENT_FAILED"}),
+                                serde_json::json!({"kind":"stop","reason":reason}),
                                 &CancellationToken::new(),
                             )
                             .await;
@@ -748,6 +768,19 @@ impl EffectDriver030 for NativeDriver030<'_> {
             let inspection =
                 flow::inspect_run(self.host.flow030(), self.host, self.pool, self.owner).await?;
             let emitter = (self.emitter)(inspection.capture.source.owner.project_id);
+            let tracks_humans = self
+                .executors
+                .clock
+                .as_ref()
+                .is_some_and(|clock| clock.tracks_humans());
+            let (release, ready) =
+                if tracks_humans && inspection.capture.versions.contract == argentic_core::AGSDL_040
+                {
+                    let (release, ready) = tokio::sync::oneshot::channel();
+                    (Some(release), Some(ready))
+                } else {
+                    (None, None)
+                };
             let mut started = start_agent_work030(
                 self.host,
                 self.pool,
@@ -758,14 +791,10 @@ impl EffectDriver030 for NativeDriver030<'_> {
                 self.executors.agents.clone(),
                 emitter,
                 CancellationToken::new(),
+                ready,
             )
             .await?;
-            if self
-                .executors
-                .clock
-                .as_ref()
-                .is_some_and(|clock| clock.tracks_humans())
-            {
+            if tracks_humans {
                 let broker = self
                     .host
                     .flow030()
@@ -786,6 +815,8 @@ impl EffectDriver030 for NativeDriver030<'_> {
                     if !fresh.flow.state.stopping {
                         return Err(error);
                     }
+                } else if let Some(release) = release {
+                    let _ = release.send(());
                 }
             }
             let key = started.attempt.work().activation_id.clone();
@@ -899,17 +930,30 @@ impl EffectDriver030 for NativeDriver030<'_> {
             let FlowEffectKind030::Steer { work, .. } = &effect.kind else {
                 unreachable!()
             };
-            let live = self.active.get(&work.activation_id).ok_or_else(|| {
-                failure("INTERRUPTED", "delivery", "Steer recipient has no owner")
-            })?;
-            // The adapter has already observed the end. Let its terminal event
-            // settle before claiming any offer that can no longer be sent.
-            if live.steer.is_closed() {
-                self.in_flight.insert(effect.id);
-                return Ok(());
+            let recipient = self
+                .active
+                .get(&work.activation_id)
+                .map(|live| (live.attempt.clone(), live.steer.clone()));
+            if recipient
+                .as_ref()
+                .is_none_or(|(_, sender)| sender.is_closed())
+            {
+                let inspection =
+                    flow::inspect_run(self.host.flow030(), self.host, self.pool, self.owner)
+                        .await?;
+                if inspection.capture.versions.contract != argentic_core::AGSDL_040 {
+                    if recipient.is_none() {
+                        return Err(failure(
+                            "INTERRUPTED",
+                            "delivery",
+                            "Steer recipient has no owner",
+                        ));
+                    }
+                    self.in_flight.insert(effect.id);
+                    return Ok(());
+                }
             }
-            let future =
-                (self.steer_delivery)(effect.clone(), live.attempt.clone(), live.steer.clone());
+            let future = (self.steer_delivery)(effect.clone(), recipient);
             let id = effect.id;
             self.in_flight.insert(id.clone());
             self.steering
@@ -949,7 +993,8 @@ impl EffectDriver030 for NativeDriver030<'_> {
                     &effect.identity,
                     &effect.id,
                 )
-                .await? else {
+                .await?
+                else {
                     // Retirement can settle a Start that never reached the
                     // approval executor between Stop selection and claim.
                     let inspection =
@@ -963,7 +1008,11 @@ impl EffectDriver030 for NativeDriver030<'_> {
                     }) {
                         return Ok(());
                     }
-                    return Err(failure("STALE_REFERENCE", "approval", "Approval stop changed"));
+                    return Err(failure(
+                        "STALE_REFERENCE",
+                        "approval",
+                        "Approval stop changed",
+                    ));
                 };
                 let request = claim.request_id();
                 claim.handoff_host(self.tasks, async {}).await?;
@@ -1191,9 +1240,29 @@ pub(crate) async fn supervise_with_emitter030(
     tasks: &StreamTasks,
     owner: &EngineOwner,
     executors: &Executors030,
+    wake: watch::Receiver<u64>,
+    cancel: &CancellationToken,
+    emitter: Arc<dyn Fn(String) -> EventEmitter030 + Send + Sync>,
+) -> Result<()> {
+    supervise_with_steer_port030(
+        app, host, pool, config, tasks, owner, executors, wake, cancel, emitter, None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn supervise_with_steer_port030(
+    app: Option<&HostState>,
+    host: &HostState,
+    pool: &SqlitePool,
+    config: &HostContext,
+    tasks: &StreamTasks,
+    owner: &EngineOwner,
+    executors: &Executors030,
     mut wake: watch::Receiver<u64>,
     cancel: &CancellationToken,
     emitter: Arc<dyn Fn(String) -> EventEmitter030 + Send + Sync>,
+    steer_port: Option<SteerDeliveryPort030>,
 ) -> Result<()> {
     let mut driver = NativeDriver030 {
         app,
@@ -1212,7 +1281,8 @@ pub(crate) async fn supervise_with_emitter030(
         calls: BTreeMap::new(),
         call_joins: FuturesUnordered::new(),
         joined_calls: BTreeMap::new(),
-        steer_delivery: native_steer_port030(app.cloned(), pool.clone()),
+        steer_delivery: steer_port
+            .unwrap_or_else(|| native_steer_port030(app.cloned(), pool.clone())),
         steering: FuturesUnordered::new(),
         in_flight: BTreeSet::new(),
     };

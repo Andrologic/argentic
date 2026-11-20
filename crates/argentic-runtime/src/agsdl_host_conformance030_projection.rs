@@ -25,7 +25,8 @@ fn activation<'a>(view: &'a FlowView030, id: &str) -> &'a Activation030 {
 }
 
 pub(super) async fn project(f: &Fixture, view: &FlowView030) -> Value {
-    assert!(view.state.activations.iter().all(|a| !a.physical));
+    let interrupted = view.state.verdict.as_deref() == Some("interrupted");
+    assert!(interrupted || view.state.activations.iter().all(|a| !a.physical));
     let admitted = sqlx::query_scalar::<_, String>(
         "SELECT effect_id FROM engine_flow030_handoffs WHERE system_id=? AND invocation_id=?",
     )
@@ -39,8 +40,45 @@ pub(super) async fn project(f: &Fixture, view: &FlowView030) -> Value {
     let mut starts = BTreeMap::<String, u64>::new();
     let (mut messages, mut failures, mut cancelled, mut answers) =
         (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-    for row in &view.effects {
-        assert_eq!(row["status"], "settled", "undrained effect: {row}");
+    let mut effects: Vec<_> = view.effects.iter().collect();
+    let confirmed: BTreeMap<_, _> = view
+        .events
+        .iter()
+        .enumerate()
+        .filter_map(|(i, row)| {
+            row["event"]["kind"]["SteerConsumed"]["effect_id"]
+                .as_str()
+                .map(|id| (id, i))
+        })
+        .collect();
+    let commits: BTreeMap<_, _> = view
+        .events
+        .iter()
+        .enumerate()
+        .filter_map(|(i, row)| {
+            row["receipt"]["revision"]
+                .as_str()
+                .map(|revision| (revision, i))
+        })
+        .collect();
+    effects.sort_by_key(|row| {
+        let effect = &row["effect"];
+        confirmed
+            .get(effect["id"].as_str().unwrap())
+            .copied()
+            .unwrap_or_else(|| commits[effect["revision"].as_str().unwrap()])
+    });
+    for row in effects {
+        assert!(
+            row["status"] == "settled"
+                || interrupted
+                || (view.state.stopping
+                    && (!crate::persistence::flow_store030::eligible(
+                        &view.state,
+                        &serde_json::from_value(row["effect"].clone()).unwrap()
+                    ) || row["effect"]["kind"]["kind"] == "runEnded")),
+            "undrained effect: {row}"
+        );
         let effect: FlowEffect030 = serde_json::from_value(row["effect"].clone()).unwrap();
         let delivery = match &effect.kind {
             FlowEffectKind030::Start {
@@ -59,21 +97,12 @@ pub(super) async fn project(f: &Fixture, view: &FlowView030) -> Value {
                 delivery_activation_id,
                 message_json,
                 ..
-            } => {
-                // Only consumption counts. A superseded offer is delivered by
-                // its eventual Start or another accepted steer.
-                let receipt: String = sqlx::query_scalar("SELECT settlement_json FROM engine_flow030_outbox WHERE system_id=? AND invocation_id=? AND effect_id=?")
-                    .bind(&f.identity.system_start_id).bind(&f.identity.flow_invocation_id).bind(&effect.id).fetch_one(&f.pool).await.unwrap();
-                let receipt: Value = serde_json::from_str(&receipt).unwrap();
-                match receipt["kind"].as_str().unwrap() {
-                    "nativeSteerConsumed030" => Some((
-                        activation(view, delivery_activation_id),
-                        Some(message_json.clone()),
-                    )),
-                    "nativeSteerSuperseded030" => None,
-                    kind => panic!("Unprojectable steer settlement: {kind}"),
-                }
-            }
+            } => confirmed.contains_key(effect.id.as_str()).then(|| {
+                (
+                    activation(view, delivery_activation_id),
+                    Some(message_json.clone()),
+                )
+            }),
             FlowEffectKind030::Failure {
                 activation_id,
                 step: Some(step),
@@ -137,6 +166,24 @@ pub(super) async fn project(f: &Fixture, view: &FlowView030) -> Value {
             }
         }
     }
+    if view.state.stopping {
+        let mut state = FlowState030::new(f.identity.clone());
+        for row in &view.events {
+            if !row["diagnostic"].is_null() {
+                continue;
+            }
+            let event = crate::persistence::replay_verify030::read_test_event(row["event"].clone());
+            if matches!(event.kind, FlowEventKind030::Stop) {
+                for a in state.activations.iter().filter(|a| a.phase == "body") {
+                    let mut value = json!({"step":a.step.as_ref().unwrap().join("/")});
+                    item(a, &mut value);
+                    cancelled.push(value);
+                }
+                break;
+            }
+            state = reduce(&f.plan, &state, &event).unwrap().state;
+        }
+    }
     let mut groups = view
         .state
         .groups
@@ -167,6 +214,9 @@ pub(super) async fn project(f: &Fixture, view: &FlowView030) -> Value {
         .bind(&f.identity.system_start_id).bind(&f.identity.flow_invocation_id).fetch_all(&f.pool).await.unwrap();
     for row in rows {
         let resolution: Option<String> = row.get("resolution_json");
+        if (view.state.stopping || interrupted) && resolution.is_none() {
+            continue;
+        }
         let resolution: Value =
             serde_json::from_str(resolution.as_deref().expect("unresolved human request")).unwrap();
         if row.get::<&str, _>("kind") != "approval" && resolution["expired"] == true {

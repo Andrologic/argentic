@@ -321,6 +321,7 @@ impl HumanBroker030 {
         effect_id: &str,
         attempt: Option<&FlowWorkAttempt030>,
     ) -> Result<OwnedHumanWork030> {
+        self.settle_pending_retirement(host).await?;
         let lease = host.start_lease().await?;
         let _gate = host.admission_lock().lock_owned().await;
         let mut connection = self.durable_connection().await?;
@@ -538,6 +539,7 @@ impl HumanBroker030 {
                 "Plan content absent",
             )?;
         }
+        self.settle_pending_retirement(host).await?;
         let lease = host.start_lease().await?;
         let _gate = host.admission_lock().lock_owned().await;
         let mut connection = self.durable_connection().await?;
@@ -603,6 +605,7 @@ impl HumanBroker030 {
         request_id: &str,
         works: &[OwnedHumanWork030],
     ) -> Result<()> {
+        self.settle_pending_retirement(host).await?;
         let lease = host.start_lease().await?;
         let _gate = host.admission_lock().lock_owned().await;
         let mut connection = self.durable_connection().await?;
@@ -662,6 +665,7 @@ impl HumanBroker030 {
             ));
         }
         validate_json(&answer_json)?;
+        self.settle_pending_retirement(host).await?;
         let lease = host.start_lease().await?;
         let _gate = host.admission_lock().lock_owned().await;
         let mut connection = self.durable_connection().await?;
@@ -797,7 +801,27 @@ impl HumanBroker030 {
     pub(crate) async fn tick(&self, host: &HostState) -> Result<()> {
         self.event(host, json!({"kind":"tick"})).await
     }
+    // The work transaction can reserve a retirement asynchronously. Clock
+    // writers hold the broker operation lock and must apply that exact
+    // reservation before appending their own event.
+    async fn settle_pending_retirement(&self, host: &HostState) -> Result<()> {
+        let pending: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM engine_flow030_clock_events
+              WHERE system_id=? AND invocation_id=? AND output_json IS NULL
+                AND json_extract(ticket_json ->> '$.eventJson', '$.event.kind')='retire')",
+        )
+        .bind(&self.identity.system_start_id)
+        .bind(&self.identity.flow_invocation_id)
+        .fetch_one(&self.pool)
+        .await?;
+        if pending {
+            self.pump(host, &CancellationToken::new()).await?;
+        }
+        Ok(())
+    }
+
     async fn event(&self, host: &HostState, event: Value) -> Result<()> {
+        self.settle_pending_retirement(host).await?;
         let lease = host.start_lease().await?;
         let _gate = host.admission_lock().lock_owned().await;
         let mut connection = self.durable_connection().await?;
@@ -839,8 +863,9 @@ impl HumanBroker030 {
         let _gate = host.admission_lock().lock_owned().await;
         let mut connection = self.durable_connection().await?;
         let mut tx = connection.begin_with("BEGIN IMMEDIATE").await?;
-        self.guard(&mut tx, &lease).await?;
-        self.commit(&mut tx, &input, &output).await?;
+        let capture = self.guard(&mut tx, &lease).await?;
+        self.commit(&mut tx, &input, &output, &capture.versions.contract)
+            .await?;
         lease.ensure_live()?;
         tx.commit().await?;
         Ok(Some(output))
@@ -850,6 +875,7 @@ impl HumanBroker030 {
         db: &mut SqliteConnection,
         input: &HostClockInput030,
         output: &HostClockOutput030,
+        contract: &str,
     ) -> Result<()> {
         let stored: Option<String> = sqlx::query_scalar("SELECT output_json FROM engine_flow030_clock_events WHERE system_id=? AND invocation_id=? AND event_id=? AND ticket_json=?")
             .bind(&self.identity.system_start_id).bind(&self.identity.flow_invocation_id).bind(&input.event_id).bind(serde_json::to_string(input)?).fetch_one(&mut *db).await?;
@@ -946,6 +972,27 @@ impl HumanBroker030 {
             .as_array()
             .ok_or_else(|| failure("CORRELATION", "clock", "Missing expirations"))?
         {
+            if contract == argentic_core::AGSDL_040 {
+                // A committed acceptance ends the agent's work budget. The
+                // registry may still be joining its process and reading proof
+                // of a steer. Both decisions arbitrate under the admission lock.
+                let finished: bool = sqlx::query_scalar(
+                    "SELECT EXISTS (
+                        SELECT 1 FROM engine_flow030_work_events
+                        WHERE system_id=? AND invocation_id=? AND activation_id=?
+                          AND json_extract(decision_json ->> '$.receiptJson', '$.decision.kind')
+                              IN ('accepted', 'stopping', 'finished')
+                    )",
+                )
+                .bind(&self.identity.system_start_id)
+                .bind(&self.identity.flow_invocation_id)
+                .bind(work_id.as_str())
+                .fetch_one(&mut *db)
+                .await?;
+                if finished {
+                    continue;
+                }
+            }
             sqlx::query("INSERT INTO engine_flow030_clock_controls(system_id,invocation_id,activation_id,receipt_id,reason,observed_ms) VALUES(?,?,?,?,'TIMEOUT',?) ON CONFLICT DO NOTHING")
                 .bind(&self.identity.system_start_id).bind(&self.identity.flow_invocation_id).bind(work_id.as_str()).bind(uuid()).bind(event["nowMs"].as_str()).execute(&mut *db).await?;
         }
@@ -1137,6 +1184,7 @@ impl HumanBroker030 {
                 && decision.generation == self.generation,
             "Foreign delivery acknowledgment",
         )?;
+        self.settle_pending_retirement(host).await?;
         let lease = host.start_lease().await?;
         let _gate = host.admission_lock().lock_owned().await;
         let mut connection = self.durable_connection().await?;
@@ -1201,11 +1249,52 @@ impl HumanBroker030 {
         self.acknowledge(host, decision).await
     }
     pub(crate) async fn retire_finished(&self, host: &HostState, id: &str) -> Result<()> {
-        let raw: String = sqlx::query_scalar("SELECT work_json FROM engine_flow030_clock_works WHERE system_id=? AND invocation_id=? AND activation_id=?")
+        self.settle_pending_retirement(host).await?;
+        let row = sqlx::query("SELECT work_json,retired FROM engine_flow030_clock_works WHERE system_id=? AND invocation_id=? AND activation_id=?")
             .bind(&self.identity.system_start_id).bind(&self.identity.flow_invocation_id).bind(id).fetch_one(&self.pool).await?;
-        let work: OwnedHumanWork030 = serde_json::from_str(&raw)?;
+        if row.get::<bool, _>("retired") {
+            return Ok(());
+        }
+        let work: OwnedHumanWork030 = serde_json::from_str(row.get("work_json"))?;
         self.retire(host, &work).await?;
         self.pump(host, &CancellationToken::new()).await?;
+        Ok(())
+    }
+    pub(crate) async fn reserve_agent_retirement_tx(
+        &self,
+        db: &mut SqliteConnection,
+        id: &str,
+    ) -> Result<()> {
+        let timed_out: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM engine_flow030_clock_controls
+              WHERE system_id=? AND invocation_id=? AND activation_id=? AND joined=0)",
+        )
+        .bind(&self.identity.system_start_id)
+        .bind(&self.identity.flow_invocation_id)
+        .bind(id)
+        .fetch_one(&mut *db)
+        .await?;
+        if timed_out {
+            return Err(failure("TIMEOUT", "clock", "The work deadline already committed"));
+        }
+        let active: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM engine_flow030_clock_works
+              WHERE system_id=? AND invocation_id=? AND activation_id=?
+                AND kind='agent' AND retired=0)",
+        )
+        .bind(&self.identity.system_start_id)
+        .bind(&self.identity.flow_invocation_id)
+        .bind(id)
+        .fetch_one(&mut *db)
+        .await?;
+        if active {
+            self.reserve(
+                db,
+                json!({"kind":"retire","workId":id}),
+                &self.clock.now_ms().to_string(),
+            )
+            .await?;
+        }
         Ok(())
     }
     /// TIMEOUT was already persisted by pump, under the shared admission fence.

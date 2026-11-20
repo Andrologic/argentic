@@ -14,7 +14,7 @@ macro_rules! dto {
 
 dto!(pub(crate) RuntimeProjection030 { system_start_id:String, flow_invocation_id:String, snapshot_id:String, revision:String, stopping:bool, verdict:Option<String>, instances:Vec<RuntimeInstance030>, activations:Vec<RuntimeActivation030>, groups:Vec<RuntimeGroup030>, paths:Vec<RuntimePath030> });
 dto!(pub RuntimeInstance030 { id:String, agent:String, selector_kind:String, selector_name:Option<String>, current_activation_id:Option<String>, queue_activation_ids:Vec<String>, discarded:bool });
-dto!(pub RuntimeMessage030 { sequence:String, delivery:String, sender:String, message_json:String, statuses:Vec<String>, target_activation_id:Option<String> });
+dto!(pub RuntimeMessage030 { sequence:String, delivery:String, sender:String, message_json:String, statuses:Vec<String>, target_activation_id:Option<String>, #[serde(default, skip_serializing_if = "Option::is_none")] steer_failure:Option<String> });
 dto!(pub RuntimeActivation030 { id:String, step:Option<Vec<String>>, agent:Option<String>, instance_id:Option<String>, phase:String, physical:bool, physical_wait_group_ids:Vec<String>, stop_requested:bool, context:Vec<RuntimeFrame030>, path_ids:Vec<String>, compose_activation_ids:Vec<String>, nearest_fanout_index:Option<String>, #[serde(default, skip_serializing_if = "Option::is_none")] call_result_json:Option<String>, #[serde(default, skip_serializing_if = "Option::is_none")] message:Option<RuntimeMessage030>, #[serde(default, skip_serializing_if = "Option::is_none")] work_text:Option<String> });
 dto!(pub RuntimeGroup030 { id:String, join:Vec<String>, origin_activation_id:String, activation_id:String, decision:Option<String>, released:bool, context:Vec<RuntimeFrame030>, parent_path_ids:Vec<String>, branches:Vec<RuntimeBranch030> });
 dto!(pub RuntimeBranch030 { name:String, fanout:bool, path_ids:Vec<String> });
@@ -97,6 +97,7 @@ fn index_for_context(
 pub(crate) fn project_runtime030(
     plan: &FlowPlan030,
     state: &FlowState030,
+    handoffs: &std::collections::BTreeSet<String>,
 ) -> Result<RuntimeProjection030, ProjectionError030> {
     if let Some(bound) = &state.plan_json {
         if serde_json::to_string(plan).map_err(|_| ProjectionError030::InvalidState)? != *bound {
@@ -165,6 +166,22 @@ pub(crate) fn project_runtime030(
     if instances.windows(2).any(|pair| pair[0].id == pair[1].id) {
         return Err(ProjectionError030::InvalidState);
     }
+    let confirmed_after_stop =
+        if plan.versions.contract == argentic_core::AGSDL_040 && state.stopping {
+            state
+                .events
+                .values()
+                .filter_map(|record| {
+                    let event: serde_json::Value = serde_json::from_str(&record.event_json).ok()?;
+                    event
+                        .pointer("/kind/SteerConsumed/delivery_activation_id")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                })
+                .collect::<std::collections::BTreeSet<_>>()
+        } else {
+            Default::default()
+        };
     let mut activations = state
         .activations
         .iter()
@@ -206,12 +223,20 @@ pub(crate) fn project_runtime030(
                         if steer.is_some_and(|s| s.status == "fallback") {
                             statuses.push("fallback".into());
                         }
-                        if a.start_effect_id.is_some()
-                            || steer.is_some_and(|s| s.status == "consumed")
-                        {
+                        let consumed = steer.is_some_and(|s| s.status == "consumed")
+                            || confirmed_after_stop.contains(&a.id);
+                        let started = a.start_effect_id.as_ref().is_some_and(|id| {
+                            plan.versions.contract != argentic_core::AGSDL_040
+                                || handoffs.contains(id)
+                        });
+                        if started || consumed {
                             statuses.push("delivered".into());
                         }
-                        if a.result.is_some() || steer.is_some_and(|s| s.status == "consumed") {
+                        if (started && a.result.is_some())
+                            || consumed
+                            || (plan.versions.contract != argentic_core::AGSDL_040
+                                && a.result.is_some())
+                        {
                             statuses.push("consumed".into());
                         }
                         RuntimeMessage030 {
@@ -232,6 +257,9 @@ pub(crate) fn project_runtime030(
                             message_json: raw.clone(),
                             statuses,
                             target_activation_id: steer.map(|s| s.work.activation_id.clone()),
+                            steer_failure: steer
+                                .filter(|s| s.status == "failed")
+                                .and_then(|s| s.reason.clone()),
                         }
                     }),
                 work_text: a

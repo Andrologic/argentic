@@ -517,7 +517,7 @@ pub(crate) async fn record_handoff_clock_tx(
     Ok(())
 }
 
-#[cfg(feature = "dev-support")]
+#[cfg(any(test, feature = "dev-support"))]
 impl ClockBroker030 {
     pub(crate) fn approval_check_probe(&self, probe: crate::agsdl_host_evaluation030::Probe) {
         *self
