@@ -517,3 +517,106 @@ async fn explicit_no_send_releases_only_the_claim_and_terminal_performs_queue_fa
     assert!(c.work("nudge").agent_instance_id.is_some());
     c.verify_replay().await;
 }
+
+#[tokio::test]
+async fn quorum_stop_waits_for_steer_settlement_without_failing_the_branch() {
+    for claimed in [false, true] {
+        let plan = include_str!("../tests/fixtures/agsdl030_pending_steer_quorum_plan.json")
+            .replace("agsdl-0.3.0", argentic_core::AGSDL_040)
+            .replace("finish", "stop");
+        let mut c = Case::new(&plan).await;
+        c.settle_fixture_handoffs().await;
+        let steer = c.steer().await;
+        let work = c.work("a");
+        let attempt = c.attempt(&work);
+
+        let (send, mut inbox) = crate::agsdl_host_steer030::channel030();
+        let mut task = if claimed {
+            let (acknowledged, wait_for_offer) = tokio::sync::oneshot::channel();
+            let (lose_evidence, hold_offer) = tokio::sync::oneshot::channel();
+            let host = c.host.clone();
+            let pool = c.pool.clone();
+            let identity = c.state.identity.clone();
+            let effect = steer.id.clone();
+            let attempt = attempt.clone();
+            let task = tokio::spawn(async move {
+                let claim = claim_expected(host.flow030(), &host, &pool, &identity, &effect)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                claim.deliver_steer030(&attempt, &send).await.unwrap();
+            });
+            let adapter = tokio::spawn(async move {
+                let offer = inbox.receive().await.unwrap();
+                acknowledged.send(()).unwrap();
+                hold_offer.await.unwrap();
+                drop(offer);
+            });
+            wait_for_offer.await.unwrap();
+            Some((lose_evidence, task, adapter))
+        } else {
+            None
+        };
+        c.apply(FlowEventKind030::WorkResult {
+            work,
+            result: WorkResult030::Completed {
+                output_json: r#"{"choice":"no"}"#.into(),
+                route_key: Some("no".into()),
+            },
+            physical: Some(PhysicalEvidence030 {
+                native_receipt_id: "physical:a".into(),
+                descendants_joined: true,
+            }),
+        })
+        .await;
+        assert_eq!(c.state.groups[0].decision.as_deref(), Some("missed"));
+        assert!(!c.state.groups[0].released);
+        assert_eq!(c.state.steer_deliveries[0].status, "pending");
+        assert_eq!(c.state.visits_at(&["after".into()]), "0");
+
+        c.settle_fixture_handoffs().await;
+        if let Some((lose_evidence, task, adapter)) = task.take() {
+            lose_evidence.send(()).unwrap();
+            adapter.await.unwrap();
+            task.await.unwrap();
+        } else {
+            claim_expected(
+                c.host.flow030(),
+                &c.host,
+                &c.pool,
+                &c.state.identity,
+                &steer.id,
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .resolve_steer030(None)
+            .await
+            .unwrap();
+        }
+        let state: String = sqlx::query_scalar("SELECT state_json FROM engine_flow030_runs")
+            .fetch_one(&c.pool)
+            .await
+            .unwrap();
+        c.state = serde_json::from_str(&state).unwrap();
+        assert!(c.state.groups[0].released);
+        assert_eq!(c.state.visits_at(&["b".into()]), "0");
+        assert!(!c.state.unhandled_failure);
+        let failures: Vec<String> = sqlx::query_scalar(
+            "SELECT effect_json FROM engine_flow030_outbox WHERE json_extract(effect_json,'$.kind.kind')='failure'")
+            .fetch_all(&c.pool).await.unwrap();
+        if claimed {
+            assert_eq!(c.state.steer_deliveries[0].status, "failed");
+            let [failure] = failures.as_slice() else {
+                panic!("Expected one diagnostic")
+            };
+            assert!(
+                matches!(serde_json::from_str::<FlowEffect030>(failure).unwrap().kind,
+                FlowEffectKind030::Failure { error, counted: false, .. } if error.code == "STEER_UNCERTAIN")
+            );
+        } else {
+            assert_eq!(c.state.steer_deliveries[0].status, "withdrawn");
+            assert!(failures.is_empty());
+        }
+    }
+}

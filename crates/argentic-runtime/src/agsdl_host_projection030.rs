@@ -57,6 +57,7 @@ pub struct RuntimeProjectionPage030 {
     pub flow_invocation_id: String,
     pub revision: String,
     pub stopping: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub termination_uncertain: bool,
     pub verdict: Option<String>,
     pub total: String,
@@ -253,6 +254,18 @@ mod tests {
         };
         let first = page(scope.clone(), None, view.clone()).unwrap();
         assert_eq!(first.items.len(), 100);
+        let legacy = serde_json::to_value(&first).unwrap();
+        assert!(legacy.get("terminationUncertain").is_none());
+        assert_eq!(
+            serde_json::from_value::<RuntimeProjectionPage030>(legacy).unwrap(),
+            first
+        );
+        let mut uncertain = first.clone();
+        uncertain.termination_uncertain = true;
+        assert_eq!(
+            serde_json::to_value(uncertain).unwrap()["terminationUncertain"],
+            true
+        );
         let next = first.next_page.unwrap();
         assert_eq!(
             page(scope.clone(), Some(next.clone()), view.clone())

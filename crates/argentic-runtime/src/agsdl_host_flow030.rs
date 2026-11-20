@@ -2052,8 +2052,12 @@ impl DispatchLease030<'_> {
         } else {
             Some(self._admission)
         };
+        let withdrawing = current
+            && state.activations.iter().any(|activation| {
+                activation.id == *delivery_activation_id && activation.phase == "withdrawingSteer"
+            });
         let (consumed, code) = match recipient
-            .filter(|_| crate::persistence::flow030::accepts_steer030(&state, work))
+            .filter(|_| !withdrawing && crate::persistence::flow030::accepts_steer030(&state, work))
         {
             Some((attempt, sender)) => match tokio::time::timeout(
                 std::time::Duration::from_secs(30),
@@ -2069,7 +2073,8 @@ impl DispatchLease030<'_> {
                 Ok(Err(error)) if error.code == "CORRELATION" => (false, "HARNESS_REFUSED"),
                 _ => (false, "STEER_UNCERTAIN"),
             },
-            None if recipient.is_none()
+            None if !withdrawing
+                && recipient.is_none()
                 && crate::persistence::flow030::accepts_steer030(&state, work) =>
             {
                 (false, "STEER_UNCERTAIN")

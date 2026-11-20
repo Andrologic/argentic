@@ -139,12 +139,20 @@ impl SteerDelivery030 {
         .bind(&self.effect.identity.flow_invocation_id)
         .fetch_one(pool)
         .await?;
-        let state = serde_json::from_str(&raw)?;
-        let FlowEffectKind030::Steer { work, .. } = &self.effect.kind else {
+        let state: crate::persistence::flow030::FlowState030 = serde_json::from_str(&raw)?;
+        let FlowEffectKind030::Steer {
+            work,
+            delivery_activation_id,
+            ..
+        } = &self.effect.kind
+        else {
             return Err(refused());
         };
         if !crate::persistence::flow030::accepts_steer030(&state, work)
             || !crate::persistence::flow030::steer_effect_eligible030(&state, &self.effect)
+            || state.activations.iter().any(|activation| {
+                activation.id == *delivery_activation_id && activation.phase == "withdrawingSteer"
+            })
         {
             return Err(failure(
                 "STALE_REFERENCE",
@@ -178,7 +186,14 @@ impl SteerDelivery030 {
         attempt: &FlowWorkAttempt030,
         consumed: bool,
     ) -> Result<()> {
-        self.evidence(tasks, attempt, consumed)?().map_err(|_| uncertain())
+        let asynchronous = self.gate.is_some();
+        match self.evidence(tasks, attempt, consumed)?() {
+            Ok(()) => Ok(()),
+            // Argentic already settled the sender's attempt. A late report
+            // cannot affect the recipient's work.
+            Err(()) if asynchronous => Ok(()),
+            Err(()) => Err(uncertain()),
+        }
     }
 
     #[cfg(test)]
@@ -246,6 +261,48 @@ mod tests {
                 sender: None,
             },
         }
+    }
+
+    #[tokio::test]
+    async fn expired_040_confirmation_does_not_fail_the_recipient() {
+        let attempt = FlowWorkAttempt030::registry_fixture030("attempt");
+        let (send, mut inbox) = channel030();
+        let tasks = StreamTasks::default();
+        let owned_tasks = tasks.clone();
+        let target = attempt.clone();
+        let (received, receipt) = oneshot::channel();
+        let (expired, wait) = oneshot::channel();
+        let (completed, done) = oneshot::channel();
+        tasks
+            .start_agent030(
+                format!(
+                    "flow030:{}:{}",
+                    attempt.identity().system_start_id,
+                    attempt.start_effect_id()
+                ),
+                &attempt,
+                async move {
+                    let delivery = inbox.receive().await.unwrap();
+                    received.send(()).unwrap();
+                    wait.await.unwrap();
+                    completed
+                        .send(delivery.acknowledge(&owned_tasks, &target))
+                        .unwrap();
+                },
+            )
+            .unwrap();
+        let fx = effect(&attempt);
+        let pool = crate::sqlite::memory().await.unwrap();
+        let mut delivery =
+            Box::pin(send.deliver_with_gate(&fx, &attempt, Some((Arc::new(Mutex::new(())), pool))));
+        tokio::select! {
+            result = &mut delivery => panic!("Delivery resolved before expiry: {}", result.err().unwrap().code),
+            result = receipt => result.unwrap(),
+        }
+        drop(delivery);
+        expired.send(()).unwrap();
+        done.await.unwrap().unwrap();
+        tasks.join_agent030(&attempt, false).await.unwrap();
     }
 
     #[tokio::test]

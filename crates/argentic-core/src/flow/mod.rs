@@ -100,7 +100,7 @@ pub fn steer_effect_eligible030(state: &FlowState030, effect: &FlowEffect030) ->
         })
         && state.activations.iter().any(|delivery| {
             delivery.id == *delivery_activation_id
-                && delivery.phase == "steering"
+                && matches!(delivery.phase.as_str(), "steering" | "withdrawingSteer")
                 && delivery.instance_id == work.agent_instance_id
                 && delivery.message_json.as_deref().unwrap_or("{}") == message_json
                 && delivery.occurrence == *occurrence
@@ -612,11 +612,16 @@ impl Engine<'_> {
                     return Err(FlowInputError030::StaleReference);
                 }
                 let i = self.ai(delivery_activation_id)?;
-                if self.state.activations[i].phase != "steering" {
+                let phase = self.state.activations[i].phase.as_str();
+                if !matches!(phase, "steering" | "withdrawingSteer") {
                     return Err(FlowInputError030::StaleReference);
                 }
+                let withdrawing = phase == "withdrawingSteer";
                 self.state.steer_deliveries[pending].status = "consumed".into();
                 self.state.steer_deliveries[pending].resolved_event_id = Some(self.event_id.into());
+                if withdrawing {
+                    return self.end(i, None);
+                }
                 let c = self.checked_work(work)?;
                 let by = self.state.activations[c]
                     .step
@@ -652,12 +657,31 @@ impl Engine<'_> {
                 let i = self.ai(delivery_activation_id)?;
                 // The native executor attests that this attempt cannot deliver.
                 // The logical end of its recipient can commit just after that proof.
-                let fallback = code == "not-received";
+                let withdrawing = self.state.activations[i].phase == "withdrawingSteer";
+                let fallback = !withdrawing && code == "not-received";
                 let record = &mut self.state.steer_deliveries[pending];
-                record.status = if fallback { "fallback" } else { "failed" }.into();
+                record.status = if withdrawing && code == "not-received" {
+                    "withdrawn"
+                } else if fallback {
+                    "fallback"
+                } else {
+                    "failed"
+                }
+                .into();
                 record.resolved_event_id = Some(self.event_id.into());
                 record.reason = Some(code.clone());
-                if fallback {
+                if withdrawing {
+                    if code != "not-received" {
+                        let a = &self.state.activations[i];
+                        self.effect(FlowEffectKind030::Failure {
+                            activation_id: a.id.clone(),
+                            step: a.step.clone(),
+                            error: Failure030::new(code),
+                            counted: false,
+                        });
+                    }
+                    self.end(i, None)?;
+                } else if fallback {
                     self.state.activations[i].phase = "ready".into();
                     self.admit_delivery(i, false)?;
                     // Activations are allocated in message arrival order.
@@ -1920,6 +1944,14 @@ impl Engine<'_> {
             if self.state.activations[i].phase != "done" {
                 self.state.activations[i].phase = "stopping".into();
             }
+        } else if !self.state.stopping
+            && self.plan.versions.contract == crate::AGSDL_040
+            && matches!(
+                self.state.activations[i].phase.as_str(),
+                "steering" | "withdrawingSteer"
+            )
+        {
+            self.state.activations[i].phase = "withdrawingSteer".into();
         } else {
             self.state.activations[i].phase = "done".into();
         }
@@ -2010,7 +2042,8 @@ impl Engine<'_> {
         for path in &mut self.state.paths {
             if path.phase != "cancelling"
                 || self.state.activations.iter().any(|a| {
-                    a.physical && a.stop_effect_id.is_some() && a.context.iter().any(|frame| {
+                    ((a.physical && a.stop_effect_id.is_some()) || a.phase == "withdrawingSteer")
+                        && a.context.iter().any(|frame| {
                         matches!(frame, Frame030::Path { path_id, .. } if *path_id == path.id)
                     })
                 })
@@ -2197,7 +2230,10 @@ impl Engine<'_> {
                     continue;
                 }
                 let i = self.ai(&pending.delivery_activation_id)?;
-                if self.state.activations[i].phase != "steering" {
+                if !matches!(
+                    self.state.activations[i].phase.as_str(),
+                    "steering" | "withdrawingSteer"
+                ) {
                     self.state.steer_deliveries[n].status = "withdrawn".into();
                     self.state.steer_deliveries[n].resolved_event_id = Some(self.event_id.into());
                     self.state.steer_deliveries[n].reason = Some("delivery-cancelled".into());
