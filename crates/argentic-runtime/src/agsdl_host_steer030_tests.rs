@@ -520,7 +520,7 @@ async fn explicit_no_send_releases_only_the_claim_and_terminal_performs_queue_fa
 
 #[tokio::test]
 async fn quorum_stop_waits_for_steer_settlement_without_failing_the_branch() {
-    for claimed in [false, true] {
+    for (claimed, wired) in [(false, false), (true, false), (true, true)] {
         let plan = include_str!("../tests/fixtures/agsdl030_pending_steer_quorum_plan.json")
             .replace("agsdl-0.3.0", argentic_core::AGSDL_040)
             .replace("finish", "stop");
@@ -548,6 +548,9 @@ async fn quorum_stop_waits_for_steer_settlement_without_failing_the_branch() {
             });
             let adapter = tokio::spawn(async move {
                 let offer = inbox.receive().await.unwrap();
+                if wired {
+                    drop(offer.wire_admission().await.unwrap().unwrap());
+                }
                 acknowledged.send(()).unwrap();
                 hold_offer.await.unwrap();
                 drop(offer);
@@ -605,7 +608,7 @@ async fn quorum_stop_waits_for_steer_settlement_without_failing_the_branch() {
         let failures: Vec<String> = sqlx::query_scalar(
             "SELECT effect_json FROM engine_flow030_outbox WHERE json_extract(effect_json,'$.kind.kind')='failure'")
             .fetch_all(&c.pool).await.unwrap();
-        if claimed {
+        if wired {
             assert_eq!(c.state.steer_deliveries[0].status, "failed");
             let [failure] = failures.as_slice() else {
                 panic!("Expected one diagnostic")
@@ -622,74 +625,94 @@ async fn quorum_stop_waits_for_steer_settlement_without_failing_the_branch() {
 }
 
 #[tokio::test]
-async fn undated_provider_receipt_after_recipient_exclusion_stays_uncertain() {
-    let plan = include_str!("../tests/fixtures/agsdl030_pending_steer_quorum_plan.json")
-        .replace("agsdl-0.3.0", argentic_core::AGSDL_040);
-    let mut c = Case::new(&plan).await;
-    c.settle_fixture_handoffs().await;
-    let steer = c.steer().await;
-    let work = c.work("a");
-    let attempt = c.attempt(&work);
-    let tasks = StreamTasks::default();
-    let owned_tasks = tasks.clone();
-    let target = attempt.clone();
-    let (send, mut inbox) = crate::agsdl_host_steer030::channel030();
-    let (sent, await_sent) = tokio::sync::oneshot::channel();
-    let (deliver, await_delivery) = tokio::sync::oneshot::channel();
-    tasks
-        .start_agent030(
-            format!("flow030:system:{}", work.start_effect_id),
-            &attempt,
-            async move {
-                let message = inbox.receive().await.unwrap();
-                // This is the point where the native adapter would write the provider RPC.
-                drop(message.wire_admission().await.unwrap().unwrap());
-                sent.send(()).unwrap();
-                await_delivery.await.unwrap();
-                message
-                    .acknowledge_from_provider(&owned_tasks, &target)
-                    .await
-                    .unwrap();
-            },
-        )
-        .unwrap();
-    let host = c.host.clone();
-    let pool = c.pool.clone();
-    let identity = c.state.identity.clone();
-    let target = attempt.clone();
-    let delivery = tokio::spawn(async move {
-        let claim = claim_expected(host.flow030(), &host, &pool, &identity, &steer.id)
-            .await
-            .unwrap()
+async fn receipt_after_exclusion_requires_evidence_of_earlier_delivery() {
+    for (stop, witnessed_end) in [(false, false), (true, false), (true, true)] {
+        let plan = include_str!("../tests/fixtures/agsdl030_pending_steer_quorum_plan.json")
+            .replace("agsdl-0.3.0", argentic_core::AGSDL_040);
+        let mut c = Case::new(&plan).await;
+        c.settle_fixture_handoffs().await;
+        let steer = c.steer().await;
+        let work = c.work("a");
+        let attempt = c.attempt(&work);
+        let tasks = StreamTasks::default();
+        let owned_tasks = tasks.clone();
+        let target = attempt.clone();
+        let (send, mut inbox) = crate::agsdl_host_steer030::channel030();
+        let (sent, await_sent) = tokio::sync::oneshot::channel();
+        let (deliver, await_delivery) = tokio::sync::oneshot::channel();
+        tasks
+            .start_agent030(
+                format!("flow030:system:{}", work.start_effect_id),
+                &attempt,
+                async move {
+                    let message = inbox.receive().await.unwrap();
+                    // This is the point where the native adapter would write the provider RPC.
+                    drop(message.wire_admission().await.unwrap().unwrap());
+                    let end_observed =
+                        witnessed_end && message.observe_turn_end_while_counted().await.unwrap();
+                    assert_eq!(end_observed, witnessed_end);
+                    sent.send(()).unwrap();
+                    await_delivery.await.unwrap();
+                    message
+                        .acknowledge_from_provider(&owned_tasks, &target, end_observed)
+                        .await
+                        .unwrap();
+                },
+            )
             .unwrap();
-        claim.deliver_steer030(&target, &send).await.unwrap();
-    });
-    await_sent.await.unwrap();
-    c.apply(FlowEventKind030::WorkResult {
-        work,
-        result: WorkResult030::Completed {
-            output_json: r#"{"choice":"no"}"#.into(),
-            route_key: Some("no".into()),
-        },
-        physical: None,
-    })
-    .await;
-    assert_eq!(c.state.groups[0].decision.as_deref(), Some("missed"));
-    assert!(c
-        .state
-        .activations
-        .iter()
-        .any(|a| a.id == attempt.work().activation_id && a.physical));
-    deliver.send(()).unwrap();
-    delivery.await.unwrap();
-    tasks.join_agent030(&attempt, false).await.unwrap();
+        let host = c.host.clone();
+        let pool = c.pool.clone();
+        let identity = c.state.identity.clone();
+        let target = attempt.clone();
+        let delivery = tokio::spawn(async move {
+            let claim = claim_expected(host.flow030(), &host, &pool, &identity, &steer.id)
+                .await
+                .unwrap()
+                .unwrap();
+            claim.deliver_steer030(&target, &send).await.unwrap();
+        });
+        await_sent.await.unwrap();
+        if stop {
+            c.apply(FlowEventKind030::Stop).await;
+        } else {
+            c.apply(FlowEventKind030::WorkResult {
+                work,
+                result: WorkResult030::Completed {
+                    output_json: r#"{"choice":"no"}"#.into(),
+                    route_key: Some("no".into()),
+                },
+                physical: None,
+            })
+            .await;
+            assert_eq!(c.state.groups[0].decision.as_deref(), Some("missed"));
+            assert!(c
+                .state
+                .activations
+                .iter()
+                .any(|a| a.id == attempt.work().activation_id && a.physical));
+        }
+        deliver.send(()).unwrap();
+        delivery.await.unwrap();
+        tasks.join_agent030(&attempt, false).await.unwrap();
 
-    let state: String = sqlx::query_scalar("SELECT state_json FROM engine_flow030_runs")
-        .fetch_one(&c.pool)
-        .await
-        .unwrap();
-    let state: FlowState030 = serde_json::from_str(&state).unwrap();
-    let receipt = &state.steer_deliveries[0];
-    assert_eq!(receipt.status, "failed");
-    assert_eq!(receipt.reason.as_deref(), Some("STEER_UNCERTAIN"));
+        let state: String = sqlx::query_scalar("SELECT state_json FROM engine_flow030_runs")
+            .fetch_one(&c.pool)
+            .await
+            .unwrap();
+        let state: FlowState030 = serde_json::from_str(&state).unwrap();
+        let receipt = &state.steer_deliveries[0];
+        if stop {
+            assert_eq!(receipt.status, "withdrawn");
+            assert_eq!(
+                state
+                    .events
+                    .values()
+                    .any(|event| event.event_json.contains("\"SteerConsumed\"")),
+                witnessed_end
+            );
+        } else {
+            assert_eq!(receipt.status, "failed");
+            assert_eq!(receipt.reason.as_deref(), Some("STEER_UNCERTAIN"));
+        }
+    }
 }

@@ -9,7 +9,10 @@ use crate::{
     },
     tasks::StreamTasks,
 };
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use tokio::sync::{mpsc, oneshot, Mutex, OwnedMutexGuard};
 
 #[derive(Clone)]
@@ -49,6 +52,34 @@ pub(crate) struct SteerGate030 {
     pub admission: Arc<Mutex<()>>,
     pub pool: sqlx::SqlitePool,
     pub deadline: tokio::time::Instant,
+    wire_admitted: Arc<AtomicBool>,
+}
+
+impl SteerGate030 {
+    pub(crate) fn new(
+        admission: Arc<Mutex<()>>,
+        pool: sqlx::SqlitePool,
+        deadline: tokio::time::Instant,
+    ) -> Self {
+        Self {
+            admission,
+            pool,
+            deadline,
+            wire_admitted: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn lost_evidence(&self) -> crate::persistence::dto::EngineFailure {
+        if self.wire_admitted.load(Ordering::SeqCst) {
+            uncertain()
+        } else {
+            failure(
+                "STEER_NOT_SENT",
+                "steer",
+                "The offer did not reach provider admission",
+            )
+        }
+    }
 }
 
 pub(crate) struct SteerDelivery030 {
@@ -108,7 +139,7 @@ impl SteerSender030 {
         let offered = match &gate {
             Some(gate) => tokio::time::timeout_at(gate.deadline, offer)
                 .await
-                .map_err(|_| uncertain())?,
+                .map_err(|_| gate.lost_evidence())?,
             None => offer.await,
         };
         if offered.is_err() {
@@ -120,12 +151,12 @@ impl SteerSender030 {
         }
         if let Some(gate) = gate {
             match tokio::time::timeout_at(gate.deadline, &mut result).await {
-                Ok(receipt) => receipt.map_err(|_| uncertain())?,
+                Ok(receipt) => receipt.map_err(|_| gate.lost_evidence())?,
                 Err(_) => {
                     // Do not close the receiver while admission can authorize
                     // a send. A write already admitted holds the same guard.
-                    let _admission = gate.admission.lock_owned().await;
-                    let receipt = result.try_recv().map_err(|_| uncertain());
+                    let _admission = gate.admission.clone().lock_owned().await;
+                    let receipt = result.try_recv().map_err(|_| gate.lost_evidence());
                     drop(result);
                     receipt?
                 }
@@ -219,7 +250,22 @@ impl SteerDelivery030 {
                 "The targeted work can no longer receive a steer",
             ));
         }
+        self.gate
+            .as_ref()
+            .unwrap()
+            .wire_admitted
+            .store(true, Ordering::SeqCst);
         Ok(Some(guard))
+    }
+
+    pub(crate) async fn observe_turn_end_while_counted(&self) -> Result<bool> {
+        let Some((_guard, state)) = self.current_state().await? else {
+            return Ok(false);
+        };
+        let FlowEffectKind030::Steer { work, .. } = &self.effect.kind else {
+            return Err(refused());
+        };
+        Ok(crate::persistence::flow030::accepts_steer030(&state, work))
     }
 
     pub(crate) fn deadline(&self) -> Option<tokio::time::Instant> {
@@ -244,13 +290,15 @@ impl SteerDelivery030 {
         self,
         tasks: &StreamTasks,
         attempt: &FlowWorkAttempt030,
+        turn_ended_while_counted: bool,
     ) -> Result<()> {
         let observation = self.current_state().await?;
         if let Some((_guard, state)) = &observation {
             let FlowEffectKind030::Steer { work, .. } = &self.effect.kind else {
                 return Err(refused());
             };
-            if !crate::persistence::flow030::accepts_steer030(state, work)
+            if (!turn_ended_while_counted
+                && !crate::persistence::flow030::accepts_steer030(state, work))
                 || self
                     .deadline()
                     .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
@@ -368,11 +416,11 @@ mod tests {
         let mut result = Box::pin(send.deliver_with_gate(
             &fx,
             &attempt,
-            Some(SteerGate030 {
-                admission: Arc::new(Mutex::new(())),
-                pool: crate::sqlite::memory().await.unwrap(),
-                deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(2),
-            }),
+            Some(SteerGate030::new(
+                Arc::new(Mutex::new(())),
+                crate::sqlite::memory().await.unwrap(),
+                tokio::time::Instant::now() + std::time::Duration::from_secs(2),
+            )),
         ));
         tokio::select! {
             biased;
@@ -402,11 +450,11 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        let gate = SteerGate030 {
-            admission: Arc::new(Mutex::new(())),
+        let gate = SteerGate030::new(
+            Arc::new(Mutex::new(())),
             pool,
-            deadline: tokio::time::Instant::now() + std::time::Duration::from_millis(250),
-        };
+            tokio::time::Instant::now() + std::time::Duration::from_millis(250),
+        );
         let hold = gate.admission.clone().lock_owned().await;
         let (send, mut inbox) = channel030();
         let (receipt, ()) = tokio::join!(
@@ -420,7 +468,7 @@ mod tests {
                 assert_eq!(guard.unwrap_err().code, "UNCERTAIN");
             }
         );
-        assert_eq!(receipt.err().unwrap().code, "UNCERTAIN");
+        assert_eq!(receipt.err().unwrap().code, "STEER_NOT_SENT");
     }
 
     #[tokio::test]
@@ -456,11 +504,11 @@ mod tests {
         let mut delivery = Box::pin(send.deliver_with_gate(
             &fx,
             &attempt,
-            Some(SteerGate030 {
-                admission: Arc::new(Mutex::new(())),
+            Some(SteerGate030::new(
+                Arc::new(Mutex::new(())),
                 pool,
-                deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(30),
-            }),
+                tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+            )),
         ));
         tokio::select! {
             result = &mut delivery => panic!("Delivery resolved before expiry: {}", result.err().unwrap().code),

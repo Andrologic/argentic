@@ -2040,10 +2040,12 @@ impl DispatchLease030<'_> {
                 return Err(refused());
             }
         }
-        let gate = current.then(|| crate::agsdl_host_steer030::SteerGate030 {
-            admission: OwnedMutexGuard::mutex(&self._admission).clone(),
-            pool: self.pool.clone(),
-            deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+        let gate = current.then(|| {
+            crate::agsdl_host_steer030::SteerGate030::new(
+                OwnedMutexGuard::mutex(&self._admission).clone(),
+                self.pool.clone(),
+                tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+            )
         });
         let _admission = if current {
             drop(self._admission);
@@ -2055,7 +2057,7 @@ impl DispatchLease030<'_> {
             && state.activations.iter().any(|activation| {
                 activation.id == *delivery_activation_id && activation.phase == "withdrawingSteer"
             });
-        let (consumed, code) = match recipient
+        let (consumed, mut code) = match recipient
             .filter(|_| !withdrawing && crate::persistence::flow030::accepts_steer030(&state, work))
         {
             Some((attempt, sender)) => {
@@ -2076,6 +2078,7 @@ impl DispatchLease030<'_> {
                     Err(error) if error.code == "CONTENT_UNAVAILABLE" => {
                         (false, "CONTENT_UNAVAILABLE")
                     }
+                    Err(error) if error.code == "STEER_NOT_SENT" => (false, "unsent-at-deadline"),
                     _ => (false, "STEER_UNCERTAIN"),
                 }
             }
@@ -2111,6 +2114,13 @@ impl DispatchLease030<'_> {
             .fetch_one(&mut *tx)
             .await?;
             let state: FlowState030 = serde_json::from_str(&state)?;
+            if code == "unsent-at-deadline" {
+                code = if crate::persistence::flow030::accepts_steer030(&state, work) {
+                    "STEER_UNCERTAIN"
+                } else {
+                    "not-received"
+                };
+            }
             let closed = state.steer_deliveries.iter().any(|delivery| {
                 delivery.effect_id == self.effect.id && delivery.status == "withdrawn"
             });
