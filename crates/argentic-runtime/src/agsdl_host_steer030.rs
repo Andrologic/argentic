@@ -125,9 +125,14 @@ impl SteerDelivery030 {
         &self.effect
     }
 
-    /// Serialize the actual provider send with Stop and recipient completion.
-    /// The adapter releases the guard before awaiting a provider response.
-    pub(crate) async fn wire_admission(&self) -> Result<Option<OwnedMutexGuard<()>>> {
+    async fn current_state(
+        &self,
+    ) -> Result<
+        Option<(
+            OwnedMutexGuard<()>,
+            crate::persistence::flow030::FlowState030,
+        )>,
+    > {
         let Some((gate, pool)) = &self.gate else {
             return Ok(None);
         };
@@ -139,7 +144,15 @@ impl SteerDelivery030 {
         .bind(&self.effect.identity.flow_invocation_id)
         .fetch_one(pool)
         .await?;
-        let state: crate::persistence::flow030::FlowState030 = serde_json::from_str(&raw)?;
+        Ok(Some((guard, serde_json::from_str(&raw)?)))
+    }
+
+    /// Serialize the actual provider send with Stop and recipient completion.
+    /// The adapter releases the guard before awaiting a provider response.
+    pub(crate) async fn wire_admission(&self) -> Result<Option<OwnedMutexGuard<()>>> {
+        let Some((guard, state)) = self.current_state().await? else {
+            return Ok(None);
+        };
         let FlowEffectKind030::Steer {
             work,
             delivery_activation_id,
@@ -165,6 +178,28 @@ impl SteerDelivery030 {
 
     pub(crate) fn wrong_recipient(self) {
         let _ = self.ack.send(Err(refused()));
+    }
+
+    /// A matching Codex notification identifies the work, but carries no
+    /// evidence that its input was received before a committed exclusion.
+    pub(crate) async fn acknowledge_from_provider(
+        self,
+        tasks: &StreamTasks,
+        attempt: &FlowWorkAttempt030,
+    ) -> Result<()> {
+        let observation = self.current_state().await?;
+        if let Some((_guard, state)) = &observation {
+            let FlowEffectKind030::Steer { work, .. } = &self.effect.kind else {
+                return Err(refused());
+            };
+            if !crate::persistence::flow030::accepts_steer030(state, work) {
+                // Codex does not date input receipt relative to the engine's
+                // exclusion. Dropping the channel reports uncertainty while
+                // explicit evidence of the wrong recipient reports refusal.
+                return Ok(());
+            }
+        }
+        self.acknowledge(tasks, attempt)
     }
 
     /// Call only after the transport has consumed the message and sender.

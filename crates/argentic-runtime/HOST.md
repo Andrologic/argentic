@@ -130,6 +130,9 @@ stop. Poll `inspect` for `stopping: true` while the executors are still
 terminating. The terminal verdict is `cancelled` after physical confirmation.
 The stop withdraws queued work and closes human requests when it commits.
 Late evidence of receipt before the stop is retained for reporting.
+Codex notifications identify a turn and message. When the first observation
+comes after a committed exclusion, those identifiers alone leave the timing
+of receipt uncertain.
 
 ## Storage, API and limits
 
