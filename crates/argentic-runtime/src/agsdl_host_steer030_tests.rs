@@ -653,10 +653,15 @@ async fn receipt_after_exclusion_requires_evidence_of_earlier_delivery() {
                     assert_eq!(end_observed, witnessed_end);
                     sent.send(()).unwrap();
                     await_delivery.await.unwrap();
-                    message
-                        .acknowledge_from_provider(&owned_tasks, &target, end_observed)
-                        .await
-                        .unwrap();
+                    let mut offer = Some(message);
+                    crate::agsdl_host_steer030::SteerDelivery030::acknowledge_from_provider(
+                        &mut offer,
+                        &owned_tasks,
+                        &target,
+                        end_observed,
+                    )
+                    .await
+                    .unwrap();
                 },
             )
             .unwrap();

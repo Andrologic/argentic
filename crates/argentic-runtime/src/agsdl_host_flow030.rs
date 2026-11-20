@@ -2116,7 +2116,7 @@ impl DispatchLease030<'_> {
             let state: FlowState030 = serde_json::from_str(&state)?;
             if code == "unsent-at-deadline" {
                 code = if crate::persistence::flow030::accepts_steer030(&state, work) {
-                    "STEER_UNCERTAIN"
+                    "HARNESS_REFUSED"
                 } else {
                     "not-received"
                 };

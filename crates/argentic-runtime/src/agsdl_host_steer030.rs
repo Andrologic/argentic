@@ -85,8 +85,13 @@ impl SteerGate030 {
 pub(crate) struct SteerDelivery030 {
     effect: FlowEffect030,
     attempt: FlowWorkAttempt030,
-    ack: oneshot::Sender<Result<ConsumedSteer030>>,
+    ack: oneshot::Sender<Result<SteerProof030>>,
     gate: Option<SteerGate030>,
+}
+
+enum SteerProof030 {
+    Receipt(ConsumedSteer030),
+    Observation(futures::future::BoxFuture<'static, Result<ConsumedSteer030>>),
 }
 
 /// Sealed evidence from the owned consumer, never deserialized from IPC.
@@ -149,7 +154,7 @@ impl SteerSender030 {
                 consumed: false,
             });
         }
-        if let Some(gate) = gate {
+        let proof = if let Some(gate) = gate {
             match tokio::time::timeout_at(gate.deadline, &mut result).await {
                 Ok(receipt) => receipt.map_err(|_| gate.lost_evidence())?,
                 Err(_) => {
@@ -163,6 +168,10 @@ impl SteerSender030 {
             }
         } else {
             result.await.map_err(|_| uncertain())?
+        }?;
+        match proof {
+            SteerProof030::Receipt(receipt) => Ok(receipt),
+            SteerProof030::Observation(observation) => observation.await,
         }
     }
 }
@@ -181,11 +190,11 @@ struct QueuedSteer030(Option<SteerDelivery030>);
 impl Drop for QueuedSteer030 {
     fn drop(&mut self) {
         if let Some(offer) = self.0.take().filter(|offer| offer.gate.is_some()) {
-            let _ = offer.ack.send(Ok(ConsumedSteer030 {
+            let _ = offer.ack.send(Ok(SteerProof030::Receipt(ConsumedSteer030 {
                 effect: offer.effect,
                 attempt: offer.attempt,
                 consumed: false,
-            }));
+            })));
         }
     }
 }
@@ -287,29 +296,70 @@ impl SteerDelivery030 {
     /// A matching Codex notification identifies the work, but carries no
     /// evidence that its input was received before a committed exclusion.
     pub(crate) async fn acknowledge_from_provider(
-        self,
+        delivery: &mut Option<Self>,
         tasks: &StreamTasks,
         attempt: &FlowWorkAttempt030,
         turn_ended_while_counted: bool,
     ) -> Result<()> {
-        let observation = self.current_state().await?;
+        let Some(offer) = delivery.as_ref() else {
+            return Ok(());
+        };
+        // Keep the proof and offer in their owner until the cancellable read
+        // returns. Stop can continue this same observation if it wins the race.
+        let observation = if turn_ended_while_counted {
+            None
+        } else {
+            offer.current_state().await?
+        };
+        let offer = delivery.take().unwrap();
         if let Some((_guard, state)) = &observation {
-            let FlowEffectKind030::Steer { work, .. } = &self.effect.kind else {
+            let FlowEffectKind030::Steer { work, .. } = &offer.effect.kind else {
                 return Err(refused());
             };
-            if (!turn_ended_while_counted
-                && !crate::persistence::flow030::accepts_steer030(state, work))
-                || self
-                    .deadline()
-                    .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
-            {
-                // Codex does not date input receipt relative to the engine's
-                // exclusion. Dropping the channel reports uncertainty while
-                // explicit evidence of the wrong recipient reports refusal.
+            if !crate::persistence::flow030::accepts_steer030(state, work) {
                 return Ok(());
             }
         }
-        self.acknowledge(tasks, attempt)
+        if offer
+            .deadline()
+            .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+        {
+            return Ok(());
+        }
+        offer.acknowledge(tasks, attempt)
+    }
+
+    /// Transfer a bounded, read-only observation to the already supervised
+    /// steer task. The recipient can join its process and commit its result
+    /// while this observer reads any remaining notifications.
+    pub(crate) fn handoff_observation<F>(
+        self,
+        tasks: &StreamTasks,
+        attempt: &FlowWorkAttempt030,
+        observation: F,
+    ) -> Result<()>
+    where
+        F: std::future::Future<Output = Result<Option<bool>>> + Send + 'static,
+    {
+        self.verify_consumer(tasks, attempt)?;
+        let deadline = self
+            .deadline()
+            .unwrap_or_else(|| tokio::time::Instant::now() + std::time::Duration::from_secs(2));
+        let observe = async move {
+            let consumed = tokio::time::timeout_at(deadline, observation)
+                .await
+                .map_err(|_| uncertain())??
+                .ok_or_else(uncertain)?;
+            Ok(ConsumedSteer030 {
+                effect: self.effect,
+                attempt: self.attempt,
+                consumed,
+            })
+        };
+        let _ = self
+            .ack
+            .send(Ok(SteerProof030::Observation(Box::pin(observe))));
+        Ok(())
     }
 
     /// Call only after the transport has consumed the message and sender.
@@ -357,6 +407,19 @@ impl SteerDelivery030 {
         attempt: &FlowWorkAttempt030,
         consumed: bool,
     ) -> Result<impl FnOnce() -> std::result::Result<(), ()> + Send> {
+        self.verify_consumer(tasks, attempt)?;
+        Ok(move || {
+            self.ack
+                .send(Ok(SteerProof030::Receipt(ConsumedSteer030 {
+                    effect: self.effect,
+                    attempt: self.attempt,
+                    consumed,
+                })))
+                .map_err(|_| ())
+        })
+    }
+
+    fn verify_consumer(&self, tasks: &StreamTasks, attempt: &FlowWorkAttempt030) -> Result<()> {
         if !matches_attempt(&self.effect, attempt)
             || self.attempt.provider_attempt_id() != attempt.provider_attempt_id()
             || self.attempt.owner() != attempt.owner()
@@ -371,16 +434,7 @@ impl SteerDelivery030 {
         );
         tasks
             .verify_agent_scope030(&request, attempt)
-            .map_err(|_| refused())?;
-        Ok(move || {
-            self.ack
-                .send(Ok(ConsumedSteer030 {
-                    effect: self.effect,
-                    attempt: self.attempt,
-                    consumed,
-                }))
-                .map_err(|_| ())
-        })
+            .map_err(|_| refused())
     }
 }
 
@@ -406,6 +460,47 @@ mod tests {
                 sender: None,
             },
         }
+    }
+
+    #[tokio::test]
+    async fn recipient_finishes_while_steer_task_waits_for_the_transferred_observation() {
+        let attempt = FlowWorkAttempt030::registry_fixture030("attempt");
+        let target = attempt.clone();
+        let fx = effect(&attempt);
+        let tasks = StreamTasks::default();
+        let registry = tasks.clone();
+        let (send, mut inbox) = channel030();
+        let (finished, ended) = oneshot::channel();
+        let (confirm, receipt) = oneshot::channel();
+        tasks
+            .start_agent030(
+                format!(
+                    "flow030:{}:{}",
+                    attempt.identity().system_start_id,
+                    attempt.start_effect_id()
+                ),
+                &attempt,
+                async move {
+                    inbox
+                        .receive()
+                        .await
+                        .unwrap()
+                        .handoff_observation(&registry, &target, async {
+                            Ok(receipt.await.ok().map(|()| true))
+                        })
+                        .unwrap();
+                    finished.send(()).unwrap();
+                },
+            )
+            .unwrap();
+        let mut pending = Box::pin(send.deliver(&fx, &attempt));
+        tokio::select! {
+            _ = &mut pending => panic!("Steer settled before the receipt"),
+            result = ended => result.unwrap(),
+        }
+        tasks.join_agent030(&attempt, false).await.unwrap();
+        confirm.send(()).unwrap();
+        assert!(pending.await.unwrap().consumed());
     }
 
     #[tokio::test]
