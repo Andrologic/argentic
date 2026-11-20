@@ -2040,11 +2040,10 @@ impl DispatchLease030<'_> {
                 return Err(refused());
             }
         }
-        let gate = current.then(|| {
-            (
-                OwnedMutexGuard::mutex(&self._admission).clone(),
-                self.pool.clone(),
-            )
+        let gate = current.then(|| crate::agsdl_host_steer030::SteerGate030 {
+            admission: OwnedMutexGuard::mutex(&self._admission).clone(),
+            pool: self.pool.clone(),
+            deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(30),
         });
         let _admission = if current {
             drop(self._admission);
@@ -2059,20 +2058,27 @@ impl DispatchLease030<'_> {
         let (consumed, code) = match recipient
             .filter(|_| !withdrawing && crate::persistence::flow030::accepts_steer030(&state, work))
         {
-            Some((attempt, sender)) => match tokio::time::timeout(
-                std::time::Duration::from_secs(30),
-                sender.deliver_with_gate(&self.effect, attempt, gate.clone()),
-            )
-            .await
-            {
-                Ok(Ok(receipt)) if receipt.verifies(&self.effect, attempt) => {
-                    (receipt.consumed(), "not-received")
+            Some((attempt, sender)) => {
+                let delivery = sender.deliver_with_gate(&self.effect, attempt, gate.clone());
+                let receipt = if current {
+                    delivery.await
+                } else {
+                    tokio::time::timeout(std::time::Duration::from_secs(30), delivery)
+                        .await
+                        .map_err(|_| uncertain())?
+                };
+                match receipt {
+                    Ok(receipt) if receipt.verifies(&self.effect, attempt) => {
+                        (receipt.consumed(), "not-received")
+                    }
+                    Err(error) if !current => return Err(error),
+                    Err(error) if error.code == "CORRELATION" => (false, "HARNESS_REFUSED"),
+                    Err(error) if error.code == "CONTENT_UNAVAILABLE" => {
+                        (false, "CONTENT_UNAVAILABLE")
+                    }
+                    _ => (false, "STEER_UNCERTAIN"),
                 }
-                Ok(Err(error)) if !current => return Err(error),
-                Err(_) if !current => return Err(uncertain()),
-                Ok(Err(error)) if error.code == "CORRELATION" => (false, "HARNESS_REFUSED"),
-                _ => (false, "STEER_UNCERTAIN"),
-            },
+            }
             None if !withdrawing
                 && recipient.is_none()
                 && crate::persistence::flow030::accepts_steer030(&state, work) =>
@@ -2082,7 +2088,7 @@ impl DispatchLease030<'_> {
             None => (false, "not-received"),
         };
         let _resolution_admission = match gate {
-            Some((admission, _)) => Some(admission.lock_owned().await),
+            Some(gate) => Some(gate.admission.lock_owned().await),
             None => None,
         };
         self.lease.ensure_live().map_err(|_| uncertain())?;

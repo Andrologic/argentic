@@ -248,13 +248,9 @@ pub(crate) fn project_runtime030(
                             message_json: raw.clone(),
                             statuses,
                             target_activation_id: steer.map(|s| s.work.activation_id.clone()),
-                            steer_failure: steer.filter(|s| s.status == "failed").map(|s| {
-                                if s.reason.as_deref() == Some("STEER_UNCERTAIN") {
-                                    "STEER_UNCERTAIN".into()
-                                } else {
-                                    "HARNESS_REFUSED".into()
-                                }
-                            }),
+                            steer_failure: steer
+                                .filter(|s| s.status == "failed")
+                                .and_then(|s| s.reason.clone()),
                         }
                     }),
                 work_text: a

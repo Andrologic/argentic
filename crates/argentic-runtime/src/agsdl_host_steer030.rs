@@ -13,8 +13,8 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, Mutex, OwnedMutexGuard};
 
 #[derive(Clone)]
-pub(crate) struct SteerSender030(mpsc::Sender<SteerDelivery030>);
-pub(crate) struct SteerInbox030(mpsc::Receiver<SteerDelivery030>);
+pub(crate) struct SteerSender030(mpsc::Sender<QueuedSteer030>);
+pub(crate) struct SteerInbox030(mpsc::Receiver<QueuedSteer030>);
 
 pub(crate) fn channel030() -> (SteerSender030, SteerInbox030) {
     let (send, recv) = mpsc::channel(1);
@@ -44,11 +44,18 @@ fn matches_attempt(effect: &FlowEffect030, attempt: &FlowWorkAttempt030) -> bool
         && work.agent_instance_id == attempt.work().agent_instance_id)
 }
 
+#[derive(Clone)]
+pub(crate) struct SteerGate030 {
+    pub admission: Arc<Mutex<()>>,
+    pub pool: sqlx::SqlitePool,
+    pub deadline: tokio::time::Instant,
+}
+
 pub(crate) struct SteerDelivery030 {
     effect: FlowEffect030,
     attempt: FlowWorkAttempt030,
     ack: oneshot::Sender<Result<ConsumedSteer030>>,
-    gate: Option<(Arc<Mutex<()>>, sqlx::SqlitePool)>,
+    gate: Option<SteerGate030>,
 }
 
 /// Sealed evidence from the owned consumer, never deserialized from IPC.
@@ -86,30 +93,46 @@ impl SteerSender030 {
         &self,
         effect: &FlowEffect030,
         attempt: &FlowWorkAttempt030,
-        gate: Option<(Arc<Mutex<()>>, sqlx::SqlitePool)>,
+        gate: Option<SteerGate030>,
     ) -> Result<ConsumedSteer030> {
         if !matches_attempt(effect, attempt) {
             return Err(refused());
         }
-        let (ack, result) = oneshot::channel();
-        if self
-            .0
-            .send(SteerDelivery030 {
-                effect: effect.clone(),
-                attempt: attempt.clone(),
-                ack,
-                gate,
-            })
-            .await
-            .is_err()
-        {
+        let (ack, mut result) = oneshot::channel();
+        let offer = self.0.send(QueuedSteer030(Some(SteerDelivery030 {
+            effect: effect.clone(),
+            attempt: attempt.clone(),
+            ack,
+            gate: gate.clone(),
+        })));
+        let offered = match &gate {
+            Some(gate) => tokio::time::timeout_at(gate.deadline, offer)
+                .await
+                .map_err(|_| uncertain())?,
+            None => offer.await,
+        };
+        if offered.is_err() {
             return Ok(ConsumedSteer030 {
                 effect: effect.clone(),
                 attempt: attempt.clone(),
                 consumed: false,
             });
         }
-        result.await.map_err(|_| uncertain())?
+        if let Some(gate) = gate {
+            match tokio::time::timeout_at(gate.deadline, &mut result).await {
+                Ok(receipt) => receipt.map_err(|_| uncertain())?,
+                Err(_) => {
+                    // Do not close the receiver while admission can authorize
+                    // a send. A write already admitted holds the same guard.
+                    let _admission = gate.admission.lock_owned().await;
+                    let receipt = result.try_recv().map_err(|_| uncertain());
+                    drop(result);
+                    receipt?
+                }
+            }
+        } else {
+            result.await.map_err(|_| uncertain())?
+        }
     }
 }
 impl SteerInbox030 {
@@ -117,9 +140,25 @@ impl SteerInbox030 {
         self.0.close();
     }
     pub(crate) async fn receive(&mut self) -> Option<SteerDelivery030> {
-        self.0.recv().await
+        self.0.recv().await.and_then(|mut offer| offer.0.take())
     }
 }
+/// The mailbox can prove non-receipt even if preparation fails before
+/// the executor starts polling its inbox.
+struct QueuedSteer030(Option<SteerDelivery030>);
+
+impl Drop for QueuedSteer030 {
+    fn drop(&mut self) {
+        if let Some(offer) = self.0.take().filter(|offer| offer.gate.is_some()) {
+            let _ = offer.ack.send(Ok(ConsumedSteer030 {
+                effect: offer.effect,
+                attempt: offer.attempt,
+                consumed: false,
+            }));
+        }
+    }
+}
+
 impl SteerDelivery030 {
     pub(crate) fn effect(&self) -> &FlowEffect030 {
         &self.effect
@@ -133,16 +172,16 @@ impl SteerDelivery030 {
             crate::persistence::flow030::FlowState030,
         )>,
     > {
-        let Some((gate, pool)) = &self.gate else {
+        let Some(gate) = &self.gate else {
             return Ok(None);
         };
-        let guard = gate.clone().lock_owned().await;
+        let guard = gate.admission.clone().lock_owned().await;
         let raw: String = sqlx::query_scalar(
             "SELECT state_json FROM engine_flow030_runs WHERE system_id=? AND invocation_id=?",
         )
         .bind(&self.effect.identity.system_start_id)
         .bind(&self.effect.identity.flow_invocation_id)
-        .fetch_one(pool)
+        .fetch_one(&gate.pool)
         .await?;
         Ok(Some((guard, serde_json::from_str(&raw)?)))
     }
@@ -161,6 +200,13 @@ impl SteerDelivery030 {
         else {
             return Err(refused());
         };
+        if self.ack.is_closed()
+            || self
+                .deadline()
+                .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+        {
+            return Err(uncertain());
+        }
         if !crate::persistence::flow030::accepts_steer030(&state, work)
             || !crate::persistence::flow030::steer_effect_eligible030(&state, &self.effect)
             || state.activations.iter().any(|activation| {
@@ -174,6 +220,18 @@ impl SteerDelivery030 {
             ));
         }
         Ok(Some(guard))
+    }
+
+    pub(crate) fn deadline(&self) -> Option<tokio::time::Instant> {
+        self.gate.as_ref().map(|gate| gate.deadline)
+    }
+
+    pub(crate) fn unavailable_content(self) {
+        let _ = self.ack.send(Err(failure(
+            "CONTENT_UNAVAILABLE",
+            "steer",
+            "The steer message content could not be prepared",
+        )));
     }
 
     pub(crate) fn wrong_recipient(self) {
@@ -192,7 +250,11 @@ impl SteerDelivery030 {
             let FlowEffectKind030::Steer { work, .. } = &self.effect.kind else {
                 return Err(refused());
             };
-            if !crate::persistence::flow030::accepts_steer030(state, work) {
+            if !crate::persistence::flow030::accepts_steer030(state, work)
+                || self
+                    .deadline()
+                    .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+            {
                 // Codex does not date input receipt relative to the engine's
                 // exclusion. Dropping the channel reports uncertainty while
                 // explicit evidence of the wrong recipient reports refusal.
@@ -299,6 +361,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dropping_an_unpolled_040_mailbox_proves_non_receipt() {
+        let attempt = FlowWorkAttempt030::registry_fixture030("attempt");
+        let fx = effect(&attempt);
+        let (send, inbox) = channel030();
+        let mut result = Box::pin(send.deliver_with_gate(
+            &fx,
+            &attempt,
+            Some(SteerGate030 {
+                admission: Arc::new(Mutex::new(())),
+                pool: crate::sqlite::memory().await.unwrap(),
+                deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(2),
+            }),
+        ));
+        tokio::select! {
+            biased;
+            _ = &mut result => panic!("Mail was settled before closing"),
+            _ = tokio::task::yield_now() => (),
+        }
+        assert_eq!(send.0.capacity(), 0);
+        drop(inbox);
+        assert!(!result.await.unwrap().consumed());
+    }
+
+    #[tokio::test]
+    async fn expiration_while_waiting_for_admission_prevents_provider_send() {
+        let attempt = FlowWorkAttempt030::registry_fixture030("attempt");
+        let fx = effect(&attempt);
+        let id = attempt.identity();
+        let pool = crate::sqlite::memory().await.unwrap();
+        sqlx::query("INSERT INTO engine_flow030_runs VALUES(?,?,?,?,'{}','{}',?)")
+            .bind(&id.system_start_id)
+            .bind(&id.flow_invocation_id)
+            .bind(&id.snapshot_id)
+            .bind(&id.epoch)
+            .bind(
+                serde_json::to_string(&crate::persistence::flow030::FlowState030::new(id.clone()))
+                    .unwrap(),
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+        let gate = SteerGate030 {
+            admission: Arc::new(Mutex::new(())),
+            pool,
+            deadline: tokio::time::Instant::now() + std::time::Duration::from_millis(250),
+        };
+        let hold = gate.admission.clone().lock_owned().await;
+        let (send, mut inbox) = channel030();
+        let (receipt, ()) = tokio::join!(
+            send.deliver_with_gate(&fx, &attempt, Some(gate.clone())),
+            async {
+                let offer = inbox.receive().await.unwrap();
+                let (guard, ()) = tokio::join!(offer.wire_admission(), async {
+                    tokio::time::sleep_until(gate.deadline).await;
+                    drop(hold);
+                });
+                assert_eq!(guard.unwrap_err().code, "UNCERTAIN");
+            }
+        );
+        assert_eq!(receipt.err().unwrap().code, "UNCERTAIN");
+    }
+
+    #[tokio::test]
     async fn expired_040_confirmation_does_not_fail_the_recipient() {
         let attempt = FlowWorkAttempt030::registry_fixture030("attempt");
         let (send, mut inbox) = channel030();
@@ -328,8 +453,15 @@ mod tests {
             .unwrap();
         let fx = effect(&attempt);
         let pool = crate::sqlite::memory().await.unwrap();
-        let mut delivery =
-            Box::pin(send.deliver_with_gate(&fx, &attempt, Some((Arc::new(Mutex::new(())), pool))));
+        let mut delivery = Box::pin(send.deliver_with_gate(
+            &fx,
+            &attempt,
+            Some(SteerGate030 {
+                admission: Arc::new(Mutex::new(())),
+                pool,
+                deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+            }),
+        ));
         tokio::select! {
             result = &mut delivery => panic!("Delivery resolved before expiry: {}", result.err().unwrap().code),
             result = receipt => result.unwrap(),

@@ -694,10 +694,9 @@ impl Engine<'_> {
                             .sort_by_cached_key(|id| activations.iter().position(|a| a.id == *id));
                     }
                 } else {
-                    let reason = if code == "STEER_UNCERTAIN" {
-                        "STEER_UNCERTAIN"
-                    } else {
-                        "HARNESS_REFUSED"
+                    let reason = match code.as_str() {
+                        "STEER_UNCERTAIN" | "CONTENT_UNAVAILABLE" => code.as_str(),
+                        _ => "HARNESS_REFUSED",
                     };
                     self.fail(i, Failure030::new(reason))?;
                 }
