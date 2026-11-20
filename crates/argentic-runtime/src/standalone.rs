@@ -1156,6 +1156,8 @@ mod tests {
                        CAST(json_extract(ticket_json ->> '$.eventJson','$.nowMs') AS INTEGER) + 1
                        FROM engine_flow030_clock_events)",
                      "human.readback"),
+                    ("UPDATE engine_flow030_clock SET observed_ms=X'FF'",
+                     "human.readback"),
                 ].into_iter().enumerate() {
                     let copy = f.data.join(format!("wrong-replay-{index}.sqlite"));
                     std::fs::copy(f.data.join("engine.sqlite"), &copy).unwrap();

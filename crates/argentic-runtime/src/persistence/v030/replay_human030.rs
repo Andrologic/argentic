@@ -89,6 +89,7 @@ pub(super) async fn verify(
     }
     require(clocks.len() == 1, "Duplicate clock")?;
     let clock = &clocks[0];
+    let retained_observed = ms(clock.try_get("observed_ms")?)?;
     let native_owner = sqlx::query(
         "SELECT o.owner_epoch,o.generation,o.status,EXISTS (
             SELECT 1 FROM engine_flow030_system_stop_requests s
@@ -349,7 +350,7 @@ pub(super) async fn verify(
             // retain an undecided tail, but it contributes no clock output.
             require(fenced_stop && index + 1 == events.len(), "Uncommitted clock ticket")?;
             require(
-                index != 0 || now >= ms(clock.get("observed_ms"))?,
+                index != 0 || now >= retained_observed,
                 "Initial clock observation is later than its reservation",
             )?;
             break;
@@ -415,7 +416,7 @@ pub(super) async fn verify(
         clock.get::<&str, _>("revision") == journal.len().to_string()
             && clock.get::<&str, _>("state_json") == previous
             && parsed(clock, "receipt_json")? == last
-            && (journal.is_empty() || ms(clock.get("observed_ms"))? == observed),
+            && (journal.is_empty() || retained_observed == observed),
         "Final clock differs",
     )?;
     require(
