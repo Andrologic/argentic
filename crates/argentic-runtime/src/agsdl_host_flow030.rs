@@ -2675,23 +2675,7 @@ pub(crate) async fn recover_pending_stops030(host: &HostState, pool: &SqlitePool
                             step.r#type == "approval" && Some(&step.address) == activation.step.as_ref()
                         })
                 }) {
-                    let current = control.read(pool).await?;
-                    let result = control.apply(pool, &FlowEvent030 {
-                        identity: control.identity.clone(),
-                        event_id: format!("reopened-approval-stop:{stop}"),
-                        expected_revision: current.state.revision,
-                        kind: FlowEventKind030::PhysicalEnded {
-                            work,
-                            stop_effect_id: Some(stop.clone()),
-                            evidence: PhysicalEvidence030 {
-                                native_receipt_id: format!("reopened-approval:{start_effect_id}"),
-                                descendants_joined: true,
-                            },
-                        },
-                    }).await?;
-                    if matches!(result, Apply030::Diagnostic(_)) {
-                        return Err(refused());
-                    }
+                    control.settle_reopened_approval(pool, work, stop).await?;
                 }
             }
         }
@@ -2921,6 +2905,86 @@ struct NoAdmissionReceipt030 {
 }
 
 impl FlowControl030 {
+    async fn settle_reopened_approval(
+        &self,
+        pool: &SqlitePool,
+        work: WorkRef030,
+        stop: &str,
+    ) -> Result<()> {
+        let _admission = self.admission.clone().lock_owned().await;
+        let mut db = pool.acquire().await?;
+        sqlx::query("PRAGMA synchronous=FULL").execute(&mut *db).await?;
+        let mut tx = db.begin_with("BEGIN IMMEDIATE").await?;
+        let view = flow_store030::read_tx(&mut tx, self, &self.identity)
+            .await.map_err(store_error)?;
+        let start: Option<String> = sqlx::query_scalar(
+            "SELECT receipt_json FROM engine_flow030_handoffs
+             WHERE system_id=? AND invocation_id=? AND effect_id=? AND owner_epoch=? AND generation=?",
+        )
+        .bind(&self.identity.system_start_id).bind(&self.identity.flow_invocation_id)
+        .bind(&work.start_effect_id).bind(&self.owner.owner_epoch).bind(&self.generation)
+        .fetch_optional(&mut *tx).await?;
+        let Some(start) = start else {
+            return Ok(());
+        };
+        let start: Value = serde_json::from_str(&start)?;
+        let expected_start = format!("flow030:{}:{}", self.identity.system_start_id, work.start_effect_id);
+        if start["kind"] != "nativeOwnedHandoff030" || start["requestId"] != expected_start
+            || start.get("workAttempt").is_some() || !view.state.stopping
+        {
+            return Err(refused());
+        }
+        let row = sqlx::query(
+            "SELECT status,effect_json FROM engine_flow030_outbox
+             WHERE system_id=? AND invocation_id=? AND effect_id=? AND owner_epoch=?",
+        )
+        .bind(&self.identity.system_start_id).bind(&self.identity.flow_invocation_id)
+        .bind(stop).bind(&self.owner.owner_epoch).fetch_one(&mut *tx).await?;
+        let effect: FlowEffect030 = serde_json::from_str(row.get("effect_json"))?;
+        if effect.id != stop || effect.identity != self.identity
+            || !matches!(&effect.kind, FlowEffectKind030::StopWork { work: target, include_descendants: true } if target == &work)
+        {
+            return Err(refused());
+        }
+        let event = FlowEvent030 {
+            identity: self.identity.clone(),
+            event_id: format!("reopened-approval-stop:{stop}"),
+            expected_revision: view.state.revision,
+            kind: FlowEventKind030::PhysicalEnded {
+                work: work.clone(),
+                stop_effect_id: Some(stop.into()),
+                evidence: PhysicalEvidence030 {
+                    native_receipt_id: expected_start,
+                    descendants_joined: true,
+                },
+            },
+        };
+        let result = flow_store030::apply_tx(&mut tx, self, &event).await.map_err(store_error)?;
+        if !matches!(result, Apply030::Applied(_)) {
+            return Err(refused());
+        }
+        if row.get::<&str, _>("status") != "settled" {
+            let receipt = json!({
+                "kind":"nativeReopenedApprovalStop030", "eventId":event.event_id,
+                "startEffectId":work.start_effect_id, "stopEffectId":stop,
+                "requestId":start["requestId"], "ownerEpoch":self.owner.owner_epoch,
+                "generation":self.generation
+            });
+            let changed = sqlx::query(
+                "UPDATE engine_flow030_outbox SET status='settled',settlement_json=?
+                 WHERE system_id=? AND invocation_id=? AND effect_id=? AND owner_epoch=?
+                 AND status IN ('pending','uncertain')",
+            )
+            .bind(receipt.to_string()).bind(&self.identity.system_start_id)
+            .bind(&self.identity.flow_invocation_id).bind(stop).bind(&self.owner.owner_epoch)
+            .execute(&mut *tx).await?.rows_affected();
+            if changed != 1 {
+                return Err(refused());
+            }
+        }
+        tx.commit().await.map_err(|_| uncertain())?;
+        Ok(())
+    }
     pub(crate) fn identity(&self) -> &FlowIdentity030 {
         &self.identity
     }

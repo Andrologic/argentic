@@ -341,11 +341,18 @@ impl PendingSteer030 {
             return Ok(());
         }
         let id = delivery.effect().id.clone();
+        let request_id = self.request_id;
         delivery.handoff_observation(&context.tasks, &context.attempt, async move {
             // Keep the app-server and its registry cleanup alive until it
             // emits the remaining evidence or the observation expires.
             let _owned = owned;
             while let Ok(event) = client.notification().await {
+                if request_id.is_some()
+                    && event["id"].as_u64() == request_id
+                    && steer_invalid_params(&event)
+                {
+                    return Err(failure("CORRELATION", "steer", "Codex refused steer parameters"));
+                }
                 if is_steer_message(&event, &id) {
                     client.check_auth_current().await?;
                     match steer_recipient(&event, &thread, &turn) {
@@ -417,6 +424,11 @@ impl PendingSteer030 {
             // The RPC response has no receipt semantics in 0.4.0. Even an
             // error can precede the matching input notification.
             if asynchronous {
+                if steer_invalid_params(event) {
+                    if let Some(delivery) = self.delivery.take() {
+                        delivery.wrong_recipient();
+                    }
+                }
                 return Ok(true);
             }
             match client.response_value030(event) {
@@ -454,6 +466,15 @@ impl PendingSteer030 {
         }
         Ok(false)
     }
+}
+
+// A JSON-RPC Invalid params response rejects the invocation before execution.
+// Native server error codes and message text do not prove non-receipt.
+fn steer_invalid_params(event: &Value) -> bool {
+    event.get("method").is_none()
+        && event.get("result").is_none()
+        && event["error"]["code"].as_i64() == Some(-32602)
+        && event["error"]["message"].is_string()
 }
 
 fn is_steer_message(event: &Value, id: &str) -> bool {
@@ -1605,6 +1626,8 @@ for line in sys.stdin:
    response={'id':i,'error':{'code':-1,'message':'Could not establish whether there is no active turn'}}
   if mode == 'steer-null-error-040':
    response={'id':i,'error':None}
+  if mode == 'steer-invalid-params-040':
+   response={'id':i,'error':{'code':-32602,'message':'Invalid params'}}
   print(json.dumps(response),flush=True)
   print(json.dumps({'method':'item/completed','params':{'threadId':'thread','turnId':turn_id,'item':{'id':'comment'+str(count),'type':'agentMessage','phase':'commentary','text':'Working'}}}),flush=True)
   if mode == 'steer-obsolete-040':
@@ -2410,6 +2433,7 @@ for line in sys.stdin:
             "steer-incomplete-item-040",
             "steer-ambiguous-error-040",
             "steer-null-error-040",
+            "steer-invalid-params-040",
             "steer-content-040",
             "steer-oversized-040",
             "steer-correction-040",
@@ -2611,11 +2635,12 @@ for line in sys.stdin:
             if matches!(
                 mode,
                 "steer-malformed-040" | "steer-content-040" | "steer-oversized-040"
+                    | "steer-invalid-params-040"
             ) {
-                let code = if mode == "steer-malformed-040" {
-                    "UNCERTAIN"
-                } else {
-                    "CONTENT_UNAVAILABLE"
+                let code = match mode {
+                    "steer-malformed-040" => "UNCERTAIN",
+                    "steer-invalid-params-040" => "CORRELATION",
+                    _ => "CONTENT_UNAVAILABLE",
                 };
                 assert_eq!(receipt.err().unwrap().code, code);
                 outcome.unwrap();

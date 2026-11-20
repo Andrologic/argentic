@@ -1106,11 +1106,17 @@ mod tests {
                 source: host.source().await,
                 snapshot_id: None,
             };
-            let page = host.projection(query, None).await.unwrap();
+            let page = host.projection(query.clone(), None).await.unwrap();
             assert_eq!(page.verdict.as_deref(), Some("cancelled"));
             assert!(!page.stopping && !page.termination_uncertain);
             host.shutdown(&[]).await.unwrap();
             host.close().await.unwrap();
+            let replay = persistence::replay_verify030::verify_path030(
+                &f.data.join("engine.sqlite"),
+                &query.system_start_id,
+                &page.flow_invocation_id,
+            ).await;
+            assert!(replay.ok, "{replay:?}");
         }
     }
 
