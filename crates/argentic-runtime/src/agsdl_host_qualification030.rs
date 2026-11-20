@@ -47,7 +47,11 @@ pub(crate) fn product_slice030(
     compiled: Option<&str>,
 ) -> Option<PreflightDiagnostic> {
     let document = exact_json::value(authored).ok()?;
-    if document.get("contract").and_then(Value::as_str) != Some("agsdl-0.3.0") {
+    if !document
+        .get("contract")
+        .and_then(Value::as_str)
+        .is_some_and(argentic_core::supports_contract)
+    {
         return None;
     }
     let issue = |pointer: String, message: &str| {

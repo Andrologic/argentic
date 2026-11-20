@@ -6,6 +6,11 @@ provider. Codex preflight and Start require both `--codex` and an explicit comma
 It offers no HTTP fallback, automatically approved action or fabricated native
 receipt. Default tests use synthetic inputs only.
 
+The host accepts documents marked `agsdl-0.4.0` and `agsdl-0.3.0`.
+The compiled plan and persisted capture keep the authored marker. The
+Argentic crate version and protocol DTO names are independent of that
+marker. The bundled harness descriptions come from AgSDL v0.4.0.
+
 ## Build and open
 
 Keep `argentic-core` beside `argentic-runtime`. Each owns a manifest and lockfile.
@@ -111,6 +116,21 @@ resumes work or releases storage before successful drainage. EOF drainage retrie
 errors while retaining owners. Fix the reported storage/resource issue instead
 of interpreting a timeout or forced process exit as success.
 
+## AgSDL 0.4.0 delivery and cancellation
+
+An accepted steer remains pending until the adapter proves receipt by the
+target work. A confirmed message is reported as delivered. Definite
+non-receipt after the target becomes unavailable returns the message to the
+queue in arrival order. Lost or expired evidence produces `STEER_UNCERTAIN`
+on the sender path. Inspect the destination activation's message for
+`targetActivationId`, delivery statuses and `steerFailure` when present.
+
+A 0.4.0 `stop` response with kind `requested` acknowledges a durable whole-run
+stop. Poll `inspect` for `stopping: true` while the executors are still
+terminating. The terminal verdict is `cancelled` after physical confirmation.
+The stop withdraws queued work and closes human requests when it commits.
+Late evidence of receipt before the stop is retained for reporting.
+
 ## Storage, API and limits
 
 `standalone::Host::open` owns an exclusive OS file lock for its lifetime. It
@@ -119,9 +139,18 @@ opens a new engine-only database or verifies the complete existing schema and
 unknown revisions and Macro databases are refused. There are no implicit
 migrations. `sqlite::memory()` is an independent shared-memory pool; file and
 memory use the same engine SQL. Raw-pool embedders own their process exclusion.
-After a crash, `runs` reports `interrupted: true`; inspection remains available,
-and old owners cannot be adopted or automatically resumed. Review external
-side effects before explicitly starting new work.
+After a crash, an ordinary unfinished 0.4.0 run reports
+`verdict: "interrupted"` in `inspect`. The `runs` list also reports
+`interrupted: true`. The host fences the old owner and does not retry its work
+or adopt its session. `terminationUncertain` indicates that activity may have
+survived the interruption.
+
+An explicit 0.4.0 whole-run stop survives reopening the file. Recovery can
+settle a Start that never crossed the executor boundary. If previously admitted
+work still lacks physical termination evidence, inspection continues to show
+`stopping: true` with `terminationUncertain: true`. The standalone host has
+no transport for reconnecting to a lost external executor. Run history and
+projections remain available for 0.3.0 databases.
 
 The small embedding API exposes `Host`, `Policy`, preflight, Start, projections,
 human submissions, message delivery, Stop, shutdown and close. It keeps the Start

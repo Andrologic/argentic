@@ -489,12 +489,12 @@ fn validate_result(job: &HostCompileJob, generation: &str, result: &Value) -> Re
                         object.remove(field);
                     }
                 }
-                if authored.get("contract").and_then(Value::as_str) != Some("agsdl-0.3.0")
+                let contract = authored.get("contract").and_then(Value::as_str);
+                if !contract.is_some_and(argentic_core::supports_contract)
                     || registry.get("format").and_then(Value::as_str)
                         != Some("macro-agsdl-registry/030")
                     || plan.pointer("/versions/snapshot").and_then(Value::as_str) != Some("2")
-                    || plan.pointer("/versions/contract").and_then(Value::as_str)
-                        != Some("agsdl-0.3.0")
+                    || plan.pointer("/versions/contract").and_then(Value::as_str) != contract
                     || plan.pointer("/versions/profile").and_then(Value::as_str)
                         != Some("macro-agsdl-030-v1")
                     || result.pointer("/runtime/profile").and_then(Value::as_str)

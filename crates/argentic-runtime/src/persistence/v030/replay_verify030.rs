@@ -187,6 +187,12 @@ enum KindRead {
         work: WorkRef030,
         delivery_activation_id: String,
     },
+    SteerFailed {
+        effect_id: String,
+        work: WorkRef030,
+        delivery_activation_id: String,
+        code: String,
+    },
     PhysicalEnded {
         work: WorkRef030,
         stop_effect_id: Option<String>,
@@ -940,7 +946,10 @@ async fn verify_settlement(
             .iter()
             .find(|d| d.effect_id == effect.id)
             .ok_or_else(|| mismatch("steer.record", "replayed delivery", Value::Null))?;
-        if matches!(delivery.status.as_str(), "fallback" | "withdrawn") {
+        if matches!(
+            delivery.status.as_str(),
+            "fallback" | "withdrawn" | "failed"
+        ) {
             let expected = json!({"kind":"nativeSteerSuperseded030", "effectId":effect.id,
                 "deliveryActivationId":delivery_activation_id, "work":work, "eventId":delivery.resolved_event_id,
                 "resolution":delivery.status, "reason":delivery.reason});

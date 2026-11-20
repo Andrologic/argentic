@@ -102,7 +102,7 @@ pub fn validate_capture(
     if request.source != capture.source
         || request.profile != "macro-agsdl-030-v1"
         || capture.versions.snapshot != "2"
-        || capture.versions.contract != "agsdl-0.3.0"
+        || !argentic_core::supports_contract(&capture.versions.contract)
         || capture.versions.profile != request.profile
         || format!("{:x}", Sha256::digest(capture.authored_source.as_bytes()))
             != capture.source.source_sha256
@@ -133,7 +133,8 @@ pub fn validate_capture(
         || serde_json::to_value(&plan.versions)? != serde_json::to_value(&capture.versions)?
         || !argentic_core::durable_json::equal(&serde_json::to_string(&plan.source)?, &source_json)?
         || !document_tokens_equal(&plan.document_json, &capture.authored_source)?
-        || authored.get("contract").and_then(|v| v.as_str()) != Some("agsdl-0.3.0")
+        || authored.get("contract").and_then(|v| v.as_str())
+            != Some(capture.versions.contract.as_str())
         || registry.get("format").and_then(|v| v.as_str()) != Some("macro-agsdl-registry/030")
         || registry.get("version").and_then(|v| v.as_str())
             != Some(capture.versions.registry.as_str())

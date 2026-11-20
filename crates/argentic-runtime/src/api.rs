@@ -70,10 +70,19 @@ impl HostState {
     ) -> Result<persistence::public::PublicStopState> {
         let result =
             crate::agsdl_host_stop030::request(self.flow030(), pool, tasks, request).await?;
-        self.flow030()
-            .supervisors
-            .wait(&request.system_start_id)
-            .await?;
+        let asynchronous: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM engine_flow030_runs WHERE system_id=?
+             AND json_extract(plan_json,'$.versions.contract')='agsdl-0.4.0')",
+        )
+        .bind(&request.system_start_id)
+        .fetch_one(pool)
+        .await?;
+        if !asynchronous {
+            self.flow030()
+                .supervisors
+                .wait(&request.system_start_id)
+                .await?;
+        }
         Ok(result)
     }
     pub async fn ensure_stop(

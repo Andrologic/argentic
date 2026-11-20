@@ -294,6 +294,8 @@ impl SteerContext030 {
 struct PendingSteer030 {
     request_id: Option<u64>,
     delivery: Option<crate::agsdl_host_steer030::SteerDelivery030>,
+    ended: bool,
+    evidence_deadline: Option<tokio::time::Instant>,
 }
 impl PendingSteer030 {
     fn is_pending(&self) -> bool {
@@ -315,11 +317,23 @@ impl PendingSteer030 {
                 Ok(response) if response["turnId"] == turn => {}
                 Err(error) if error.code == "CODEX_REQUEST_FAILED" => {
                     let context = steer.as_mut().ok_or_else(|| missing("steerOwner"))?;
-                    self.delivery
+                    let delivery = self
+                        .delivery
                         .take()
-                        .ok_or_else(|| missing("steerRejectedAfterConsumption"))?
-                        .not_sent(&context.tasks, &context.attempt)?;
-                    context.close().await?;
+                        .ok_or_else(|| missing("steerRejectedAfterConsumption"))?;
+                    if context.document["contract"] == argentic_core::AGSDL_040
+                        && !self.ended
+                        && !event["error"]["message"].as_str().is_some_and(|message| {
+                            let message = message.to_ascii_lowercase();
+                            message.contains("no active turn")
+                                || message.contains("turn is not active")
+                        })
+                    {
+                        delivery.wrong_recipient();
+                    } else {
+                        delivery.not_sent(&context.tasks, &context.attempt)?;
+                        context.close().await?;
+                    }
                 }
                 Ok(_) => return Err(missing("steerTurn")),
                 Err(error) => return Err(error),
@@ -337,6 +351,13 @@ impl PendingSteer030 {
             if required(&event["params"], "threadId")? != thread
                 || required(&event["params"], "turnId")? != turn
             {
+                if steer
+                    .as_ref()
+                    .is_some_and(|context| context.document["contract"] == argentic_core::AGSDL_040)
+                {
+                    self.delivery.take().unwrap().wrong_recipient();
+                    return Ok(true);
+                }
                 return Err(missing("steerRecipient"));
             }
             let context = steer.as_ref().ok_or_else(|| missing("steerOwner"))?;
@@ -738,6 +759,9 @@ impl CodexExecutor030 {
             let mut final_item = None;
             let mut native_failure = None;
             let mut scope_declined = false;
+            let current_steer = steer
+                .as_ref()
+                .is_some_and(|context| context.document["contract"] == argentic_core::AGSDL_040);
             let mut pending_steer = PendingSteer030::default();
             let mut deferred_native = std::collections::VecDeque::new();
             let mut deferred_bytes = 0usize;
@@ -747,7 +771,7 @@ impl CodexExecutor030 {
                     biased;
                     // Reading is cancellation-safe, including partial stdio frames.
                     event = async {
-                        if pending_steer.request_id.is_none() {
+                        if current_steer || pending_steer.request_id.is_none() {
                             if let Some(event) = deferred_native.pop_front() {
                                 deferred_bytes -= serde_json::to_vec(&event)?.len();
                                 return Ok(event);
@@ -768,8 +792,38 @@ impl CodexExecutor030 {
                         let id = delivery.effect().id.clone();
                         // Keep the single session reader active while this RPC is in
                         // flight, so server requests use the same bounded ask handler.
-                        let request_id = client.begin_request("turn/steer", json!({"threadId":thread,"expectedTurnId":turn,"clientUserMessageId":id,"input":[{"type":"text","text":format!("Message from {sender}\n{mission}"),"text_elements":[]}],"additionalContext":additional_context030(&data)})).await?;
-                        pending_steer = PendingSteer030 { request_id: Some(request_id), delivery: Some(delivery) };
+                        let admission = match delivery.wire_admission().await {
+                            Ok(admission) => admission,
+                            Err(error) if error.code == "STALE_REFERENCE" => {
+                                delivery.not_sent(&context.tasks, &context.attempt)?;
+                                continue;
+                            }
+                            Err(error) => return Err(error),
+                        };
+                        let send = client.begin_request("turn/steer", json!({"threadId":thread,"expectedTurnId":turn,"clientUserMessageId":id,"input":[{"type":"text","text":format!("Message from {sender}\n{mission}"),"text_elements":[]}],"additionalContext":additional_context030(&data)}));
+                        let request_id = if current_steer {
+                            tokio::time::timeout(std::time::Duration::from_secs(2), send).await
+                                .map_err(|_| failure("NATIVE_UNCERTAIN", "steer", "The steer request may have been sent"))??
+                        } else {
+                            send.await?
+                        };
+                        drop(admission);
+                        pending_steer = PendingSteer030 {
+                            request_id: Some(request_id),
+                            delivery: Some(delivery),
+                            evidence_deadline: current_steer.then(||
+                                tokio::time::Instant::now() + std::time::Duration::from_secs(30)),
+                            ended: false,
+                        };
+                        continue;
+                    }
+                    _ = async {
+                        match pending_steer.evidence_deadline {
+                            Some(deadline) => tokio::time::sleep_until(deadline).await,
+                            None => std::future::pending().await,
+                        }
+                    }, if pending_steer.is_pending() => {
+                        pending_steer = PendingSteer030::default();
                         continue;
                     }
                 };
@@ -859,7 +913,7 @@ impl CodexExecutor030 {
                                             defer_native030(&mut deferred_native, &mut deferred_bytes, event)?;
                                         }
                                     }
-                                    Some(delivery) = async { match steer.as_mut() { Some(context) => context.inbox.receive().await, None => std::future::pending().await } } => {
+                                    Some(delivery) = async { match steer.as_mut() { Some(context) => context.inbox.receive().await, None => std::future::pending().await } }, if !current_steer => {
                                         // An unsent steer may hold admission while waiting for
                                         // consumption. Release it so the human answer can enter
                                         // the same gate; the existing queue fallback retains it.
@@ -890,7 +944,7 @@ impl CodexExecutor030 {
                         "Unexpected Codex server request",
                     ));
                 }
-                if pending_steer.request_id.is_some() {
+                if pending_steer.request_id.is_some() && !current_steer {
                     // Preserve RPC-era notification order, including a turn end
                     // that precedes its steer response. Server asks above remain live.
                     defer_native030(&mut deferred_native, &mut deferred_bytes, event)?;
@@ -972,6 +1026,35 @@ impl CodexExecutor030 {
                             })
                         };
                         return Err(failure(code, "turn", "Codex turn did not complete"));
+                    }
+                    if pending_steer.is_pending() && current_steer {
+                        pending_steer.ended = true;
+                        // Close the inbox as soon as this turn ends. The existing
+                        // correlation remains valid for delayed evidence from it.
+                        if let Some(context) = steer.as_mut() {
+                            context.close().await?;
+                        }
+                        if let Ok(result) =
+                            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                                while pending_steer.is_pending() {
+                                    let Ok(event) = client.notification().await else {
+                                        break;
+                                    };
+                                    if client.handle_auth_request(&event).await? {
+                                        continue;
+                                    }
+                                    client.check_auth_current().await?;
+                                    pending_steer
+                                        .receive(client, &event, &thread, &turn, &mut steer)
+                                        .await?;
+                                }
+                                Ok::<_, crate::persistence::dto::EngineFailure>(())
+                            })
+                            .await
+                        {
+                            result?;
+                        }
+                        break;
                     }
                     if pending_steer.is_pending() {
                         return Err(failure(
@@ -1293,10 +1376,12 @@ for line in sys.stdin:
    continue
   print(json.dumps({'id':i,'result':{'turnId':'turn1'}}),flush=True)
   print(json.dumps({'method':'item/completed','params':{'threadId':'thread','turnId':'turn1','item':{'id':'comment','type':'agentMessage','phase':'commentary','text':'Working'}}}),flush=True)
-  if mode!='steer-uncertain':
+  if mode == 'steer':
    print(json.dumps({'method':'item/completed','params':{'threadId':'thread','turnId':'turn1','item':{'id':'received','type':'userMessage','clientId':p['clientUserMessageId']}}}),flush=True)
   print(json.dumps({'method':'item/completed','params':{'threadId':'thread','turnId':'turn1','item':{'id':'final','type':'agentMessage','phase':'final_answer','text':json.dumps({'text':'Updated changelog','submissionJson':json.dumps({'results':{'summary':'Updated'},'choice':'approve'})})}}}),flush=True)
   print(json.dumps({'method':'turn/completed','params':{'threadId':'thread','turn':{'id':'turn1','status':'completed'}}}),flush=True)
+  if mode == 'steer-late-040':
+   print(json.dumps({'method':'item/completed','params':{'threadId':'thread','turnId':'turn1','item':{'id':'received','type':'userMessage','clientId':p['clientUserMessageId']}}}),flush=True)
   continue
  elif method=='turn/start':
   count+=1
@@ -1355,9 +1440,9 @@ for line in sys.stdin:
   if mode!='diagnostic-retry':
    print(json.dumps({'method':'turn/completed','params':{'threadId':thread,'turn':{'id':'turn1','status':'failed','error':error}}}),flush=True)
    continue
- if method=='turn/start' and mode in ('steer','steer-uncertain'):
+ if method=='turn/start' and mode.startswith('steer'):
   print(json.dumps({'method':'item/completed','params':{'threadId':'thread','turnId':'turn1','item':{'id':'early','type':'agentMessage','phase':'commentary','text':'Starting'}}}),flush=True)
- if method=='turn/start' and not mode.startswith('cancel') and mode not in ('steer','steer-uncertain'):
+ if method=='turn/start' and not mode.startswith('cancel') and not mode.startswith('steer'):
   choice='bad' if mode in ('correct','exhausted') and count==1 else 'approve'
   submission={'version':'macro-agsdl-agent-work/030','agentJson':'{}'} if mode=='internal_contract' and count==1 else {'results':{'summary':'Done'},'choice':choice}
   text='{}' if mode=='invalid_envelope' and count==1 else json.dumps({'text':'hello','submissionJson':json.dumps(submission)})
@@ -1999,7 +2084,7 @@ for line in sys.stdin:
         use crate::agsdl_host_flow030::FlowWorkAttempt030;
         use crate::persistence::flow030::{FlowEffect030, WorkRef030};
         use crate::tasks::StreamTasks;
-        for mode in ["steer", "steer-uncertain"] {
+        for mode in ["steer", "steer-uncertain", "steer-late-040"] {
             let temp = tempfile::tempdir().unwrap();
             let root = temp.path().canonicalize().unwrap();
             let workspace = root.join("workspace");
@@ -2081,7 +2166,11 @@ for line in sys.stdin:
                                 inbox,
                                 tasks: registry,
                                 attempt: target,
-                                document: json!({}),
+                                document: if mode == "steer-late-040" {
+                                    json!({"contract":argentic_core::AGSDL_040})
+                                } else {
+                                    json!({})
+                                },
                                 approvals: None,
                                 policy: {
                                     let p = crate::permissions::normalize_requested(
@@ -2119,7 +2208,7 @@ for line in sys.stdin:
             drop(claimed);
             let outcome = result.await.unwrap();
             tasks.join_agent030(&attempt, false).await.unwrap();
-            if mode == "steer" {
+            if mode != "steer-uncertain" {
                 assert!(receipt.unwrap().consumed());
                 outcome.unwrap();
                 assert_eq!(

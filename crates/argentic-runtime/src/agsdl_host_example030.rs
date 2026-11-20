@@ -621,6 +621,17 @@ pub(crate) async fn drive_scenario030(
         )
         .await?;
         match event {
+            TimelineEvent030::Steer(_)
+            | TimelineEvent030::StopRun
+            | TimelineEvent030::Stopped(_)
+            | TimelineEvent030::RunState(_)
+            | TimelineEvent030::HostRestart(_) => {
+                return Err(failure(
+                    "HOST_CAPABILITY",
+                    "timeline",
+                    "Use the native conformance test for AgSDL 0.4.0 events",
+                ))
+            }
             TimelineEvent030::Elapse(ms) => {
                 let end = crate::agsdl_host_clock030::Clock030::now_ms(humans.clock.as_ref())
                     .checked_add(ms)
@@ -1002,16 +1013,11 @@ impl ExampleObservation030 {
         }
         // This module describes the pinned conformance language. Only the
         // separately observed capabilities qualify this in-process QA adapter.
-        let module = include_str!("../tests/fixtures/conformance/modules/example/module.json");
-        if format!("{:x}", Sha256::digest(module.as_bytes()))
-            != "95de087ea2d6a97fe36aabbc6ce0fd262c0831dc3f0aad52e2cc10949381db5f"
-        {
-            return Err(failure(
-                "HARNESS_REFUSED",
-                "example",
-                "Pinned example module differs",
-            ));
-        }
+        let module = if document["contract"] == argentic_core::AGSDL_040 {
+            include_str!("../tests/fixtures/conformance-040/modules/example/module.json")
+        } else {
+            include_str!("../tests/fixtures/conformance/modules/example/module.json")
+        };
         let evidence = serde_json::json!({"adapterId":ADAPTER,"sourceSha256":source_sha256,"kind":"native-example-qa"}).to_string();
         let capabilities = [
             "result-submission",

@@ -57,6 +57,7 @@ pub struct RuntimeProjectionPage030 {
     pub flow_invocation_id: String,
     pub revision: String,
     pub stopping: bool,
+    pub termination_uncertain: bool,
     pub verdict: Option<String>,
     pub total: String,
     pub items: Vec<RuntimeProjectionItem030>,
@@ -134,6 +135,7 @@ fn page(
         flow_invocation_id: view.flow_invocation_id,
         revision: view.revision,
         stopping: view.stopping,
+        termination_uncertain: false,
         verdict: view.verdict,
         total: total.to_string(),
         items,
@@ -149,7 +151,9 @@ pub(crate) async fn read(
 ) -> Result<RuntimeProjectionPage030> {
     // Observation does not require a live executor or grant authority to resume.
     // Read capture and state together so a page describes one committed revision.
-    let row = sqlx::query("SELECT s.capture_json,r.plan_json,r.state_json,r.source_json,r.snapshot_id,r.epoch FROM engine_start030_requests s JOIN engine_flow030_runs r ON r.system_id=s.system_id AND r.invocation_id=s.invocation_id WHERE s.system_id=?")
+    let row = sqlx::query("SELECT s.capture_json,r.plan_json,r.state_json,r.source_json,r.snapshot_id,r.epoch,
+        EXISTS(SELECT 1 FROM engine_flow030_interruptions i WHERE i.system_id=r.system_id) AS interrupted,
+        EXISTS(SELECT 1 FROM engine_flow030_owners o WHERE o.system_id=r.system_id AND o.status='revoked') AS revoked FROM engine_start030_requests s JOIN engine_flow030_runs r ON r.system_id=s.system_id AND r.invocation_id=s.invocation_id WHERE s.system_id=?")
         .bind(&query.system_start_id).fetch_optional(pool).await?
         .ok_or_else(|| failure("NOT_FOUND", "systemStartId", "Native flow capture is absent"))?;
     let capture: crate::persistence::start030::StartCapture030 =
@@ -188,7 +192,22 @@ pub(crate) async fn read(
             "Captured flow projection is invalid",
         )
     })?;
-    page(scope, continuation, projection)
+    let mut page = page(scope, continuation, projection)?;
+    if plan.versions.contract == argentic_core::AGSDL_040 {
+        let interrupted: bool = row.try_get("interrupted")?;
+        let revoked: bool = row.try_get("revoked")?;
+        if interrupted {
+            page.verdict = Some("interrupted".into());
+            page.stopping = false;
+        }
+        page.stopping &= page.verdict.is_none();
+        page.termination_uncertain = (interrupted || (revoked && page.verdict.is_none()))
+            && state
+                .activations
+                .iter()
+                .any(|activation| activation.physical);
+    }
+    Ok(page)
 }
 
 #[cfg(test)]

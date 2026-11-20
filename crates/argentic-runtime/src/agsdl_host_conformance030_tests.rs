@@ -4,10 +4,10 @@ use super::*;
 use crate::agsdl_host_flow030 as flow;
 use crate::agsdl_host_runtime030::*;
 use crate::agsdl_host_scenario030::{
-    self as scenarios, ExampleResult030, TimelineEvent030, WorkKey030,
+    self as scenarios, ExampleResult030, SteerOutcome040, TimelineEvent030, WorkKey030,
 };
 use crate::agsdl_host_work_admission030::{AttestedWorkPolicy030, PreparedEffectiveAgentWork030};
-use crate::persistence::{flow030::*, start030::StartCapture030, Result};
+use crate::persistence::{dto::EngineStopRequest, flow030::*, start030::StartCapture030, Result};
 use crate::process::{background_command, background_tokio_command};
 use futures::{future::BoxFuture, FutureExt};
 use serde_json::{json, Value};
@@ -215,7 +215,9 @@ impl Fixture {
         // Read exact source text from the fixture, preserving numeric tokens.
         let fields: BTreeMap<String, Box<serde_json::value::RawValue>> =
             serde_json::from_str(raw).unwrap();
-        let authored = fields["document"].get().to_owned();
+        let authored = scenarios::fixture_document(fields["document"].get())
+            .unwrap()
+            .to_owned();
         let document: Value = serde_json::from_str(&authored).unwrap();
         let source = json!({"owner":{"projectId":"project","planId":"source","branch":"develop"},"revision":"1","sourceSha256":format!("{:x}",Sha256::digest(authored.as_bytes()))});
         let scope = json!({"projectId":"project","root":workspace,"rootIdentity":crate::content_io::admitted::workspace_root_identity(&workspace).unwrap().observation_key().unwrap(),"sourceOwner":source["owner"]});
@@ -386,14 +388,21 @@ struct ScriptedAgent {
     key: WorkKey030,
     activation: String,
     send: tokio::sync::oneshot::Sender<ExampleResult030>,
+    stopped: CancellationToken,
 }
 struct ScriptedCall {
     key: WorkKey030,
     activation: String,
     send: tokio::sync::oneshot::Sender<crate::agsdl_host_calls030::CallEvent030>,
+    stopped: CancellationToken,
 }
+type DeferredSteers =
+    Arc<Mutex<BTreeMap<String, Box<dyn FnOnce() -> std::result::Result<(), ()> + Send>>>>;
+
 struct CallTransport {
+    effect_marker: Option<std::path::PathBuf>,
     running: Arc<Mutex<Vec<ScriptedCall>>>,
+    whole_stop: CancellationToken,
     wake: watch::Sender<u64>,
 }
 impl crate::agsdl_host_call_executor030::CallTransport030 for CallTransport {
@@ -409,6 +418,7 @@ impl crate::agsdl_host_call_executor030::CallTransport030 for CallTransport {
     > {
         let (send, receive) = tokio::sync::oneshot::channel();
         let work = attempt.work();
+        let effect_marker = self.effect_marker.clone();
         let FlowEffectKind030::Start {
             item_json,
             occurrence,
@@ -423,16 +433,34 @@ impl crate::agsdl_host_call_executor030::CallTransport030 for CallTransport {
                 .as_ref()
                 .map(|_| occurrence.as_ref().unwrap().item_index.clone()),
         };
+        let stopped = CancellationToken::new();
+        let whole_stop = self.whole_stop.clone();
         self.running.lock().unwrap().push(ScriptedCall {
             key,
             activation: work.activation_id.clone(),
             send,
+            stopped: stopped.clone(),
         });
         self.wake.send_modify(|n| *n += 1);
         Ok(Box::pin(async move {
             use crate::persistence::call_protocol030::CallEnd030;
+            if let Some(path) = effect_marker {
+                use std::io::Write;
+                let mut marker = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                    .unwrap();
+                writeln!(marker, "external effect").unwrap();
+            }
             tokio::select! {
-                _ = control.stop.cancelled() => Ok(CallEnd030::Stopped),
+                biased;
+                _ = control.stop.cancelled() => {
+                    if whole_stop.is_cancelled() {
+                        stopped.cancelled().await;
+                    }
+                    Ok(CallEnd030::Stopped)
+                },
                 _ = control.machine_timeout.cancelled() => Ok(CallEnd030::TimedOut),
                 receipt = receive => Ok(CallEnd030::Returned { event: receipt.map_err(|_| failure("INTERRUPTED", "call", "Scripted receipt lost"))? }),
             }
@@ -440,6 +468,9 @@ impl crate::agsdl_host_call_executor030::CallTransport030 for CallTransport {
     }
 }
 struct Executor {
+    whole_stop: CancellationToken,
+    steer_script: Arc<Mutex<BTreeMap<String, SteerOutcome040>>>,
+    deferred: DeferredSteers,
     plans: Mutex<BTreeMap<String, Arc<crate::agsdl_host_work_admission030::NativePlanLock030>>>,
     running: Arc<Mutex<Vec<ScriptedAgent>>>,
     wake: watch::Sender<u64>,
@@ -489,6 +520,10 @@ impl AgentExecutor030 for Executor {
             .lock()
             .unwrap()
             .remove(&work.attempt.work().activation_id);
+        let stopped = CancellationToken::new();
+        let whole_stop = self.whole_stop.clone();
+        let steer_script = self.steer_script.clone();
+        let deferred = self.deferred.clone();
         self.running.lock().unwrap().push(ScriptedAgent {
             attempt: work.attempt.clone(),
             protocol,
@@ -496,14 +531,41 @@ impl AgentExecutor030 for Executor {
             key,
             activation: work.attempt.work().activation_id.clone(),
             send,
+            stopped: stopped.clone(),
         });
         let wake = self.wake.clone();
         Box::pin(async move {
             let mut inbox = work.steer;
             let outcome = loop {
                 tokio::select! {
-                    _ = cancel.cancelled() => return Ok(()),
-                    Some(delivery) = inbox.receive() => { delivery.acknowledge(&work.tasks, &work.attempt)?; wake.send_modify(|n| *n += 1); },
+                    _ = cancel.cancelled() => {
+                        if whole_stop.is_cancelled() {
+                            stopped.cancelled().await;
+                        }
+                        return Ok(());
+                    },
+                    Some(delivery) = inbox.receive() => {
+                        let FlowEffectKind030::Steer { delivery_activation_id, .. } = &delivery.effect().kind else {
+                            unreachable!()
+                        };
+                        // The timeline resolves by delivery activation. Its address is read
+                        // from the persisted effect before the executor is allowed to send.
+                        let id = delivery_activation_id.clone();
+                        let outcome = steer_script.lock().unwrap().remove(&id);
+                        if let Some(outcome) = outcome {
+                            let receipt = delivery.simulation(&work.tasks, &work.attempt,
+                                matches!(outcome, SteerOutcome040::Received))?;
+                            assert!(deferred.lock().unwrap().insert(id, Box::new(move || {
+                                match outcome {
+                                    SteerOutcome040::Uncertain => { drop(receipt); Ok(()) },
+                                    _ => receipt(),
+                                }
+                            })).is_none());
+                        } else {
+                            delivery.acknowledge(&work.tasks, &work.attempt)?;
+                        }
+                        wake.send_modify(|n| *n += 1);
+                    },
                     result = &mut result => break result.map_err(|_| crate::persistence::failure("INTERRUPTED","test","Scripted outcome lost"))?,
                     Some((body,reply)) = protocol_events.recv() => {
                         let result=events.emit(body,&cancel).await;
@@ -545,8 +607,11 @@ async fn idle(
     running: &Mutex<Vec<ScriptedAgent>>,
     calls: &Mutex<Vec<ScriptedCall>>,
     ended: Option<&str>,
+    deferred: &DeferredSteers,
+    hold_steers: bool,
 ) -> crate::persistence::flow_store030::FlowView030 {
     tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(12);
         loop {
             let host = &f.host;
             let view = flow::inspect_run(host.flow030(), &host, &f.pool, &f.owner)
@@ -582,7 +647,23 @@ async fn idle(
                 && !view
                     .effects
                     .iter()
-                    .any(|r| r["status"] == "pending" || r["status"] == "uncertain")
+                    .any(|r| {
+                        if r["status"] != "pending" && r["status"] != "uncertain" {
+                            return false;
+                        }
+                        let kind = &r["effect"]["kind"];
+                        if view.state.stopping && kind["kind"] == "stopWork" && r["status"] == "uncertain" {
+                            return false;
+                        }
+                        if hold_steers && kind["kind"] == "steer"
+                            && kind["deliveryActivationId"].as_str()
+                                .is_some_and(|id| deferred.lock().unwrap().contains_key(id))
+                        {
+                            return false;
+                        }
+                        !view.state.stopping || crate::persistence::flow_store030::eligible(
+                            &view.state, &serde_json::from_value(r["effect"].clone()).unwrap())
+                    })
                 && view
                     .state
                     .preparations
@@ -614,11 +695,46 @@ async fn idle(
             if ready {
                 return view;
             }
+            assert!(tokio::time::Instant::now() < deadline,
+                "Timeline did not quiesce: stopping={}, verdict={:?}, ended={ended:?}, activations={:?}, effects={:?}, clock={pending_clock}/{pending_controls}",
+                view.state.stopping, view.state.verdict,
+                view.state.activations.iter().map(|a| (&a.id, &a.step, &a.phase, a.physical)).collect::<Vec<_>>(),
+                view.effects.iter().filter(|row| row["status"] != "settled").collect::<Vec<_>>());
             tokio::time::sleep(std::time::Duration::from_millis(2)).await;
         }
     })
     .await
     .expect("Supervisor did not reach the next timeline boundary")
+}
+
+async fn wait_for_steer(f: &Fixture, id: &str, stopping: bool, outcome: &SteerOutcome040) {
+    if stopping && !matches!(outcome, SteerOutcome040::Received) {
+        return;
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let view = flow::inspect_run(f.host.flow030(), &f.host, &f.pool, &f.owner)
+                .await
+                .unwrap()
+                .flow;
+            let resolved = if stopping {
+                view.events.iter().any(|row| {
+                    row["event"]["kind"]["SteerConsumed"]["delivery_activation_id"] == id
+                })
+            } else {
+                view.state
+                    .steer_deliveries
+                    .iter()
+                    .any(|record| record.delivery_activation_id == id && record.status != "pending")
+            };
+            if resolved {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("steer outcome not committed");
 }
 
 async fn native_timeline(
@@ -630,6 +746,19 @@ async fn native_timeline(
     let running = Arc::new(Mutex::new(Vec::<ScriptedAgent>::new()));
     let calls = Arc::new(Mutex::new(Vec::<ScriptedCall>::new()));
     let tasks = crate::tasks::StreamTasks::default();
+    let whole_stop = CancellationToken::new();
+    let deferred: DeferredSteers = Default::default();
+    let scripted: BTreeMap<_, _> = scenario
+        .timeline
+        .iter()
+        .filter_map(|event| match event {
+            TimelineEvent030::Steer(event) => {
+                Some(((event.to.clone(), event.nth), event.outcome.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    let steer_script = Arc::new(Mutex::new(BTreeMap::new()));
     let host = &f.host;
     let clock = host.flow030().humans.virtual_clock().await?;
     let human = host
@@ -639,6 +768,9 @@ async fn native_timeline(
         .await?;
     let executors: Executors030 = Executors030 {
         agents: Arc::new(Executor {
+            whole_stop: whole_stop.clone(),
+            deferred: deferred.clone(),
+            steer_script: steer_script.clone(),
             plans: Default::default(),
             running: running.clone(),
             wake: wake.clone(),
@@ -650,6 +782,9 @@ async fn native_timeline(
                 tasks: tasks.clone(),
                 owner: f.owner.clone(),
                 transport: Arc::new(CallTransport {
+                    whole_stop: whole_stop.clone(),
+                    effect_marker: (scenario.name == "restart-interrupted")
+                        .then(|| f._temp.path().join("external-effects.txt")),
                     running: calls.clone(),
                     wake: wake.clone(),
                 }),
@@ -690,7 +825,7 @@ async fn native_timeline(
     let host = &f.host;
     let cancel = CancellationToken::new();
     let native_config = f.config.clone();
-    let supervisor = supervise_with_emitter030(
+    let supervisor = supervise_with_steer_port030(
         Some(&f.host),
         &host,
         &f.pool,
@@ -701,13 +836,193 @@ async fn native_timeline(
         receiver,
         &cancel,
         emitter,
+        Some({
+            let port = native_steer_port030(Some(f.host.clone()), f.pool.clone());
+            let pool = f.pool.clone();
+            let steer_script = steer_script.clone();
+            let scripted = scripted.clone();
+            Arc::new(move |effect: FlowEffect030, recipient| {
+                let pool = pool.clone();
+                let port = port.clone();
+                let scripted = scripted.clone();
+                let steer_script = steer_script.clone();
+                Box::pin(async move {
+                    if !scripted.is_empty() {
+                        let FlowEffectKind030::Steer {
+                            delivery_activation_id,
+                            ..
+                        } = &effect.kind
+                        else {
+                            unreachable!()
+                        };
+                        let raw: String = sqlx::query_scalar(
+                            "SELECT state_json FROM engine_flow030_runs WHERE system_id=?",
+                        )
+                        .bind(&effect.identity.system_start_id)
+                        .fetch_one(&pool)
+                        .await?;
+                        let state: FlowState030 = serde_json::from_str(&raw)?;
+                        let activation =
+                            |id: &str| state.activations.iter().find(|a| a.id == id).unwrap();
+                        let address = activation(delivery_activation_id).step.as_ref().unwrap();
+                        let nth = state
+                            .steer_deliveries
+                            .iter()
+                            .filter(|record| {
+                                activation(&record.delivery_activation_id).step.as_ref()
+                                    == Some(address)
+                            })
+                            .position(|record| record.effect_id == effect.id)
+                            .unwrap()
+                            + 1;
+                        if let Some(outcome) = scripted.get(&(address.join("/"), nth)) {
+                            steer_script
+                                .lock()
+                                .unwrap()
+                                .insert(delivery_activation_id.clone(), outcome.clone());
+                        }
+                    }
+                    port(effect, recipient).await
+                })
+            })
+        }),
     );
+    let checkpoint = scenario
+        .timeline
+        .iter()
+        .any(|event| matches!(event, TimelineEvent030::HostRestart(_)));
     let timeline = async {
         let mut ended = None;
         for event in scenario.timeline {
-            let view = idle(f, &running, &calls, ended.as_deref()).await;
+            let view = idle(
+                f,
+                &running,
+                &calls,
+                ended.as_deref(),
+                &deferred,
+                !scripted.is_empty(),
+            )
+            .await;
             match event {
+                TimelineEvent030::StopRun => {
+                    whole_stop.cancel();
+                    flow::request_system_stop030(
+                        host.flow030(),
+                        &f.pool,
+                        &EngineStopRequest {
+                            system_start_id: f.identity.system_start_id.clone(),
+                            request_id: "timeline-stop".into(),
+                            activation_id: None,
+                        },
+                    )
+                    .await?;
+                }
+                TimelineEvent030::RunState(expected) => {
+                    let actual = view
+                        .state
+                        .verdict
+                        .as_deref()
+                        .unwrap_or(if view.state.stopping {
+                            "stopping"
+                        } else {
+                            "running"
+                        });
+                    assert_eq!(actual, expected);
+                }
+                TimelineEvent030::Steer(event) => {
+                    let id = view
+                        .state
+                        .steer_deliveries
+                        .iter()
+                        .filter(|record| {
+                            view.state.activations.iter().any(|a| {
+                                a.id == record.delivery_activation_id
+                                    && a.step
+                                        .as_ref()
+                                        .is_some_and(|step| step.join("/") == event.to)
+                            })
+                        })
+                        .nth(event.nth - 1)
+                        .unwrap()
+                        .delivery_activation_id
+                        .clone();
+                    let settle = deferred
+                        .lock()
+                        .unwrap()
+                        .remove(&id)
+                        .expect("deferred steer");
+                    settle().expect("steer receiver still awaiting evidence");
+                    wait_for_steer(f, &id, view.state.stopping, &event.outcome).await;
+                }
+                TimelineEvent030::Stopped(key) => {
+                    let mut agents = running.lock().unwrap();
+                    let mut calls = calls.lock().unwrap();
+                    let agent = agents.iter().position(|work| work.key == key);
+                    let call = calls.iter().position(|work| work.key == key);
+                    match (agent, call) {
+                        (Some(index), None) => {
+                            let work = agents.remove(index);
+                            ended = Some(work.activation);
+                            work.stopped.cancel();
+                        }
+                        (None, Some(index)) => {
+                            let work = calls.remove(index);
+                            ended = Some(work.activation);
+                            work.stopped.cancel();
+                        }
+                        _ => panic!("No unique stopped work: {key:?}"),
+                    }
+                }
+                TimelineEvent030::HostRestart(_) => return Ok(view),
                 TimelineEvent030::Work { key, outcome } => {
+                    if view.state.stopping {
+                        let mut active = view.state.activations.iter().filter(|a| {
+                            a.physical
+                                && a.step.as_ref() == Some(&key.step)
+                                && a.item_json
+                                    .as_ref()
+                                    .map(|_| &a.occurrence.as_ref().unwrap().item_index)
+                                    == key.item.as_ref()
+                        });
+                        let a = active
+                            .next()
+                            .expect("late notification for a stopping work");
+                        assert!(active.next().is_none());
+                        let result = match outcome {
+                            ExampleResult030::Failed(code) => WorkResult030::Failed {
+                                error: Failure030::new(&code),
+                            },
+                            ExampleResult030::Returned { submit_json, .. } => {
+                                let answer: Value = serde_json::from_str(&submit_json)?;
+                                WorkResult030::Completed {
+                                    output_json: submit_json,
+                                    route_key: answer["choice"].as_str().map(str::to_owned),
+                                }
+                            }
+                        };
+                        let late = flow::apply_native_event(
+                            host.flow030(),
+                            host,
+                            &f.pool,
+                            &FlowEvent030 {
+                                identity: f.identity.clone(),
+                                event_id: format!("fixture-late:{}", a.id),
+                                expected_revision: view.state.revision,
+                                kind: FlowEventKind030::WorkResult {
+                                    work: WorkRef030 {
+                                        activation_id: a.id.clone(),
+                                        start_effect_id: a.start_effect_id.clone().unwrap(),
+                                        agent_instance_id: a.instance_id.clone(),
+                                    },
+                                    result,
+                                    physical: None,
+                                },
+                            },
+                        )
+                        .await;
+                        assert_eq!(late.unwrap_err().code, flow::refused().code);
+                        continue;
+                    }
                     let approval = view.state.activations.iter().find(|a| {
                         a.physical && a.step.as_ref() == Some(&key.step) && a.agent.is_none()
                     });
@@ -867,7 +1182,15 @@ async fn native_timeline(
                     use crate::agsdl_host_clock030::Clock030;
                     let end = clock.now_ms() + ms;
                     loop {
-                        let fresh = idle(f, &running, &calls, ended.as_deref()).await;
+                        let fresh = idle(
+                            f,
+                            &running,
+                            &calls,
+                            ended.as_deref(),
+                            &deferred,
+                            !scripted.is_empty(),
+                        )
+                        .await;
                         let _operation = human.operation.lock().await;
                         if fresh.state.verdict.is_some() {
                             clock.advance_to(end)?;
@@ -928,7 +1251,15 @@ async fn native_timeline(
             }
             wake.send_modify(|n| *n += 1);
         }
-        let view = idle(f, &running, &calls, ended.as_deref()).await;
+        let view = idle(
+            f,
+            &running,
+            &calls,
+            ended.as_deref(),
+            &deferred,
+            !scripted.is_empty(),
+        )
+        .await;
         assert!(view.state.verdict.is_some());
         assert!(view.state.activations.iter().all(|a| !a.physical));
         Ok::<_, crate::persistence::dto::EngineFailure>(view)
@@ -946,6 +1277,12 @@ async fn native_timeline(
                 // A broken timeline must still let the same supervisor cancel
                 // and physically join every scripted executor before returning.
                 cancel.cancel();
+                for agent in running.lock().unwrap().iter() {
+                    agent.stopped.cancel();
+                }
+                for call in calls.lock().unwrap().iter() {
+                    call.stopped.cancel();
+                }
                 let message = match other {
                     Ok(Err(_)) => "Native timeline exceeded 30 seconds".into(),
                     Ok(Ok(Err(error))) => format!("Native timeline failed: {error:?}"),
@@ -960,6 +1297,15 @@ async fn native_timeline(
             }
         }
     };
+    if checkpoint {
+        return tokio::select! {
+            view = guarded_timeline => view,
+            outcome = supervisor => {
+                outcome?;
+                Err(failure("CONFORMANCE", "restart", "Run ended before restart"))
+            },
+        };
+    }
     let (outcome, view) = tokio::join!(
         async {
             let result = supervisor.await;
@@ -1053,6 +1399,185 @@ fn product_gap(f: &Fixture) -> Option<String> {
     .map(|d| format!("{} {}: {}", d.code, d.pointer, d.message))
 }
 
+async fn replay_after_restart(
+    f: &mut Fixture,
+    timeline: Vec<TimelineEvent030>,
+    mut view: crate::persistence::flow_store030::FlowView030,
+) -> Result<crate::persistence::flow_store030::FlowView030> {
+    let query = crate::api::RuntimeProjectionQuery030 {
+        system_start_id: f.identity.system_start_id.clone(),
+        source: serde_json::from_value(f.plan.source.clone())?,
+        snapshot_id: Some(f.identity.snapshot_id.clone()),
+    };
+    let request = EngineStopRequest {
+        system_start_id: f.identity.system_start_id.clone(),
+        request_id: "timeline-stop".into(),
+        activation_id: None,
+    };
+    let mut stop = None;
+    for event in timeline {
+        match event {
+            TimelineEvent030::HostRestart(mode) => {
+                f.pool.close().await;
+                f.host = HostState::new();
+                f.pool = crate::sqlite::open_file(&f._temp.path().join("run.db")).await?;
+                crate::api::interrupt_previous_runs(&f.pool).await?;
+                flow::recover_pending_stops030(&f.host, &f.pool).await?;
+                let page = f
+                    .host
+                    .runtime_projection(&f.pool, query.clone(), None)
+                    .await?;
+                if mode == "interrupt" {
+                    assert_eq!(page.verdict.as_deref(), Some("interrupted"));
+                    assert!(page.termination_uncertain);
+                    view.state.verdict = page.verdict;
+                } else {
+                    assert!(page.stopping && page.verdict.is_none() && page.termination_uncertain);
+                    stop = Some(
+                        flow::inspect_system_stop_request030(f.host.flow030(), &f.pool, &request)
+                            .await?
+                            .expect("durable Stop"),
+                    );
+                    view = stop.as_ref().unwrap().control().read(&f.pool).await?;
+                }
+            }
+            TimelineEvent030::RunState(expected) => {
+                let page = f
+                    .host
+                    .runtime_projection(&f.pool, query.clone(), None)
+                    .await?;
+                assert_eq!(
+                    page.verdict.as_deref().unwrap_or(if page.stopping {
+                        "stopping"
+                    } else {
+                        "running"
+                    }),
+                    expected
+                );
+            }
+            TimelineEvent030::Stopped(key) => {
+                let mut works = view.state.activations.iter().filter(|a| {
+                    a.physical
+                        && a.step.as_ref() == Some(&key.step)
+                        && a.item_json
+                            .as_ref()
+                            .map(|_| &a.occurrence.as_ref().unwrap().item_index)
+                            == key.item.as_ref()
+                });
+                let activation = works.next().expect("stopping work");
+                assert!(works.next().is_none());
+                let control = stop.as_ref().unwrap().control();
+                // The published executor fixture supplies the physical evidence,
+                // only at its stopped event. The reopened host applies native cleanup.
+                control
+                    .apply(
+                        &f.pool,
+                        &FlowEvent030 {
+                            identity: f.identity.clone(),
+                            event_id: format!("fixture-physical-end:{}", activation.id),
+                            expected_revision: view.state.revision.clone(),
+                            kind: FlowEventKind030::PhysicalEnded {
+                                work: WorkRef030 {
+                                    activation_id: activation.id.clone(),
+                                    start_effect_id: activation.start_effect_id.clone().unwrap(),
+                                    agent_instance_id: activation.instance_id.clone(),
+                                },
+                                stop_effect_id: activation.stop_effect_id.clone(),
+                                evidence: PhysicalEvidence030 {
+                                    native_receipt_id: format!("fixture-stop:{}", activation.id),
+                                    descendants_joined: true,
+                                },
+                            },
+                        },
+                    )
+                    .await?;
+                view = control.read(&f.pool).await?;
+            }
+            event => panic!("Unexpected event after restart: {event:?}"),
+        }
+    }
+    Ok(view)
+}
+
+#[tokio::test]
+async fn agsdl040_published_runs() {
+    let only = std::env::var("ARGENTIC_SCENARIO").ok();
+    let mut failures = Vec::new();
+    for &(name, raw) in scenarios::SCENARIOS_040 {
+        if only.as_deref().is_some_and(|filter| !name.contains(filter)) {
+            continue;
+        }
+        let (document, scenario) = scenarios::published_fixture(name, raw).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&document).unwrap()["contract"],
+            argentic_core::AGSDL_040
+        );
+        let after_restart = scenario
+            .timeline
+            .iter()
+            .position(|e| matches!(e, TimelineEvent030::HostRestart(_)))
+            .map(|i| scenario.timeline[i..].to_vec());
+        if matches!(after_restart.as_deref(), Some([TimelineEvent030::HostRestart(mode), ..]) if mode == "resume")
+            && !scenario
+                .timeline
+                .iter()
+                .any(|e| matches!(e, TimelineEvent030::StopRun))
+        {
+            eprintln!("{name}: SKIP optional resumption of ordinary runs");
+            continue;
+        }
+        let result = std::panic::AssertUnwindSafe(async {
+            let mut f = Fixture::new(raw).await;
+            let (wake, receiver) = watch::channel(0);
+            let mut view = native_timeline(&f, scenario, wake, receiver).await.unwrap();
+            if let Some(timeline) = after_restart {
+                view = replay_after_restart(&mut f, timeline, view).await.unwrap();
+            }
+            let observed = projection::project(&f, &view).await;
+            if name == "restart-interrupted" {
+                assert_eq!(
+                    std::fs::read_to_string(f._temp.path().join("external-effects.txt")).unwrap(),
+                    "external effect\n"
+                );
+            }
+            let expected: Value = serde_json::from_str(raw).unwrap();
+            let mut expected = expected["expect"].clone();
+            let differences = projection::compare(&expected, &observed);
+            f.pool.close().await;
+            if matches!(
+                name,
+                "steer-confirmed" | "steer-falls-back-to-queue" | "stop-during-steer"
+            ) {
+                assert!(
+                    matches!(differences.as_slice(), [message] if message.starts_with("messages:")),
+                    "{differences:?}"
+                );
+                let message = expected["messages"][0].as_object_mut().unwrap();
+                let text = message.remove("prompt").unwrap();
+                message.insert("resources".into(), json!({"text":text}));
+                let remaining = projection::compare(&expected, &observed);
+                assert!(remaining.is_empty(), "{remaining:?}");
+                return Some(differences);
+            }
+            assert!(
+                differences.is_empty(),
+                "{differences:?}, observed {observed}"
+            );
+            None
+        })
+        .catch_unwind()
+        .await;
+        match result {
+            Ok(None) => eprintln!("{name}: PASS"),
+            Ok(Some(differences)) => {
+                eprintln!("{name}: PUBLISHED MESSAGE MISMATCH {differences:?}")
+            }
+            Err(panic) => failures.push(format!("{name}: {}", panic_message(panic))),
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
 #[tokio::test]
 async fn agsdl030_conformance_all_37_scenarios() {
     for memory in [false, true] {
@@ -1083,9 +1608,8 @@ async fn shared_stop_scenarios_resume_other_groups_after_termination() {
                 let mut state = FlowState030::new(f.identity.clone());
                 let mut stop_sent = false;
                 for row in &view.events {
-                    let event = crate::persistence::replay_verify030::read_test_event(
-                        row["event"].clone(),
-                    );
+                    let event =
+                        crate::persistence::replay_verify030::read_test_event(row["event"].clone());
                     let transition = reduce(&f.plan, &state, &event).unwrap();
                     state = transition.state;
                     for effect in transition.effects {
@@ -1217,9 +1741,10 @@ async fn run_all_37(compare_ts: bool, memory: bool) {
         pinned, discovered,
         "Every scenario must be explicitly covered"
     );
-    let provenance: Value =
-        serde_json::from_str(include_str!("../tests/fixtures/conformance/provenance.json"))
-            .unwrap();
+    let provenance: Value = serde_json::from_str(include_str!(
+        "../tests/fixtures/conformance/provenance.json"
+    ))
+    .unwrap();
     let upstream_hashes: BTreeMap<_, _> = provenance["files"]
         .as_array()
         .unwrap()

@@ -9,7 +9,8 @@ use crate::{
     },
     tasks::StreamTasks,
 };
-use tokio::sync::{mpsc, oneshot};
+use std::sync::Arc;
+use tokio::sync::{mpsc, oneshot, Mutex, OwnedMutexGuard};
 
 #[derive(Clone)]
 pub(crate) struct SteerSender030(mpsc::Sender<SteerDelivery030>);
@@ -46,7 +47,8 @@ fn matches_attempt(effect: &FlowEffect030, attempt: &FlowWorkAttempt030) -> bool
 pub(crate) struct SteerDelivery030 {
     effect: FlowEffect030,
     attempt: FlowWorkAttempt030,
-    ack: oneshot::Sender<ConsumedSteer030>,
+    ack: oneshot::Sender<Result<ConsumedSteer030>>,
+    gate: Option<(Arc<Mutex<()>>, sqlx::SqlitePool)>,
 }
 
 /// Sealed evidence from the owned consumer, never deserialized from IPC.
@@ -71,10 +73,20 @@ impl SteerSender030 {
     pub(crate) fn is_closed(&self) -> bool {
         self.0.is_closed()
     }
+    #[cfg(test)]
     pub(crate) async fn deliver(
         &self,
         effect: &FlowEffect030,
         attempt: &FlowWorkAttempt030,
+    ) -> Result<ConsumedSteer030> {
+        self.deliver_with_gate(effect, attempt, None).await
+    }
+
+    pub(crate) async fn deliver_with_gate(
+        &self,
+        effect: &FlowEffect030,
+        attempt: &FlowWorkAttempt030,
+        gate: Option<(Arc<Mutex<()>>, sqlx::SqlitePool)>,
     ) -> Result<ConsumedSteer030> {
         if !matches_attempt(effect, attempt) {
             return Err(refused());
@@ -86,6 +98,7 @@ impl SteerSender030 {
                 effect: effect.clone(),
                 attempt: attempt.clone(),
                 ack,
+                gate,
             })
             .await
             .is_err()
@@ -96,7 +109,7 @@ impl SteerSender030 {
                 consumed: false,
             });
         }
-        result.await.map_err(|_| uncertain())
+        result.await.map_err(|_| uncertain())?
     }
 }
 impl SteerInbox030 {
@@ -110,6 +123,40 @@ impl SteerInbox030 {
 impl SteerDelivery030 {
     pub(crate) fn effect(&self) -> &FlowEffect030 {
         &self.effect
+    }
+
+    /// Serialize the actual provider send with Stop and recipient completion.
+    /// The adapter releases the guard before awaiting a provider response.
+    pub(crate) async fn wire_admission(&self) -> Result<Option<OwnedMutexGuard<()>>> {
+        let Some((gate, pool)) = &self.gate else {
+            return Ok(None);
+        };
+        let guard = gate.clone().lock_owned().await;
+        let raw: String = sqlx::query_scalar(
+            "SELECT state_json FROM engine_flow030_runs WHERE system_id=? AND invocation_id=?",
+        )
+        .bind(&self.effect.identity.system_start_id)
+        .bind(&self.effect.identity.flow_invocation_id)
+        .fetch_one(pool)
+        .await?;
+        let state = serde_json::from_str(&raw)?;
+        let FlowEffectKind030::Steer { work, .. } = &self.effect.kind else {
+            return Err(refused());
+        };
+        if !crate::persistence::flow030::accepts_steer030(&state, work)
+            || !crate::persistence::flow030::steer_effect_eligible030(&state, &self.effect)
+        {
+            return Err(failure(
+                "STALE_REFERENCE",
+                "steer",
+                "The targeted work can no longer receive a steer",
+            ));
+        }
+        Ok(Some(guard))
+    }
+
+    pub(crate) fn wrong_recipient(self) {
+        let _ = self.ack.send(Err(refused()));
     }
 
     /// Call only after the transport has consumed the message and sender.
@@ -131,6 +178,25 @@ impl SteerDelivery030 {
         attempt: &FlowWorkAttempt030,
         consumed: bool,
     ) -> Result<()> {
+        self.evidence(tasks, attempt, consumed)?().map_err(|_| uncertain())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn simulation(
+        self,
+        tasks: &StreamTasks,
+        attempt: &FlowWorkAttempt030,
+        consumed: bool,
+    ) -> Result<impl FnOnce() -> std::result::Result<(), ()> + Send> {
+        self.evidence(tasks, attempt, consumed)
+    }
+
+    fn evidence(
+        self,
+        tasks: &StreamTasks,
+        attempt: &FlowWorkAttempt030,
+        consumed: bool,
+    ) -> Result<impl FnOnce() -> std::result::Result<(), ()> + Send> {
         if !matches_attempt(&self.effect, attempt)
             || self.attempt.provider_attempt_id() != attempt.provider_attempt_id()
             || self.attempt.owner() != attempt.owner()
@@ -146,13 +212,15 @@ impl SteerDelivery030 {
         tasks
             .verify_agent_scope030(&request, attempt)
             .map_err(|_| refused())?;
-        self.ack
-            .send(ConsumedSteer030 {
-                effect: self.effect,
-                attempt: self.attempt,
-                consumed,
-            })
-            .map_err(|_| uncertain())
+        Ok(move || {
+            self.ack
+                .send(Ok(ConsumedSteer030 {
+                    effect: self.effect,
+                    attempt: self.attempt,
+                    consumed,
+                }))
+                .map_err(|_| ())
+        })
     }
 }
 
