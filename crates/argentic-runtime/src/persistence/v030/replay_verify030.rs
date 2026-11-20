@@ -760,6 +760,16 @@ async fn verify_physical_end(
         if event.event_id.starts_with("reopened-approval-stop:")
             || receipt["kind"] == "nativeReopenedApprovalStop030"
         {
+            if !matches!(
+                receipt["kind"].as_str(),
+                Some("nativeReopenedApprovalStop030" | "nativeOwnedHandoff030")
+            ) {
+                return Err(mismatch(
+                    "reopenedApproval.settlementKind",
+                    "reopened approval or existing native handoff",
+                    &receipt["kind"],
+                ));
+            }
             let local_approval = plan.versions.contract == argentic_core::AGSDL_040
                 && work.agent_instance_id.is_none()
                 && state.activations.iter().any(|activation| {
@@ -1201,6 +1211,15 @@ async fn verify_settlement(
                 )
             })?,
         )?;
+        if receipt["kind"] != "nativeReopenedApprovalStop030"
+            && !original["workAttempt"].is_object()
+        {
+            return Err(mismatch(
+                "joinedStop.workAttempt",
+                "native agent attempt",
+                &original["workAttempt"],
+            ));
+        }
         for key in ["workAttempt", "requestId", "ownerEpoch", "generation"] {
             equal(&format!("joinedStop.{key}"), &original[key], &receipt[key])?;
         }

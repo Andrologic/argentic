@@ -1067,6 +1067,20 @@ mod tests {
             )
             .await
             .unwrap();
+            // Stop can commit after the approval ticket is reserved while
+            // evaluation of its clock output is still in flight.
+            let lease = host.engine.start_lease().await.unwrap();
+            lease.clock_jobs030().approval_check_probe(Arc::new(|job, _| {
+                let job: Value = serde_json::from_str(job).unwrap();
+                let event: Value =
+                    serde_json::from_str(job["input"]["eventJson"].as_str().unwrap()).unwrap();
+                if event["event"]["kind"] == "approval" {
+                    loop {
+                        std::thread::park();
+                    }
+                }
+            }));
+            drop(lease);
             let started = host.start("start".into(), entry(), false).await.unwrap();
             let scope = persistence::public030::HumanScope030 {
                 system_start_id: started.receipt.identity.system_start_id,
@@ -1097,7 +1111,7 @@ mod tests {
                 .output(),
         ).await.unwrap().unwrap();
         assert!(child.status.success(), "{child:?}");
-        for _ in 0..2 {
+        for reopening in 0..2 {
             let host = f.open().await.unwrap();
             let runs = host.runs().await.unwrap();
             let query = api::RuntimeProjectionQuery030 {
@@ -1109,6 +1123,10 @@ mod tests {
             let page = host.projection(query.clone(), None).await.unwrap();
             assert_eq!(page.verdict.as_deref(), Some("cancelled"));
             assert!(!page.stopping && !page.termination_uncertain);
+            let pending: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM engine_flow030_clock_events WHERE output_json IS NULL",
+            ).fetch_one(&host.pool).await.unwrap();
+            assert_eq!(pending, 1);
             host.shutdown(&[]).await.unwrap();
             host.close().await.unwrap();
             let replay = persistence::replay_verify030::verify_path030(
@@ -1117,6 +1135,22 @@ mod tests {
                 &page.flow_invocation_id,
             ).await;
             assert!(replay.ok, "{replay:?}");
+            if reopening == 1 {
+                let copy = f.data.join("wrong-stop-receipt.sqlite");
+                std::fs::copy(f.data.join("engine.sqlite"), &copy).unwrap();
+                let pool = crate::sqlite::open_file(&copy).await.unwrap();
+                let changed = sqlx::query(
+                    "UPDATE engine_flow030_outbox
+                     SET settlement_json=json_set(settlement_json,'$.kind','nativeJoinedGroupStop030')
+                     WHERE settlement_json ->> '$.kind'='nativeReopenedApprovalStop030'",
+                ).execute(&pool).await.unwrap().rows_affected();
+                assert_eq!(changed, 1);
+                pool.close().await;
+                let replay = persistence::replay_verify030::verify_path030(
+                    &copy, &query.system_start_id, &page.flow_invocation_id,
+                ).await;
+                assert_eq!(replay.divergence.unwrap().field, "joinedStop.workAttempt");
+            }
         }
     }
 
