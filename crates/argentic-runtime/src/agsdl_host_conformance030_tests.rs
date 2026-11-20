@@ -553,6 +553,9 @@ impl AgentExecutor030 for Executor {
                         let id = delivery_activation_id.clone();
                         let outcome = steer_script.lock().unwrap().remove(&id);
                         if let Some(outcome) = outcome {
+                            // The fixture acknowledges the injection attempt now
+                            // and supplies receipt evidence at the timeline event.
+                            drop(delivery.wire_admission().await?);
                             let receipt = delivery.simulation(&work.tasks, &work.attempt,
                                 matches!(outcome, SteerOutcome040::Received))?;
                             assert!(deferred.lock().unwrap().insert(id, Box::new(move || {
