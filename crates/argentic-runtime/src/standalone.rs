@@ -1072,8 +1072,12 @@ mod tests {
             let lease = host.engine.start_lease().await.unwrap();
             lease.clock_jobs030().approval_check_probe(Arc::new(|job, _| {
                 let job: Value = serde_json::from_str(job).unwrap();
+                let input: Value = serde_json::from_str(job["inputJson"].as_str().unwrap()).unwrap();
+                if input["operation"] != "humanClock" {
+                    return;
+                }
                 let event: Value =
-                    serde_json::from_str(job["input"]["eventJson"].as_str().unwrap()).unwrap();
+                    serde_json::from_str(input["input"]["eventJson"].as_str().unwrap()).unwrap();
                 if event["event"]["kind"] == "approval" {
                     loop {
                         std::thread::park();
