@@ -156,6 +156,7 @@ type BaseKey = (&'static str, &'static str, String, String);
 /// The JS `Report`.
 #[derive(Default)]
 pub(crate) struct Report {
+    current_edition: bool,
     pub(crate) diagnostics: Vec<Diagnostic>,
     pub(crate) joins: OrderedMap<String, ReportJoin>,
     seen: HashSet<(BaseKey, Vec<String>)>,
@@ -230,7 +231,11 @@ impl Report {
     pub(crate) fn to_json(&self) -> String {
         let mut out = format!(
             "{{\"contract\":{},\"valid\":{},\"diagnostics\":[",
-            quote(CONTRACT),
+            quote(if self.current_edition {
+                crate::AGSDL_040
+            } else {
+                CONTRACT
+            }),
             self.valid()
         );
         for (index, item) in self.diagnostics.iter().enumerate() {
@@ -280,7 +285,7 @@ fn string_array(values: &[String]) -> String {
 
 /// `check_module(module)`: the module itself, or the first problem.
 pub(crate) fn check_module(module: Value) -> Result<Value, ReadError> {
-    let problems = schema::module_schema()?.check(&module)?;
+    let problems = schema::edition_schema(&module, true)?.check(&module)?;
     if let Some((at, message)) = problems.first() {
         let at = if at.is_empty() { "/" } else { at.as_str() };
         return Err(ModuleError {
@@ -313,7 +318,9 @@ pub(crate) fn check_module(module: Value) -> Result<Value, ReadError> {
 /// `validate_document(document, modules)`.
 pub(crate) fn validate_document(document: &Value, modules: &ModuleMap) -> Result<Report, Internal> {
     let mut report = Report::new();
-    let problems = schema::document_schema()?.check(document)?;
+    report.current_edition = matches!(member(Some(document), "contract"),
+        Some(Value::String(contract)) if contract == crate::AGSDL_040);
+    let problems = schema::edition_schema(document, false)?.check(document)?;
     if !problems.is_empty() {
         for (at, message) in problems {
             report.error_at("SHAPE", &at, message);
@@ -337,6 +344,20 @@ pub(crate) fn validate_bytes(bytes: &[u8], modules: &ModuleMap) -> Result<Report
         }
         Ok(parsed) => validate_document(&parsed.tree, modules),
     }
+}
+
+fn approval_comments() -> &'static Value {
+    static SCHEMA: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
+    SCHEMA.get_or_init(|| {
+        super::exact::scan::parse_v030(
+            br#"{
+            "type":"array","items":{"type":"object","additionalProperties":false,
+            "properties":{"step":{"type":"string"},"comment":{"type":"string"}}}
+        }"#,
+        )
+        .expect("approval comments schema")
+        .tree
+    })
 }
 
 fn article(word: &str) -> String {
@@ -2057,6 +2078,14 @@ impl<'a, 'r> Checker<'a, 'r> {
                         repr_part(&path[1])
                     ));
                 }
+                if part_is(path.get(1), "comments") {
+                    return Ok(Done(
+                        match valueschema::descend(approval_comments(), &path[2..])? {
+                            Descent::Refused(reason) => Some(reason),
+                            _ => None,
+                        },
+                    ));
+                }
                 if part_is(path.get(1), "resources") && path.len() > 2 {
                     if let Some(names) = self.received_resources(graph, &node.addr, infos)? {
                         if !part_text(&path[2]).is_some_and(|name| names.contains(name)) {
@@ -2142,19 +2171,9 @@ impl<'a, 'r> Checker<'a, 'r> {
                     return Ok(Done(error_path_problem(rest)));
                 }
                 if !rest.is_empty() {
-                    let members = info.branches.get(branch).expect("branch members");
-                    let mut candidates = Vec::new();
-                    for (index, producer) in graph.edges.iter().enumerate() {
-                        if producer.dst != node.addr || producer.kind != RouteKind::Normal {
-                            continue;
-                        }
-                        let local = scope_member(&producer.src, &info.prefix);
-                        let direct =
-                            local.as_deref() == Some(info.origin.as_str()) && info.origin == branch;
-                        if local.as_ref().is_some_and(|local| members.contains(local)) || direct {
-                            candidates.push(index);
-                        }
-                    }
+                    let candidates = Self::branch_producers(graph, &node.addr, info, branch)
+                        .map(|(index, _)| index)
+                        .collect();
                     return Ok(Pending(Scan {
                         candidates,
                         next: 0,
@@ -2284,6 +2303,25 @@ impl<'a, 'r> Checker<'a, 'r> {
         }
     }
 
+    fn branch_producers<'b>(
+        graph: &'b Graph<'a>,
+        address: &'b str,
+        info: &'b LocalJoin,
+        branch: &'b str,
+    ) -> impl Iterator<Item = (usize, &'b Edge<'a>)> + 'b {
+        graph.edges.iter().enumerate().filter(move |(_, edge)| {
+            edge.dst == address
+                && edge.kind == RouteKind::Normal
+                && scope_member(&edge.src, &info.prefix).is_some_and(|local| {
+                    info.branches
+                        .get(branch)
+                        .expect("branch members")
+                        .contains(&local)
+                        || (local == info.origin && local == branch)
+                })
+        })
+    }
+
     fn declared_kind(
         &self,
         graph: &Graph<'a>,
@@ -2357,8 +2395,8 @@ impl<'a, 'r> Checker<'a, 'r> {
                 if path.len() == 1 || parts_are(&path[1..], &["resources"]) {
                     return kind("object");
                 }
-                if parts_are(&path[1..], &["comments"]) {
-                    return kind("array");
+                if part_is(path.get(1), "comments") {
+                    return Ok(valueschema::kind_at(approval_comments(), &path[2..])?);
                 }
                 Ok(None)
             }
@@ -2369,14 +2407,46 @@ impl<'a, 'r> Checker<'a, 'r> {
                 if path.len() == 1 {
                     return kind("object");
                 }
-                match infos.get(&node.addr) {
-                    Some(info) if path.len() == 2 => {
-                        let fan =
-                            part_text(&path[1]).is_some_and(|name| info.fanout.contains(name));
-                        kind(if fan { "array" } else { "object" })
-                    }
-                    _ => Ok(None),
+                let Some((info, branch)) = infos
+                    .get(&node.addr)
+                    .zip(part_text(&path[1]))
+                    .filter(|(info, branch)| info.branches.contains_key(*branch))
+                else {
+                    return Ok(None);
+                };
+                let fan = info.fanout.contains(branch);
+                let mut rest = &path[2..];
+                if rest.is_empty() {
+                    return kind(if fan { "array" } else { "object" });
                 }
+                if fan {
+                    if !is_index(rest.first()) {
+                        return Ok(None);
+                    }
+                    rest = &rest[1..];
+                    if rest.is_empty() {
+                        return kind("object");
+                    }
+                    if part_is(rest.first(), "item") {
+                        return Ok(None);
+                    }
+                }
+                match rest.first().and_then(part_text) {
+                    Some("ended" | "by") => return kind("string"),
+                    Some("error") => return Ok(None),
+                    _ => {}
+                }
+                let mut producers = Self::branch_producers(graph, &node.addr, info, branch);
+                let Some((_, first)) = producers.next() else {
+                    return Ok(None);
+                };
+                let first = self.declared_kind(graph, first, rest, infos)?;
+                for (_, edge) in producers {
+                    if self.declared_kind(graph, edge, rest, infos)? != first {
+                        return Ok(None);
+                    }
+                }
+                Ok(first)
             }
             _ => Ok(None),
         }

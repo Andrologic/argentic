@@ -24,6 +24,13 @@ pub(crate) mod native;
 pub(crate) mod reader;
 pub(crate) mod route;
 pub(crate) mod schema;
+
+pub const AGSDL_040: &str = "agsdl-0.4.0";
+
+/// Published document editions understood by the reader and runtime.
+pub fn supports_contract(contract: &str) -> bool {
+    matches!(contract, "agsdl-0.3.0" | AGSDL_040)
+}
 pub(crate) mod validate;
 pub(crate) mod valueschema;
 pub(crate) mod work;

@@ -346,13 +346,19 @@ pub(crate) fn finish(mut state: Prepared) -> Value {
             });
         let versions = o([
             ("snapshot", s("2")),
-            ("contract", s("agsdl-0.3.0")),
+            (
+                "contract",
+                s(exact::text(document.get("contract"), "/contract")?),
+            ),
             ("compiler", s(COMPILER)),
-            ("runtime", s(if graph.has_shared_stop() {
-                crate::flow::SHARED_STOP_RUNTIME
-            } else {
-                RUNTIME
-            })),
+            (
+                "runtime",
+                s(if graph.has_shared_stop() {
+                    crate::flow::SHARED_STOP_RUNTIME
+                } else {
+                    RUNTIME
+                }),
+            ),
             ("registry", registry.get("version").clone()),
             ("profile", s(PROFILE)),
         ]);

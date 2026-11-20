@@ -43,9 +43,10 @@ fn refuse<T>(message: impl Into<String>) -> Result<T, SchemaError> {
     })
 }
 
-pub(crate) const DOCUMENT_SCHEMA_JSON: &str = include_str!("../../assets/schema/agsdl.schema.json");
+pub(crate) const DOCUMENT_SCHEMA_JSON: &str =
+    include_str!("../../assets/schema/agsdl-030.schema.json");
 pub(crate) const MODULE_SCHEMA_JSON: &str =
-    include_str!("../../assets/schema/harness-module.schema.json");
+    include_str!("../../assets/schema/harness-module-030.schema.json");
 
 /// JS truthiness of a JSON value. A `NumberToken` is an object, so truthy.
 pub(crate) fn truthy(value: &Value) -> bool {
@@ -560,6 +561,36 @@ fn pinned(
     cell.get_or_init(|| build().map(SchemaChecker::new))
         .as_ref()
         .map_err(Clone::clone)
+}
+
+pub(crate) fn edition_schema(
+    value: &Value,
+    module: bool,
+) -> Result<&'static SchemaChecker, SchemaError> {
+    let current = matches!(value.as_object().and_then(|o| o.get("contract")),
+        Some(Value::String(contract)) if contract == crate::AGSDL_040);
+    match (current, module) {
+        (false, false) => document_schema(),
+        (false, true) => module_schema(),
+        (true, false) => {
+            static CELL: OnceLock<Result<SchemaChecker, SchemaError>> = OnceLock::new();
+            pinned(&CELL, || {
+                parse_pinned(
+                    "agsdl-040.schema.json",
+                    include_str!("../../assets/schema/agsdl.schema.json"),
+                )
+            })
+        }
+        (true, true) => {
+            static CELL: OnceLock<Result<SchemaChecker, SchemaError>> = OnceLock::new();
+            pinned(&CELL, || {
+                parse_pinned(
+                    "harness-module-040.schema.json",
+                    include_str!("../../assets/schema/harness-module.schema.json"),
+                )
+            })
+        }
+    }
 }
 
 /// The document schema root, `agsdl.schema.json`.
