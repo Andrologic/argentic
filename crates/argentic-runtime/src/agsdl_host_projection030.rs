@@ -153,6 +153,9 @@ pub(crate) async fn read(
     // Observation does not require a live executor or grant authority to resume.
     // Read capture and state together so a page describes one committed revision.
     let row = sqlx::query("SELECT s.capture_json,r.plan_json,r.state_json,r.source_json,r.snapshot_id,r.epoch,
+        (SELECT json_group_array(h.effect_id) FROM engine_flow030_handoffs h
+          WHERE h.system_id=r.system_id AND h.invocation_id=r.invocation_id
+          AND h.receipt_json ->> '$.kind'='nativeOwnedHandoff030') AS handoffs,
         EXISTS(SELECT 1 FROM engine_flow030_interruptions i WHERE i.system_id=r.system_id) AS interrupted,
         EXISTS(SELECT 1 FROM engine_flow030_owners o WHERE o.system_id=r.system_id AND o.status='revoked') AS revoked FROM engine_start030_requests s JOIN engine_flow030_runs r ON r.system_id=s.system_id AND r.invocation_id=s.invocation_id WHERE s.system_id=?")
         .bind(&query.system_start_id).fetch_optional(pool).await?
@@ -186,13 +189,15 @@ pub(crate) async fn read(
         snapshot_id: capture.identity.snapshot_id,
     };
     let plan: FlowPlan030 = serde_json::from_str(&capture.compiled_plan_json)?;
-    let projection = runtime_projection030::project_runtime030(&plan, &state).map_err(|_| {
-        failure(
-            "CORRELATION",
-            "projection",
-            "Captured flow projection is invalid",
-        )
-    })?;
+    let handoffs = serde_json::from_str(row.try_get("handoffs")?)?;
+    let projection =
+        runtime_projection030::project_runtime030(&plan, &state, &handoffs).map_err(|_| {
+            failure(
+                "CORRELATION",
+                "projection",
+                "Captured flow projection is invalid",
+            )
+        })?;
     let mut page = page(scope, continuation, projection)?;
     if plan.versions.contract == argentic_core::AGSDL_040 {
         let interrupted: bool = row.try_get("interrupted")?;

@@ -1053,6 +1053,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reopening_finishes_a_committed_stop_of_a_local_approval() {
+        const CHILD: &str = "ARGENTIC_TEST_STOPPED_APPROVAL_ROOT";
+        if let Some(root) = std::env::var_os(CHILD) {
+            let root = PathBuf::from(root);
+            let policy = root.join("policy.json");
+            let host = Host::open(
+                &root.join("data"),
+                &root.join("workspace"),
+                &root.join("source.json"),
+                &policy,
+                &digest(std::fs::read(&policy).unwrap()),
+            )
+            .await
+            .unwrap();
+            let started = host.start("start".into(), entry(), false).await.unwrap();
+            let scope = persistence::public030::HumanScope030 {
+                system_start_id: started.receipt.identity.system_start_id,
+                source: started.capture.source,
+            };
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while host.humans(scope.clone(), None).await.unwrap().requests.is_empty() {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            }).await.unwrap();
+            let hook = host.engine.flow030().install_system_stop_commit_hook("stop");
+            tokio::select! {
+                _ = hook.reached() => std::process::exit(0),
+                result = host.stop(EngineStopRequest {
+                    request_id: "stop".into(),
+                    system_start_id: scope.system_start_id,
+                    activation_id: None,
+                }) => panic!("Stop reached its reply before the commit hook: {result:?}"),
+            }
+        }
+        let f = Fixture::new(&WAIT.replace("agsdl-0.3.0", argentic_core::AGSDL_040));
+        let child = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            tokio::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "standalone::tests::reopening_finishes_a_committed_stop_of_a_local_approval"])
+                .env(CHILD, f._temp.path())
+                .kill_on_drop(true)
+                .output(),
+        ).await.unwrap().unwrap();
+        assert!(child.status.success(), "{child:?}");
+        for _ in 0..2 {
+            let host = f.open().await.unwrap();
+            let runs = host.runs().await.unwrap();
+            let query = api::RuntimeProjectionQuery030 {
+                system_start_id: runs[0]["receipt"]["identity"]["systemStartId"]
+                    .as_str().unwrap().into(),
+                source: host.source().await,
+                snapshot_id: None,
+            };
+            let page = host.projection(query, None).await.unwrap();
+            assert_eq!(page.verdict.as_deref(), Some("cancelled"));
+            assert!(!page.stopping && !page.termination_uncertain);
+            host.shutdown(&[]).await.unwrap();
+            host.close().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn restart_marks_unfinished_run_interrupted_without_adoption() {
         const CHILD: &str = "ARGENTIC_SYNTHETIC_CRASH_ROOT";
         if let Some(root) = std::env::var_os(CHILD) {

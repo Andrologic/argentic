@@ -2619,7 +2619,7 @@ pub(crate) async fn interrupt_previous_runs030(pool: &SqlitePool) -> Result<()> 
     Ok(())
 }
 
-/// Recover only cleanup authority for an explicitly stopped 0.4 run.
+/// Recover cleanup authority after exclusive reopening of a stopped 0.4 run.
 pub(crate) async fn recover_pending_stops030(host: &HostState, pool: &SqlitePool) -> Result<()> {
     let rows = sqlx::query(
         "SELECT o.system_id,o.owner_epoch,o.generation,c.capture_json,s.request_json
@@ -2633,6 +2633,8 @@ pub(crate) async fn recover_pending_stops030(host: &HostState, pool: &SqlitePool
     ).fetch_all(pool).await?;
     for row in rows {
         let capture: StartCapture030 = serde_json::from_str(row.get("capture_json"))?;
+        let plan: repository::flow030::FlowPlan030 =
+            serde_json::from_str(&capture.compiled_plan_json)?;
         let owner = EngineOwner {
             system_start_id: row.get("system_id"),
             owner_epoch: row.get("owner_epoch"),
@@ -2657,17 +2659,40 @@ pub(crate) async fn recover_pending_stops030(host: &HostState, pool: &SqlitePool
             .insert(control.identity.system_start_id.clone(), control.clone());
         for activation in view.state.activations.iter().filter(|a| a.physical) {
             if let Some(start_effect_id) = &activation.start_effect_id {
-                control
-                    .settle_unadmitted(
-                        host.flow030(),
-                        pool,
-                        &WorkRef030 {
-                            activation_id: activation.id.clone(),
-                            start_effect_id: start_effect_id.clone(),
-                            agent_instance_id: activation.instance_id.clone(),
+                let work = WorkRef030 {
+                    activation_id: activation.id.clone(),
+                    start_effect_id: start_effect_id.clone(),
+                    agent_instance_id: activation.instance_id.clone(),
+                };
+                if control.settle_unadmitted(host.flow030(), pool, &work).await?.is_some() {
+                    continue;
+                }
+                // The autonomous approval executor only owns an in-memory
+                // wait. It cannot outlive the previous exclusive host.
+                if let Some(stop) = activation.stop_effect_id.as_ref().filter(|_| {
+                    activation.agent.is_none() && activation.instance_id.is_none()
+                        && plan.steps.iter().any(|step| {
+                            step.r#type == "approval" && Some(&step.address) == activation.step.as_ref()
+                        })
+                }) {
+                    let current = control.read(pool).await?;
+                    let result = control.apply(pool, &FlowEvent030 {
+                        identity: control.identity.clone(),
+                        event_id: format!("reopened-approval-stop:{stop}"),
+                        expected_revision: current.state.revision,
+                        kind: FlowEventKind030::PhysicalEnded {
+                            work,
+                            stop_effect_id: Some(stop.clone()),
+                            evidence: PhysicalEvidence030 {
+                                native_receipt_id: format!("reopened-approval:{start_effect_id}"),
+                                descendants_joined: true,
+                            },
                         },
-                    )
-                    .await?;
+                    }).await?;
+                    if matches!(result, Apply030::Diagnostic(_)) {
+                        return Err(refused());
+                    }
+                }
             }
         }
     }

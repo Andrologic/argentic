@@ -341,7 +341,6 @@ impl PendingSteer030 {
             return Ok(());
         }
         let id = delivery.effect().id.clone();
-        let request_id = self.request_id;
         delivery.handoff_observation(&context.tasks, &context.attempt, async move {
             // Keep the app-server and its registry cleanup alive until it
             // emits the remaining evidence or the observation expires.
@@ -360,17 +359,6 @@ impl PendingSteer030 {
                         }
                         None => (),
                     }
-                }
-                if request_id.is_some()
-                    && event.get("method").is_none()
-                    && event["id"].as_u64() == request_id
-                    && event.get("error").is_some()
-                {
-                    return if unavailable_turn(&event) {
-                        Ok(Some(false))
-                    } else {
-                        Err(failure("CORRELATION", "steer", "Codex rejected the steer"))
-                    };
                 }
             }
             Ok(None)
@@ -426,7 +414,9 @@ impl PendingSteer030 {
             && event.get("id").and_then(Value::as_u64) == self.request_id
         {
             self.request_id = None;
-            if asynchronous && self.delivery.is_none() {
+            // The RPC response has no receipt semantics in 0.4.0. Even an
+            // error can precede the matching input notification.
+            if asynchronous {
                 return Ok(true);
             }
             match client.response_value030(event) {
@@ -437,17 +427,9 @@ impl PendingSteer030 {
                         .delivery
                         .take()
                         .ok_or_else(|| missing("steerRejectedAfterConsumption"))?;
-                    if asynchronous && !unavailable_turn(event) {
-                        delivery.wrong_recipient();
-                    } else {
-                        delivery.not_sent(&context.tasks, &context.attempt)?;
-                        if !asynchronous {
-                            context.close().await?;
-                        }
-                    }
+                    delivery.not_sent(&context.tasks, &context.attempt)?;
+                    context.close().await?;
                 }
-                // A non-confirming response does not settle receipt.
-                Ok(_) | Err(_) if asynchronous => {}
                 Ok(_) => return Err(missing("steerTurn")),
                 Err(error) => return Err(error),
             }
@@ -472,13 +454,6 @@ impl PendingSteer030 {
         }
         Ok(false)
     }
-}
-
-fn unavailable_turn(event: &Value) -> bool {
-    event["error"]["message"].as_str().is_some_and(|message| {
-        let message = message.to_ascii_lowercase();
-        message.contains("no active turn") || message.contains("turn is not active")
-    })
 }
 
 fn is_steer_message(event: &Value, id: &str) -> bool {
@@ -1625,7 +1600,12 @@ for line in sys.stdin:
     print(json.dumps({'id':i,'result':{'turnId':'turn1'}}),flush=True)
    print(json.dumps({'method':'item/completed','params':{'threadId':thread,'turnId':'turn1','item':{'id':'received','type':'userMessage','clientId':p['clientUserMessageId']}}}),flush=True)
    continue
-  print(json.dumps({'id':i,'result':{} if mode.startswith('steer-malformed') else {'turnId':turn_id}}),flush=True)
+  response={'id':i,'result':{} if mode.startswith('steer-malformed') else {'turnId':turn_id}}
+  if mode == 'steer-ambiguous-error-040':
+   response={'id':i,'error':{'code':-1,'message':'Could not establish whether there is no active turn'}}
+  if mode == 'steer-null-error-040':
+   response={'id':i,'error':None}
+  print(json.dumps(response),flush=True)
   print(json.dumps({'method':'item/completed','params':{'threadId':'thread','turnId':turn_id,'item':{'id':'comment'+str(count),'type':'agentMessage','phase':'commentary','text':'Working'}}}),flush=True)
   if mode == 'steer-obsolete-040':
    print(json.dumps({'id':i-1,'result':{'turn':{'id':turn_id}}}),flush=True)
@@ -1638,7 +1618,7 @@ for line in sys.stdin:
   print(json.dumps({'method':'turn/completed','params':{'threadId':'thread','turn':{'id':turn_id,'status':status}}}),flush=True)
   if mode in ('steer-late-040','steer-failed-040'):
    time.sleep(.25)
-  if mode in ('steer-late-040','steer-failed-040','steer-obsolete-040','steer-correction-040','steer-malformed-receipt-040','steer-incomplete-item-040'):
+  if mode in ('steer-late-040','steer-failed-040','steer-obsolete-040','steer-correction-040','steer-malformed-receipt-040','steer-incomplete-item-040','steer-ambiguous-error-040','steer-null-error-040'):
    print(json.dumps({'method':'item/completed','params':{'threadId':'thread','turnId':turn_id,'item':{'id':'received','type':'userMessage','clientId':p['clientUserMessageId']}}}),flush=True)
   continue
  elif method=='turn/start':
@@ -2428,6 +2408,8 @@ for line in sys.stdin:
             "steer-malformed-040",
             "steer-malformed-receipt-040",
             "steer-incomplete-item-040",
+            "steer-ambiguous-error-040",
+            "steer-null-error-040",
             "steer-content-040",
             "steer-oversized-040",
             "steer-correction-040",

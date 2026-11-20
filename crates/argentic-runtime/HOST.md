@@ -124,6 +124,9 @@ non-receipt after the target becomes unavailable returns the message to the
 queue in arrival order. Lost or expired evidence produces `STEER_UNCERTAIN`
 on the sender path. Inspect the destination activation's message for
 `targetActivationId`, delivery statuses and `steerFailure` when present.
+For new work, `delivered` requires the durable executor handoff. For a
+steer to existing work, the Codex RPC reply leaves receipt pending until
+the matching input notification arrives or the evidence deadline expires.
 
 A 0.4.0 `stop` response with kind `requested` acknowledges a durable whole-run
 stop. Poll `inspect` for `stopping: true` while the executors are still
@@ -154,7 +157,8 @@ or adopt its session. `terminationUncertain` indicates that activity may have
 survived the interruption.
 
 An explicit 0.4.0 whole-run stop survives reopening the file. Recovery can
-settle a Start that never crossed the executor boundary. If previously admitted
+settle a Start that never crossed the executor boundary and a local approval
+whose in-memory wait ended with the previous host. If other previously admitted
 work still lacks physical termination evidence, inspection continues to show
 `stopping: true` with `terminationUncertain: true`. The standalone host has
 no transport for reconnecting to a lost external executor. Run history and

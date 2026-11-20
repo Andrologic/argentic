@@ -2078,7 +2078,7 @@ impl<'a, 'r> Checker<'a, 'r> {
                         repr_part(&path[1])
                     ));
                 }
-                if part_is(path.get(1), "comments") {
+                if self.report.current_edition && part_is(path.get(1), "comments") {
                     return Ok(Done(
                         match valueschema::descend(approval_comments(), &path[2..])? {
                             Descent::Refused(reason) => Some(reason),
@@ -2396,6 +2396,9 @@ impl<'a, 'r> Checker<'a, 'r> {
                     return kind("object");
                 }
                 if part_is(path.get(1), "comments") {
+                    if !self.report.current_edition {
+                        return if path.len() == 2 { kind("array") } else { Ok(None) };
+                    }
                     return Ok(valueschema::kind_at(approval_comments(), &path[2..])?);
                 }
                 Ok(None)
@@ -2406,6 +2409,16 @@ impl<'a, 'r> Checker<'a, 'r> {
                 }
                 if path.len() == 1 {
                     return kind("object");
+                }
+                if !self.report.current_edition {
+                    return match infos.get(&node.addr) {
+                        Some(info) if path.len() == 2 => {
+                            let fan =
+                                part_text(&path[1]).is_some_and(|name| info.fanout.contains(name));
+                            kind(if fan { "array" } else { "object" })
+                        }
+                        _ => Ok(None),
+                    };
                 }
                 let Some((info, branch)) = infos
                     .get(&node.addr)

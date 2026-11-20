@@ -97,6 +97,7 @@ fn index_for_context(
 pub(crate) fn project_runtime030(
     plan: &FlowPlan030,
     state: &FlowState030,
+    handoffs: &std::collections::BTreeSet<String>,
 ) -> Result<RuntimeProjection030, ProjectionError030> {
     if let Some(bound) = &state.plan_json {
         if serde_json::to_string(plan).map_err(|_| ProjectionError030::InvalidState)? != *bound {
@@ -224,10 +225,18 @@ pub(crate) fn project_runtime030(
                         }
                         let consumed = steer.is_some_and(|s| s.status == "consumed")
                             || confirmed_after_stop.contains(&a.id);
-                        if a.start_effect_id.is_some() || consumed {
+                        let started = a.start_effect_id.as_ref().is_some_and(|id| {
+                            plan.versions.contract != argentic_core::AGSDL_040
+                                || handoffs.contains(id)
+                        });
+                        if started || consumed {
                             statuses.push("delivered".into());
                         }
-                        if a.result.is_some() || consumed {
+                        if (started && a.result.is_some())
+                            || consumed
+                            || (plan.versions.contract != argentic_core::AGSDL_040
+                                && a.result.is_some())
+                        {
                             statuses.push("consumed".into());
                         }
                         RuntimeMessage030 {

@@ -123,7 +123,7 @@ fn nearest_fanout_ignores_fixed_routes_and_equal_values_remain_distinct() {
         "running",
         true,
     ));
-    let p = project_runtime030(&plan, &state).unwrap();
+    let p = project_runtime030(&plan, &state, &Default::default()).unwrap();
     let index = |id: &str| {
         p.activations
             .iter()
@@ -210,7 +210,7 @@ fn phases_physical_barriers_groups_and_fifo_are_retained() {
         continuation: None,
         released: false,
     });
-    let p = project_runtime030(&plan, &state).unwrap();
+    let p = project_runtime030(&plan, &state, &Default::default()).unwrap();
     assert_eq!(
         p.instances
             .iter()
@@ -244,13 +244,13 @@ fn invalid_batch_reference_and_wrong_plan_are_rejected() {
         .push(activation("a", contexts[0].clone(), "done", false));
     state.batches[0].items[0].occurrence.item_index = "1".into();
     assert_eq!(
-        project_runtime030(&plan, &state).unwrap_err(),
+        project_runtime030(&plan, &state, &Default::default()).unwrap_err(),
         ProjectionError030::InvalidState
     );
     state.batches[0].items[0].occurrence.item_index = "0".into();
     state.plan_json = Some(json!({"different":true}).to_string());
     assert_eq!(
-        project_runtime030(&plan, &state).unwrap_err(),
+        project_runtime030(&plan, &state, &Default::default()).unwrap_err(),
         ProjectionError030::PlanMismatch
     );
 }
@@ -261,8 +261,10 @@ fn no_fanout_is_none_and_output_json_is_stable() {
     state
         .activations
         .push(activation("a", context, "done", false));
-    let a = serde_json::to_string(&project_runtime030(&plan, &state).unwrap()).unwrap();
-    let b = serde_json::to_string(&project_runtime030(&plan, &state).unwrap()).unwrap();
+    let a = serde_json::to_string(&project_runtime030(&plan, &state, &Default::default()).unwrap())
+        .unwrap();
+    let b = serde_json::to_string(&project_runtime030(&plan, &state, &Default::default()).unwrap())
+        .unwrap();
     assert_eq!(a, b);
     assert!(a.contains("\"nearestFanoutIndex\":null"));
     assert!(!a.contains("PRIVATE_") && !a.contains("private-epoch"));
@@ -281,7 +283,7 @@ fn projects_a_real_reducer_transition_without_exposing_input() {
         },
     };
     let next = reduce(&plan, &state, &event).unwrap().state;
-    let view = project_runtime030(&plan, &next).unwrap();
+    let view = project_runtime030(&plan, &next, &Default::default()).unwrap();
     let start = view
         .activations
         .iter()
@@ -323,7 +325,7 @@ fn preserve_declared_fanout_order_and_sort_top_level_ids() {
     state
         .activations
         .push(activation("a", contexts[2].clone(), "done", false));
-    let view = project_runtime030(&plan, &state).unwrap();
+    let view = project_runtime030(&plan, &state, &Default::default()).unwrap();
     assert_eq!(
         view.groups[0].branches[0].path_ids,
         (0..12).map(|i| format!("b-path-{i}")).collect::<Vec<_>>()
@@ -371,7 +373,7 @@ fn message_projection_distinguishes_queue_consumption_and_steer_fallback() {
         resolved_event_id: Some("ack".into()),
         reason: None,
     });
-    let view = project_runtime030(&plan, &state).unwrap();
+    let view = project_runtime030(&plan, &state, &Default::default()).unwrap();
     let statuses = |id: &str| {
         view.activations
             .iter()
@@ -402,9 +404,29 @@ fn message_projection_distinguishes_queue_consumption_and_steer_fallback() {
     state.steer_deliveries[0].status = "fallback".into();
     state.activations[2].start_effect_id = Some("start-fallback".into());
     state.activations[2].phase = "running".into();
-    let view = project_runtime030(&plan, &state).unwrap();
+    let view = project_runtime030(&plan, &state, &Default::default()).unwrap();
     assert_eq!(
         view.activations[2].message.as_ref().unwrap().statuses,
         vec!["sent", "fallback", "delivered"]
     );
+}
+
+#[test]
+fn proposed_start_is_not_a_delivery_in_040() {
+    let (mut plan, mut state) = setup();
+    plan.versions.contract = argentic_core::AGSDL_040.into();
+    let mut work = activation("work", vec![], "running", true);
+    work.start_effect_id = Some("start-work".into());
+    work.message_json = Some(r#"{"prompt":"Start"}"#.into());
+    state.activations.push(work);
+    for (handoffs, expected) in [
+        (Default::default(), vec!["sent"]),
+        (["start-work".into()].into(), vec!["sent", "delivered"]),
+    ] {
+        let view = project_runtime030(&plan, &state, &handoffs).unwrap();
+        assert_eq!(
+            view.activations[0].message.as_ref().unwrap().statuses,
+            expected
+        );
+    }
 }

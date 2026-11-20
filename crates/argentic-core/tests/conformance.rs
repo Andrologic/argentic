@@ -80,6 +80,16 @@ fn agsdl_040_comments_and_join_selections() {
                 .unwrap();
         assert_eq!(report["contract"], argentic_core::AGSDL_040);
         check_diagnostics(name, &report, &json!({"errors":errors,"warnings":[]}));
+        if !errors.is_empty() {
+            let legacy = std::str::from_utf8(document)
+                .unwrap()
+                .replace(argentic_core::AGSDL_040, "agsdl-0.3.0");
+            let report: Value = serde_json::from_str(
+                &validate_document_json(legacy.as_bytes(), Some(&[EXAMPLE])).unwrap(),
+            )
+            .unwrap();
+            check_diagnostics(name, &report, &json!({"errors":[],"warnings":[]}));
+        }
     }
 }
 
