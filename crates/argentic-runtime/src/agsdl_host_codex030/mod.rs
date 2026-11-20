@@ -305,13 +305,22 @@ impl PendingSteer030 {
     }
     async fn settle_observed(&mut self, context: &SteerContext030) -> HostResult<()> {
         if self.receipt_observed {
-            crate::agsdl_host_steer030::SteerDelivery030::acknowledge_from_provider(
+            let deadline = self.delivery.as_ref().and_then(|offer| offer.deadline());
+            let settle = crate::agsdl_host_steer030::SteerDelivery030::acknowledge_from_provider(
                 &mut self.delivery,
                 &context.tasks,
                 &context.attempt,
                 self.turn_ended_while_counted,
-            )
-            .await?;
+            );
+            if let Some(deadline) = deadline {
+                if let Ok(result) = tokio::time::timeout_at(deadline, settle).await {
+                    result?;
+                } else {
+                    self.delivery = None;
+                }
+            } else {
+                settle.await?;
+            }
             self.receipt_observed = false;
         }
         Ok(())
@@ -320,6 +329,7 @@ impl PendingSteer030 {
     fn handoff(
         &mut self,
         mut client: Client,
+        owned: crate::tasks::OwnedProcess,
         thread: String,
         turn: String,
         context: &SteerContext030,
@@ -333,6 +343,9 @@ impl PendingSteer030 {
         let id = delivery.effect().id.clone();
         let request_id = self.request_id;
         delivery.handoff_observation(&context.tasks, &context.attempt, async move {
+            // Keep the app-server and its registry cleanup alive until it
+            // emits the remaining evidence or the observation expires.
+            let _owned = owned;
             while let Ok(event) = client.notification().await {
                 if is_steer_message(&event, &id) {
                     client.check_auth_current().await?;
@@ -343,7 +356,7 @@ impl PendingSteer030 {
                                 "CORRELATION",
                                 "steer",
                                 "Steer reached the wrong work",
-                            ))
+                            ));
                         }
                         None => (),
                     }
@@ -387,6 +400,11 @@ impl PendingSteer030 {
         .await
         {
             result?;
+        }
+        if self.receipt_observed {
+            if let Some(context) = steer.as_ref() {
+                self.settle_observed(context).await?;
+            }
         }
         *self = Self::default();
         Ok(())
@@ -819,14 +837,9 @@ impl CodexExecutor030 {
             (current_thread, current_turn, steer.as_ref())
         {
             if current_steer && pending_steer.turn_ended_while_counted {
-                result = result.and(pending_steer.handoff(client, thread, turn, context));
-            } else {
-                drop(client);
+                result = result.and(pending_steer.handoff(client, owned, thread, turn, context));
             }
-        } else {
-            drop(client);
         }
-        drop(owned); // StreamTasks owns and joins the physical cleanup.
         match steer.as_ref() {
             Some(context) => diagnostics::at(&context.attempt, Stage::Session, result),
             None => result,
@@ -1331,7 +1344,7 @@ impl CodexExecutor030 {
                         "HARNESS_CAPABILITY",
                         "planFirst",
                         "Codex ended without presenting the plan for this work",
-                    ))
+                    ));
                 }
                 _ => return Err(missing("decision")),
             }
@@ -1623,6 +1636,8 @@ for line in sys.stdin:
   print(json.dumps({'method':'item/completed','params':{'threadId':'thread','turnId':turn_id,'item':{'id':'final'+str(count),'type':'agentMessage','phase':'final_answer','text':json.dumps({'text':'Updated changelog','submissionJson':json.dumps({'results':{'summary':'Updated'},'choice':'bad' if mode=='steer-correction-040' and count==1 else 'approve'})})}}}),flush=True)
   status = 'failed' if mode == 'steer-failed-040' else 'completed'
   print(json.dumps({'method':'turn/completed','params':{'threadId':'thread','turn':{'id':turn_id,'status':status}}}),flush=True)
+  if mode in ('steer-late-040','steer-failed-040'):
+   time.sleep(.25)
   if mode in ('steer-late-040','steer-failed-040','steer-obsolete-040','steer-correction-040','steer-malformed-receipt-040','steer-incomplete-item-040'):
    print(json.dumps({'method':'item/completed','params':{'threadId':'thread','turnId':turn_id,'item':{'id':'received','type':'userMessage','clientId':p['clientUserMessageId']}}}),flush=True)
   continue
@@ -2476,7 +2491,7 @@ for line in sys.stdin:
                     crate::agsdl_host_steer030::SteerGate030::new(
                         Arc::new(tokio::sync::Mutex::new(())),
                         pool.clone(),
-                        tokio::time::Instant::now() + std::time::Duration::from_secs(10),
+                        tokio::time::Instant::now() + std::time::Duration::from_secs(2),
                     )
                 })
             };

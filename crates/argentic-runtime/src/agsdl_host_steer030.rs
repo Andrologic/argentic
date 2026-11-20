@@ -85,13 +85,8 @@ impl SteerGate030 {
 pub(crate) struct SteerDelivery030 {
     effect: FlowEffect030,
     attempt: FlowWorkAttempt030,
-    ack: oneshot::Sender<Result<SteerProof030>>,
+    ack: oneshot::Sender<Result<ConsumedSteer030>>,
     gate: Option<SteerGate030>,
-}
-
-enum SteerProof030 {
-    Receipt(ConsumedSteer030),
-    Observation(futures::future::BoxFuture<'static, Result<ConsumedSteer030>>),
 }
 
 /// Sealed evidence from the owned consumer, never deserialized from IPC.
@@ -154,7 +149,7 @@ impl SteerSender030 {
                 consumed: false,
             });
         }
-        let proof = if let Some(gate) = gate {
+        if let Some(gate) = gate {
             match tokio::time::timeout_at(gate.deadline, &mut result).await {
                 Ok(receipt) => receipt.map_err(|_| gate.lost_evidence())?,
                 Err(_) => {
@@ -168,10 +163,6 @@ impl SteerSender030 {
             }
         } else {
             result.await.map_err(|_| uncertain())?
-        }?;
-        match proof {
-            SteerProof030::Receipt(receipt) => Ok(receipt),
-            SteerProof030::Observation(observation) => observation.await,
         }
     }
 }
@@ -190,11 +181,11 @@ struct QueuedSteer030(Option<SteerDelivery030>);
 impl Drop for QueuedSteer030 {
     fn drop(&mut self) {
         if let Some(offer) = self.0.take().filter(|offer| offer.gate.is_some()) {
-            let _ = offer.ack.send(Ok(SteerProof030::Receipt(ConsumedSteer030 {
+            let _ = offer.ack.send(Ok(ConsumedSteer030 {
                 effect: offer.effect,
                 attempt: offer.attempt,
                 consumed: false,
-            })));
+            }));
         }
     }
 }
@@ -329,11 +320,10 @@ impl SteerDelivery030 {
         offer.acknowledge(tasks, attempt)
     }
 
-    /// Transfer a bounded, read-only observation to the already supervised
-    /// steer task. The recipient can join its process and commit its result
-    /// while this observer reads any remaining notifications.
+    /// Let the recipient return after submitting its result. Its registry
+    /// still joins the observer and the provider process before routing.
     pub(crate) fn handoff_observation<F>(
-        self,
+        mut self,
         tasks: &StreamTasks,
         attempt: &FlowWorkAttempt030,
         observation: F,
@@ -341,25 +331,30 @@ impl SteerDelivery030 {
     where
         F: std::future::Future<Output = Result<Option<bool>>> + Send + 'static,
     {
-        self.verify_consumer(tasks, attempt)?;
+        let request = self.verify_consumer(tasks, attempt)?;
         let deadline = self
             .deadline()
             .unwrap_or_else(|| tokio::time::Instant::now() + std::time::Duration::from_secs(2));
-        let observe = async move {
-            let consumed = tokio::time::timeout_at(deadline, observation)
-                .await
-                .map_err(|_| uncertain())??
-                .ok_or_else(uncertain)?;
-            Ok(ConsumedSteer030 {
-                effect: self.effect,
-                attempt: self.attempt,
-                consumed,
-            })
-        };
-        let _ = self
-            .ack
-            .send(Ok(SteerProof030::Observation(Box::pin(observe))));
-        Ok(())
+        let cleanup = tokio::spawn(async move {
+            let observed = tokio::select! {
+                result = tokio::time::timeout_at(deadline, observation) => result,
+                _ = self.ack.closed() => return Ok(()),
+            };
+            let result = observed
+                .map_err(|_| uncertain())
+                .and_then(|result| result)
+                .and_then(|receipt| receipt.ok_or_else(uncertain))
+                .map(|consumed| ConsumedSteer030 {
+                    effect: self.effect,
+                    attempt: self.attempt,
+                    consumed,
+                });
+            let _ = self.ack.send(result);
+            Ok(())
+        });
+        tasks
+            .attach_cleanup030(&request, cleanup)
+            .map_err(|_| refused())
     }
 
     /// Call only after the transport has consumed the message and sender.
@@ -410,16 +405,16 @@ impl SteerDelivery030 {
         self.verify_consumer(tasks, attempt)?;
         Ok(move || {
             self.ack
-                .send(Ok(SteerProof030::Receipt(ConsumedSteer030 {
+                .send(Ok(ConsumedSteer030 {
                     effect: self.effect,
                     attempt: self.attempt,
                     consumed,
-                })))
+                }))
                 .map_err(|_| ())
         })
     }
 
-    fn verify_consumer(&self, tasks: &StreamTasks, attempt: &FlowWorkAttempt030) -> Result<()> {
+    fn verify_consumer(&self, tasks: &StreamTasks, attempt: &FlowWorkAttempt030) -> Result<String> {
         if !matches_attempt(&self.effect, attempt)
             || self.attempt.provider_attempt_id() != attempt.provider_attempt_id()
             || self.attempt.owner() != attempt.owner()
@@ -434,7 +429,8 @@ impl SteerDelivery030 {
         );
         tasks
             .verify_agent_scope030(&request, attempt)
-            .map_err(|_| refused())
+            .map_err(|_| refused())?;
+        Ok(request)
     }
 }
 
@@ -463,7 +459,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recipient_finishes_while_steer_task_waits_for_the_transferred_observation() {
+    async fn recipient_returns_before_observation_but_joins_it_before_routing() {
         let attempt = FlowWorkAttempt030::registry_fixture030("attempt");
         let target = attempt.clone();
         let fx = effect(&attempt);
@@ -498,9 +494,15 @@ mod tests {
             _ = &mut pending => panic!("Steer settled before the receipt"),
             result = ended => result.unwrap(),
         }
-        tasks.join_agent030(&attempt, false).await.unwrap();
+        let mut joined = Box::pin(tasks.join_agent030(&attempt, false));
+        tokio::select! {
+            biased;
+            _ = &mut joined => panic!("Work joined before its observer ended"),
+            _ = tokio::task::yield_now() => (),
+        }
         confirm.send(()).unwrap();
         assert!(pending.await.unwrap().consumed());
+        joined.await.unwrap();
     }
 
     #[tokio::test]
