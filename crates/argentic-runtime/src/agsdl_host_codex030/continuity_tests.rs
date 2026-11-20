@@ -400,6 +400,8 @@ struct CheckClock {
 #[tokio::test]
 async fn accepted_040_result_survives_deadline_during_physical_cleanup() {
     struct PendingCleanup {
+        host: Arc<HostState>,
+        committed: tokio::sync::mpsc::Sender<Arc<flow::CommitTestHook030>>,
         accepted: Arc<Notify>,
         finish: Arc<Notify>,
     }
@@ -417,9 +419,16 @@ async fn accepted_040_result_survives_deadline_during_physical_cleanup() {
             events: WorkEventSink030,
             cancel: CancellationToken,
         ) -> BoxFuture<'static, HostResult<()>> {
+            let host = self.host.clone();
+            let committed = self.committed.clone();
             let accepted = self.accepted.clone();
             let finish = self.finish.clone();
             Box::pin(async move {
+                let hook = host.flow030().install_work_commit_hook(
+                    work.attempt.identity(),
+                    &format!("work:{}:event-0", work.attempt.provider_attempt_id()),
+                );
+                committed.send(hook).await.unwrap();
                 let decision = events
                     .emit(json!({"kind":"submit","callId":"submit","argumentsJson":"{\"results\":{}}"}), &cancel)
                     .await?;
@@ -454,6 +463,7 @@ async fn accepted_040_result_survives_deadline_during_physical_cleanup() {
     }))
     .await;
     let clock = f.host.flow030().humans.virtual_clock().await.unwrap();
+    let (committed, mut commit_hooks) = tokio::sync::mpsc::channel(1);
     let accepted = Arc::new(Notify::new());
     let finish = Arc::new(Notify::new());
     let tasks = StreamTasks::default();
@@ -464,6 +474,8 @@ async fn accepted_040_result_survives_deadline_during_physical_cleanup() {
     });
     let executors = Executors030 {
         agents: Arc::new(PendingCleanup {
+            host: f.host.clone(),
+            committed,
             accepted: accepted.clone(),
             finish: finish.clone(),
         }),
@@ -486,6 +498,19 @@ async fn accepted_040_result_survives_deadline_during_physical_cleanup() {
         f.emitter(&tasks),
     );
     let expire_after_result = async {
+        let hook = commit_hooks.recv().await.unwrap();
+        hook.reached().await;
+        let retirement: String = query_scalar(
+            "SELECT ticket_json ->> '$.eventJson' FROM engine_flow030_clock_events WHERE output_json IS NULL",
+        )
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+        let retirement: Value = serde_json::from_str(&retirement).unwrap();
+        assert_eq!(retirement["event"]["kind"], "retire");
+        assert_eq!(retirement["nowMs"], "0");
+        clock.advance_to(1).unwrap();
+        hook.release();
         accepted.notified().await;
         let broker = f
             .host

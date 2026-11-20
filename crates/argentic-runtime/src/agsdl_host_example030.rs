@@ -295,6 +295,7 @@ async fn start_scripted_work030(
         executor.clone(),
         emitter,
         cancelled.child_token(),
+        None,
     )
     .await?;
     let plan_lock = executor.plan_lock.lock().unwrap().clone();

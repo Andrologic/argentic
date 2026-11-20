@@ -1234,6 +1234,43 @@ impl HumanBroker030 {
         self.pump(host, &CancellationToken::new()).await?;
         Ok(())
     }
+    pub(crate) async fn reserve_agent_retirement_tx(
+        &self,
+        db: &mut SqliteConnection,
+        id: &str,
+    ) -> Result<()> {
+        let timed_out: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM engine_flow030_clock_controls
+              WHERE system_id=? AND invocation_id=? AND activation_id=? AND joined=0)",
+        )
+        .bind(&self.identity.system_start_id)
+        .bind(&self.identity.flow_invocation_id)
+        .bind(id)
+        .fetch_one(&mut *db)
+        .await?;
+        if timed_out {
+            return Err(failure("TIMEOUT", "clock", "The work deadline already committed"));
+        }
+        let active: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM engine_flow030_clock_works
+              WHERE system_id=? AND invocation_id=? AND activation_id=?
+                AND kind='agent' AND retired=0)",
+        )
+        .bind(&self.identity.system_start_id)
+        .bind(&self.identity.flow_invocation_id)
+        .bind(id)
+        .fetch_one(&mut *db)
+        .await?;
+        if active {
+            self.reserve(
+                db,
+                json!({"kind":"retire","workId":id}),
+                &self.clock.now_ms().to_string(),
+            )
+            .await?;
+        }
+        Ok(())
+    }
     /// TIMEOUT was already persisted by pump, under the shared admission fence.
     /// Return only its native control. Cancel AND join the actual owned future
     /// and descendants after this method returns, with no gate held. The work
