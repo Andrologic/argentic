@@ -1224,9 +1224,12 @@ impl HumanBroker030 {
         self.acknowledge(host, decision).await
     }
     pub(crate) async fn retire_finished(&self, host: &HostState, id: &str) -> Result<()> {
-        let raw: String = sqlx::query_scalar("SELECT work_json FROM engine_flow030_clock_works WHERE system_id=? AND invocation_id=? AND activation_id=?")
+        let row = sqlx::query("SELECT work_json,retired FROM engine_flow030_clock_works WHERE system_id=? AND invocation_id=? AND activation_id=?")
             .bind(&self.identity.system_start_id).bind(&self.identity.flow_invocation_id).bind(id).fetch_one(&self.pool).await?;
-        let work: OwnedHumanWork030 = serde_json::from_str(&raw)?;
+        if row.get::<bool, _>("retired") {
+            return Ok(());
+        }
+        let work: OwnedHumanWork030 = serde_json::from_str(row.get("work_json"))?;
         self.retire(host, &work).await?;
         self.pump(host, &CancellationToken::new()).await?;
         Ok(())

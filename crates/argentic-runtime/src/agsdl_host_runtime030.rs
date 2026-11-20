@@ -1481,10 +1481,56 @@ pub(crate) async fn emit_work_event030(
     drop(db);
     drop(gate);
     drop(lease);
-    flow_work_protocol030::transition_owned_agent030(
+    let decision = flow_work_protocol030::transition_owned_agent030(
         host, pool, attempt, &input, permit, policies, cancelled,
     )
-    .await
+    .await?;
+    let receipt: Value = serde_json::from_str(&decision.receipt_json)?;
+    if matches!(receipt["decision"]["kind"].as_str(), Some("accepted" | "stopping")) {
+        retire_decided_agent_clock030(host, pool, attempt).await?;
+    }
+    Ok(decision)
+}
+
+async fn retire_decided_agent_clock030(
+    host: &HostState,
+    pool: &SqlitePool,
+    attempt: &FlowWorkAttempt030,
+) -> Result<()> {
+    let id = attempt.identity();
+    let work = &attempt.work().activation_id;
+    let active: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+            SELECT 1 FROM engine_flow030_clock_works clock
+            JOIN engine_start030_requests start
+              ON start.system_id=clock.system_id AND start.invocation_id=clock.invocation_id
+            WHERE clock.system_id=? AND clock.invocation_id=? AND clock.activation_id=?
+              AND clock.retired=0 AND start.capture_json ->> '$.versions.contract' = ?
+        )",
+    )
+    .bind(&id.system_start_id)
+    .bind(&id.flow_invocation_id)
+    .bind(work)
+    .bind(argentic_core::AGSDL_040)
+    .fetch_one(pool)
+    .await?;
+    if !active {
+        return Ok(());
+    }
+    let broker = host.flow030().humans.broker(host, pool, id).await?;
+    let _operation = broker.operation.lock().await;
+    let retire = async {
+        broker.pump(host, &CancellationToken::new()).await?;
+        broker.retire_finished(host, work).await
+    }
+    .await;
+    if retire.is_err() && flow::inspect_run(host.flow030(), host, pool, attempt.owner())
+        .await?
+        .flow.state.stopping
+    {
+        return Ok(());
+    }
+    retire
 }
 
 #[cfg(test)]

@@ -457,6 +457,11 @@ async fn accepted_040_result_survives_deadline_during_physical_cleanup() {
     let accepted = Arc::new(Notify::new());
     let finish = Arc::new(Notify::new());
     let tasks = StreamTasks::default();
+    let runtime_clock = Arc::new(CheckClock {
+        host: f.host.clone(),
+        pool: f.pool.clone(),
+        identity: f.identity.clone(),
+    });
     let executors = Executors030 {
         agents: Arc::new(PendingCleanup {
             accepted: accepted.clone(),
@@ -464,11 +469,7 @@ async fn accepted_040_result_survives_deadline_during_physical_cleanup() {
         }),
         humans: None,
         calls: None,
-        clock: Some(Arc::new(CheckClock {
-            host: f.host.clone(),
-            pool: f.pool.clone(),
-            identity: f.identity.clone(),
-        })),
+        clock: Some(runtime_clock.clone()),
     };
     let (_wake, receiver) = watch::channel(0);
     let cancel = CancellationToken::new();
@@ -493,18 +494,27 @@ async fn accepted_040_result_survives_deadline_during_physical_cleanup() {
             .broker(&f.host, &f.pool, &f.identity)
             .await
             .unwrap();
-        let _clock_operation = broker.operation.lock().await;
-        clock.advance_to(1).unwrap();
-        broker.tick(&f.host).await.unwrap();
-        let observed = broker.pump(&f.host, &cancel).await.unwrap().unwrap();
-        assert_eq!(
-            serde_json::from_str::<Value>(&observed.receipt_json).unwrap()["expiredWorkIds"]
-                .as_array()
+        let clock_events = || async {
+            query_scalar::<_, i64>("SELECT count(*) FROM engine_flow030_clock_events")
+                .fetch_one(&f.pool)
+                .await
                 .unwrap()
-                .len(),
-            1
-        );
-        assert!(broker.timeout_controls().await.unwrap().is_empty());
+        };
+        let count = clock_events().await;
+        for time in [1, 2, 10] {
+            clock.advance_to(time).unwrap();
+            runtime_clock.tick().await.unwrap();
+            assert_eq!(broker.next_wake_ms().await.unwrap(), None);
+            assert_eq!(clock_events().await, count);
+            assert!(broker.timeout_controls().await.unwrap().is_empty());
+        }
+        let elapsed: String = query_scalar(
+            "SELECT snapshot_json ->> '$.elapsedMachineMs' FROM engine_flow030_clock_works WHERE retired=1",
+        )
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+        assert_eq!(elapsed, "0");
         finish.notify_one();
     };
     let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
