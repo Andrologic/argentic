@@ -1140,20 +1140,47 @@ mod tests {
             ).await;
             assert!(replay.ok, "{replay:?}");
             if reopening == 1 {
-                let copy = f.data.join("wrong-stop-receipt.sqlite");
-                std::fs::copy(f.data.join("engine.sqlite"), &copy).unwrap();
-                let pool = crate::sqlite::open_file(&copy).await.unwrap();
-                let changed = sqlx::query(
-                    "UPDATE engine_flow030_outbox
-                     SET settlement_json=json_set(settlement_json,'$.kind','nativeJoinedGroupStop030')
-                     WHERE settlement_json ->> '$.kind'='nativeReopenedApprovalStop030'",
-                ).execute(&pool).await.unwrap().rows_affected();
-                assert_eq!(changed, 1);
-                pool.close().await;
-                let replay = persistence::replay_verify030::verify_path030(
-                    &copy, &query.system_start_id, &page.flow_invocation_id,
-                ).await;
-                assert_eq!(replay.divergence.unwrap().field, "joinedStop.workAttempt");
+                for (index, (mutation, expected)) in [
+                    ("UPDATE engine_flow030_outbox
+                      SET settlement_json=json_set(settlement_json,'$.kind','nativeJoinedGroupStop030')
+                      WHERE settlement_json ->> '$.kind'='nativeReopenedApprovalStop030'",
+                     "joinedStop.workAttempt"),
+                    ("UPDATE engine_flow030_clock_events SET ticket_json=json_remove(ticket_json,'$.optionsJson')",
+                     "human.readback"),
+                    ("UPDATE engine_flow030_clock_events SET ticket_json=json_set(ticket_json,'$.eventJson',
+                       json_set(ticket_json ->> '$.eventJson','$.event.choices',json('[\"other\"]')) || '')",
+                     "human.readback"),
+                    ("UPDATE engine_flow030_clock SET receipt_json='{\"unexpected\":true}'",
+                     "human.readback"),
+                    ("UPDATE engine_flow030_clock SET observed_ms=(SELECT
+                       CAST(json_extract(ticket_json ->> '$.eventJson','$.nowMs') AS INTEGER) + 1
+                       FROM engine_flow030_clock_events)",
+                     "human.readback"),
+                ].into_iter().enumerate() {
+                    let copy = f.data.join(format!("wrong-replay-{index}.sqlite"));
+                    std::fs::copy(f.data.join("engine.sqlite"), &copy).unwrap();
+                    let pool = crate::sqlite::open_file(&copy).await.unwrap();
+                    let mut tx = pool.begin().await.unwrap();
+                    let edits_ticket = mutation.starts_with("UPDATE engine_flow030_clock_events");
+                    if edits_ticket {
+                        sqlx::query("DROP TRIGGER engine_flow030_clock_ticket_immutable")
+                            .execute(&mut *tx).await.unwrap();
+                    }
+                    let changed = sqlx::query(mutation).execute(&mut *tx).await.unwrap().rows_affected();
+                    assert_eq!(changed, 1);
+                    if edits_ticket {
+                        sqlx::query(
+                            "CREATE TRIGGER engine_flow030_clock_ticket_immutable BEFORE UPDATE OF ticket_json ON engine_flow030_clock_events
+                             BEGIN SELECT RAISE(ABORT,'immutable clock ticket'); END",
+                        ).execute(&mut *tx).await.unwrap();
+                    }
+                    tx.commit().await.unwrap();
+                    pool.close().await;
+                    let replay = persistence::replay_verify030::verify_path030(
+                        &copy, &query.system_start_id, &page.flow_invocation_id,
+                    ).await;
+                    assert_eq!(replay.divergence.unwrap().field, expected, "{mutation}");
+                }
             }
         }
     }

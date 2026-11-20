@@ -119,27 +119,26 @@ pub(super) async fn verify(
     let mut last = json!({});
     let mut journal = Vec::<Value>::new();
     for (index, row) in events.iter().enumerate() {
-        let ticket = parsed(row, "ticket_json")?;
+        let ticket: crate::agsdl_host_clock030::HostClockInput030 =
+            serde_json::from_str(row.try_get("ticket_json")?)?;
         require(
-            ticket["identity"] == serde_json::to_value(id)?
-                && ticket["owner"] == owner
-                && ticket["eventId"] == row.get::<&str, _>("event_id")
-                && ticket["expectedRevision"] == index.to_string()
-                && ticket["stateJson"] == previous,
+            ticket.identity == *id
+                && serde_json::to_value(&ticket.owner)? == owner
+                && ticket.event_id == row.get::<&str, _>("event_id")
+                && ticket.expected_revision == index.to_string()
+                && ticket.state_json == previous,
             "Clock ticket correlation",
         )?;
-        let envelope: Value = serde_json::from_str(
-            ticket["eventJson"]
-                .as_str()
-                .ok_or("Clock event JSON absent")?,
-        )?;
+        let options: Value = serde_json::from_str(&ticket.options_json)?;
+        require(options == json!({"maxSliceMs":2147483647}), "Clock options differ")?;
+        let envelope: Value = serde_json::from_str(&ticket.event_json)?;
         let event = &envelope["event"];
         let kind = event["kind"].as_str().ok_or("Clock event kind absent")?;
         let now = ms(envelope["nowMs"].as_str().ok_or("Clock time absent")?)?;
         require(
             now >= observed
                 && envelope["owner"] == owner
-                && envelope["eventId"] == ticket["eventId"],
+                && envelope["eventId"] == ticket.event_id,
             "Clock event identity/time",
         )?;
         match kind {
@@ -191,6 +190,15 @@ pub(super) async fn verify(
                     "Clock origin/duration",
                 )?;
                 let declaration: Value = serde_json::from_str(&step.declaration_json)?;
+                require((kind == "approval") == (step.r#type == "approval"), "Clock admission kind differs")?;
+                if kind == "approval" {
+                    let choices = declaration["next"].as_object().ok_or("Approval choices absent")?;
+                    require(
+                        !choices.is_empty()
+                            && event["choices"] == json!(choices.keys().collect::<Vec<_>>()),
+                        "Approval ticket choices differ",
+                    )?;
+                }
                 let agent_declaration = step
                     .agent
                     .as_ref()
@@ -233,6 +241,12 @@ pub(super) async fn verify(
                 .iter()
                 .find(|r| r.get::<&str, _>("request_id") == request_id)
                 .ok_or("Request row absent")?;
+            if kind == "approval" {
+                require(
+                    parsed(r, "payload_json")?["choices"] == event["choices"],
+                    "Approval presentation choices differ",
+                )?;
+            }
             let ids = if kind == "approval" {
                 vec![event["workId"]
                     .as_str()
@@ -334,6 +348,10 @@ pub(super) async fn verify(
             // Verify facts written at reservation above. A fenced Stop can
             // retain an undecided tail, but it contributes no clock output.
             require(fenced_stop && index + 1 == events.len(), "Uncommitted clock ticket")?;
+            require(
+                index != 0 || now >= ms(clock.get("observed_ms"))?,
+                "Initial clock observation is later than its reservation",
+            )?;
             break;
         };
         let output: Value = serde_json::from_str(output)?;
@@ -350,12 +368,12 @@ pub(super) async fn verify(
             &envelope,
             &receipt,
         )?;
-        journal.push(json!({"eventJson":ticket["eventJson"],"receiptJson":output["receiptJson"]}));
+        journal.push(json!({"eventJson":ticket.event_json,"receiptJson":output["receiptJson"]}));
         let state_json = output["stateJson"].as_str().ok_or("Clock state absent")?;
         let clock_state: Value = serde_json::from_str(state_json)?;
         require(
             clock_state
-                == json!({"format":"macro-agsdl-human-clock-journal/1","owner":owner,"options":serde_json::from_str::<Value>(ticket["optionsJson"].as_str().ok_or("Clock options absent")?)?,"entries":journal}),
+                == json!({"format":"macro-agsdl-human-clock-journal/1","owner":owner,"options":options,"entries":journal}),
             "Clock journal differs",
         )?;
         for w in &mut works {
@@ -396,9 +414,8 @@ pub(super) async fn verify(
     require(
         clock.get::<&str, _>("revision") == journal.len().to_string()
             && clock.get::<&str, _>("state_json") == previous
-            && (journal.is_empty()
-                || parsed(clock, "receipt_json")? == last
-                    && ms(clock.get("observed_ms"))? == observed),
+            && parsed(clock, "receipt_json")? == last
+            && (journal.is_empty() || ms(clock.get("observed_ms"))? == observed),
         "Final clock differs",
     )?;
     require(
