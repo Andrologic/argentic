@@ -1503,6 +1503,47 @@ async fn plan_text_uses_ecmascript_emptiness_before_opening_a_native_request() {
 }
 
 #[tokio::test]
+async fn a_pending_retirement_is_applied_before_the_next_admission() {
+    let f = fixture_with_second_work("call", Some(1), None, Some(10)).await;
+    let _operation = f.broker.operation.lock().await;
+    let first = f
+        .broker
+        .admit_host_work(&f.host, f.attempt.start_effect_id())
+        .await
+        .unwrap();
+    pump(&f).await;
+    f.broker.retire(&f.host, &first).await.unwrap();
+    // Submitting the next ticket while the retire still occupies the single
+    // slot must apply that retire with its original timestamp first.
+    f.clock.at(1);
+    let (second, ()) = tokio::try_join!(
+        f.broker.admit_host_work(&f.host, "second-start"),
+        async {
+            let job = f.broker.jobs.next().await.unwrap();
+            let output = evaluate(&job).await;
+            f.broker
+                .jobs
+                .complete(&job.generation, complete(&job, output))
+                .unwrap();
+            Ok(())
+        },
+    )
+    .unwrap();
+    let result = pump(&f).await;
+    assert_eq!(result["clocks"][0]["workId"], second.work_id());
+    assert_eq!(result["expiredWorkIds"], json!([]));
+    let retired: String = sqlx::query_scalar(
+        "SELECT snapshot_json ->> '$.elapsedMachineMs' FROM engine_flow030_clock_works
+         WHERE activation_id=? AND retired=1",
+    )
+    .bind(first.work_id())
+    .fetch_one(&f.broker.pool)
+    .await
+    .unwrap();
+    assert_eq!(retired, "0");
+}
+
+#[tokio::test]
 async fn retiring_the_first_expired_work_preserves_the_second_work_deadline() {
     let f = fixture_with_second_work("call", Some(60000), None, Some(90000)).await;
     let first = f
