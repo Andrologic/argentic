@@ -130,10 +130,6 @@ impl ModuleMap {
     pub(crate) fn iter(&self) -> impl Iterator<Item = (&String, &Value)> {
         self.entries.iter()
     }
-
-    pub(crate) fn len(&self) -> usize {
-        self.entries.len()
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -335,7 +331,8 @@ pub(crate) fn validate_document(document: &Value, modules: &ModuleMap) -> Result
 }
 
 /// `validate_bytes(bytes, modules)`.
-pub(crate) fn validate_bytes(bytes: &[u8], modules: &ModuleMap) -> Result<Report, Internal> {
+#[cfg(test)]
+fn validate_bytes(bytes: &[u8], modules: &ModuleMap) -> Result<Report, Internal> {
     match super::exact::scan::parse_v030(bytes) {
         Err(error) => {
             let mut report = Report::new();

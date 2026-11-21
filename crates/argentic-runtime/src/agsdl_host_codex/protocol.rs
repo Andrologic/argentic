@@ -282,6 +282,7 @@ impl Client {
         self.bootstrap_auth(profile, std::path::Path::new(cwd), read_only)
             .await
     }
+    #[cfg(test)]
     pub async fn qualify(
         &mut self,
         profile: &Profile,
@@ -517,6 +518,7 @@ impl Client {
         }
     }
 }
+#[cfg(test)]
 fn conclusive_turn(value: &Value, turn: &str) -> Result<bool> {
     if required(value, "id")? != turn {
         return Err(failure(

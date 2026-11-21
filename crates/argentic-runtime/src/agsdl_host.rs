@@ -583,9 +583,6 @@ impl HostState {
         self.inner.admission.clone()
     }
 
-    pub(crate) async fn admission_gate(&self) -> tokio::sync::MutexGuard<'_, ()> {
-        self.inner.admission.lock().await
-    }
     pub(crate) async fn start_lease(&self) -> Result<HostStartLease> {
         let host = self
             .inner

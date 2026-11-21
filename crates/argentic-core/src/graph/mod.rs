@@ -292,7 +292,6 @@ pub(crate) struct Scope<'a> {
     pub(crate) composition: Option<String>,
     pub(crate) bindings: OrderedMap<String, Option<String>>,
     pub(crate) compose: Option<String>,
-    pub(crate) parent: Option<usize>,
     pub(crate) compose_name: Option<String>,
 }
 
@@ -478,7 +477,6 @@ impl<'a> Graph<'a> {
             composition: None,
             bindings: OrderedMap::new(),
             compose: None,
-            parent: None,
             compose_name: None,
         });
         graph.add_scope(scope, &[])?;
@@ -564,7 +562,6 @@ impl<'a> Graph<'a> {
             composition: composition.map(str::to_owned),
             bindings: OrderedMap::new(),
             compose: None,
-            parent: None,
             compose_name: None,
         });
         for (name, decl) in steps.iter() {
@@ -655,7 +652,6 @@ impl<'a> Graph<'a> {
             composition: Some(name.to_owned()),
             bindings: OrderedMap::new(),
             compose: None,
-            parent: None,
             compose_name: None,
         });
         graph.add_scope(scope, &[name.to_owned()])?;
@@ -743,7 +739,6 @@ impl<'a> Graph<'a> {
                 composition: Some(target.to_owned()),
                 bindings,
                 compose: Some(addr.clone()),
-                parent: Some(scope),
                 compose_name,
             });
             self.composes.set(
@@ -1122,11 +1117,10 @@ pub(crate) struct JoinInfo {
     pub(crate) fanout: OrderedSet<String>,
 }
 
-/// `['JOIN', pointer, addr, message]` or `[pointer, addr, message]`.
+/// Diagnostic produced by join and fork analysis.
 #[derive(Clone, Debug)]
 pub(crate) struct GraphProblem {
     pub(crate) pointer: Vec<PointerPart>,
-    pub(crate) addr: String,
     pub(crate) message: String,
 }
 
@@ -1164,7 +1158,6 @@ pub(crate) fn open_body_forks(
             }
             problems.push(GraphProblem {
                 pointer: node.pointer.clone(),
-                addr: addr.clone(),
                 message: format!(
                     "the fork at '{}' does not start the branches of one join; a composition leaves at most once",
                     node.name
@@ -1328,7 +1321,6 @@ pub(crate) fn analyse_joins(
         {
             problems.push(GraphProblem {
                 pointer: node.pointer.clone(),
-                addr: addr.clone(),
                 message: format!(
                     "no route of the origin '{}' starts two branches or more at once",
                     last_of(origin)
@@ -1340,7 +1332,6 @@ pub(crate) fn analyse_joins(
             if fanout.contains(&edge.dst) && edge.each.is_none() {
                 problems.push(GraphProblem {
                     pointer: edge.pointer.clone(),
-                    addr: origin.clone(),
                     message: format!(
                         "branch '{}' of join '{}' is a fan-out on another route; start it with each on every route",
                         name_of(&edge.dst),
@@ -1357,7 +1348,6 @@ pub(crate) fn analyse_joins(
                     let step = sorted_addresses(&shared).remove(0);
                     problems.push(GraphProblem {
                         pointer: graph.node_at(&step)?.pointer.clone(),
-                        addr: step.clone(),
                         message: format!(
                             "step '{}' belongs to two branches of join '{}'",
                             last_of(&step),
@@ -1376,7 +1366,6 @@ pub(crate) fn analyse_joins(
                     }
                     problems.push(GraphProblem {
                         pointer: edge.pointer.clone(),
-                        addr: edge.src.clone(),
                         message: format!(
                             "a route from '{}' enters branch '{}' of join '{}' from outside",
                             last_of(&edge.src),
@@ -1400,7 +1389,6 @@ pub(crate) fn analyse_joins(
             }
             problems.push(GraphProblem {
                 pointer: edge.pointer.clone(),
-                addr: edge.src.clone(),
                 message: format!(
                     "join '{}' receives a route from '{}', which is not one of its branches",
                     last_of(addr),
@@ -1418,7 +1406,6 @@ pub(crate) fn analyse_joins(
                     if !inside.is_empty() && inside.len() < dsts.len() {
                         problems.push(GraphProblem {
                             pointer: graph.node_at(member)?.pointer.clone(),
-                            addr: member.clone(),
                             message: format!(
                                 "a route of '{}' starts targets inside and outside branch '{}' of join '{}' at once",
                                 last_of(member),
@@ -1451,7 +1438,6 @@ pub(crate) fn analyse_joins(
                     if open_fork {
                         problems.push(GraphProblem {
                             pointer: graph.node_at(member)?.pointer.clone(),
-                            addr: member.clone(),
                             message: format!(
                                 "the fork at '{}' is not closed by its own join before join '{}'",
                                 last_of(member),
@@ -1474,7 +1460,6 @@ pub(crate) fn analyse_joins(
                     pointer.extend([key("quorum"), key("count")]);
                     problems.push(GraphProblem {
                         pointer,
-                        addr: addr.clone(),
                         message: format!(
                             "count {} exceeds the {} branches of join '{}'",
                             count.raw(),

@@ -366,6 +366,7 @@ pub(crate) async fn start_agent_work030(
     })
 }
 
+#[cfg(test)]
 pub(crate) async fn finish_agent_work030(
     host: &HostState,
     pool: &SqlitePool,
@@ -558,9 +559,6 @@ pub(crate) struct Executors030 {
     pub humans: Option<Arc<dyn HostExecutor030>>,
     pub clock: Option<Arc<dyn RuntimeClock030>>,
 }
-
-#[cfg(test)]
-pub(crate) struct TestAgentExecutor030(pub Arc<dyn AgentExecutor030>);
 
 struct SupervisorHandle030 {
     wake: watch::Sender<u64>,

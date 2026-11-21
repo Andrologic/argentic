@@ -135,6 +135,7 @@ impl CallAttempt030 {
             _ => unreachable!(),
         }
     }
+    #[cfg(test)]
     pub(crate) fn answer_timeout_ms_json(&self) -> Result<Option<String>> {
         let step: Object = serde_json::from_str(&self.declaration_json)?;
         Ok(step.get("answerTimeoutMs").map(|v| v.get().to_owned()))
@@ -632,6 +633,7 @@ pub(crate) async fn commit_marker_tx(
         row_sha256: sha(exact.as_bytes()),
     })
 }
+#[cfg(test)]
 pub(crate) async fn verify_commit_marker_tx<A: CallAuthority030>(
     db: &mut SqliteConnection,
     authority: &A,
@@ -1866,6 +1868,7 @@ pub(crate) async fn read_route_receipt_tx(
 
 /// N-HUMAN must use this in its own admission transaction before opening or
 /// changing an MCP association. This does not implement a human broker.
+#[cfg(test)]
 pub(crate) async fn require_live_mcp_tx<A: CallAuthority030>(
     db: &mut SqliteConnection,
     authority: &A,

@@ -145,7 +145,8 @@ type JobObjectHandle = OwnedHandle;
 #[cfg(unix)]
 #[derive(Debug)]
 struct UnixContainmentMarker {
-    file: std::fs::File,
+    // Hold the marker descriptor open for the lifetime of the containment marker.
+    _file: std::fs::File,
     path: PathBuf,
 }
 
@@ -171,7 +172,7 @@ impl UnixContainmentMarker {
             let _ = std::fs::remove_file(&path);
             return Err(error);
         }
-        Ok(Self { file, path })
+        Ok(Self { _file: file, path })
     }
 }
 
@@ -220,7 +221,7 @@ impl ContainedBackgroundProcess {
             use std::os::unix::process::CommandExt;
 
             let marker = UnixContainmentMarker::create(&containment_id)?;
-            let marker_descriptor = marker.file.as_raw_fd();
+            let marker_descriptor = marker._file.as_raw_fd();
             unsafe {
                 command.as_std_mut().pre_exec(move || {
                     if libc::fcntl(marker_descriptor, libc::F_SETFD, 0) == -1 {
@@ -1398,6 +1399,7 @@ mod tests {
         is_known_visible_terminal_app_id, windows_creation_flags_for_visibility,
         ProcessLaunchVisibility, CREATE_NO_WINDOW,
     };
+    #[cfg(unix)]
     use std::fs;
 
     #[cfg(unix)]

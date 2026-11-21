@@ -92,12 +92,6 @@ pub(crate) fn parse_shared(bytes: &[u8]) -> Result<Parsed, ParseError> {
     parse(bytes, KeyOrder::Js)
 }
 
-/// `experimental/readers/javascript/json.mjs` `parse`: same algorithm and
-/// object order as the shared scanner.
-pub(crate) fn parse_experimental(bytes: &[u8]) -> Result<Parsed, ParseError> {
-    parse(bytes, KeyOrder::Js)
-}
-
 /// `v0.3/json.mjs` `parse`: insertion-ordered records.
 pub(crate) fn parse_v030(bytes: &[u8]) -> Result<Parsed, ParseError> {
     parse(bytes, KeyOrder::Insertion)

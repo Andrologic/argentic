@@ -1486,7 +1486,7 @@ async fn failed_join_source_requires_native_prepared_failure_and_reads_back_afte
 }
 
 #[tokio::test]
-async fn agent_error_without_joined_witness_is_rejected_before_commit() {
+async fn join_error_relabelled_as_agent_is_rejected_before_commit() {
     let (_temp, pool, host, capture, reference, owner, _) =
         failed_join_fixture(Some("agent")).await;
     let result = crate::agsdl_host_dispatch030::dispatch_source_route030(
@@ -1500,7 +1500,37 @@ async fn agent_error_without_joined_witness_is_rejected_before_commit() {
     .await;
     let error = result
         .err()
-        .expect("agent error without ownership was accepted");
+        .expect("join error relabelled as agent was accepted");
+    assert_eq!(error.code, "AUTHORITY");
+    assert_eq!(error.message, "Native route material is not attested");
+    let count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM engine_flow030_route_source_attestations")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(count, 0);
+    assert_eq!(capture.identity, reference.identity);
+}
+
+#[tokio::test]
+async fn agent_route_without_joined_witness_is_rejected_before_commit() {
+    let (_temp, pool, host, capture, reference) = sql_fixture("ok").await;
+    let owner = EngineOwner {
+        system_start_id: capture.identity.system_start_id.clone(),
+        owner_epoch: "owner".into(),
+    };
+    let result = crate::agsdl_host_dispatch030::dispatch_source_route030(
+        &host,
+        &pool,
+        &owner,
+        &reference,
+        crate::agsdl_host_dispatch030::SourceOwnership030::Join,
+        &CancellationToken::new(),
+    )
+    .await;
+    let error = result
+        .err()
+        .expect("agent route without a joined witness was accepted");
     assert_eq!(error.code, "CORRELATION");
     assert_eq!(error.message, "Route source ownership kind differs");
     let count: i64 =
@@ -1509,7 +1539,11 @@ async fn agent_error_without_joined_witness_is_rejected_before_commit() {
             .await
             .unwrap();
     assert_eq!(count, 0);
-    assert_eq!(capture.identity, reference.identity);
+    assert!(host
+        .flow030()
+        .pending_route_source_commit(&reference)
+        .unwrap()
+        .is_none());
 }
 
 async fn rejected_join_error_fixture(fault: &str) {

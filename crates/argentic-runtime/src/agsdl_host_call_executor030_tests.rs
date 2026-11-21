@@ -1,9 +1,11 @@
 //! Production call adapter, real confined children, native supervisor and Rust adapters.
 use super::*;
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 async fn host_fixture(document: Value) -> (Fixture, crate::tasks::StreamTasks) {
     host_fixture_with_entry(document, json!({})).await
 }
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 async fn host_fixture_with_entry(
     document: Value,
     entry: Value,
@@ -67,9 +69,9 @@ async fn host_fixture_with_entry(
         },
     )
     .unwrap();
-    drop(host);
     (f, tasks)
 }
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 async fn finish(f: &Fixture) -> crate::persistence::flow_store030::FlowView030 {
     let host = &f.host;
     let result = tokio::time::timeout(
@@ -266,7 +268,6 @@ async fn stop_and_assert(mut doc: Value, shutdown: bool) {
         )
         .await
         .unwrap();
-        drop(host);
         finish(&f).await
     };
     let pids = observed.expect("Confined command did not start");
@@ -526,7 +527,6 @@ async fn nested_entry_approval_keeps_host_prompt_provenance_through_its_output()
             .unwrap();
         broker.pump(&host, &CancellationToken::new()).await.unwrap();
     }
-    drop(host);
     let view = finish(&f).await;
     assert_eq!(view.state.verdict.as_deref(), Some("succeeded"));
     let approval = view

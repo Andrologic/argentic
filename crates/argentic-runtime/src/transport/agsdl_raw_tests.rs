@@ -1,7 +1,9 @@
 use super::*;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use crate::agsdl_host_calls::tests::grant;
 use crate::agsdl_host_calls::{
     execute,
-    tests::{grant, identity, TestHost},
+    tests::{identity, TestHost},
     CallRequest, Invocation, LaunchGrant,
 };
 use std::sync::{

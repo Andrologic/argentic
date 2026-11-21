@@ -5,14 +5,13 @@ pub(crate) mod diagnostics;
 pub(crate) mod profile;
 pub(crate) mod protocol;
 use crate::host::HostContext;
-use crate::persistence::{dto::*, failure, Result};
+use crate::persistence::{failure, Result};
 use crate::process::ContainedBackgroundProcess;
 
 pub use profile::CodexStatus;
-use profile::VERSION;
 pub(crate) use profile::{Profile, ADAPTER};
 use protocol::Client;
-use serde_json::{json, Value};
+use serde_json::Value;
 
 /// Diagnose the host and native-tool composition before requesting a login.
 /// This scope contains no user source and never creates a model thread.
@@ -109,28 +108,6 @@ pub(crate) struct CodexObservation030 {
     pub account_digest: String,
 }
 
-/// Native account and scope qualification must succeed before publishing a
-/// catalogue. External auth is available only through an explicit host opt-in.
-pub(crate) async fn observe(
-    manager: &HostContext,
-    scope: &Value,
-    read_only: bool,
-) -> Result<Option<(Profile, Vec<String>, String)>> {
-    Ok(observe_catalogue030(manager, scope, read_only)
-        .await?
-        .map(|observed| {
-            (
-                observed.profile,
-                observed
-                    .models
-                    .iter()
-                    .filter_map(|model| model["name"].as_str().map(str::to_owned))
-                    .collect(),
-                observed.account_digest,
-            )
-        }))
-}
-
 pub(crate) async fn observe_catalogue030(
     manager: &HostContext,
     scope: &Value,
@@ -224,7 +201,9 @@ pub(crate) async fn observe_catalogue030(
 }
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{profile::VERSION, *};
+    use crate::persistence::dto::EngineFailure;
+    use serde_json::json;
     #[test]
     fn frozen_write_denials_make_native_tools_read_only() {
         let profile = Profile {

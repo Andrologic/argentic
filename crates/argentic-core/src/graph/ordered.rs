@@ -142,10 +142,6 @@ impl<K: Eq + Hash + Clone, V> OrderedMap<K, V> {
         self.index.contains_key(key)
     }
 
-    pub(crate) fn len(&self) -> usize {
-        self.keys.len()
-    }
-
     pub(crate) fn keys(&self) -> std::slice::Iter<'_, K> {
         self.keys.iter()
     }

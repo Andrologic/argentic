@@ -4,7 +4,7 @@ use crate::argentic_core::{
     clock,
     messages::captured::CapturedOccurrences,
     native::{self, o, s, Text, Value},
-    route::preparation::{self, Content},
+    route::preparation,
     work,
 };
 pub(crate) fn evaluate(input_json: &Text, decoder: &impl native::JsonDecoder) -> Result<Value> {
@@ -43,12 +43,7 @@ pub(crate) fn evaluate(input_json: &Text, decoder: &impl native::JsonDecoder) ->
             c::evaluate_call_data(&parsed)?
         } else {
             let mut content = CapturedOccurrences::new(parsed.get("contentReceipts"))?;
-            s(preparation::prepare_flow_route(
-                &parsed,
-                &mut Content::Occurrences(&mut content),
-                decoder,
-            )?
-            .stringify())
+            s(preparation::prepare_flow_route(&parsed, &mut content, decoder)?.stringify())
         };
         Ok(o([("kind", s("ready")), ("resultJson", result)]))
     })();

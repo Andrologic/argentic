@@ -1,7 +1,12 @@
 //! Local installation observations only. No model request or qualification.
+#[cfg(unix)]
 use crate::process::{background_contained_tokio_command, ContainedBackgroundProcess};
-use serde_json::{json, Value};
+#[cfg(unix)]
+use serde_json::json;
+use serde_json::Value;
+#[cfg(unix)]
 use std::{ffi::OsStr, io, path::PathBuf, process::Stdio, time::Duration};
+#[cfg(unix)]
 use tokio::io::AsyncReadExt;
 
 #[cfg(unix)]

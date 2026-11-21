@@ -7,12 +7,13 @@ use crate::agsdl_host_route030::RouteBroker030;
 use crate::agsdl_host_route030::{HostRouteCompletion030, HostRouteJob030};
 use crate::persistence::{
     call_protocol030 as protocol,
-    flow030::{FlowEffect030, FlowIdentity030, WorkRef030},
+    flow030::{FlowEffect030, FlowIdentity030},
     flow_store030::{Authority030, CheckFuture},
     start030::StartCapture030,
     Result,
 };
-use async_trait::async_trait;
+#[cfg(test)]
+use crate::persistence::{call_protocol030::CallCauseReceipt030, flow030::WorkRef030};
 use serde::{Deserialize, Serialize};
 use sqlx::{Connection, SqliteConnection, SqlitePool};
 use std::sync::Arc;
@@ -21,9 +22,7 @@ use tokio::sync::oneshot;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
-pub(crate) use protocol::{
-    CallAttempt030, CallCauseReceipt030, CallDiagnostic030, CallReceipt030, CallSettlement030,
-};
+pub(crate) use protocol::{CallAttempt030, CallDiagnostic030, CallReceipt030, CallSettlement030};
 
 /// Implemented by the native flow/policy owner. The same admission exclusion
 /// must guard Stop, launch, receipt commits and generation retirement. Neither
@@ -69,6 +68,7 @@ impl CallCommitFence030 {
             Ok(())
         }
     }
+    #[cfg(test)]
     pub(crate) fn pending(&self, id: &FlowIdentity030) -> Option<protocol::CallCommitMarker030> {
         self.0
             .lock()
@@ -109,6 +109,7 @@ async fn commit_call_tx<A: CallAuthority030>(
 }
 /// A matching retained marker is the only way to clear an unknown COMMIT.
 /// Missing/mismatching rows remain blocked; no status is reset for convenience.
+#[cfg(test)]
 pub(crate) async fn inspect_call_commit030<A: CallAuthority030>(
     pool: &SqlitePool,
     authority: &A,
@@ -442,22 +443,6 @@ pub(crate) async fn launch_native030<A: CallAuthority030, T>(
     Ok(start())
 }
 
-/// Private native attribution for N-HUMAN. Obtain it only while this exact
-/// launched MCP call is live, under the same admission gate/SQL snapshot.
-/// human_open/answer/close have the same responsibilities as legacy HostPort;
-/// no human implementation or default answer is provided by N-CALLS.
-#[async_trait]
-pub(crate) trait CallHumanPort030: Send + Sync {
-    async fn human_open(
-        &self,
-        call: &CallAttempt030,
-        server: &str,
-        request_json: &str,
-    ) -> Result<String>;
-    async fn human_answer(&self, ticket: &str) -> Result<String>;
-    async fn human_close(&self, ticket: &str, answer: &Result<String>) -> Result<()>;
-}
-
 // Kept in a private child module so even this module's transport/data paths
 // cannot construct a join witness. The sole constructor is the actual join.
 mod joined {
@@ -713,6 +698,7 @@ pub(crate) async fn stop_before_launch030<A: CallAuthority030>(
 /// The 040 clock decision is re-read on this transaction; call admission alone
 /// cannot authorize expiration. No reason, proof or timestamp comes from a caller.
 /// This transaction includes the exact cause in the unknown-commit fence.
+#[cfg(test)]
 pub(crate) async fn record_call_cause030<A: CallAuthority030>(
     pool: &SqlitePool,
     authority: &A,
@@ -729,6 +715,7 @@ pub(crate) async fn record_call_cause030<A: CallAuthority030>(
     commit_call_tx(tx, authority, attempt).await?;
     Ok(receipt)
 }
+#[cfg(test)]
 pub(crate) async fn read_call_diagnostic030<A: CallAuthority030>(
     pool: &SqlitePool,
     authority: &A,
@@ -743,6 +730,7 @@ pub(crate) async fn read_call_diagnostic030<A: CallAuthority030>(
 }
 
 /// Readback grants no launch capability and never calls the pure worker.
+#[cfg(test)]
 pub(crate) async fn read_call_receipt030<A: CallAuthority030>(
     pool: &SqlitePool,
     authority: &A,

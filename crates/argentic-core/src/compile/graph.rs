@@ -6,7 +6,7 @@ use crate::argentic_core::{
     graph::{
         analyse_joins,
         ordered::{OrderedMap, OrderedSet},
-        step_routes, Graph, JoinInfo, RouteKind,
+        step_routes, Graph, JoinInfo,
     },
     native::{self, a, fail, o, s, Error, Value},
     route::{self, RouteTarget, Scope, ScopeStep},

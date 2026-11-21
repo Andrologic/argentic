@@ -258,13 +258,6 @@ fn keyed(values: &Value, key: &str) -> Result<BTreeMap<String, Value>> {
     }
     Ok(result)
 }
-pub(super) fn strip_reason(mut value: Value) -> Value {
-    if let Some(object) = value.as_object_mut() {
-        object.remove("reason");
-    }
-    value
-}
-
 pub(super) fn validate_projection(
     works: Vec<Work>,
     mut requests: Vec<Request>,

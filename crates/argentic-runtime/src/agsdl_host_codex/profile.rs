@@ -11,7 +11,6 @@ use std::path::{Path, PathBuf};
 
 pub(crate) const ADAPTER: &str = "codex-app-server-v1";
 pub(crate) const VERSION: &str = "0.167.0";
-pub(crate) const PROVIDER: &str = "codex-native";
 const HELPERS: &[&str] = &["codex-code-mode-host", "codex-exec-server"];
 
 /// Presence/executability and capture binding, not release qualification. The
@@ -451,6 +450,7 @@ impl Profile {
         json!({"format":"macro-codex-native-profile/1","version":VERSION,"platform":format!("{}-{}",std::env::consts::OS,std::env::consts::ARCH),
             "digest":self.digest,"toolPolicy":"codex-native","approvalPolicy":"never"}).to_string()
     }
+    #[cfg(test)]
     pub fn attestation(&self, read_only: bool, scope: &Value) -> Result<String> {
         Ok(json!({"format":"macro-codex-native-profile/1","version":VERSION,"platform":format!("{}-{}",std::env::consts::OS,std::env::consts::ARCH),
             "digest":self.digest,"toolPolicy":"codex-native","approvalPolicy":"never","readOnly":read_only,"contextCwd":self.bootstrap,

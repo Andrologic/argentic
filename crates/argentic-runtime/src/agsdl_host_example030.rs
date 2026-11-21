@@ -485,7 +485,7 @@ impl crate::agsdl_host_runtime030::EffectDriver030 for ScenarioDriver030<'_> {
     }
     fn steer(&mut self, effect: FlowEffect030) -> futures::future::BoxFuture<'_, Result<()>> {
         Box::pin(async move {
-            let (app, pool, tasks, works) = (self.app, self.pool, self.tasks, &mut *self.works);
+            let (app, pool, works) = (self.app, self.pool, &mut *self.works);
             let host = app;
             let FlowEffectKind030::Steer { work, .. } = &effect.kind else {
                 unreachable!()

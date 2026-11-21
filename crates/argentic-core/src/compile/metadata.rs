@@ -46,27 +46,6 @@ pub(crate) fn at(p: &Text, key: &Text) -> Text {
     }
     Text::from_units(units)
 }
-pub(crate) fn capture_native_json(v: &Value, p: &str) -> Result<Value> {
-    let mut pending = vec![(v, Text::from(p))];
-    while let Some((v, p)) = pending.pop() {
-        match v {
-            Value::Null | Value::String(_) | Value::Bool(_) => {}
-            Value::Number(n) if n.is_finite() => {}
-            Value::Array(items) => {
-                for (i, v) in items.iter().enumerate().rev() {
-                    pending.push((v, at(&p, &Text::from(i.to_string()))));
-                }
-            }
-            Value::Object(fields) => {
-                for (k, v) in fields.iter().rev() {
-                    pending.push((v, at(&p, k)));
-                }
-            }
-            _ => return fail("UNSUPPORTED", p, "Expected a plain metadata object."),
-        }
-    }
-    Ok(v.clone())
-}
 pub(crate) fn capture_source(v: &Value) -> Result<Value> {
     object(v, "/source", "CORRELATION")?;
     let owner = v.get("owner");

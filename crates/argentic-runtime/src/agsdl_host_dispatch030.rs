@@ -15,56 +15,12 @@ use tokio_util::sync::CancellationToken;
 
 pub(crate) use crate::tasks::JoinedOwnedAgent030;
 
-/// Recover an already committed 037 error source and send it to the actual
-/// route mailbox. Absence is unresolved: this path never emits a new receipt.
-pub(crate) async fn resume_error_route030(
-    host: &HostState,
-    pool: &SqlitePool,
-    owner: &EngineOwner,
-    reference: &PrepareRef030,
-    cancelled: &CancellationToken,
-) -> Result<Apply030> {
-    resume_source_route030(host, pool, owner, reference, cancelled).await
-}
-
-/// A joined agent is process-local evidence for a newly committed failure.
-/// It cannot be reconstructed from an absent SQL row after a restart.
-pub(crate) async fn dispatch_joined_error_route030(
-    host: &HostState,
-    pool: &SqlitePool,
-    owner: &EngineOwner,
-    reference: &PrepareRef030,
-    joined: &JoinedOwnedAgent030,
-    cancelled: &CancellationToken,
-) -> Result<Apply030> {
-    dispatch_source_route030(
-        host,
-        pool,
-        owner,
-        reference,
-        SourceOwnership030::Agent(joined),
-        cancelled,
-    )
-    .await
-}
-
-/// Read back only; an absent source remains unresolved even for joins.
-pub(crate) async fn resume_source_route030(
-    host: &HostState,
-    pool: &SqlitePool,
-    owner: &EngineOwner,
-    reference: &PrepareRef030,
-    cancelled: &CancellationToken,
-) -> Result<Apply030> {
-    source_route030(
-        host,
-        pool,
-        owner,
-        reference,
-        SourceRouteMode030::InspectOnly,
-        cancelled,
-    )
-    .await
+#[derive(Clone, Copy)]
+pub(crate) enum SourceOwnership030<'a> {
+    Host,
+    Agent(&'a JoinedOwnedAgent030),
+    Call(&'a crate::agsdl_host_calls030::JoinedCall030),
+    Join,
 }
 
 /// Creation remains authenticated by the 037 writer. A join requires no
@@ -77,40 +33,8 @@ pub(crate) async fn dispatch_source_route030(
     ownership: SourceOwnership030<'_>,
     cancelled: &CancellationToken,
 ) -> Result<Apply030> {
-    source_route030(
-        host,
-        pool,
-        owner,
-        reference,
-        SourceRouteMode030::Dispatch(ownership),
-        cancelled,
-    )
-    .await
-}
-
-#[derive(Clone, Copy)]
-pub(crate) enum SourceOwnership030<'a> {
-    Host,
-    Agent(&'a JoinedOwnedAgent030),
-    Call(&'a crate::agsdl_host_calls030::JoinedCall030),
-    Join,
-}
-enum SourceRouteMode030<'a> {
-    InspectOnly,
-    Dispatch(SourceOwnership030<'a>),
-}
-
-async fn source_route030(
-    host: &HostState,
-    pool: &SqlitePool,
-    owner: &EngineOwner,
-    reference: &PrepareRef030,
-    mode: SourceRouteMode030<'_>,
-    cancelled: &CancellationToken,
-) -> Result<Apply030> {
-    let joined = match &mode {
-        SourceRouteMode030::InspectOnly => None,
-        SourceRouteMode030::Dispatch(SourceOwnership030::Agent(joined)) => Some(*joined),
+    let joined = match ownership {
+        SourceOwnership030::Agent(joined) => Some(joined),
         _ => None,
     };
     let attestor = RouteAttestor030::capture(host, owner).await?;
@@ -135,7 +59,7 @@ async fn source_route030(
     let mut created = false;
     let source = match source {
         Some(source) => source,
-        None if pending.is_some() || matches!(mode, SourceRouteMode030::InspectOnly) => {
+        None if pending.is_some() => {
             return Err(failure(
                 "UNCERTAIN",
                 "route",
@@ -166,70 +90,53 @@ async fn source_route030(
             ));
         }
     }
-    if matches!(mode, SourceRouteMode030::Dispatch(_)) {
-        use crate::agsdl_host_route_attestations030::SourceOwnershipKind030;
-        match (&mode, source.ownership_kind()) {
-            (
-                SourceRouteMode030::Dispatch(SourceOwnership030::Host),
-                SourceOwnershipKind030::Host,
-            ) => {}
-            (
-                SourceRouteMode030::Dispatch(SourceOwnership030::Agent(_)),
-                SourceOwnershipKind030::Agent,
-            ) => {}
-            (
-                SourceRouteMode030::Dispatch(SourceOwnership030::Join),
-                SourceOwnershipKind030::Join,
-            ) => {}
-            (
-                SourceRouteMode030::Dispatch(SourceOwnership030::Host),
-                SourceOwnershipKind030::Call,
-            ) => {
-                let receipt = crate::agsdl_host_route_verifier030::verify_call_source_tx(
-                    &mut tx,
-                    &capture,
-                    source.producer(),
-                    owner,
-                    lease.generation(),
-                )
-                .await
-                .map_err(|_| failure("AUTHORITY", "route", "Call preparation receipt differs"))?;
-                if !receipt.not_started() {
-                    return Err(failure(
-                        "CORRELATION",
-                        "route",
-                        "Launched calls require their joined owner",
-                    ));
-                }
-            }
-            (
-                SourceRouteMode030::Dispatch(SourceOwnership030::Call(joined)),
-                SourceOwnershipKind030::Call,
-            ) => {
-                let receipt = crate::agsdl_host_route_verifier030::verify_call_source_tx(
-                    &mut tx,
-                    &capture,
-                    source.producer(),
-                    owner,
-                    lease.generation(),
-                )
-                .await
-                .map_err(|_| failure("AUTHORITY", "route", "Call source receipt differs"))?;
-                if !receipt.matches_joined(joined)? {
-                    return Err(failure(
-                        "CORRELATION",
-                        "route",
-                        "Call source requires its exact joined owner",
-                    ));
-                }
-            }
-            _ => {
+    use crate::agsdl_host_route_attestations030::SourceOwnershipKind030;
+    match (ownership, source.ownership_kind()) {
+        (SourceOwnership030::Host, SourceOwnershipKind030::Host) => {}
+        (SourceOwnership030::Agent(_), SourceOwnershipKind030::Agent) => {}
+        (SourceOwnership030::Join, SourceOwnershipKind030::Join) => {}
+        (SourceOwnership030::Host, SourceOwnershipKind030::Call) => {
+            let receipt = crate::agsdl_host_route_verifier030::verify_call_source_tx(
+                &mut tx,
+                &capture,
+                source.producer(),
+                owner,
+                lease.generation(),
+            )
+            .await
+            .map_err(|_| failure("AUTHORITY", "route", "Call preparation receipt differs"))?;
+            if !receipt.not_started() {
                 return Err(failure(
                     "CORRELATION",
                     "route",
-                    "Route source ownership kind differs",
-                ))
+                    "Launched calls require their joined owner",
+                ));
             }
+        }
+        (SourceOwnership030::Call(joined), SourceOwnershipKind030::Call) => {
+            let receipt = crate::agsdl_host_route_verifier030::verify_call_source_tx(
+                &mut tx,
+                &capture,
+                source.producer(),
+                owner,
+                lease.generation(),
+            )
+            .await
+            .map_err(|_| failure("AUTHORITY", "route", "Call source receipt differs"))?;
+            if !receipt.matches_joined(joined)? {
+                return Err(failure(
+                    "CORRELATION",
+                    "route",
+                    "Call source requires its exact joined owner",
+                ));
+            }
+        }
+        _ => {
+            return Err(failure(
+                "CORRELATION",
+                "route",
+                "Route source ownership kind differs",
+            ))
         }
     }
     if created {
@@ -264,6 +171,7 @@ async fn source_route030(
 /// Request cancellation, then wait until the existing native owner has joined
 /// the future and attached cleanups. Call outside lifecycle/admission guards.
 /// A missing owner or uncertain cleanup never yields a join witness.
+#[cfg(test)]
 pub(crate) async fn cancel_and_join_owned_agent030(
     tasks: &StreamTasks,
     attempt: &FlowWorkAttempt030,
@@ -291,6 +199,7 @@ pub(crate) async fn join_owned_agent030(
 
 /// Claim one exact StopWork before signalling the already-owned parent. The
 /// claim remains uncertain if joining or its physical commit cannot complete.
+#[cfg(test)]
 pub(crate) async fn dispatch_stop_work030(
     host: &HostState,
     pool: &SqlitePool,
