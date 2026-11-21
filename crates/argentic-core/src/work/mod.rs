@@ -8,8 +8,8 @@ use crate::argentic_core::{
     exact,
     native::{self, o, s, Text, Value},
 };
-pub(crate) use controller::Controller;
-pub(crate) use journal::evaluate_host;
+pub(crate) use controller::{assemble_visible_text, Controller};
+pub(crate) use journal::{evaluate_host, evaluate_journal, EMPTY_JOURNAL};
 pub(crate) use submission::{requires_submission, validate_submission};
 
 #[derive(Clone, Debug)]

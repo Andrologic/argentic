@@ -29,7 +29,10 @@ impl CompiledGraph {
             let stops = join.get("remaining").eq_str("stop");
             for branch in join.get("branches").array().unwrap() {
                 let target = (origin.clone(), branch.get("target").stringify());
-                if targets.insert(target, stops).is_some_and(|previous| previous || stops) {
+                if targets
+                    .insert(target, stops)
+                    .is_some_and(|previous| previous || stops)
+                {
                     return true;
                 }
             }

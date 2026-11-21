@@ -568,7 +568,7 @@ pub(crate) fn edition_schema(
     module: bool,
 ) -> Result<&'static SchemaChecker, SchemaError> {
     let current = matches!(value.as_object().and_then(|o| o.get("contract")),
-        Some(Value::String(contract)) if contract == crate::AGSDL_040);
+        Some(Value::String(contract)) if contract == crate::argentic_core::AGSDL_040);
     match (current, module) {
         (false, false) => document_schema(),
         (false, true) => module_schema(),

@@ -192,7 +192,7 @@ fn validate_plan(plan: &FlowPlan030) -> Result<()> {
     let bad = |s: &str| FlowInputError030::InvalidPlan(s.into());
     if plan.format != "macro-agsdl-compiled-plan/2"
         || plan.versions.snapshot != "2"
-        || !crate::supports_contract(&plan.versions.contract)
+        || !crate::argentic_core::supports_contract(&plan.versions.contract)
         || plan.versions.profile != "macro-agsdl-030-v1"
     {
         return Err(bad("Unsupported plan version"));
@@ -598,7 +598,7 @@ impl Engine<'_> {
                             && delivery.work == *work
                             && delivery.delivery_activation_id == *delivery_activation_id
                             && (delivery.status == "pending"
-                                || (self.plan.versions.contract == crate::AGSDL_040
+                                || (self.plan.versions.contract == crate::argentic_core::AGSDL_040
                                     && self.state.stopping
                                     && delivery.status == "withdrawn"))
                     })
@@ -606,7 +606,7 @@ impl Engine<'_> {
                 if self.state.steer_deliveries[pending].status == "withdrawn" {
                     return Ok(());
                 }
-                if self.plan.versions.contract != crate::AGSDL_040
+                if self.plan.versions.contract != crate::argentic_core::AGSDL_040
                     && !accepts_steer030(&self.state, work)
                 {
                     return Err(FlowInputError030::StaleReference);
@@ -636,7 +636,7 @@ impl Engine<'_> {
                 delivery_activation_id,
                 code,
             } => {
-                if self.plan.versions.contract != crate::AGSDL_040 {
+                if self.plan.versions.contract != crate::argentic_core::AGSDL_040 {
                     return Err(FlowInputError030::StaleReference);
                 }
                 let pending = self
@@ -730,10 +730,12 @@ impl Engine<'_> {
                 for p in &mut self.state.paths {
                     if p.phase == "pending" {
                         p.phase = "withdrawn".into();
-                    } else if self.plan.versions.contract == crate::AGSDL_040 && p.phase == "live" {
+                    } else if self.plan.versions.contract == crate::argentic_core::AGSDL_040
+                        && p.phase == "live"
+                    {
                         p.phase = "cancelling".into();
                     }
-                    if self.plan.versions.contract == crate::AGSDL_040 {
+                    if self.plan.versions.contract == crate::argentic_core::AGSDL_040 {
                         for membership in &mut p.memberships {
                             if matches!(membership.phase.as_str(), "pending" | "live") {
                                 membership.phase = p.phase.clone();
@@ -1944,7 +1946,7 @@ impl Engine<'_> {
                 self.state.activations[i].phase = "stopping".into();
             }
         } else if !self.state.stopping
-            && self.plan.versions.contract == crate::AGSDL_040
+            && self.plan.versions.contract == crate::argentic_core::AGSDL_040
             && matches!(
                 self.state.activations[i].phase.as_str(),
                 "steering" | "withdrawingSteer"
@@ -2216,7 +2218,8 @@ impl Engine<'_> {
         loop {
             let mut changed = false;
             if self.plan.versions.runtime == SHARED_STOP_RUNTIME
-                || (self.state.stopping && self.plan.versions.contract == crate::AGSDL_040)
+                || (self.state.stopping
+                    && self.plan.versions.contract == crate::argentic_core::AGSDL_040)
             {
                 self.finish_shared_stops();
             }
@@ -2237,7 +2240,7 @@ impl Engine<'_> {
                     self.state.steer_deliveries[n].resolved_event_id = Some(self.event_id.into());
                     self.state.steer_deliveries[n].reason = Some("delivery-cancelled".into());
                     changed = true;
-                } else if self.plan.versions.contract != crate::AGSDL_040
+                } else if self.plan.versions.contract != crate::argentic_core::AGSDL_040
                     && !accepts_steer030(&self.state, &pending.work)
                 {
                     let still_running = self

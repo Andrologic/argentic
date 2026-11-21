@@ -14,7 +14,11 @@ use crate::argentic_core::{
     },
 };
 use std::collections::HashSet;
-
+pub(crate) enum Content<'a> {
+    None,
+    Shared(&'a mut CapturedReceipts),
+    Occurrences(&'a mut CapturedOccurrences),
+}
 fn get<'a>(v: &'a E, k: &str) -> Option<&'a E> {
     v.as_object().and_then(|o| o.get(k))
 }
@@ -53,7 +57,7 @@ fn serialize(v: &impl serde::Serialize) -> Value {
 }
 pub(crate) fn prepare_flow_route(
     input: &Value,
-    content: &mut CapturedOccurrences,
+    content: &mut Content<'_>,
     decoder: &impl native::JsonDecoder,
 ) -> Result<Value> {
     prepare(input, content, decoder).map_err(|e| {
@@ -72,7 +76,7 @@ pub(crate) fn prepare_flow_route(
 }
 fn prepare(
     input: &Value,
-    content: &mut CapturedOccurrences,
+    content: &mut Content<'_>,
     decoder: &impl native::JsonDecoder,
 ) -> Result<Value> {
     let reference = input.get("reference").get("route");
@@ -429,7 +433,11 @@ fn prepare(
                 if !receives {
                     return Ok(None);
                 }
-                let mut resolver = content.select(ordinal, &index.to_string());
+                let mut resolver: Option<&mut CapturedReceipts> = match content {
+                    Content::None => None,
+                    Content::Shared(r) => Some(&mut **r),
+                    Content::Occurrences(c) => c.select(ordinal, &index.to_string()),
+                };
                 let mut context = CapturedContent {
                     defer_prompt_uris: matches!(input.get("deferPromptUris"), Value::Bool(true))
                         && recipient_type == "agent",

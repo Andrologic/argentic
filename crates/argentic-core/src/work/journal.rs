@@ -4,6 +4,8 @@ use crate::argentic_core::{
     exact::BigInteger,
     native::{a, JsonDecoder},
 };
+pub(crate) const EMPTY_JOURNAL: &str = "{\"format\":\"macro-agsdl-work-journal/1\",\"events\":[]}";
+
 pub(crate) fn evaluate_journal(
     state_json: &Value,
     expected_revision: &Value,

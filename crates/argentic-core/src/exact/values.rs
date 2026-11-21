@@ -91,6 +91,11 @@ pub(crate) fn decimal(token: &NumberToken) -> SharedDecimal {
     }
 }
 
+/// Shared `integer(x)`: a number whose normalized exponent is not negative.
+pub(crate) fn integer(value: &Value) -> bool {
+    matches!(value, Value::Number(token) if !decimal(token).exponent.is_negative())
+}
+
 /// Shared JSON `uint(v, positive)`: a nonnegative integer at most
 /// `Number.MAX_SAFE_INTEGER`, with at most 16 significant positions.
 pub(crate) fn uint(value: &Value, positive: bool) -> bool {
@@ -351,8 +356,7 @@ pub(crate) fn compare_numbers(left: Num<'_>, right: Num<'_>) -> Ordering {
 }
 
 /// 0.3 `compareNumbers` result as the JS `-1 | 0 | 1`.
-#[cfg(test)]
-fn ordering_number(order: Ordering) -> i8 {
+pub(crate) fn ordering_number(order: Ordering) -> i8 {
     match order {
         Ordering::Less => -1,
         Ordering::Equal => 0,

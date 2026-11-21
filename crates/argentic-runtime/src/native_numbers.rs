@@ -1,4 +1,6 @@
 //! Native scalar conversion; authored number tokens never enter this module.
+#[derive(Debug)]
+pub(crate) struct Error(pub(crate) String);
 /// Shortest decimal digits from the locked serializer, with JS presentation
 /// rules applied explicitly. The digits are not rounded a second time.
 pub(crate) fn number_text(value: f64) -> String {
@@ -49,6 +51,15 @@ pub(crate) fn number_text(value: f64) -> String {
         )
     }
 }
+pub(crate) fn decimal_bits(raw: &str) -> Result<u64, Error> {
+    raw.parse::<f64>()
+        .map(f64::to_bits)
+        .map_err(|e| Error(e.to_string()))
+}
+pub(crate) fn bits_text(bits: u64) -> String {
+    number_text(f64::from_bits(bits))
+}
+
 pub(crate) fn normalize(raw: &str) -> Result<String, String> {
     let value = raw.parse::<f64>().map_err(|e| e.to_string())?;
     Ok(if value.is_nan() {

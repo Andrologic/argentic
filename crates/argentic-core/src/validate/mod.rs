@@ -130,6 +130,10 @@ impl ModuleMap {
     pub(crate) fn iter(&self) -> impl Iterator<Item = (&String, &Value)> {
         self.entries.iter()
     }
+
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -228,7 +232,7 @@ impl Report {
         let mut out = format!(
             "{{\"contract\":{},\"valid\":{},\"diagnostics\":[",
             quote(if self.current_edition {
-                crate::AGSDL_040
+                crate::argentic_core::AGSDL_040
             } else {
                 CONTRACT
             }),
@@ -315,7 +319,7 @@ pub(crate) fn check_module(module: Value) -> Result<Value, ReadError> {
 pub(crate) fn validate_document(document: &Value, modules: &ModuleMap) -> Result<Report, Internal> {
     let mut report = Report::new();
     report.current_edition = matches!(member(Some(document), "contract"),
-        Some(Value::String(contract)) if contract == crate::AGSDL_040);
+        Some(Value::String(contract)) if contract == crate::argentic_core::AGSDL_040);
     let problems = schema::edition_schema(document, false)?.check(document)?;
     if !problems.is_empty() {
         for (at, message) in problems {
@@ -331,8 +335,7 @@ pub(crate) fn validate_document(document: &Value, modules: &ModuleMap) -> Result
 }
 
 /// `validate_bytes(bytes, modules)`.
-#[cfg(test)]
-fn validate_bytes(bytes: &[u8], modules: &ModuleMap) -> Result<Report, Internal> {
+pub(crate) fn validate_bytes(bytes: &[u8], modules: &ModuleMap) -> Result<Report, Internal> {
     match super::exact::scan::parse_v030(bytes) {
         Err(error) => {
             let mut report = Report::new();
@@ -2394,7 +2397,11 @@ impl<'a, 'r> Checker<'a, 'r> {
                 }
                 if part_is(path.get(1), "comments") {
                     if !self.report.current_edition {
-                        return if path.len() == 2 { kind("array") } else { Ok(None) };
+                        return if path.len() == 2 {
+                            kind("array")
+                        } else {
+                            Ok(None)
+                        };
                     }
                     return Ok(valueschema::kind_at(approval_comments(), &path[2..])?);
                 }
