@@ -5,14 +5,13 @@ pub(crate) mod diagnostics;
 pub(crate) mod profile;
 pub(crate) mod protocol;
 use crate::host::HostContext;
-use crate::persistence::{dto::*, failure, Result};
+use crate::persistence::{failure, Result};
 use crate::process::ContainedBackgroundProcess;
 
 pub use profile::CodexStatus;
-use profile::VERSION;
 pub(crate) use profile::{Profile, ADAPTER};
 use protocol::Client;
-use serde_json::{json, Value};
+use serde_json::Value;
 
 /// Diagnose the host and native-tool composition before requesting a login.
 /// This scope contains no user source and never creates a model thread.
@@ -224,7 +223,9 @@ pub(crate) async fn observe_catalogue030(
 }
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{profile::VERSION, *};
+    use crate::persistence::dto::EngineFailure;
+    use serde_json::json;
     #[test]
     fn frozen_write_denials_make_native_tools_read_only() {
         let profile = Profile {

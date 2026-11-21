@@ -1,7 +1,7 @@
 use super::fixture::*;
 use super::*;
 use crate::agsdl_host_clock030::{HostClockCompletion030, HostClockJob030};
-use crate::persistence::flow030::{Activation030, Instance030};
+#[cfg(feature = "editor-parity")]
 use tokio::io::AsyncWriteExt;
 
 #[tokio::test]

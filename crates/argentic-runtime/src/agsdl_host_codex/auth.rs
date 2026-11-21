@@ -1,20 +1,23 @@
 //! Host-selected file authentication only. No config loading, OAuth or writes.
 //! Credentials are serialized solely to the contained app-server's private stdin.
 use crate::persistence::{dto::EngineFailure, failure, Result};
+#[cfg(any(unix, test))]
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+#[cfg(unix)]
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+#[cfg(unix)]
+use std::time::{SystemTime, UNIX_EPOCH};
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
 };
-use tokio::{
-    io::AsyncReadExt,
-    sync::{Mutex, OwnedMutexGuard},
-};
+#[cfg(unix)]
+use tokio::io::AsyncReadExt;
+use tokio::sync::{Mutex, OwnedMutexGuard};
 
 pub(super) const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+#[cfg(unix)]
 const FILE_LIMIT: u64 = 128 * 1024;
 
 pub(super) fn error(code: &str) -> EngineFailure {
@@ -38,6 +41,7 @@ pub(super) fn no_private_auth(profile: &Path) -> Result<()> {
 }
 
 // Deliberately no Debug/Serialize or refresh/id-token fields on these types.
+#[cfg(unix)]
 #[derive(Deserialize)]
 struct Record {
     auth_mode: Option<String>,
@@ -45,6 +49,7 @@ struct Record {
     api_key: Option<serde::de::IgnoredAny>,
     tokens: Option<Tokens>,
 }
+#[cfg(unix)]
 #[derive(Deserialize)]
 struct Tokens {
     access_token: String,

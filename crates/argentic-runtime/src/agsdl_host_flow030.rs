@@ -15,7 +15,7 @@ use crate::persistence::{
     },
     flow_store030::{self, Apply030, Authority030, CheckFuture, FlowView030, StoreError030},
     flow_work_protocol030::AcceptedWorkTerminal030,
-    start030::{self, RetainedStart030, StartAuthority030, StartCapture030, StartInspection030},
+    start030::StartCapture030,
     Result,
 };
 use serde::{Deserialize, Serialize};
@@ -223,9 +223,9 @@ pub(crate) fn refused() -> repository::dto::EngineFailure {
 }
 fn store_error(error: StoreError030) -> repository::dto::EngineFailure {
     match error {
-        StoreError030::Sql(error) => {
+        StoreError030::Sql(_error) => {
             #[cfg(test)]
-            eprintln!("NATIVE SQLITE FLOW ERROR: {error:?}");
+            eprintln!("NATIVE SQLITE FLOW ERROR: {_error:?}");
             failure("STORAGE", "", "Native flow storage failed")
         }
         StoreError030::Authority => failure("AUTHORITY", "", "Native flow owner was revoked"),

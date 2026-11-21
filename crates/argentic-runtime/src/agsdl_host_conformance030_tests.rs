@@ -8,7 +8,9 @@ use crate::agsdl_host_scenario030::{
 };
 use crate::agsdl_host_work_admission030::{AttestedWorkPolicy030, PreparedEffectiveAgentWork030};
 use crate::persistence::{dto::EngineStopRequest, flow030::*, start030::StartCapture030, Result};
-use crate::process::{background_command, background_tokio_command};
+#[cfg(unix)]
+use crate::process::background_command;
+use crate::process::background_tokio_command;
 use futures::{future::BoxFuture, FutureExt};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};

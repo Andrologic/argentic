@@ -97,7 +97,7 @@ fn event_key(event: &Value) -> Result<Option<Text>> {
     }
     Ok(None)
 }
-pub(crate) fn assemble_visible_text(messages: &[Vec<Text>]) -> Text {
+fn assemble_visible_text(messages: &[Vec<Text>]) -> Text {
     let mut out = Text::default();
     let mut any = false;
     for parts in messages {

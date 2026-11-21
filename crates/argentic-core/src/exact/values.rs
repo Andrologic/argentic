@@ -356,7 +356,8 @@ pub(crate) fn compare_numbers(left: Num<'_>, right: Num<'_>) -> Ordering {
 }
 
 /// 0.3 `compareNumbers` result as the JS `-1 | 0 | 1`.
-pub(crate) fn ordering_number(order: Ordering) -> i8 {
+#[cfg(test)]
+fn ordering_number(order: Ordering) -> i8 {
     match order {
         Ordering::Less => -1,
         Ordering::Equal => 0,

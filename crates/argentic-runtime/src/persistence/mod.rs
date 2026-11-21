@@ -8,8 +8,7 @@ pub(crate) mod json_lexemes030 {
 }
 use dto::*;
 use serde::{Deserialize, Serialize};
-use sqlx::{Connection, Row, Sqlite, SqliteConnection, SqlitePool, Transaction};
-use std::collections::BTreeMap;
+use sqlx::{Connection, Sqlite, SqliteConnection, Transaction};
 
 pub type Result<T> = std::result::Result<T, EngineFailure>;
 impl From<sqlx::Error> for EngineFailure {
