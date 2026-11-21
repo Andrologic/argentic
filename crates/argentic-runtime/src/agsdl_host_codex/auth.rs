@@ -74,20 +74,22 @@ pub(super) async fn read(source: &Path) -> Result<Credentials> {
 }
 #[cfg(unix)]
 async fn read_file(source: &Path) -> Result<Credentials> {
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let file = open_private_candidate(source).await?;
+    read_private_candidate(source, file).await
+}
+
+#[cfg(unix)]
+async fn read_private_candidate(source: &Path, mut file: tokio::fs::File) -> Result<Credentials> {
+    use std::os::unix::fs::MetadataExt;
+
     let unavailable = || error("CODEX_AUTH_SOURCE_UNAVAILABLE");
-    if !source.is_absolute() || source.canonicalize().map_err(|_| unavailable())? != source {
-        return Err(unavailable());
+    let mut meta = file.metadata().await.map_err(|_| unavailable())?;
+    // An atomic refresh can unlink the inode after open. Reopen the same
+    // approved path once and apply the full checks to the replacement.
+    if meta.nlink() == 0 {
+        file = open_private_candidate(source).await?;
+        meta = file.metadata().await.map_err(|_| unavailable())?;
     }
-    let mut options = std::fs::OpenOptions::new();
-    options
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-    let mut file = tokio::fs::OpenOptions::from(options)
-        .open(source)
-        .await
-        .map_err(|_| unavailable())?;
-    let meta = file.metadata().await.map_err(|_| unavailable())?;
     if !meta.is_file()
         || meta.uid() != unsafe { libc::geteuid() }
         || meta.mode() & 0o077 != 0
@@ -149,6 +151,24 @@ async fn read_file(source: &Path) -> Result<Credentials> {
         access_token: tokens.access_token,
         account_id: tokens.account_id,
     })
+}
+
+#[cfg(unix)]
+async fn open_private_candidate(source: &Path) -> Result<tokio::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let unavailable = || error("CODEX_AUTH_SOURCE_UNAVAILABLE");
+    if !source.is_absolute() || source.canonicalize().map_err(|_| unavailable())? != source {
+        return Err(unavailable());
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    tokio::fs::OpenOptions::from(options)
+        .open(source)
+        .await
+        .map_err(|_| unavailable())
 }
 #[cfg(not(unix))]
 async fn read_file(_: &Path) -> Result<Credentials> {
@@ -220,6 +240,29 @@ mod tests {
         assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
         fixture(&path, "synthetic-account", 1, "expired");
         assert_eq!(read(&path).await.err().unwrap().code, "CODEX_AUTH_EXPIRED");
+    }
+    #[tokio::test]
+    async fn auth_file_reopens_an_unlinked_candidate_and_checks_the_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let source = root.join("auth.json");
+        let next = root.join("next.json");
+
+        for mode in [0o600, 0o644] {
+            fixture(&source, "original-account", u64::MAX, "before");
+            std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let opened = open_private_candidate(&source).await.unwrap();
+            fixture(&next, "replacement-account", u64::MAX, "after");
+            std::fs::set_permissions(&next, std::fs::Permissions::from_mode(mode)).unwrap();
+            std::fs::rename(&next, &source).unwrap();
+
+            let read = read_private_candidate(&source, opened).await;
+            if mode == 0o600 {
+                assert_eq!(read.unwrap().account_id, "replacement-account");
+            } else {
+                assert_eq!(read.err().unwrap().code, "CODEX_AUTH_SOURCE_UNAVAILABLE");
+            }
+        }
     }
     #[tokio::test]
     async fn auth_file_refuses_bad_sources_without_reflecting_data() {
