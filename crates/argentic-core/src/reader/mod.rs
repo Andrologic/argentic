@@ -275,7 +275,7 @@ mod tests {
         map.set("codex".to_owned(), broken);
         let codex = load_harness_module(PINNED_MODULES[1].1.as_bytes()).unwrap();
         map.set("codex".to_owned(), codex);
-        assert_eq!(registry(Modules::Explicit(&map)).unwrap().iter().count(), 1);
+        assert_eq!(registry(Modules::Explicit(&map)).unwrap().len(), 1);
         let mut renamed = ModuleMap::new();
         renamed.set(
             "other".to_owned(),

@@ -354,7 +354,7 @@ pub(crate) fn finish(mut state: Prepared) -> Value {
             (
                 "runtime",
                 s(if graph.has_shared_stop() {
-                    crate::flow::SHARED_STOP_RUNTIME
+                    crate::argentic_core::flow::SHARED_STOP_RUNTIME
                 } else {
                     RUNTIME
                 }),

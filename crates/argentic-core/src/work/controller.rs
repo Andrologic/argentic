@@ -97,7 +97,7 @@ fn event_key(event: &Value) -> Result<Option<Text>> {
     }
     Ok(None)
 }
-fn assemble_visible_text(messages: &[Vec<Text>]) -> Text {
+pub(crate) fn assemble_visible_text(messages: &[Vec<Text>]) -> Text {
     let mut out = Text::default();
     let mut any = false;
     for parts in messages {
@@ -163,7 +163,6 @@ impl Controller {
             operations: HashMap::new(),
         })
     }
-    #[cfg(test)]
     pub(crate) fn snapshot(&self) -> Value {
         o([
             ("state", s(self.state)),
@@ -175,6 +174,9 @@ impl Controller {
             ("planLock", s(self.plan_lock)),
             ("accepted", self.accepted.clone()),
         ])
+    }
+    pub(crate) fn allows_effect(&self, effect: &str) -> bool {
+        self.state == "working" && (self.plan_lock == "unlocked" || effect == "read")
     }
     pub(crate) fn dispatch(&mut self, input: &Value) -> Result<Value> {
         access(input, "input.eventId")?;
