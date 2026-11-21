@@ -130,10 +130,6 @@ impl ModuleMap {
     pub(crate) fn iter(&self) -> impl Iterator<Item = (&String, &Value)> {
         self.entries.iter()
     }
-
-    pub(crate) fn len(&self) -> usize {
-        self.entries.len()
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

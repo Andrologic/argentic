@@ -517,6 +517,7 @@ impl FlowHost030 {
         Ok(marker)
     }
     /// Retrieving a marker grants no authority and does not release the gate.
+    #[cfg(test)]
     pub(crate) fn pending_work_commit(
         &self,
         identity: &FlowIdentity030,
@@ -1052,28 +1053,6 @@ impl FlowHost030 {
     }
 }
 
-pub(crate) async fn read(
-    runtime: &FlowHost030,
-    host: &HostState,
-    pool: &SqlitePool,
-    id: &FlowIdentity030,
-) -> Result<FlowView030> {
-    let lease = host.start_lease().await?;
-    let authority = Authority {
-        runtime,
-        owner: lease.owner(&id.system_start_id)?,
-        lease: &lease,
-    };
-    let mut db = pool.acquire().await?;
-    let mut tx = db.begin().await?;
-    let result = flow_store030::read_tx(&mut tx, &authority, id)
-        .await
-        .map_err(store_error)?;
-    tx.commit().await?;
-    lease.ensure_live()?;
-    Ok(result)
-}
-
 /// Private input for 0.3 controllers and executors. The capture and state are
 /// read in one SQLite snapshot and never adapted into a historical State020.
 pub(crate) struct NativeFlowInspection030 {
@@ -1232,6 +1211,7 @@ pub(crate) async fn apply_work_terminal_tx(
     Ok(applied)
 }
 
+#[cfg(test)]
 pub(crate) async fn apply_native_event(
     runtime: &FlowHost030,
     host: &HostState,
@@ -2352,6 +2332,7 @@ impl DispatchLease030<'_> {
     }
 }
 
+#[cfg(test)]
 pub(crate) async fn claim_next<'a>(
     runtime: &'a FlowHost030,
     host: &HostState,

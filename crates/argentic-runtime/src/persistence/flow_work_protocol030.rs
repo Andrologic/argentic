@@ -731,10 +731,8 @@ async fn commit_tx(
     Ok(())
 }
 
-/// The only entry point returning a decision. It owns the lifecycle/gate at
-/// both durable boundaries and invokes the concrete authenticated mailbox in
-/// between, with no SQL transaction held while awaiting it. 09 must implement
-/// `evaluate_flow_work030` as described above; no public commit function exists.
+/// Exercise the unowned transition path against the real controller.
+#[cfg(test)]
 pub(crate) async fn transition(
     host: &HostState,
     pool: &SqlitePool,
@@ -1104,6 +1102,7 @@ async fn transition_inner(
 
 /// Reconcile an unknown decision commit from a single SQL snapshot. This does
 /// not replay the controller, claim a check, or grant authority to dispatch.
+#[cfg(test)]
 pub(crate) async fn inspect_work_commit(
     host: &HostState,
     pool: &SqlitePool,

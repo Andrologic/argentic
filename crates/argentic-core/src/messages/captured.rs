@@ -231,24 +231,4 @@ impl CapturedOccurrences {
             .find(|(k, _, _)| k == &format!("{ordinal}:{index}"))
             .map(|(_, _, v)| v)
     }
-    pub(crate) fn resolve(
-        &mut self,
-        ordinal: &Value,
-        index: &Value,
-        source: &Value,
-        usage: &Value,
-        pointer: &Value,
-    ) -> Result<Value> {
-        let key = format!(
-            "{}:{}",
-            ordinal.stringify(),
-            index
-                .text()
-                .map_or_else(|| index.stringify(), |t| t.lossy())
-        );
-        match self.entries.iter_mut().find(|(k, _, _)| k == &key) {
-            Some((_, _, v)) => v.resolve(source, usage, pointer),
-            None => Ok(native::o([])),
-        }
-    }
 }

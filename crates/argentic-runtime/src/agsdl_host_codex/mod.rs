@@ -108,28 +108,6 @@ pub(crate) struct CodexObservation030 {
     pub account_digest: String,
 }
 
-/// Native account and scope qualification must succeed before publishing a
-/// catalogue. External auth is available only through an explicit host opt-in.
-pub(crate) async fn observe(
-    manager: &HostContext,
-    scope: &Value,
-    read_only: bool,
-) -> Result<Option<(Profile, Vec<String>, String)>> {
-    Ok(observe_catalogue030(manager, scope, read_only)
-        .await?
-        .map(|observed| {
-            (
-                observed.profile,
-                observed
-                    .models
-                    .iter()
-                    .filter_map(|model| model["name"].as_str().map(str::to_owned))
-                    .collect(),
-                observed.account_digest,
-            )
-        }))
-}
-
 pub(crate) async fn observe_catalogue030(
     manager: &HostContext,
     scope: &Value,

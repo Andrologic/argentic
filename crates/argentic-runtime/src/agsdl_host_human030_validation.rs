@@ -4,6 +4,13 @@ use super::*;
 mod core;
 pub(super) use core::ms;
 use core::*;
+fn strip_reason(mut value: Value) -> Value {
+    if let Some(object) = value.as_object_mut() {
+        object.remove("reason");
+    }
+    value
+}
+
 async fn facts(
     broker: &HumanBroker030,
     db: &mut SqliteConnection,
