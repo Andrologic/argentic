@@ -102,7 +102,14 @@ fn symlinks_in_a_selected_path_are_refused() {
 
 #[test]
 fn folders_refuse_the_names_archives_refuse() {
-    for hidden in [".git/config", ".env", ".ENV.local", "nul.txt"] {
+    for hidden in [
+        ".git/config",
+        ".env",
+        ".ENV.local",
+        "nul.txt",
+        "nul .md",
+        "COM1 .txt",
+    ] {
         let temp = tempfile::tempdir().unwrap();
         project(temp.path(), "../notes.md", Some("skills/review/SKILL.md"));
         write(temp.path(), "skills/review/SKILL.md", "Review.\n");

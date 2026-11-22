@@ -439,7 +439,7 @@ async fn read_uri(
                         }
                         // A retained member that resolves elsewhere has been
                         // altered, as with a digest mismatch.
-                        Ok(_) if member_read => {
+                        Ok(_) if member_read && expected_path.as_ref() != Some(&resolved) => {
                             *admission_error.lock().unwrap() = Some(error(
                                 "CONTENT_UNAVAILABLE",
                                 "Captured project bytes changed.",

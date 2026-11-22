@@ -74,7 +74,8 @@ pub(super) fn portable(name: &str) -> Result<()> {
     }
     for part in name.split('/') {
         let folded = unicase::UniCase::new(part).to_folded_case();
-        let stem = folded.split('.').next().unwrap_or("");
+        // Windows ignores spaces before the extension: `nul .md` is NUL.
+        let stem = folded.split('.').next().unwrap_or("").trim_end_matches(' ');
         let device = matches!(stem, "con" | "prn" | "aux" | "nul" | "conin$" | "conout$")
             || stem
                 .strip_prefix("com")
