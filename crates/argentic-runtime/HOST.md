@@ -62,6 +62,36 @@ diagnostics arrive inside `result_json` (`/static/diagnostics` and
 pointer and message to `locate_error` to name its component file. The
 standalone host locates the first error and appends the full compile report.
 
+For a project folder or an opened archive, `selected_files()` returns a
+borrowed iterator in ascending path order over the original selected files.
+Each `SelectedFile` carries a portable project-relative `path`, exact `bytes`
+and the `executable` flag. Plain JSON documents return `None`. Use
+`component_origin(pointer)` to map an assembled JSON pointer to its
+project-relative file and local JSON pointer. It uses the closest declaring
+component, so callers can also locate a missing field. Inline fields map
+to `agsdl.json`.
+
+To save the opened project as an immutable version, call
+`input.write_archive(&mut output)?` with an empty file or buffer. The writer
+uses the selected bytes from the open operation. It emits deterministic
+stored ZIP32 data without history, and accepts an opened archive for
+re-export. Plain JSON sources and archive limit violations return `PROJECT`
+before writing. The host owns the output. When saving to disk, write to a
+private temporary file, flush it and publish the completed file at a new
+`.agsdl` path. Discard the temporary file on failure.
+
+The optional interoperability test uses Python 3.9 or newer and the
+AgSDL v0.5.0 reference tool. Set `AGSDL_REFERENCE_CHECKOUT` to the root
+of that checkout and run the test with Cargo.
+
+```sh
+cargo test --locked --manifest-path crates/argentic-runtime/Cargo.toml \
+  --lib archive_interchanges_with_reference_tool -- --nocapture
+```
+
+The test also looks in `~/github/AgSDL` when the variable is unset. It skips
+when Python 3 or the reference tool is unavailable.
+
 Pass the bound scope to native registry preparation and save it unchanged as
 `callScopeJson` in the private Start capture. Build the registry with the same
 scope and source digest used for admission. The engine's native reader uses

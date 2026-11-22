@@ -44,12 +44,9 @@ fn pack(files: &BTreeMap<String, Vec<u8>>) -> Vec<u8> {
 
 fn files(opened: &OpenedSource) -> BTreeMap<String, Vec<u8>> {
     opened
-        .project
-        .as_ref()
+        .selected_files()
         .unwrap()
-        .files
-        .iter()
-        .map(|(name, file)| (name.clone(), file.bytes.clone()))
+        .map(|file| (file.path.to_owned(), file.bytes.to_vec()))
         .collect()
 }
 
@@ -370,11 +367,16 @@ fn a_linked_project_root_or_snapshot_folder_is_refused() {
 
 #[test]
 fn skill_tree_directories_follow_the_name_rules_even_when_empty() {
-    for directory in [".git", "CON", "Sub"] {
+    for (directory, resource) in [
+        (".git", "../notes.md"),
+        ("CON", "../notes.md"),
+        // An authored spelling can collide with an empty directory even on a
+        // filesystem that cannot create entries named both Sub and sub.
+        ("Sub", "../skills/review/sub/../../../notes.md"),
+    ] {
         let temp = tempfile::tempdir().unwrap();
-        project(temp.path(), "../notes.md", Some("skills/review/SKILL.md"));
+        project(temp.path(), resource, Some("skills/review/SKILL.md"));
         write(temp.path(), "skills/review/SKILL.md", "Review.\n");
-        write(temp.path(), "skills/review/sub", "File.\n");
         std::fs::create_dir(temp.path().join("skills/review").join(directory)).unwrap();
         let message = refused(OpenedSource::open_path(temp.path()));
         assert!(

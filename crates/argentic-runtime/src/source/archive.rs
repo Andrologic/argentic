@@ -1,16 +1,19 @@
-//! AgSDL archive format 1. Read one bounded ZIP32 member at a time.
-use super::{invalid, parse_json, sha256, Files, ProjectFile, MAX_FILES, MAX_TOTAL};
+//! AgSDL archive format 1. Read or write one bounded ZIP32 member at a time.
+use super::{invalid, parse_json, sha256, Files, ProjectFile, MANIFEST, MAX_FILES, MAX_TOTAL};
 use crate::persistence::Result;
 use serde::Deserialize;
 use std::{
     collections::BTreeMap,
-    io::{BufReader, Read, Seek, SeekFrom},
+    io::{BufReader, Read, Seek, SeekFrom, Write},
 };
 use unicode_general_category::{get_general_category, GeneralCategory};
 use unicode_normalization::UnicodeNormalization;
 
 pub(super) const INDEX_LIMIT: u64 = 2 * 1024 * 1024;
 const DIRECTORY_LIMIT: u64 = 8 * 1024 * 1024;
+const FORMAT: &str = "agsdl-archive-1";
+const INDEX_NAME: &str = "archive.json";
+const PROJECT_PREFIX: &str = "project/";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -43,8 +46,7 @@ pub(super) fn hex(value: &str, len: usize) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
-/// Byte length of the `archive.json` inventory that would list these files.
-pub(super) fn inventory_len(files: &Files) -> Result<u64> {
+pub(super) fn inventory(files: &Files) -> Result<Vec<u8>> {
     let rows = files
         .iter()
         .map(|(name, file)| {
@@ -55,9 +57,114 @@ pub(super) fn inventory_len(files: &Files) -> Result<u64> {
             )
         })
         .collect::<serde_json::Map<_, _>>();
-    let index = serde_json::json!({"archiveFormat":"agsdl-archive-1","files":rows});
-    // The official packer ends the inventory with a newline.
-    Ok(serde_json::to_vec(&index)?.len() as u64 + 1)
+    let index = serde_json::json!({"archiveFormat":FORMAT,"files":rows});
+    let mut bytes = serde_json::to_vec(&index)?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
+fn check_export_limits(files: usize, total: u64, index: u64, directory: u64) -> Result<()> {
+    let message = if files + 1 > MAX_FILES {
+        "Archive including its inventory exceeds the 8192 entry limit"
+    } else if index > INDEX_LIMIT {
+        "Archive inventory exceeds the 2 MiB limit"
+    } else if total + index > MAX_TOTAL {
+        "Archive including its inventory exceeds the 256 MiB total"
+    } else if directory > DIRECTORY_LIMIT {
+        "Archive central directory exceeds the 8 MiB limit"
+    } else {
+        return Ok(());
+    };
+    Err(invalid(INDEX_NAME, "", message))
+}
+
+/// Package the already validated selection from an opened project.
+pub(super) fn write(files: &Files, output: impl Write) -> Result<()> {
+    if !files.contains_key(MANIFEST) {
+        return Err(invalid(
+            MANIFEST,
+            "",
+            "No selected project files to archive",
+        ));
+    }
+    let index = inventory(files)?;
+    let total = files.values().map(|file| file.bytes.len() as u64).sum();
+    let directory = 46
+        + INDEX_NAME.len() as u64
+        + files
+            .keys()
+            .map(|name| (46 + PROJECT_PREFIX.len() + name.len()) as u64)
+            .sum::<u64>();
+    check_export_limits(files.len(), total, index.len() as u64, directory)?;
+
+    let members = files.iter().map(|(name, file)| {
+        (
+            format!("{PROJECT_PREFIX}{name}"),
+            file.bytes.as_slice(),
+            file.executable,
+        )
+    });
+    // Put the inventory last. Its fixed name and attributes prevent a local
+    // header offset in the final directory record from mimicking a ZIP64 locator.
+    let members = members.chain(std::iter::once((
+        INDEX_NAME.into(),
+        index.as_slice(),
+        false,
+    )));
+    write_stored_zip(output, files.len() + 1, members)
+        .map_err(|error| crate::persistence::failure("STORAGE", "archive", &error.to_string()))
+}
+
+/// The bounded sizes checked above fit ZIP32 with room for both sets of
+/// headers. Stored entries let us write the ZIP to any sequential sink.
+fn write_stored_zip<'a>(
+    mut output: impl Write,
+    count: usize,
+    entries: impl Iterator<Item = (String, &'a [u8], bool)>,
+) -> std::io::Result<()> {
+    fn set16(bytes: &mut [u8], at: usize, value: u16) {
+        bytes[at..at + 2].copy_from_slice(&value.to_le_bytes());
+    }
+    fn set32(bytes: &mut [u8], at: usize, value: u32) {
+        bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    let mut offset = 0;
+    let mut directory = Vec::new();
+    for (name, bytes, executable) in entries {
+        let mut local = [0; 30];
+        local[..4].copy_from_slice(b"PK\x03\x04");
+        set16(&mut local, 4, 20);
+        set16(&mut local, 6, 0x800); // UTF-8 names.
+        set16(&mut local, 12, 0x21); // 1980-01-01 at midnight.
+        set32(&mut local, 14, crc32fast::hash(bytes));
+        set32(&mut local, 18, bytes.len() as u32);
+        set32(&mut local, 22, bytes.len() as u32);
+        set16(&mut local, 26, name.len() as u16);
+
+        let mut central = [0; 46];
+        central[..4].copy_from_slice(b"PK\x01\x02");
+        set16(&mut central, 4, 0x0314); // Unix external attributes.
+        central[6..30].copy_from_slice(&local[4..28]);
+        let mode = if executable { 0o100755 } else { 0o100644 };
+        set32(&mut central, 38, mode << 16);
+        set32(&mut central, 42, offset);
+        directory.extend(central);
+        directory.extend(name.as_bytes());
+
+        output.write_all(&local)?;
+        output.write_all(name.as_bytes())?;
+        output.write_all(bytes)?;
+        offset += (local.len() + name.len() + bytes.len()) as u32;
+    }
+    let mut footer = [0; 22];
+    footer[..4].copy_from_slice(b"PK\x05\x06");
+    set16(&mut footer, 8, count as u16);
+    set16(&mut footer, 10, count as u16);
+    set32(&mut footer, 12, directory.len() as u32);
+    set32(&mut footer, 16, offset);
+    output.write_all(&directory)?;
+    output.write_all(&footer)
 }
 
 /// Collision key: case folding then NFC, as the archive format requires.
@@ -323,7 +430,7 @@ fn members(input: &mut (impl Read + Seek)) -> Result<BTreeMap<String, Member>> {
         if (!name.is_ascii() && flags & 0x800 == 0) || !plain_extras(&fields[name_len..], name) {
             return Err(invalid(name, "", "Invalid UTF-8 flag or ZIP extra fields"));
         }
-        if let Some(path) = name.strip_prefix("project/") {
+        if let Some(path) = name.strip_prefix(PROJECT_PREFIX) {
             portable(path)?;
         } else if !matches!(name, "archive.json" | "history.bundle") {
             return Err(invalid(name, "", "Unexpected ZIP entry"));
@@ -361,7 +468,7 @@ fn members(input: &mut (impl Read + Seek)) -> Result<BTreeMap<String, Member>> {
 pub(super) fn read(mut input: impl Read + Seek) -> Result<Files> {
     let mut entries = members(&mut input)?;
     let manifest = entries
-        .remove("archive.json")
+        .remove(INDEX_NAME)
         .filter(|entry| entry.size() <= INDEX_LIMIT)
         .ok_or_else(|| invalid("archive.json", "", "Missing or oversized inventory"))?;
     let raw = manifest.read(&mut input, "archive.json")?;
@@ -396,7 +503,7 @@ pub(super) fn read(mut input: impl Read + Seek) -> Result<Files> {
     }
     let index: Inventory =
         serde_json::from_value(value).map_err(|e| invalid("archive.json", "", &e.to_string()))?;
-    if index.archive_format != "agsdl-archive-1" || !index.files.contains_key("agsdl.json") {
+    if index.archive_format != FORMAT || !index.files.contains_key(MANIFEST) {
         return Err(invalid(
             "archive.json",
             "",
@@ -454,7 +561,7 @@ pub(super) fn read(mut input: impl Read + Seek) -> Result<Files> {
     }
     let mut files = Files::new();
     for (name, file) in index.files {
-        let bytes = read(&format!("project/{name}"), file.size, &file.sha256)?;
+        let bytes = read(&format!("{PROJECT_PREFIX}{name}"), file.size, &file.sha256)?;
         files.insert(
             name,
             ProjectFile {
@@ -478,40 +585,11 @@ pub(super) mod tests {
     // Stored ZIP32 entries make the bytes under each integrity check explicit.
     // The successful interoperability cases use the official packer fixtures.
     pub(in crate::source) fn stored_zip(entries: &BTreeMap<String, Vec<u8>>) -> Vec<u8> {
-        fn set16(bytes: &mut [u8], at: usize, value: u16) {
-            bytes[at..at + 2].copy_from_slice(&value.to_le_bytes());
-        }
-        fn set32(bytes: &mut [u8], at: usize, value: u32) {
-            bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
-        }
         let mut archive = Vec::new();
-        let mut directory = Vec::new();
-        for (name, bytes) in entries {
-            let mut local = [0; 30];
-            local[..4].copy_from_slice(b"PK\x03\x04");
-            set16(&mut local, 4, 20);
-            set32(&mut local, 14, crc32fast::hash(bytes));
-            set32(&mut local, 18, bytes.len() as u32);
-            set32(&mut local, 22, bytes.len() as u32);
-            set16(&mut local, 26, name.len() as u16);
-            let mut central = [0; 46];
-            central[..4].copy_from_slice(b"PK\x01\x02");
-            central[6..30].copy_from_slice(&local[4..28]);
-            set32(&mut central, 42, archive.len() as u32);
-            directory.extend(central);
-            directory.extend(name.bytes());
-            archive.extend(local);
-            archive.extend(name.bytes());
-            archive.extend(bytes);
-        }
-        let mut footer = [0; 22];
-        footer[..4].copy_from_slice(b"PK\x05\x06");
-        set16(&mut footer, 8, entries.len() as u16);
-        set16(&mut footer, 10, entries.len() as u16);
-        set32(&mut footer, 12, directory.len() as u32);
-        set32(&mut footer, 16, archive.len() as u32);
-        archive.extend(directory);
-        archive.extend(footer);
+        let members = entries
+            .iter()
+            .map(|(name, bytes)| (name.clone(), bytes.as_slice(), false));
+        write_stored_zip(&mut archive, entries.len(), members).unwrap();
         archive
     }
 
@@ -535,6 +613,23 @@ pub(super) mod tests {
 
     pub(in crate::source) fn row(bytes: &[u8]) -> Value {
         json!({"size":bytes.len(),"sha256":sha256(bytes),"executable":false})
+    }
+
+    #[test]
+    fn export_limits_count_the_inventory() {
+        let files = MAX_FILES - 1;
+        let total = MAX_TOTAL - INDEX_LIMIT;
+        check_export_limits(files, total, INDEX_LIMIT, DIRECTORY_LIMIT).unwrap();
+        for (files, total, index, directory, expected) in [
+            (files + 1, total, INDEX_LIMIT, DIRECTORY_LIMIT, "8192 entry"),
+            (files, total + 1, INDEX_LIMIT, DIRECTORY_LIMIT, "256 MiB"),
+            (files, 0, INDEX_LIMIT + 1, DIRECTORY_LIMIT, "2 MiB"),
+            (files, total, INDEX_LIMIT, DIRECTORY_LIMIT + 1, "8 MiB"),
+        ] {
+            let error = check_export_limits(files, total, index, directory).unwrap_err();
+            assert_eq!(error.code, "PROJECT");
+            assert!(error.message.contains(expected), "{error:?}");
+        }
     }
 
     #[tokio::test]

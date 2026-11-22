@@ -2,6 +2,8 @@
 //! resolves secret values, executes a command or retrieves an external URI.
 mod archive;
 #[cfg(test)]
+mod archive_writer_tests;
+#[cfg(test)]
 mod conformance050_tests;
 mod project;
 #[cfg(test)]
@@ -17,7 +19,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
-    io::{Cursor, Read},
+    io::{Cursor, Read, Write},
     path::{Path, PathBuf},
 };
 use url::Url;
@@ -33,6 +35,17 @@ type Files = BTreeMap<String, ProjectFile>;
 struct ProjectFile {
     bytes: Vec<u8>,
     executable: bool,
+}
+
+/// One of the original files selected by a project or archive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelectedFile<'a> {
+    /// Portable UTF-8 path relative to the project root, separated by `/`.
+    pub path: &'a str,
+    /// Exact bytes held by the opened source.
+    pub bytes: &'a [u8],
+    /// Whether the project or archive marks this file executable.
+    pub executable: bool,
 }
 
 /// Host-owned input. For an uploaded archive use [Self::open_archive_bytes].
@@ -133,7 +146,7 @@ impl OpenedSource {
     fn assembled(project: project::Project) -> Result<Self> {
         // A folder accepts only what its archive could list, which also bounds
         // the retained index that a later run reopens.
-        if archive::inventory_len(&project.files)? > archive::INDEX_LIMIT {
+        if archive::inventory(&project.files)?.len() as u64 > archive::INDEX_LIMIT {
             return Err(invalid(
                 MANIFEST,
                 "",
@@ -178,16 +191,51 @@ impl OpenedSource {
         self.project.as_ref().map(|project| &project.mcp_files)
     }
 
+    /// Borrow the selected files in ascending project-relative path order.
+    /// Returns `None` for a plain JSON document.
+    pub fn selected_files(&self) -> Option<impl ExactSizeIterator<Item = SelectedFile<'_>> + '_> {
+        self.project.as_ref().map(|project| {
+            project.files.iter().map(|(path, file)| SelectedFile {
+                path,
+                bytes: &file.bytes,
+                executable: file.executable,
+            })
+        })
+    }
+
+    /// Write a deterministic `agsdl-archive-1` snapshot to an empty sink.
+    /// Exports the opened project files without Git history.
+    /// Returns a `PROJECT` error for a plain JSON document or an archive limit
+    /// violation before writing any bytes. On an I/O error the output may be
+    /// incomplete. The caller owns flushing and publishing the output.
+    pub fn write_archive(&self, output: impl Write) -> Result<()> {
+        let project = self
+            .project
+            .as_ref()
+            .ok_or_else(|| invalid(MANIFEST, "", "Source is not an AgSDL project"))?;
+        archive::write(&project.files, output)
+    }
+
+    /// Map an assembled JSON pointer to a project-relative file and a pointer
+    /// within that file. Inline fields map to the manifest. This uses the
+    /// closest declaring component and does not check whether the value exists.
+    /// Returns `None` for a plain JSON document or a non-pointer category.
+    pub fn component_origin<'a>(&'a self, pointer: &'a str) -> Option<(&'a str, &'a str)> {
+        self.project
+            .as_ref()
+            .filter(|_| pointer.is_empty() || pointer.starts_with('/'))
+            .map(|project| project.origin(pointer))
+    }
+
     /// Translate a compiler or admission diagnostic to its declaring component.
     /// Errors whose pointer is a host category, such as `projectSnapshot`,
     /// name no component and are returned unchanged.
     pub fn locate_error(&self, mut error: EngineFailure) -> EngineFailure {
-        if let Some(project) = self
-            .project
-            .as_ref()
+        if let Some((file, local)) = self
+            .component_origin(&error.pointer)
             .filter(|_| error.pointer.starts_with('/'))
         {
-            error.message = format!("{}: {}", project.location(&error.pointer), error.message);
+            error.message = format!("{file}#{local}: {}", error.message);
         }
         error
     }

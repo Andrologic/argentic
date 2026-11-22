@@ -23,12 +23,7 @@ pub(super) struct Project {
 }
 
 impl Project {
-    pub fn location(&self, pointer: &str) -> String {
-        let (file, local) = self.origin(pointer);
-        format!("{file}#{local}")
-    }
-
-    fn origin<'a>(&'a self, pointer: &'a str) -> (&'a str, &'a str) {
+    pub(super) fn origin<'a>(&'a self, pointer: &'a str) -> (&'a str, &'a str) {
         let mut prefix = pointer;
         loop {
             if let Some(file) = self.origins.get(prefix) {
