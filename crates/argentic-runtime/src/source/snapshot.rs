@@ -1,4 +1,4 @@
-use super::{archive::hex, file_url, invalid, io, read_regular, sha256, Files, MAX_JSON_TOTAL};
+use super::{archive::hex, file_url, invalid, read_regular, sha256, Files, MAX_JSON_TOTAL};
 use crate::persistence::{failure, Result};
 use cap_std::{ambient_authority, fs::Dir};
 use serde::{Deserialize, Serialize};
@@ -63,6 +63,16 @@ struct Entry {
     executable: bool,
 }
 
+/// Host storage failures name neither the project nor host paths, which a
+/// remote client must not see.
+fn storage(_: &Path, error: std::io::Error) -> crate::persistence::dto::EngineFailure {
+    failure(
+        "STORAGE",
+        "data",
+        &format!("Host storage cannot retain the project: {}", error.kind()),
+    )
+}
+
 fn unavailable() -> crate::persistence::dto::EngineFailure {
     failure(
         "CONTENT_UNAVAILABLE",
@@ -76,10 +86,12 @@ pub(super) fn retain(
     authored_sha256: &str,
     files: &Files,
 ) -> Result<RetainedSource> {
-    let data = host_data.canonicalize().map_err(|e| io(host_data, e))?;
+    let data = host_data
+        .canonicalize()
+        .map_err(|e| storage(host_data, e))?;
     let parent = data.join(SNAPSHOTS);
-    fs::create_dir_all(&parent).map_err(|e| io(&parent, e))?;
-    if parent.canonicalize().map_err(|e| io(&parent, e))? != parent {
+    fs::create_dir_all(&parent).map_err(|e| storage(&parent, e))?;
+    if parent.canonicalize().map_err(|e| storage(&parent, e))? != parent {
         return Err(unavailable());
     }
     let manifest = Manifest {
@@ -111,15 +123,15 @@ pub(super) fn retain(
     let id = sha256(&bytes);
     let path = parent.join(&id);
     if !path.exists() {
-        let staging = tempfile::tempdir_in(&parent).map_err(|e| io(&parent, e))?;
+        let staging = tempfile::tempdir_in(&parent).map_err(|e| storage(&parent, e))?;
         let root = staging.path().join(PROJECT);
         #[cfg(unix)]
         let mut directories =
             std::collections::BTreeSet::from([root.clone(), staging.path().to_owned()]);
-        fs::create_dir(&root).map_err(|e| io(&root, e))?;
+        fs::create_dir(&root).map_err(|e| storage(&root, e))?;
         for (name, file) in files {
             let target = root.join(name);
-            fs::create_dir_all(target.parent().unwrap()).map_err(|e| io(&target, e))?;
+            fs::create_dir_all(target.parent().unwrap()).map_err(|e| storage(&target, e))?;
             #[cfg(unix)]
             directories.extend(
                 target
@@ -135,25 +147,25 @@ pub(super) fn retain(
                 use std::os::unix::fs::OpenOptionsExt;
                 options.mode(if file.executable { 0o700 } else { 0o600 });
             }
-            let mut output = options.open(&target).map_err(|e| io(&target, e))?;
+            let mut output = options.open(&target).map_err(|e| storage(&target, e))?;
             output
                 .write_all(&file.bytes)
                 .and_then(|()| output.sync_all())
-                .map_err(|e| io(&target, e))?;
+                .map_err(|e| storage(&target, e))?;
         }
         let index = staging.path().join(INDEX);
-        let mut output = fs::File::create(&index).map_err(|e| io(&index, e))?;
+        let mut output = fs::File::create(&index).map_err(|e| storage(&index, e))?;
         output
             .write_all(&bytes)
             .and_then(|()| output.sync_all())
-            .map_err(|e| io(&index, e))?;
+            .map_err(|e| storage(&index, e))?;
         #[cfg(unix)]
         for directory in directories.iter().rev() {
             sync_directory(directory)?;
         }
         if let Err(error) = fs::rename(staging.path(), &path) {
             if !path.exists() {
-                return Err(io(&path, error));
+                return Err(storage(&path, error));
             }
         }
     }
@@ -184,7 +196,7 @@ pub(super) fn retain(
 fn sync_directory(path: &Path) -> Result<()> {
     fs::File::open(path)
         .and_then(|dir| dir.sync_all())
-        .map_err(|e| io(path, e))
+        .map_err(|e| storage(path, e))
 }
 
 pub(crate) struct Snapshot {
@@ -261,7 +273,11 @@ impl Snapshot {
     }
 
     pub fn member<'a>(&self, path: &'a Path) -> Option<(&'a Path, &str)> {
-        let relative = path.strip_prefix(&self.uri_root).ok()?;
+        // Accept both spellings that `contains` accepts.
+        let relative = path
+            .strip_prefix(&self.uri_root)
+            .or_else(|_| path.strip_prefix(&self.root))
+            .ok()?;
         let name = relative.to_str()?.replace(std::path::MAIN_SEPARATOR, "/");
         self.manifest
             .files

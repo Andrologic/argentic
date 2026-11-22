@@ -439,6 +439,18 @@ async fn exercise_project_sources() {
                 "CONTENT_UNAVAILABLE"
             );
             fs::write(&resource, &bytes).unwrap();
+            // A member redirected to another member has been altered too.
+            #[cfg(unix)]
+            {
+                fs::remove_file(&resource).unwrap();
+                std::os::unix::fs::symlink(retained_root.join("mcp/asset.txt"), &resource).unwrap();
+                assert_eq!(
+                    read(policy.clone()).await.unwrap_err().code,
+                    "CONTENT_UNAVAILABLE"
+                );
+                fs::remove_file(&resource).unwrap();
+                fs::write(&resource, &bytes).unwrap();
+            }
             // A file added to the retained copy is not a project member.
             fs::write(&unlisted, "Unlisted.\n").unwrap();
             let unlisted = json!({"uri":Url::from_file_path(&unlisted).unwrap().as_str(),"mediaType":"text/plain"});

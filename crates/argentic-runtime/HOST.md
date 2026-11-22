@@ -25,7 +25,9 @@ Pass a directory, its `agsdl.json` manifest, a `.agsdl` archive, or the
 ordinary JSON document. For an archive uploaded by a remote client, pass the
 bytes to `OpenedSource::open_archive_bytes`. A client path describes files on
 the client's machine. It must never become an argument to `open_path` in
-the host process.
+the host process. As in the archive format, a file whose name ends in
+`.agsdl`, in any case, is read as an archive. A storage failure while
+retaining a project returns `STORAGE` without host paths.
 
 ```rust
 use argentic_runtime::{persistence::{dto::EngineSourceRevision, Result},
@@ -99,7 +101,10 @@ inventory is missing or altered, the runtime refuses the read with
 copy is not repaired automatically, and opening the same project again is
 refused with the same code. With no host running, remove
 `agsdl-snapshots/<id>` under the private data root. The next open then
-retains the project again under the same identity. Existing
+retains the project again under the same identity. Argentic never removes
+retained copies: each revision keeps its own, and a crash during retention
+can leave a `.tmp*` staging folder. Remove them only when no run can still
+need them. Existing
 standalone restart rules still apply. A new process shows prior interrupted
 runs and reconciles their pending Stops.
 

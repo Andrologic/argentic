@@ -437,6 +437,19 @@ async fn read_uri(
                         {
                             Ok(())
                         }
+                        // A retained member that resolves elsewhere has been
+                        // altered, as with a digest mismatch.
+                        Ok(_) if member_read => {
+                            *admission_error.lock().unwrap() = Some(error(
+                                "CONTENT_UNAVAILABLE",
+                                "Captured project bytes changed.",
+                            ));
+                            Err(
+                                crate::content_io::admitted::ReadError::FilesystemInvalidPath {
+                                    message: "Content target changed.".into(),
+                                },
+                            )
+                        }
                         Ok(_) => {
                             *admission_error.lock().unwrap() = Some(error(
                                 "CORRELATION",

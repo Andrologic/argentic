@@ -293,3 +293,18 @@ fn a_damaged_copy_is_refused_until_it_is_removed() {
         b"Notes.\n"
     );
 }
+
+/// A remote upload must not learn host paths from a storage failure.
+#[test]
+fn retain_failures_name_neither_the_project_nor_host_paths() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("agsdl-snapshots"), "not a directory").unwrap();
+    let opened = OpenedSource::open_archive_bytes(include_bytes!(
+        "../../tests/fixtures/conformance-050/review-project.agsdl"
+    ))
+    .unwrap();
+    let error = opened.retain(temp.path()).err().unwrap();
+    assert_eq!(error.code, "STORAGE");
+    let root = temp.path().to_str().unwrap();
+    assert!(!error.message.contains(root), "{}", error.message);
+}
