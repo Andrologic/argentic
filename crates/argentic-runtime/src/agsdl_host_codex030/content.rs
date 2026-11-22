@@ -572,13 +572,26 @@ mod tests {
                 .code,
             "PERMISSION"
         );
-        assert_eq!(
-            sources
-                .allowed_file(&uri(&base.join("data/engine.lock")), "/message/resources/0")
-                .unwrap_err()
-                .code,
-            "CONTENT_UNAVAILABLE"
-        );
+        // Host data outside the snapshot, including its index, stays private.
+        std::fs::write(base.join("data/engine.lock"), "").unwrap();
+        let index = std::fs::read_dir(base.join("data/agsdl-snapshots"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path()
+            .join("files.json");
+        for private in [base.join("data/engine.lock"), index] {
+            assert_eq!(
+                sources
+                    .allowed_file(&uri(&private), "/message/resources/0")
+                    .unwrap_err()
+                    .code,
+                "PERMISSION",
+                "{}",
+                private.display()
+            );
+        }
     }
 
     #[tokio::test]

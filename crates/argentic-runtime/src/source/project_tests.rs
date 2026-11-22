@@ -262,3 +262,34 @@ fn only_json_pointers_are_located_in_a_component() {
         assert_eq!(error.message, "Refused", "{category}");
     }
 }
+
+/// HOST.md: a damaged copy is refused, and removing it lets the next open
+/// retain the same identity again.
+#[test]
+fn a_damaged_copy_is_refused_until_it_is_removed() {
+    let temp = tempfile::tempdir().unwrap();
+    let project_dir = temp.path().join("project");
+    let data = temp.path().join("data");
+    std::fs::create_dir(&data).unwrap();
+    project(&project_dir, "../notes.md", None);
+    let opened = OpenedSource::open_path(&project_dir).unwrap();
+    let scope = |retained: &RetainedSource| {
+        let mut scope = json!({});
+        retained.bind_scope(&mut scope).unwrap();
+        scope
+    };
+    let first = scope(&opened.retain(&data).unwrap());
+    let id = first["projectSnapshot"].as_str().unwrap().to_owned();
+    let copy = data.join("agsdl-snapshots").join(&id);
+    std::fs::write(copy.join("project/notes.md"), "Changed.\n").unwrap();
+    assert_eq!(
+        opened.retain(&data).err().unwrap().code,
+        "CONTENT_UNAVAILABLE"
+    );
+    std::fs::remove_dir_all(&copy).unwrap();
+    assert_eq!(scope(&opened.retain(&data).unwrap()), first);
+    assert_eq!(
+        std::fs::read(copy.join("project/notes.md")).unwrap(),
+        b"Notes.\n"
+    );
+}

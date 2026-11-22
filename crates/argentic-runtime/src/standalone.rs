@@ -125,6 +125,23 @@ fn scope(root: &Path, owner: &EngineSourceOwner, source: &RetainedSource) -> Res
     source.bind_scope(&mut scope)?;
     Ok(scope)
 }
+/// Compare the project snapshot recorded by a Start with the current scope.
+/// Captures without a scope or snapshot belong to a JSON document.
+fn snapshot_matches(private_capture_json: &str, scope: &Value) -> Result<()> {
+    let private: Value = serde_json::from_str(private_capture_json)?;
+    let captured = match private["callScopeJson"].as_str() {
+        Some(scope) => serde_json::from_str::<Value>(scope)?["projectSnapshot"].take(),
+        None => Value::Null,
+    };
+    if captured != scope["projectSnapshot"] {
+        return Err(failure(
+            "CAPTURE_CHANGED",
+            "source",
+            "Start belongs to a different project snapshot",
+        ));
+    }
+    Ok(())
+}
 #[derive(Clone)]
 struct Policies(Arc<RwLock<Inputs>>);
 impl Policies {
@@ -524,29 +541,26 @@ impl Host {
                 return Err(e);
             }
         };
-        let current = self.policies.0.read().await;
-        if !current.opened.is_document() {
-            let private: Value = serde_json::from_str(&retained.capture.private_capture_json)?;
-            let captured: Value = serde_json::from_str(
-                private["callScopeJson"]
-                    .as_str()
-                    .ok_or_else(|| failure("CORRELATION", "scope", "Captured scope is absent"))?,
-            )?;
-            if captured["projectSnapshot"] != current.scope["projectSnapshot"] {
-                return Err(failure(
-                    "CAPTURE_CHANGED",
-                    "source",
-                    "Start belongs to a different project snapshot",
-                ));
-            }
-        }
-        drop(current);
-        if adapter
+        // A replay must name the snapshot this host retained, or none for a
+        // JSON document. A fresh start that fails here is released.
+        let matched = snapshot_matches(
+            &retained.capture.private_capture_json,
+            &self.policies.0.read().await.scope,
+        );
+        let fresh = adapter
             .capture
             .lock()
             .map_err(|_| failure("RUNTIME_UNAVAILABLE", "start", "Capture unavailable"))?
-            .is_some()
-        {
+            .is_some();
+        if let Err(e) = matched {
+            if fresh {
+                let id = &retained.receipt.identity.system_start_id;
+                session.interrupt_run(&self.pool, id).await?;
+                session.fail_reservation(id, e.clone());
+            }
+            return Err(e);
+        }
+        if fresh {
             if let Err(e) = session
                 .attach_committed_start(
                     &self.pool,
@@ -778,6 +792,39 @@ impl StartAuthority030 for Start<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replay_needs_the_snapshot_of_the_current_host() {
+        let private = |scope: Option<Value>| {
+            match scope {
+                Some(scope) => json!({"callScopeJson":scope.to_string()}),
+                None => json!({}),
+            }
+            .to_string()
+        };
+        let project = json!({"root":"/w","projectSnapshot":"a"});
+        let document = json!({"root":"/w"});
+        snapshot_matches(&private(Some(project.clone())), &project).unwrap();
+        snapshot_matches(&private(Some(document.clone())), &document).unwrap();
+        // Captures from before project support carry no snapshot.
+        snapshot_matches(&private(None), &document).unwrap();
+        for (captured, current) in [
+            (Some(project.clone()), document.clone()),
+            (Some(document), project.clone()),
+            (
+                Some(json!({"root":"/w","projectSnapshot":"b"})),
+                project.clone(),
+            ),
+            (None, project),
+        ] {
+            assert_eq!(
+                snapshot_matches(&private(captured), &current)
+                    .unwrap_err()
+                    .code,
+                "CAPTURE_CHANGED"
+            );
+        }
+    }
     struct Fixture {
         _temp: tempfile::TempDir,
         data: PathBuf,

@@ -95,7 +95,11 @@ its identity in the Start capture. Keep that data at the same path as long as
 a run may need it. Dropping the open handles or removing the original folder
 or archive leaves the retained bytes available. If a retained file or its
 inventory is missing or altered, the runtime refuses the read with
-`CONTENT_UNAVAILABLE`. It never substitutes current project bytes. Existing
+`CONTENT_UNAVAILABLE`. It never substitutes current project bytes. A damaged
+copy is not repaired automatically, and opening the same project again is
+refused with the same code. With no host running, remove
+`agsdl-snapshots/<id>` under the private data root. The next open then
+retains the project again under the same identity. Existing
 standalone restart rules still apply. A new process shows prior interrupted
 runs and reconciles their pending Stops.
 
