@@ -146,8 +146,10 @@ fn folder_collisions_fold_case_and_normalize_unicode() {
     assert!(message.contains("Case collision"), "{message}");
 }
 
+/// Every reference counts toward the 8 MiB JSON budget, as in the official
+/// reader, so any folder accepted here can be packed by the official tool.
 #[test]
-fn a_json_file_referenced_several_times_counts_once() {
+fn json_budget_counts_every_reference_like_the_official_reader() {
     let temp = tempfile::tempdir().unwrap();
     project(temp.path(), "../notes.md", None);
     let mut manifest: Value =
@@ -161,10 +163,9 @@ fn a_json_file_referenced_several_times_counts_once() {
         manifest["agents"][format!("a{i}")] = json!({"file":"agents/a.json"});
     }
     write(temp.path(), "agsdl.json", manifest.to_string());
-    // Counted per reference, the shared file would exceed the aggregate limit.
     assert!(10 * agent.len() as u64 > MAX_JSON_TOTAL);
-    let folder = OpenedSource::open_path(temp.path()).unwrap();
-    OpenedSource::open_archive_bytes(&pack(&files(&folder))).unwrap();
+    let message = refused(OpenedSource::open_path(temp.path()));
+    assert!(message.contains("aggregate limit"), "{message}");
 }
 
 #[test]
@@ -365,4 +366,54 @@ fn a_linked_project_root_or_snapshot_folder_is_refused() {
         .err()
         .unwrap();
     assert_eq!(error.code, "STORAGE");
+}
+
+#[test]
+fn skill_tree_directories_follow_the_name_rules_even_when_empty() {
+    for directory in [".git", "CON", "Sub"] {
+        let temp = tempfile::tempdir().unwrap();
+        project(temp.path(), "../notes.md", Some("skills/review/SKILL.md"));
+        write(temp.path(), "skills/review/SKILL.md", "Review.\n");
+        write(temp.path(), "skills/review/sub", "File.\n");
+        std::fs::create_dir(temp.path().join("skills/review").join(directory)).unwrap();
+        let message = refused(OpenedSource::open_path(temp.path()));
+        assert!(
+            message.contains("Invalid portable path") || message.contains("Case collision"),
+            "{directory}: {message}"
+        );
+    }
+}
+
+/// A trailing separator must not let a symlinked root through.
+#[cfg(unix)]
+#[test]
+fn a_linked_root_is_refused_with_a_trailing_separator() {
+    let temp = tempfile::tempdir().unwrap();
+    let real = temp.path().join("real");
+    project(&real, "../notes.md", None);
+    std::os::unix::fs::symlink(&real, temp.path().join("link")).unwrap();
+    let mut spelled = temp.path().join("link").into_os_string();
+    spelled.push("/");
+    let message = refused(OpenedSource::open_path(Path::new(&spelled)));
+    assert!(
+        message.contains("root cannot be a symbolic link"),
+        "{message}"
+    );
+}
+
+/// A plain JSON source is read without listing its directory, as before.
+#[cfg(unix)]
+#[test]
+fn a_plain_document_needs_only_search_permission_on_its_parent() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempfile::tempdir().unwrap();
+    let drop = temp.path().join("drop");
+    write(&drop, "doc.json", r#"{"contract":"agsdl-0.4.0"}"#);
+    std::fs::set_permissions(&drop, std::fs::Permissions::from_mode(0o311)).unwrap();
+    let opened = OpenedSource::open_path(&drop.join("doc.json"));
+    std::fs::set_permissions(&drop, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(
+        opened.unwrap().authored_json(),
+        r#"{"contract":"agsdl-0.4.0"}"#
+    );
 }

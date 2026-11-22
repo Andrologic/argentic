@@ -136,14 +136,14 @@ before macOS 14.4.
 
 Choose a disposable workspace containing an existing regular `sentinel.txt` with
 `before` and a newline. Keep the private data directory outside that workspace,
-with neither directory containing the other. Review `examples/fixtures/policy.json`:
+with neither directory containing the other. Review `crates/argentic-runtime/examples/fixtures/policy.json`:
 `owner` and canonical decimal `sourceRevision` identify this source; `permissions`
 is the approved host ceiling; `readOnly` is the project restriction. Increment the
 revision for a changed source. Review the source separately. Approve the exact
 policy bytes by supplying their SHA-256, not by accepting an implicit default.
 
 ```sh
-shasum -a 256 examples/fixtures/policy.json
+shasum -a 256 crates/argentic-runtime/examples/fixtures/policy.json
 /path/to/argentic-host --data /absolute/private-host-data \
   --workspace /absolute/disposable-workspace \
   --source /absolute/write-review.json --policy /absolute/policy.json \

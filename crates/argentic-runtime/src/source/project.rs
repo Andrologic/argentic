@@ -61,7 +61,6 @@ struct Reader {
     selected: BTreeSet<String>,
     skills: BTreeSet<String>,
     spellings: BTreeMap<String, String>,
-    json_counted: BTreeSet<String>,
     json_total: u64,
     total: u64,
 }
@@ -93,7 +92,6 @@ impl Reader {
             selected: BTreeSet::new(),
             skills: BTreeSet::new(),
             spellings: BTreeMap::new(),
-            json_counted: BTreeSet::new(),
             json_total: 0,
             total: 0,
         }
@@ -221,10 +219,9 @@ impl Reader {
     fn json(&mut self, file: &str) -> Result<Value> {
         self.select(file, MAX_JSON)?;
         let bytes = &self.files[file].bytes;
-        // A file referenced several times is one project file.
-        if self.json_counted.insert(file.to_owned()) {
-            self.json_total += bytes.len() as u64;
-        }
+        // As in the official reader, every reference counts toward the
+        // aggregate, so any project accepted here can be packed by the tool.
+        self.json_total += bytes.len() as u64;
         if bytes.len() as u64 > MAX_JSON || self.json_total > MAX_JSON_TOTAL {
             return Err(invalid(
                 file,
@@ -550,8 +547,14 @@ impl Reader {
         } else {
             self.resolve(owner, &path, &pointer)?
         };
-        self.select(&task, MAX_TOTAL)
-            .map_err(|cause| invalid(owner, &pointer, &cause.message))?;
+        self.select(&task, MAX_TOTAL).map_err(|cause| {
+            // `select` already names the selected file; keep one location.
+            let detail = cause
+                .message
+                .strip_prefix(&format!("{task}#: "))
+                .unwrap_or(&cause.message);
+            invalid(owner, &pointer, &format!("{task}: {detail}"))
+        })?;
         const ENCODE: percent_encoding::AsciiSet = NON_ALPHANUMERIC
             .remove(b'/')
             .remove(b'-')
@@ -584,6 +587,7 @@ impl Reader {
         let mut entries = 0;
         if let Some((dir, _)) = &self.dir {
             let mut names = Vec::new();
+            let mut directories = Vec::new();
             while let Some(path) = pending.pop() {
                 for item in dir.read_dir(&path).map_err(|e| io(&path, e))? {
                     let item = item.map_err(|e| io(&path, e))?;
@@ -594,6 +598,13 @@ impl Reader {
                     }
                     let ty = item.file_type().map_err(|e| io(&relative, e))?;
                     if ty.is_dir() {
+                        // The official walk checks directories too, including
+                        // empty ones that select no file.
+                        let name = relative
+                            .to_str()
+                            .ok_or_else(|| invalid(directory, "", "Expected UTF-8 skill path"))?
+                            .replace(std::path::MAIN_SEPARATOR, "/");
+                        directories.push(name);
                         pending.push(relative);
                     } else if ty.is_file() {
                         let name = relative
@@ -608,6 +619,10 @@ impl Reader {
                         ));
                     }
                 }
+            }
+            for name in directories {
+                archive::portable(&name)?;
+                self.spell(&name, &name)?;
             }
             for name in names {
                 self.select(&name, MAX_TOTAL)?;

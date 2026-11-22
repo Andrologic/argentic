@@ -12,7 +12,7 @@ pub use snapshot::RetainedSource;
 pub(crate) use snapshot::Snapshot;
 
 use crate::persistence::{dto::EngineFailure, failure, Result};
-use cap_std::{ambient_authority, fs::Dir};
+use cap_std::fs::Dir;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
@@ -47,31 +47,35 @@ impl OpenedSource {
     /// Open a local JSON document, a project directory or manifest, or an archive.
     /// Only a trusted local caller should select a path on the host machine.
     pub fn open_path(path: &Path) -> Result<Self> {
-        let path = std::path::absolute(path).map_err(|e| io(path, e))?;
+        // Rebuild from components: with a trailing separator, `lstat` would
+        // follow a symlinked project root.
+        let path: PathBuf = std::path::absolute(path)
+            .map_err(|e| io(path, e))?
+            .components()
+            .collect();
         if path.is_dir() {
             return Self::folder(&path, None);
         }
-        // An input that cannot be opened keeps the host's existing codes:
-        // SOURCE_UNAVAILABLE, or INPUT_LIMIT when a document grows while read.
-        let dir =
-            Dir::open_ambient_dir(path.parent().unwrap_or(Path::new(".")), ambient_authority())
-                .map_err(|_| source_unavailable())?;
         let name = path
             .file_name()
             .ok_or_else(|| invalid("", "", "Expected a source file"))?;
+        // Open a single file directly, as the host did before projects: its
+        // parent needs search permission only. An input that cannot be
+        // opened keeps the host's codes, SOURCE_UNAVAILABLE or INPUT_LIMIT.
+        // A symlinked source, including a symlinked manifest, is refused.
+        let meta = std::fs::symlink_metadata(&path).map_err(|_| source_unavailable())?;
         if path
             .extension()
             .is_some_and(|ext| ext.eq_ignore_ascii_case("agsdl"))
         {
+            if !meta.is_file() {
+                return Err(source_unavailable());
+            }
             return Self::archived(archive::read(
-                open_regular(&dir, Path::new(name)).map_err(|_| source_unavailable())?,
+                open_local(&path).map_err(|_| source_unavailable())?,
             )?);
         }
         // Preserve the exact UTF-8 bytes and 8 MiB limit of the existing JSON input.
-        // A symlinked source, including a symlinked manifest, is not a regular file.
-        let meta = dir
-            .symlink_metadata(name)
-            .map_err(|_| source_unavailable())?;
         if !meta.is_file() || meta.len() > MAX_JSON_TOTAL {
             return Err(failure(
                 "SOURCE_UNAVAILABLE",
@@ -79,7 +83,7 @@ impl OpenedSource {
                 "Expected a regular input file of at most 8 MiB",
             ));
         }
-        let file = read_regular(&dir, Path::new(name), MAX_JSON_TOTAL).map_err(|e| {
+        let file = read_local(&path, MAX_JSON_TOTAL).map_err(|e| {
             if e.kind() == std::io::ErrorKind::FileTooLarge {
                 failure("INPUT_LIMIT", "host", "Input grew beyond 8 MiB")
             } else {
@@ -261,6 +265,45 @@ fn open_regular(dir: &Dir, path: &Path) -> std::io::Result<cap_std::fs::File> {
         return Err(std::io::Error::other("Expected a regular file"));
     }
     Ok(file)
+}
+
+/// Open one regular local file without listing its directory.
+fn open_local(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+    }
+    let file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::other("Expected a regular file"));
+    }
+    Ok(file)
+}
+
+fn read_local(path: &Path, limit: u64) -> std::io::Result<ProjectFile> {
+    let file = open_local(path)?;
+    let meta = file.metadata()?;
+    let mut bytes = Vec::new();
+    if meta.len() <= limit {
+        (&file).take(limit + 1).read_to_end(&mut bytes)?;
+    }
+    if meta.len() > limit || bytes.len() as u64 > limit {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::FileTooLarge,
+            "File exceeds the read limit",
+        ));
+    }
+    #[cfg(unix)]
+    let executable = {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode() & 0o111 != 0
+    };
+    #[cfg(not(unix))]
+    let executable = false;
+    Ok(ProjectFile { bytes, executable })
 }
 
 fn read_regular(dir: &Dir, path: &Path, limit: u64) -> std::io::Result<ProjectFile> {
