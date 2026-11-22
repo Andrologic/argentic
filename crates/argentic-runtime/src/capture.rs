@@ -43,6 +43,22 @@ fn version_requirement(range: &str) -> std::result::Result<VersionReq, semver::E
     })
 }
 
+/// The retained project root in the same form `canonicalize` gives a skill
+/// path, including Windows' verbatim prefix. A missing snapshot is refused.
+fn captured_project_root(document_location: Option<&url::Url>) -> Result<std::path::PathBuf> {
+    document_location
+        .and_then(|uri| uri.to_file_path().ok())
+        .and_then(|path| path.parent().map(Path::to_owned))
+        .and_then(|root| root.canonicalize().ok())
+        .ok_or_else(|| {
+            failure(
+                "CONTENT_UNAVAILABLE",
+                "projectSnapshot",
+                "The captured project snapshot is missing or has changed",
+            )
+        })
+}
+
 /// Describe only the installed adapter observed through the native profile.
 /// This prepares compiler inputs and never authorizes execution.
 pub fn codex_registry(
@@ -67,10 +83,7 @@ pub fn codex_registry(
             .as_str()
             .ok_or_else(|| failure("CORRELATION", "skills", "Native project scope is absent"))?;
         let snapshot_root = if scope.get("projectSnapshot").is_some() {
-            document_location
-                .as_ref()
-                .and_then(|uri| uri.to_file_path().ok())
-                .and_then(|path| path.parent().map(Path::to_owned))
+            Some(captured_project_root(document_location.as_ref())?)
         } else {
             None
         };
@@ -158,6 +171,35 @@ pub fn codex_registry(
 mod tests {
     use super::*;
     use sha2::{Digest, Sha256};
+
+    /// The comparison in `qualify_skill_folders` uses canonical paths. A
+    /// document URL that differs only in spelling still selects its skill.
+    #[cfg(unix)]
+    #[test]
+    fn captured_project_root_matches_canonical_skill_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let real = temp.path().canonicalize().unwrap().join("project");
+        std::fs::create_dir_all(real.join("skills/review")).unwrap();
+        std::fs::write(real.join("skills/review/SKILL.md"), "Review.\n").unwrap();
+        let alias = temp.path().join("alias");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let location = url::Url::from_file_path(alias.join("agsdl.json")).unwrap();
+        let root = captured_project_root(Some(&location)).unwrap();
+        assert_eq!(root, real);
+        let document = json!({"agents":{"worker":{"skills":["review"]}},
+            "skills":{"review":{"uri":"skills/review/SKILL.md"}}});
+        crate::agsdl_host_codex030::content::qualify_skill_folders(
+            &document,
+            &root,
+            Some(&location),
+        )
+        .unwrap();
+        std::fs::remove_dir_all(&real).unwrap();
+        assert_eq!(
+            captured_project_root(Some(&location)).unwrap_err().code,
+            "CONTENT_UNAVAILABLE"
+        );
+    }
 
     #[test]
     fn codex_version_requirement_is_checked_against_native_observation() {

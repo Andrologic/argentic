@@ -8,7 +8,7 @@ use percent_encoding::{percent_decode_str, utf8_percent_encode, NON_ALPHANUMERIC
 use serde_json::{Map, Value};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
     sync::OnceLock,
 };
 
@@ -61,6 +61,7 @@ struct Reader {
     selected: BTreeSet<String>,
     skills: BTreeSet<String>,
     spellings: BTreeMap<String, String>,
+    json_counted: BTreeSet<String>,
     json_total: u64,
     total: u64,
 }
@@ -92,18 +93,21 @@ impl Reader {
             selected: BTreeSet::new(),
             skills: BTreeSet::new(),
             spellings: BTreeMap::new(),
+            json_counted: BTreeSet::new(),
             json_total: 0,
             total: 0,
         }
     }
 
     fn select(&mut self, path: &str, limit: u64) -> Result<()> {
+        // Folder and archive inputs select the same portable names.
+        archive::portable(path)?;
         for (end, _) in path
             .match_indices('/')
             .chain(std::iter::once((path.len(), "")))
         {
             let part = &path[..end];
-            let folded = unicase::UniCase::new(part).to_folded_case();
+            let folded = archive::path_key(part);
             if self
                 .spellings
                 .insert(folded, part.into())
@@ -146,30 +150,9 @@ impl Reader {
         {
             return Err(error("Invalid project-relative path"));
         }
-        let base = Path::new(owner).parent().unwrap_or(Path::new(""));
-        if let Some((dir, root)) = &self.dir {
-            let joined = base.join(name);
-            let relative = dir
-                .canonicalize(&joined)
-                .or_else(|_| {
-                    root.join(&joined).canonicalize().and_then(|path| {
-                        path.strip_prefix(root)
-                            .map(Path::to_owned)
-                            .map_err(std::io::Error::other)
-                    })
-                })
-                .map_err(|_| error("File is outside the project, missing or unresolvable"))?;
-            return relative
-                .components()
-                .map(|part| match part {
-                    Component::Normal(name) => {
-                        name.to_str().ok_or_else(|| error("Expected a UTF-8 path"))
-                    }
-                    _ => Err(error("Expected a path inside the project")),
-                })
-                .collect::<Result<Vec<_>>>()
-                .map(|parts| parts.join("/"));
-        }
+        // Resolve lexically in both modes, as the official reader does. A
+        // component traversed only on the way to `..` may be absent, but an
+        // existing component must be neither a symlink nor a regular file.
         let mut parts: Vec<_> = owner
             .rsplit_once('/')
             .map_or("", |(parent, _)| parent)
@@ -185,26 +168,45 @@ impl Reader {
                     }
                 }
                 _ => {
-                    if self.files.contains_key(&parts.join("/")) {
+                    if !parts.is_empty() && self.is_file(&parts.join("/")) {
                         return Err(error("Path traverses a regular file"));
                     }
                     parts.push(part);
-                    archive::portable(&parts.join("/"))
-                        .map_err(|_| error("Invalid portable path"))?;
+                    if let Some((dir, _)) = &self.dir {
+                        if dir
+                            .symlink_metadata(parts.join("/"))
+                            .is_ok_and(|meta| meta.is_symlink())
+                        {
+                            return Err(error("Path contains a symbolic link"));
+                        }
+                    }
                 }
             }
         }
         let path = parts.join("/");
-        if !self.files.contains_key(&path) {
+        if path.is_empty() {
+            return Err(error("Expected a file inside the project"));
+        }
+        if self.dir.is_none() && !self.files.contains_key(&path) {
             return Err(error("File absent from archive inventory"));
         }
         Ok(path)
     }
 
+    fn is_file(&self, path: &str) -> bool {
+        match &self.dir {
+            Some((dir, _)) => dir.symlink_metadata(path).is_ok_and(|meta| meta.is_file()),
+            None => self.files.contains_key(path),
+        }
+    }
+
     fn json(&mut self, file: &str) -> Result<Value> {
         self.select(file, MAX_JSON)?;
         let bytes = &self.files[file].bytes;
-        self.json_total += bytes.len() as u64;
+        // A file referenced several times is one project file.
+        if self.json_counted.insert(file.to_owned()) {
+            self.json_total += bytes.len() as u64;
+        }
         if bytes.len() as u64 > MAX_JSON || self.json_total > MAX_JSON_TOTAL {
             return Err(invalid(
                 file,

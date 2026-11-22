@@ -222,6 +222,11 @@ async fn exercise_project_sources() {
         fs::copy(fixture.join("review").join(name), &target).unwrap();
     }
     let bytes = fs::read(review.join("agents/reviewer/instructions review.md")).unwrap();
+    // A message may attach a workspace file to a run started from any input.
+    let notes = workspace.join("notes.md");
+    fs::write(&notes, "Workspace notes.\n").unwrap();
+    let notes =
+        json!({"uri":Url::from_file_path(&notes).unwrap().as_str(),"mediaType":"text/plain"});
     fs::write(
         workspace.join("agents/reviewer/instructions review.md"),
         &bytes,
@@ -265,6 +270,8 @@ async fn exercise_project_sources() {
         let resource = retained
             .resource_root()
             .join("agents/reviewer/instructions review.md");
+        let unlisted = retained.resource_root().join("unlisted.txt");
+        let retained_root = retained.resource_root().to_owned();
         retained.bind_scope(&mut scope).unwrap();
         drop((retained, input));
         if scope["projectSnapshot"].is_string() {
@@ -332,7 +339,8 @@ async fn exercise_project_sources() {
         // handles have gone away, as an embedding host can do after reopening.
         let capture: StartCapture030 =
             serde_json::from_str(&serde_json::to_string(&capture).unwrap()).unwrap();
-        let read = async |policy: argentic_runtime::permissions::NormalizedPolicy| {
+        let read_source = async |policy: argentic_runtime::permissions::NormalizedPolicy,
+                                 source: &serde_json::Value| {
             let context = ContentContext::capture(
                 capture.identity.snapshot_id.clone(),
                 capture.source.source_sha256.clone(),
@@ -350,15 +358,20 @@ async fn exercise_project_sources() {
             resolve_content(
                 &context,
                 ContentUse {
-                    source_json: resources["review"].to_string(),
+                    source_json: source.to_string(),
                     usage: ContentUsage::Resource,
-                    pointer: "/agents/reviewer/resources/review".into(),
+                    pointer: "/resources/0".into(),
                 },
             )
             .await
         };
+        let read = async |policy| read_source(policy, &resources["review"]).await;
         let receipt = read(policy.clone()).await.unwrap();
         assert!(matches!(receipt.payload, ContentPayload::Text {text} if text.as_bytes() == bytes));
+        let receipt = read_source(policy.clone(), &notes).await.unwrap();
+        assert!(
+            matches!(receipt.payload, ContentPayload::Text {ref text} if text == "Workspace notes.\n")
+        );
         if scope.get("projectSnapshot").is_some() {
             let deny = normalize_requested(
                 serde_json::from_value(json!({"preset":"read-only","rules":[
@@ -383,6 +396,17 @@ async fn exercise_project_sources() {
                 "CONTENT_UNAVAILABLE"
             );
             fs::write(&resource, &bytes).unwrap();
+            // A file added to the retained copy is not a project member.
+            fs::write(&unlisted, "Unlisted.\n").unwrap();
+            let unlisted = json!({"uri":Url::from_file_path(&unlisted).unwrap().as_str(),"mediaType":"text/plain"});
+            assert_eq!(
+                read_source(policy.clone(), &unlisted)
+                    .await
+                    .unwrap_err()
+                    .code,
+                "PERMISSION"
+            );
+            fs::remove_file(retained_root.join("unlisted.txt")).unwrap();
         }
     }
 }

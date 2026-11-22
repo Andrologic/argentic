@@ -246,6 +246,11 @@ impl Snapshot {
         Ok(Some(snapshot))
     }
 
+    /// Whether a path names a location inside the retained project.
+    pub fn contains(&self, path: &Path) -> bool {
+        path.starts_with(&self.uri_root) || path.starts_with(&self.root)
+    }
+
     pub fn member<'a>(&self, path: &'a Path) -> Option<(&'a Path, &str)> {
         let relative = path.strip_prefix(&self.uri_root).ok()?;
         let name = relative.to_str()?.replace(std::path::MAIN_SEPARATOR, "/");

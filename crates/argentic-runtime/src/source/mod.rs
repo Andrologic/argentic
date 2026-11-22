@@ -4,6 +4,8 @@ mod archive;
 #[cfg(test)]
 mod conformance050_tests;
 mod project;
+#[cfg(test)]
+mod project_tests;
 mod snapshot;
 
 pub use snapshot::RetainedSource;
@@ -49,15 +51,17 @@ impl OpenedSource {
         if path.is_dir() {
             return Self::folder(&path, None);
         }
+        // An input that cannot be opened keeps the host's existing codes:
+        // SOURCE_UNAVAILABLE, or INPUT_LIMIT when a document grows while read.
         let dir =
             Dir::open_ambient_dir(path.parent().unwrap_or(Path::new(".")), ambient_authority())
-                .map_err(|e| io(&path, e))?;
+                .map_err(|_| source_unavailable())?;
         let name = path
             .file_name()
             .ok_or_else(|| invalid("", "", "Expected a source file"))?;
         if path.extension().is_some_and(|ext| ext == "agsdl") {
             return Self::archived(archive::read(
-                open_regular(&dir, Path::new(name)).map_err(|e| io(&path, e))?,
+                open_regular(&dir, Path::new(name)).map_err(|_| source_unavailable())?,
             )?);
         }
         if name == MANIFEST
@@ -68,7 +72,23 @@ impl OpenedSource {
             return Self::folder(path.parent().unwrap(), None);
         }
         // Preserve the exact UTF-8 bytes and 8 MiB limit of the existing JSON input.
-        let file = read_regular(&dir, Path::new(name), MAX_JSON_TOTAL).map_err(|e| io(&path, e))?;
+        let meta = dir
+            .symlink_metadata(name)
+            .map_err(|_| source_unavailable())?;
+        if !meta.is_file() || meta.len() > MAX_JSON_TOTAL {
+            return Err(failure(
+                "SOURCE_UNAVAILABLE",
+                "host",
+                "Expected a regular input file of at most 8 MiB",
+            ));
+        }
+        let file = read_regular(&dir, Path::new(name), MAX_JSON_TOTAL).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::FileTooLarge {
+                failure("INPUT_LIMIT", "host", "Input grew beyond 8 MiB")
+            } else {
+                source_unavailable()
+            }
+        })?;
         let authored = std::str::from_utf8(&file.bytes)
             .map_err(|_| failure("PARSE", "source", "Source must be UTF-8"))?;
         if name == MANIFEST
@@ -81,7 +101,7 @@ impl OpenedSource {
         let authored = authored.to_owned();
         Ok(Self {
             authored,
-            origin: Some(path.canonicalize().map_err(|e| io(&path, e))?),
+            origin: Some(path.canonicalize().map_err(|_| source_unavailable())?),
             project: None,
         })
     }
@@ -165,6 +185,14 @@ fn invalid(file: &str, pointer: &str, message: &str) -> EngineFailure {
     failure("PROJECT", pointer, &format!("{file}#{pointer}: {message}"))
 }
 
+fn source_unavailable() -> EngineFailure {
+    failure(
+        "SOURCE_UNAVAILABLE",
+        "host",
+        "Standalone input or storage is unavailable",
+    )
+}
+
 fn io(path: &Path, error: std::io::Error) -> EngineFailure {
     invalid(&path.display().to_string(), "", &error.to_string())
 }
@@ -223,7 +251,10 @@ fn read_regular(dir: &Dir, path: &Path, limit: u64) -> std::io::Result<ProjectFi
         file.take(limit + 1).read_to_end(&mut bytes)?;
     }
     if meta.len() > limit || bytes.len() as u64 > limit {
-        return Err(std::io::Error::other("File exceeds the read limit"));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::FileTooLarge,
+            "File exceeds the read limit",
+        ));
     }
     #[cfg(unix)]
     let executable = {

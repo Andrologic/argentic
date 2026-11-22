@@ -330,11 +330,14 @@ async fn read_uri(
     match uri.scheme() {
         "file" => {
             let path = path_from_local_uri(uri)?;
-            // A captured project authorizes only declared members. Evaluate
-            // the same Read policy against the corresponding workspace path.
+            // Inside a captured project, only declared members are readable.
+            // Evaluate the same Read policy against the corresponding
+            // workspace path. Other files, such as a message's workspace
+            // resources, keep the ordinary document rules.
             let snapshot_member = context
                 .project_snapshot
                 .as_ref()
+                .filter(|(snapshot, _)| snapshot.contains(&path))
                 .map(|(snapshot, workspace)| {
                     snapshot
                         .member(&path)

@@ -43,6 +43,11 @@ pub(super) fn hex(value: &str, len: usize) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
+/// Collision key: case folding then NFC, as the archive format requires.
+pub(super) fn path_key(path: &str) -> String {
+    unicase::UniCase::new(path).to_folded_case().nfc().collect()
+}
+
 pub(super) fn portable(name: &str) -> Result<()> {
     if name.len() > 4096 || name.split('/').count() > 64 {
         return Err(invalid(
@@ -369,10 +374,7 @@ pub(super) fn read(mut input: impl Read + Seek) -> Result<Files> {
             .chain(std::iter::once((name.len(), "")))
         {
             let path = &name[..end];
-            let key = unicase::UniCase::new(path)
-                .to_folded_case()
-                .nfc()
-                .collect::<String>();
+            let key = path_key(path);
             if spellings
                 .insert(key, path)
                 .is_some_and(|previous| previous != path)
@@ -431,14 +433,14 @@ pub(super) fn read(mut input: impl Read + Seek) -> Result<Files> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::source::OpenedSource;
     use serde_json::{json, Value};
 
     // Stored ZIP32 entries make the bytes under each integrity check explicit.
     // The successful interoperability cases use the official packer fixtures.
-    fn stored_zip(entries: &BTreeMap<String, Vec<u8>>) -> Vec<u8> {
+    pub(in crate::source) fn stored_zip(entries: &BTreeMap<String, Vec<u8>>) -> Vec<u8> {
         fn set16(bytes: &mut [u8], at: usize, value: u16) {
             bytes[at..at + 2].copy_from_slice(&value.to_le_bytes());
         }
@@ -494,7 +496,7 @@ mod tests {
         )
     }
 
-    fn row(bytes: &[u8]) -> Value {
+    pub(in crate::source) fn row(bytes: &[u8]) -> Value {
         json!({"size":bytes.len(),"sha256":sha256(bytes),"executable":false})
     }
 
