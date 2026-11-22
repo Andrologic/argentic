@@ -554,9 +554,11 @@ impl Host {
             .is_some();
         if let Err(e) = matched {
             if fresh {
+                // Release the reservation even if interruption fails.
                 let id = &retained.receipt.identity.system_start_id;
-                session.interrupt_run(&self.pool, id).await?;
+                let interrupted = session.interrupt_run(&self.pool, id).await;
                 session.fail_reservation(id, e.clone());
+                interrupted?;
             }
             return Err(e);
         }
