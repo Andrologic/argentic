@@ -483,6 +483,7 @@ impl Host {
                         diagnostic["message"]
                             .as_str()
                             .unwrap_or("Source is unsupported")
+                            .trim_end_matches('.')
                     );
                     return Err(inputs.opened.locate_error(failure(
                         "UNSUPPORTED",

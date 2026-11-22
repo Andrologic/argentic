@@ -76,7 +76,20 @@ pub(super) fn portable(name: &str) -> Result<()> {
     for part in name.split('/') {
         let folded = unicase::UniCase::new(part).to_folded_case();
         // Windows ignores spaces before the extension: `nul .md` is NUL.
-        let stem = folded.split('.').next().unwrap_or("").trim_end_matches(' ');
+        // Compare as the official tool's case-insensitive pattern does,
+        // where dotless and dotted capital I also match `i`.
+        let stem: String = part
+            .split('.')
+            .next()
+            .unwrap_or("")
+            .trim_end_matches(' ')
+            .chars()
+            .map(|c| match c {
+                '\u{131}' | '\u{130}' => 'i',
+                c => c.to_ascii_lowercase(),
+            })
+            .collect();
+        let stem = stem.as_str();
         let device = matches!(stem, "con" | "prn" | "aux" | "nul" | "conin$" | "conout$")
             || stem
                 .strip_prefix("com")
@@ -129,7 +142,10 @@ fn read_at<const N: usize>(
     Ok(bytes)
 }
 
-fn no_zip64(mut extra: &[u8]) -> bool {
+/// Accept extra fields that neither need ZIP64 nor rename the entry. An
+/// Info-ZIP Unicode Path field (0x7075) must repeat the entry's own name,
+/// since readers that honour it would otherwise see another file.
+fn plain_extras(mut extra: &[u8], name: &str) -> bool {
     while !extra.is_empty() {
         if extra.len() < 4 || u16_at(extra, 0) == 1 {
             return false;
@@ -138,6 +154,9 @@ fn no_zip64(mut extra: &[u8]) -> bool {
         let Some(rest) = extra.get(len..) else {
             return false;
         };
+        if u16_at(extra, 0) == 0x7075 && extra.get(9..len) != Some(name.as_bytes()) {
+            return false;
+        }
         extra = rest;
     }
     true
@@ -184,7 +203,7 @@ impl Member {
         }
         let mut fields = vec![0; name.len() + extra_len];
         input.read_exact(&mut fields).map_err(io)?;
-        if &fields[..name.len()] != name.as_bytes() || !no_zip64(&fields[name.len()..]) {
+        if &fields[..name.len()] != name.as_bytes() || !plain_extras(&fields[name.len()..], name) {
             return Err(malformed("Invalid ZIP local name or extra fields"));
         }
         let bytes = if method == 0 {
@@ -301,7 +320,7 @@ fn members(input: &mut (impl Read + Seek)) -> Result<BTreeMap<String, Member>> {
         input.read_exact(&mut fields).map_err(io)?;
         let name = std::str::from_utf8(&fields[..name_len])
             .map_err(|_| zip_error("Non-UTF-8 ZIP name"))?;
-        if (!name.is_ascii() && flags & 0x800 == 0) || !no_zip64(&fields[name_len..]) {
+        if (!name.is_ascii() && flags & 0x800 == 0) || !plain_extras(&fields[name_len..], name) {
             return Err(invalid(name, "", "Invalid UTF-8 flag or ZIP extra fields"));
         }
         if let Some(path) = name.strip_prefix("project/") {
@@ -658,9 +677,27 @@ pub(super) mod tests {
             "folder/a\u{200b}",
             "a\\b",
             "folder/.git/config",
+            "nul .md",
+            "con\u{131}n$.md",
+            "CON\u{130}N$.md",
         ] {
             assert!(portable(name).is_err(), "{name}");
         }
+        // Names the official tool accepts stay accepted.
+        for name in ["\u{ff23}\u{ff2f}\u{ff2e}.md", "console.md", "com10.txt"] {
+            assert!(portable(name).is_ok(), "{name}");
+        }
+        // A Unicode Path extra field may only repeat the entry's name.
+        let unicode_path = |name: &str| {
+            let mut field = vec![0x75, 0x70];
+            field.extend(((5 + name.len()) as u16).to_le_bytes());
+            field.push(1);
+            field.extend(crc32fast::hash(b"project/a.md").to_le_bytes());
+            field.extend(name.as_bytes());
+            field
+        };
+        assert!(plain_extras(&unicode_path("project/a.md"), "project/a.md"));
+        assert!(!plain_extras(&unicode_path("project/b.md"), "project/a.md"));
         let packed = [0x03, 0x00]; // Empty raw DEFLATE stream.
         assert_eq!(inflate(&packed[..], 2, 0).unwrap(), b"");
         assert!(inflate(&packed[..1], 1, 0).is_err());
