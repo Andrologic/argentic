@@ -104,6 +104,9 @@ impl Sources030 {
             .with_resource_owner(Arc::new(move |cleanup| {
                 tasks.attach_cleanup030(&parent, cleanup)
             }));
+        let context = context
+            .with_captured_source(config.root(), capture)
+            .map_err(content_error)?;
         let mut sources = Self::from_context(
             context,
             serde_json::from_str(&capture.authored_source)?,
@@ -291,7 +294,11 @@ impl Sources030 {
         } else {
             None
         };
-        qualify_skill_folders(&self.document, &self.root, self.context.document_location())?;
+        qualify_skill_folders(
+            &self.document,
+            self.context.project_root().unwrap_or(&self.root),
+            self.context.document_location(),
+        )?;
         for key in self.document["agents"][self.context.binding().map_err(content_error)?.agent]
             ["skills"]
             .as_array()
@@ -352,7 +359,13 @@ impl Sources030 {
                     "Native content file is unavailable",
                 )
             })?;
-            if !approved_data_path(&self.root, &self.private, &path) {
+            // Project files are read from the retained snapshot. Any other
+            // file keeps the workspace rule of an equivalent JSON document.
+            let allowed = match self.context.project_root() {
+                Some(root) if path.starts_with(root) => !private_project_path(root, &path),
+                _ => approved_data_path(&self.root, &self.private, &path),
+            };
+            if !allowed {
                 return Err(failure("PERMISSION", pointer, CONTENT_SCOPE_REFUSAL));
             }
         }
@@ -484,6 +497,102 @@ mod tests {
     use super::*;
     use crate::permissions::{EffectivePolicy, PathContext, RequestedPermissions};
     use sha2::{Digest, Sha256};
+
+    /// A run from a project keeps the message rules of an equivalent JSON
+    /// document. Only paths inside the retained copy use its inventory.
+    #[test]
+    fn project_runs_keep_workspace_rules_outside_the_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let workspace = base.join("workspace");
+        let data = base.join("data");
+        std::fs::create_dir_all(workspace.join(".git")).unwrap();
+        std::fs::create_dir(&data).unwrap();
+        std::fs::write(workspace.join("notes.md"), "Workspace notes.\n").unwrap();
+        std::fs::write(workspace.join(".git/config"), "Private.\n").unwrap();
+        let opened = crate::source::OpenedSource::open_path(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/agsdl-project/review"),
+        )
+        .unwrap();
+        let retained = opened.retain(&data).unwrap();
+        let mut scope = json!({"root":workspace});
+        retained.bind_scope(&mut scope).unwrap();
+        let authored = opened.authored_json().to_owned();
+        let capture = crate::persistence::start030::StartCapture030 {
+            identity: serde_json::from_value(json!({"systemStartId":"system",
+                "flowInvocationId":"flow","snapshotId":"snapshot","epoch":"1"}))
+            .unwrap(),
+            source: serde_json::from_value(json!({
+                "owner":{"projectId":"project","planId":"review","branch":"test"},
+                "revision":"1","sourceSha256":opened.source_sha256()}))
+            .unwrap(),
+            versions: serde_json::from_value(json!({"snapshot":"2","contract":"agsdl-0.4.0",
+                "compiler":"compiler","runtime":"runtime","registry":"registry",
+                "profile":"macro-agsdl-030-v1"}))
+            .unwrap(),
+            authored_source: authored.clone(),
+            compiled_plan_json: "null".into(),
+            registry_json: String::new(),
+            private_capture_json: json!({"callScopeJson":scope.to_string()}).to_string(),
+        };
+        let policy = normalize_requested(
+            RequestedPermissions::Preset(crate::permissions::Preset::ReadOnly),
+            PathContext {
+                workspace: workspace.clone(),
+                home: workspace.clone(),
+            },
+        )
+        .unwrap();
+        let context = ContentContext::capture(
+            "snapshot".into(),
+            opened.source_sha256(),
+            authored.clone(),
+            scope["documentLocation"].as_str(),
+            "reviewer".into(),
+            EffectivePolicy::new(policy.clone(), policy.clone(), policy),
+            ExecutionPurpose::Agent,
+            CancellationToken::new(),
+            Arc::new(|_| Box::pin(async { panic!("unexpected content approval") })),
+        )
+        .unwrap()
+        .with_captured_source(&data, &capture)
+        .unwrap();
+        let document: Value = serde_json::from_str(&authored).unwrap();
+        let review = document["agents"]["reviewer"]["resources"]["review"].clone();
+        let sources = Sources030::from_context(context, document, workspace.clone(), data).unwrap();
+        let uri = |path: &Path| json!({"uri":url::Url::from_file_path(path).unwrap().as_str()});
+        sources.allowed_file(&review, "/agents/reviewer").unwrap();
+        sources
+            .allowed_file(&uri(&workspace.join("notes.md")), "/message/resources/0")
+            .unwrap();
+        assert_eq!(
+            sources
+                .allowed_file(&uri(&workspace.join(".git/config")), "/message/resources/0")
+                .unwrap_err()
+                .code,
+            "PERMISSION"
+        );
+        // Host data outside the snapshot, including its index, stays private.
+        std::fs::write(base.join("data/engine.lock"), "").unwrap();
+        let index = std::fs::read_dir(base.join("data/agsdl-snapshots"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path()
+            .join("files.json");
+        for private in [base.join("data/engine.lock"), index] {
+            assert_eq!(
+                sources
+                    .allowed_file(&uri(&private), "/message/resources/0")
+                    .unwrap_err()
+                    .code,
+                "PERMISSION",
+                "{}",
+                private.display()
+            );
+        }
+    }
 
     #[tokio::test]
     async fn recipient_read_scope_is_rechecked_at_content_admission() {

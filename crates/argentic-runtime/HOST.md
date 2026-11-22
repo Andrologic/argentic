@@ -11,37 +11,155 @@ The compiled plan and persisted capture keep the authored marker. The
 Argentic crate version and protocol DTO names are independent of that
 marker. The bundled harness descriptions come from AgSDL v0.4.0.
 
+AgSDL v0.5.0 distributes `agsdl-project-1` directories and
+`agsdl-archive-1` files. They assemble to an `agsdl-0.4.0` document and enter
+the same compiler and Start admission as JSON. The published
+[project format](https://github.com/Andrologic/AgSDL/blob/v0.5.0/spec/project.md)
+and [archive format](https://github.com/Andrologic/AgSDL/blob/v0.5.0/spec/archive.md)
+define the distribution rules.
+
+## Embedding Argentic
+
+In the native host, open a trusted local path with `OpenedSource::open_path`.
+Pass a directory, its `agsdl.json` manifest, a `.agsdl` archive, or the
+ordinary JSON document. For an archive uploaded by a remote client, pass the
+bytes to `OpenedSource::open_archive_bytes`. A client path describes files on
+the client's machine. It must never become an argument to `open_path` in
+the host process. As in the archive format, a file whose name ends in
+`.agsdl`, in any case, is read as an archive. A storage failure while
+retaining a project returns `STORAGE` without host paths.
+
+```rust
+use argentic_runtime::{persistence::{dto::EngineSourceRevision, Result},
+    source::OpenedSource, Engine};
+use serde_json::Value;
+use std::path::Path;
+
+async fn compile_project(
+    engine: &Engine,
+    host_data: &Path,
+    project_path: &Path,
+    mut revision: EngineSourceRevision,
+    scope: &mut Value,
+    build_registry: impl FnOnce(&OpenedSource, &EngineSourceRevision, &Value) -> Result<String>,
+) -> Result<String> {
+    let input = OpenedSource::open_path(project_path)?;
+    let retained = input.retain(host_data)?;
+    retained.bind_scope(scope)?;
+    revision.source_sha256 = input.source_sha256();
+    let registry_json = build_registry(&input, &revision, scope)?;
+    let result = engine
+        .compile_document(revision, input.authored_json().to_owned(), registry_json)
+        .await
+        .map_err(|error| input.locate_error(error))?;
+    Ok(result.result_json)
+}
+```
+
+`locate_error` relocates a failure whose pointer is a JSON pointer. Compiler
+diagnostics arrive inside `result_json` (`/static/diagnostics` and
+`/runtime/diagnostics`), not as an `Err`. Pass each error diagnostic's code,
+pointer and message to `locate_error` to name its component file. The
+standalone host locates the first error and appends the full compile report.
+
+Pass the bound scope to native registry preparation and save it unchanged as
+`callScopeJson` in the private Start capture. Build the registry with the same
+scope and source digest used for admission. The engine's native reader uses
+that capture to reopen project files. Custom content readers can bind the same
+capture with `ContentContext::with_captured_source`. Keep the existing workspace,
+permissions and approval checks. For packaged content, native Read policy is
+evaluated on the member's path relative to the approved workspace, while the
+bytes come from the retained project. That path is evaluated as spelled:
+symbolic links in the workspace neither redirect nor refuse a member, and a
+deny rule for the path still applies. Inside the retained copy, only inventory
+members are readable. A file outside it, such as a workspace resource attached
+to an entry or steer message, follows the same workspace rules as for a JSON
+document. A relative URI in a message resolves against the document location,
+which for a project is the retained copy, so it reaches only inventory
+members. Attach workspace files to a project run with absolute `file:` URIs.
+
+A folder and its archive select the same files. Both apply the archive name
+rules, including the refusal of `.git`, `.env` and `.env.*` in skill trees,
+and refuse symbolic links in a selected path or as the project root. A
+component traversed only on the way to `..` needs a portable name without a
+case collision, even when it does not exist. A folder is also limited to an
+inventory of at most 2 MiB, the archive limit, which bounds the retained
+index. As in the official v0.5.0 tool, a folder may select 8192 files and 256
+MiB, while an archive's 8192 entries and 256 MiB also count `archive.json` and
+any `history.bundle`. On Windows, a folder records no executable file. The
+official tool restores executables there from a `.agsdl-executables` sidecar,
+which Argentic does not read; open the archive instead to keep them. A
+reference may pass through `..` lexically, as in the official reader. A plain
+JSON source that cannot be read keeps the host codes `SOURCE_UNAVAILABLE` and
+`INPUT_LIMIT`. Project and archive diagnostics use `PROJECT` with the file and
+JSON pointer concerned.
+
+`secrets()` returns the names required by each declared MCP server.
+`mcp_files()` returns paths relative to `retained.resource_root()`. Opening
+a project works offline with a closed vault. The embedding host decides which
+MCP servers it can run and how to provide secret values. Opening either format
+does not start a server. Argentic does not run MCP commands from the retained
+copy: as for a JSON document, a relative MCP program resolves against the
+workspace. To run a declared asset, the embedding host provides it from
+`resource_root()`. The retained index records each file's executable flag;
+the mode of the retained file is not checked. When present, the ZIP's Git bundle is verified by size
+and SHA-256. The current snapshot opens without Git. Importing and browsing
+historical revisions are outside the host profile.
+
+Retain packages under the same private data root used by `HostContext`.
+Argentic publishes a content-addressed copy of the selected files and records
+its identity in the Start capture. Keep that data at the same path as long as
+a run may need it. Dropping the open handles or removing the original folder
+or archive leaves the retained bytes available. If a retained file or its
+inventory is missing or altered, the runtime refuses the read with
+`CONTENT_UNAVAILABLE`. It never substitutes current project bytes. A damaged
+copy is not repaired automatically, and opening the same project again is
+refused with the same code. With no host running, remove
+`agsdl-snapshots/<id>` under the private data root. The next open then
+retains the project again under the same identity. Argentic never removes
+retained copies: each revision keeps its own, and a crash during retention
+can leave a `.tmp*` staging folder. Remove them only when no run can still
+need them. Existing
+standalone restart rules still apply. A new process shows prior interrupted
+runs and reconciles their pending Stops.
+
 ## Build and open
 
 Keep `argentic-core` beside `argentic-runtime`. Each owns a manifest and lockfile.
 With the locked dependencies available locally:
 
 ```sh
-cargo build --offline --locked --manifest-path argentic-runtime/Cargo.toml --example argentic-host
+cargo build --offline --locked --manifest-path crates/argentic-runtime/Cargo.toml --example argentic-host
 ```
 
-From a Macro checkout, prefix the manifest with `crates/`. The executable is in
-the runtime target's `debug/examples/argentic-host`, or in `CARGO_TARGET_DIR` when
-set. On macOS the runtime build requires the Swift toolchain. The example calls
+The executable is in `crates/argentic-runtime/target/debug/examples/argentic-host`.
+If `CARGO_TARGET_DIR` is set, use its `debug/examples/argentic-host` instead. On macOS the runtime build requires the Swift toolchain. The example calls
 `content_io::file_helper::initialize` before Tokio. Downstream host packages must
 also preserve `-Wl,-weak_framework,LightweightCodeRequirements` for deployment
 before macOS 14.4.
 
 Choose a disposable workspace containing an existing regular `sentinel.txt` with
 `before` and a newline. Keep the private data directory outside that workspace,
-with neither directory containing the other. Review `examples/fixtures/policy.json`:
+with neither directory containing the other. Review `crates/argentic-runtime/examples/fixtures/policy.json`:
 `owner` and canonical decimal `sourceRevision` identify this source; `permissions`
 is the approved host ceiling; `readOnly` is the project restriction. Increment the
 revision for a changed source. Review the source separately. Approve the exact
 policy bytes by supplying their SHA-256, not by accepting an implicit default.
 
 ```sh
-shasum -a 256 examples/fixtures/policy.json
+shasum -a 256 crates/argentic-runtime/examples/fixtures/policy.json
 /path/to/argentic-host --data /absolute/private-host-data \
   --workspace /absolute/disposable-workspace \
   --source /absolute/write-review.json --policy /absolute/policy.json \
   --approve-policy THE_REVIEWED_SHA256 --stop-on-exit --codex
 ```
+
+For a packaged source, use the same command with
+`--source /absolute/review.agsdl` or `--source /absolute/review-project`.
+You can also pass `--source /absolute/review-project/agsdl.json`. The host
+verifies and retains the project before it reports `ready`. Reopen the host
+and increment the source revision to run an edited project. Local project
+files and archive assets remain subject to the existing execution profile.
 
 Omit `--codex` and use `human-only.json` for a provider-free human-flow exercise
 on Linux, Windows or macOS. `--stop-on-exit` explicitly consents to Stop/drain of

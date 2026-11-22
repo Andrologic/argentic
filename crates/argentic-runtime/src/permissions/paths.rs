@@ -296,6 +296,21 @@ pub(super) struct Subject {
 }
 impl Subject {
     pub(super) fn new(context: &PathContext, request: &ActionRequest) -> Result<Self> {
+        Self::with_resolution(context, request, true)
+    }
+
+    /// A file subject named only by its spelling. Use it for a path that
+    /// stands for bytes held elsewhere, so the filesystem at that spelling,
+    /// including its symlinks, cannot change the decision.
+    pub(super) fn lexical(context: &PathContext, request: &ActionRequest) -> Result<Self> {
+        Self::with_resolution(context, request, false)
+    }
+
+    fn with_resolution(
+        context: &PathContext,
+        request: &ActionRequest,
+        resolve: bool,
+    ) -> Result<Self> {
         let mut subject = Self {
             logical: String::new(),
             physical: None,
@@ -305,7 +320,11 @@ impl Subject {
             ActionRequest::Read { path } | ActionRequest::Write { path } => {
                 let path = expand(context, path)?;
                 subject.logical = text(&lexical(&path))?;
-                subject.physical = Some(physical(&path)?);
+                subject.physical = Some(if resolve {
+                    physical(&path)?
+                } else {
+                    lexical(&path)
+                });
             }
             ActionRequest::Shell { command } => {
                 if command.is_empty() || command.contains('\0') {

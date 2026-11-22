@@ -1183,3 +1183,34 @@ fn host_flow_content_does_not_change_existing_purposes() {
         Effect::Deny
     );
 }
+
+/// A retained project member is named by its workspace spelling. A link at
+/// that spelling neither moves the target outside the workspace nor hides
+/// a deny rule written for the logical name.
+#[cfg(unix)]
+#[test]
+fn lexical_evaluation_ignores_links_at_the_spelling() {
+    let f = Fixture::new();
+    let elsewhere = f.context.home.join("shared");
+    fs::create_dir_all(elsewhere.join("reviewer")).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, f.context.workspace.join("agents")).unwrap();
+    let member = f.context.workspace.join("agents/reviewer/agent.json");
+    let request = f.read(member.to_str().unwrap());
+    let policy = f.effective(json!("read-only"));
+    let followed = evaluate_effective(&policy, &request, ExecutionPurpose::Agent).unwrap();
+    assert!(followed
+        .resolved_path
+        .unwrap()
+        .starts_with(elsewhere.to_str().unwrap()));
+    let lexical = evaluate_effective_lexical(&policy, &request, ExecutionPurpose::Agent).unwrap();
+    assert_eq!(lexical.effect, Effect::Allow);
+    assert_eq!(lexical.resolved_path.as_deref(), member.to_str());
+    let deny = f.effective(json!({"preset":"read-only","rules":[
+        {"action":"read","effect":"deny","match":"agents/reviewer/**"}]}));
+    assert_eq!(
+        evaluate_effective_lexical(&deny, &request, ExecutionPurpose::Agent)
+            .unwrap()
+            .effect,
+        Effect::Deny
+    );
+}

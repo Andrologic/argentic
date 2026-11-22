@@ -49,6 +49,7 @@ pub struct ContentContext {
     network: Arc<dyn crate::content_network::ContentNetwork>,
     resource_owner: Option<ContentResourceOwner>,
     read_scope: Option<ContentReadScope>,
+    project_snapshot: Option<(crate::source::Snapshot, std::path::PathBuf)>,
     capture_id: String,
     source_digest: String,
     document_json: String,
@@ -118,8 +119,57 @@ impl ContentContext {
         self
     }
 
-    fn permission(&self, request: &ActionRequest) -> ContentResult<PermissionDecision> {
-        let decision = evaluate_effective(&self.policy, request, self.purpose)
+    /// Apply the project snapshot recorded by a durable native Start capture.
+    /// Existing JSON captures keep their normal document-relative file reads.
+    pub fn with_captured_source(
+        mut self,
+        host_data: &std::path::Path,
+        capture: &crate::persistence::start030::StartCapture030,
+    ) -> ContentResult<Self> {
+        if self.capture_id != capture.identity.snapshot_id
+            || self.source_digest != capture.source.source_sha256
+            || self.document_location
+                != crate::capture::captured_document_location(capture)
+                    .map_err(|e| error(&e.code, e.message))?
+        {
+            return Err(error(
+                "CORRELATION",
+                "Project source differs from the content context.",
+            ));
+        }
+        if let Some(snapshot) = crate::source::Snapshot::from_capture(host_data, capture)
+            .map_err(|e| error(&e.code, e.message))?
+        {
+            let workspace = self
+                .policy
+                .policies()
+                .next()
+                .ok_or_else(|| error("PERMISSION", "Missing content policy."))?
+                .context()
+                .workspace
+                .clone();
+            self.project_snapshot = Some((snapshot, workspace));
+        }
+        Ok(self)
+    }
+
+    pub(crate) fn project_root(&self) -> Option<&std::path::Path> {
+        self.project_snapshot
+            .as_ref()
+            .map(|(snapshot, _)| snapshot.root.as_path())
+    }
+
+    fn permission(
+        &self,
+        request: &ActionRequest,
+        lexical: bool,
+    ) -> ContentResult<PermissionDecision> {
+        let evaluate = if lexical {
+            crate::permissions::evaluate_effective_lexical
+        } else {
+            evaluate_effective
+        };
+        let decision = evaluate(&self.policy, request, self.purpose)
             .map_err(|e| error("PERMISSION", e.detail))?;
         if let (ActionRequest::Read { .. }, Some(scope)) = (request, &self.read_scope) {
             let path = decision
@@ -202,6 +252,7 @@ impl ContentContext {
             network: Arc::new(crate::content_network::UnavailableNetwork),
             resource_owner: None,
             read_scope: None,
+            project_snapshot: None,
             capture_id,
             source_digest,
             document_json,
@@ -222,13 +273,16 @@ impl ContentContext {
         }
     }
 
+    /// `lexical` evaluates a retained project member by its workspace
+    /// spelling. Every other target follows the filesystem as before.
     async fn admit(
         &self,
         request: ActionRequest,
         effect: ContentEffect,
+        lexical: bool,
     ) -> ContentResult<PermissionDecision> {
         self.active()?;
-        let decision = self.permission(&request)?;
+        let decision = self.permission(&request, lexical)?;
         match decision.effect {
             Effect::Deny => {
                 return Err(error(
@@ -253,7 +307,7 @@ impl ContentContext {
             Effect::Allow => {}
         }
         self.active()?;
-        let current = self.permission(&request)?;
+        let current = self.permission(&request, lexical)?;
         if current.effect != decision.effect
             || current.resolved_path != decision.resolved_path
             || current.policy_digest != decision.policy_digest

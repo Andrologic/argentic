@@ -16,6 +16,7 @@ use crate::{
         start030::{self, RetainedStart030, StartAuthority030, StartCapture030},
         Result,
     },
+    source::{OpenedSource, RetainedSource},
     Engine,
 };
 use serde::{Deserialize, Serialize};
@@ -75,7 +76,8 @@ struct Inputs {
     workspace: PathBuf,
     scope: Value,
     source_path: PathBuf,
-    authored: String,
+    opened: OpenedSource,
+    retained: RetainedSource,
     source: EngineSourceRevision,
     policy_path: PathBuf,
     policy_bytes: Vec<u8>,
@@ -84,9 +86,12 @@ struct Inputs {
 }
 impl Inputs {
     fn verify(&self) -> Result<()> {
-        if read(&self.source_path)? != self.authored.as_bytes()
+        if (self.opened.is_document()
+            && (read(&self.source_path)? != self.opened.authored_json().as_bytes()
+                || self.source_path.canonicalize().map_err(io_error)?
+                    != self.retained.document_path()))
             || read(&self.policy_path)? != self.policy_bytes
-            || scope(&self.workspace, &self.policy.owner, &self.source_path)? != self.scope
+            || scope(&self.workspace, &self.policy.owner, &self.retained)? != self.scope
         {
             return Err(failure(
                 "CAPTURE_CHANGED",
@@ -103,7 +108,7 @@ impl Inputs {
             "allowedToolIds":[], "riskLevel":"strict", "agsdlHostPermissions":self.policy.permissions})
     }
 }
-fn scope(root: &Path, owner: &EngineSourceOwner, source: &Path) -> Result<Value> {
+fn scope(root: &Path, owner: &EngineSourceOwner, source: &RetainedSource) -> Result<Value> {
     let root = root.canonicalize().map_err(io_error)?;
     let identity = crate::content_io::admitted::workspace_root_identity(&root)
         .map_err(|_| {
@@ -115,18 +120,27 @@ fn scope(root: &Path, owner: &EngineSourceOwner, source: &Path) -> Result<Value>
         })?
         .observation_key()
         .ok_or_else(|| failure("UNSUPPORTED", "scope", "Workspace identity is unqualified"))?;
-    let document_location = url::Url::from_file_path(source.canonicalize().map_err(io_error)?)
-        .map_err(|_| {
-            failure(
-                "SOURCE_UNAVAILABLE",
-                "source",
-                "Cannot capture document location",
-            )
-        })?;
-    Ok(
-        json!({"projectId":owner.project_id,"root":root,"rootIdentity":identity,
-        "sourceOwner":owner,"documentLocation":document_location.as_str()}),
-    )
+    let mut scope = json!({"projectId":owner.project_id,"root":root,"rootIdentity":identity,
+        "sourceOwner":owner});
+    source.bind_scope(&mut scope)?;
+    Ok(scope)
+}
+/// Compare the project snapshot recorded by a Start with the current scope.
+/// Captures without a scope or snapshot belong to a JSON document.
+fn snapshot_matches(private_capture_json: &str, scope: &Value) -> Result<()> {
+    let private: Value = serde_json::from_str(private_capture_json)?;
+    let captured = match private["callScopeJson"].as_str() {
+        Some(scope) => serde_json::from_str::<Value>(scope)?["projectSnapshot"].take(),
+        None => Value::Null,
+    };
+    if captured != scope["projectSnapshot"] {
+        return Err(failure(
+            "CAPTURE_CHANGED",
+            "source",
+            "Start belongs to a different project snapshot",
+        ));
+    }
+    Ok(())
 }
 #[derive(Clone)]
 struct Policies(Arc<RwLock<Inputs>>);
@@ -289,27 +303,7 @@ impl Host {
         }
         persistence::decimal(&policy_value.source_revision)?;
         let source_path = std::path::absolute(source).map_err(io_error)?;
-        let bytes = read(&source_path)?;
-        let source_sha256 = digest(&bytes);
-        let authored = String::from_utf8(bytes)
-            .map_err(|_| failure("PARSE", "source", "Source must be UTF-8"))?;
-        persistence::validate_json(&authored)?;
-        let inputs = Inputs {
-            scope: scope(&workspace, &policy_value.owner, &source_path)?,
-            workspace,
-            source_path,
-            authored,
-            source: EngineSourceRevision {
-                owner: policy_value.owner.clone(),
-                revision: policy_value.source_revision.clone(),
-                source_sha256,
-            },
-            policy_path: policy.to_owned(),
-            policy_bytes,
-            policy: policy_value,
-            policy_digest,
-        };
-        inputs.verify()?;
+        let opened = OpenedSource::open_path(&source_path)?;
         let lock = File::options()
             .read(true)
             .write(true)
@@ -324,6 +318,24 @@ impl Host {
                 "Standalone database is already owned",
             )
         })?;
+        let retained = opened.retain(&data)?;
+        let inputs = Inputs {
+            scope: scope(&workspace, &policy_value.owner, &retained)?,
+            workspace,
+            source_path,
+            source: EngineSourceRevision {
+                owner: policy_value.owner.clone(),
+                revision: policy_value.source_revision.clone(),
+                source_sha256: opened.source_sha256(),
+            },
+            opened: opened.without_files(),
+            retained,
+            policy_path: policy.to_owned(),
+            policy_bytes,
+            policy: policy_value,
+            policy_digest,
+        };
+        inputs.verify()?;
         let database = data.join("engine.sqlite");
         if std::fs::symlink_metadata(&database).is_ok_and(|m| !m.file_type().is_file()) {
             return Err(failure(
@@ -358,9 +370,11 @@ impl Host {
     }
     async fn prepare(&self, entry: Option<&EngineEntry>, allow_codex: bool) -> Result<Prepared> {
         let inputs = self.policies.acquire().await?;
-        let doc: Value = serde_json::from_str(&inputs.authored)?;
-        if let Some(d) = api::product_slice(&inputs.authored, None) {
-            return Err(failure(&d.code, &d.pointer, &d.message));
+        let doc: Value = serde_json::from_str(inputs.opened.authored_json())?;
+        if let Some(d) = api::product_slice(inputs.opened.authored_json(), None) {
+            return Err(inputs
+                .opened
+                .locate_error(failure(&d.code, &d.pointer, &d.message)));
         }
         if !doc["contract"]
             .as_str()
@@ -391,7 +405,8 @@ impl Host {
             crate::agsdl_host_work_admission030::validate_codex_document_at030(
                 &doc,
                 crate::capture::document_location(&inputs.scope)?.as_ref(),
-            )?;
+            )
+            .map_err(|e| inputs.opened.locate_error(e))?;
             let observed =
                 api::observe_codex(&self.context, &inputs.scope, inputs.policy.read_only).await?;
             match observed {
@@ -410,7 +425,8 @@ impl Host {
                 &inputs.source.source_sha256,
                 &inputs.scope,
                 observed,
-            )?;
+            )
+            .map_err(|e| inputs.opened.locate_error(e))?;
             (vec![h], a)
         } else {
             (vec![], vec![])
@@ -439,7 +455,7 @@ impl Host {
             .engine
             .compile_document(
                 inputs.source.clone(),
-                inputs.authored.clone(),
+                inputs.opened.authored_json().to_owned(),
                 registry.to_string(),
             )
             .await?;
@@ -447,6 +463,35 @@ impl Host {
         if result.pointer("/static/valid") != Some(&json!(true))
             || result.pointer("/runtime/supported") != Some(&json!(true))
         {
+            if !inputs.opened.is_document() {
+                if let Some(diagnostic) = ["/static/diagnostics", "/runtime/diagnostics"]
+                    .into_iter()
+                    .filter_map(|pointer| result.pointer(pointer).and_then(Value::as_array))
+                    .flatten()
+                    .find(|diagnostic| diagnostic["severity"] == "error")
+                {
+                    let pointer = diagnostic["pointer"]
+                        .as_str()
+                        .or_else(|| diagnostic["path"].as_str())
+                        .unwrap_or("");
+                    // Keep the JSON input's code. The message locates the first
+                    // error in its component file, then carries the full
+                    // compile report that a JSON source receives.
+                    let message = format!(
+                        "{}: {}. Compile report: {result}",
+                        diagnostic["code"].as_str().unwrap_or("UNSUPPORTED"),
+                        diagnostic["message"]
+                            .as_str()
+                            .unwrap_or("Source is unsupported")
+                            .trim_end_matches('.')
+                    );
+                    return Err(inputs.opened.locate_error(failure(
+                        "UNSUPPORTED",
+                        pointer,
+                        &message,
+                    )));
+                }
+            }
             return Err(failure("UNSUPPORTED", "source", &result.to_string()));
         }
         Ok(Prepared {
@@ -498,12 +543,28 @@ impl Host {
                 return Err(e);
             }
         };
-        if adapter
+        // A replay must name the snapshot this host retained, or none for a
+        // JSON document. A fresh start that fails here is released.
+        let matched = snapshot_matches(
+            &retained.capture.private_capture_json,
+            &self.policies.0.read().await.scope,
+        );
+        let fresh = adapter
             .capture
             .lock()
             .map_err(|_| failure("RUNTIME_UNAVAILABLE", "start", "Capture unavailable"))?
-            .is_some()
-        {
+            .is_some();
+        if let Err(e) = matched {
+            if fresh {
+                // Release the reservation even if interruption fails.
+                let id = &retained.receipt.identity.system_start_id;
+                let interrupted = session.interrupt_run(&self.pool, id).await;
+                session.fail_reservation(id, e.clone());
+                interrupted?;
+            }
+            return Err(e);
+        }
+        if fresh {
             if let Err(e) = session
                 .attach_committed_start(
                     &self.pool,
@@ -515,10 +576,10 @@ impl Host {
                 )
                 .await
             {
-                session
-                    .interrupt_run(&self.pool, &retained.receipt.identity.system_start_id)
-                    .await?;
-                session.fail_reservation(&retained.receipt.identity.system_start_id, e.clone());
+                let id = &retained.receipt.identity.system_start_id;
+                let interrupted = session.interrupt_run(&self.pool, id).await;
+                session.fail_reservation(id, e.clone());
+                interrupted?;
                 return Err(e);
             }
         }
@@ -672,7 +733,7 @@ impl StartAuthority030 for Start<'_> {
         let plan_value: Value = serde_json::from_str(plan)?;
         let capture=StartCapture030 {
             identity:FlowIdentity030 {system_start_id:uuid::Uuid::new_v4().to_string(),flow_invocation_id:uuid::Uuid::new_v4().to_string(),snapshot_id:uuid::Uuid::new_v4().to_string(),epoch:uuid::Uuid::new_v4().to_string()},
-            source:inputs.source.clone(),versions:serde_json::from_value(plan_value["versions"].clone())?,authored_source:inputs.authored.clone(),compiled_plan_json:plan.into(),
+            source:inputs.source.clone(),versions:serde_json::from_value(plan_value["versions"].clone())?,authored_source:inputs.opened.authored_json().to_owned(),compiled_plan_json:plan.into(),
             registry_json:p.result["capturedRegistryJson"].as_str().ok_or_else(||failure("CORRELATION","registry","Captured registry absent"))?.into(),
             private_capture_json:json!({"format":"macro-native-flow-capture/030","generation":p.generation,
                 "callScopeJson":p.scope.to_string(),"callPermissionsJson":p.permissions.to_string(),"nativeCatalogueJson":p.observation.to_string(),
@@ -735,6 +796,39 @@ impl StartAuthority030 for Start<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replay_needs_the_snapshot_of_the_current_host() {
+        let private = |scope: Option<Value>| {
+            match scope {
+                Some(scope) => json!({"callScopeJson":scope.to_string()}),
+                None => json!({}),
+            }
+            .to_string()
+        };
+        let project = json!({"root":"/w","projectSnapshot":"a"});
+        let document = json!({"root":"/w"});
+        snapshot_matches(&private(Some(project.clone())), &project).unwrap();
+        snapshot_matches(&private(Some(document.clone())), &document).unwrap();
+        // Captures from before project support carry no snapshot.
+        snapshot_matches(&private(None), &document).unwrap();
+        for (captured, current) in [
+            (Some(project.clone()), document.clone()),
+            (Some(document), project.clone()),
+            (
+                Some(json!({"root":"/w","projectSnapshot":"b"})),
+                project.clone(),
+            ),
+            (None, project),
+        ] {
+            assert_eq!(
+                snapshot_matches(&private(captured), &current)
+                    .unwrap_err()
+                    .code,
+                "CAPTURE_CHANGED"
+            );
+        }
+    }
     struct Fixture {
         _temp: tempfile::TempDir,
         data: PathBuf,
@@ -1070,20 +1164,24 @@ mod tests {
             // Stop can commit after the approval ticket is reserved while
             // evaluation of its clock output is still in flight.
             let lease = host.engine.start_lease().await.unwrap();
-            lease.clock_jobs030().approval_check_probe(Arc::new(|job, _| {
-                let job: Value = serde_json::from_str(job).unwrap();
-                let input: Value = serde_json::from_str(job["inputJson"].as_str().unwrap()).unwrap();
-                if input["operation"] != "humanClock" {
-                    return;
-                }
-                let event: Value =
-                    serde_json::from_str(input["input"]["eventJson"].as_str().unwrap()).unwrap();
-                if event["event"]["kind"] == "approval" {
-                    loop {
-                        std::thread::park();
+            lease
+                .clock_jobs030()
+                .approval_check_probe(Arc::new(|job, _| {
+                    let job: Value = serde_json::from_str(job).unwrap();
+                    let input: Value =
+                        serde_json::from_str(job["inputJson"].as_str().unwrap()).unwrap();
+                    if input["operation"] != "humanClock" {
+                        return;
                     }
-                }
-            }));
+                    let event: Value =
+                        serde_json::from_str(input["input"]["eventJson"].as_str().unwrap())
+                            .unwrap();
+                    if event["event"]["kind"] == "approval" {
+                        loop {
+                            std::thread::park();
+                        }
+                    }
+                }));
             drop(lease);
             let started = host.start("start".into(), entry(), false).await.unwrap();
             let scope = persistence::public030::HumanScope030 {
@@ -1091,11 +1189,22 @@ mod tests {
                 source: started.capture.source,
             };
             tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                while host.humans(scope.clone(), None).await.unwrap().requests.is_empty() {
+                while host
+                    .humans(scope.clone(), None)
+                    .await
+                    .unwrap()
+                    .requests
+                    .is_empty()
+                {
                     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                 }
-            }).await.unwrap();
-            let hook = host.engine.flow030().install_system_stop_commit_hook("stop");
+            })
+            .await
+            .unwrap();
+            let hook = host
+                .engine
+                .flow030()
+                .install_system_stop_commit_hook("stop");
             tokio::select! {
                 _ = hook.reached() => std::process::exit(0),
                 result = host.stop(EngineStopRequest {
@@ -1109,18 +1218,26 @@ mod tests {
         let child = tokio::time::timeout(
             std::time::Duration::from_secs(15),
             tokio::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "standalone::tests::reopening_finishes_a_committed_stop_of_a_local_approval"])
+                .args([
+                    "--exact",
+                    "standalone::tests::reopening_finishes_a_committed_stop_of_a_local_approval",
+                ])
                 .env(CHILD, f._temp.path())
                 .kill_on_drop(true)
                 .output(),
-        ).await.unwrap().unwrap();
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert!(child.status.success(), "{child:?}");
         for reopening in 0..2 {
             let host = f.open().await.unwrap();
             let runs = host.runs().await.unwrap();
             let query = api::RuntimeProjectionQuery030 {
                 system_start_id: runs[0]["receipt"]["identity"]["systemStartId"]
-                    .as_str().unwrap().into(),
+                    .as_str()
+                    .unwrap()
+                    .into(),
                 source: host.source().await,
                 snapshot_id: None,
             };
@@ -1129,7 +1246,10 @@ mod tests {
             assert!(!page.stopping && !page.termination_uncertain);
             let pending: i64 = sqlx::query_scalar(
                 "SELECT count(*) FROM engine_flow030_clock_events WHERE output_json IS NULL",
-            ).fetch_one(&host.pool).await.unwrap();
+            )
+            .fetch_one(&host.pool)
+            .await
+            .unwrap();
             assert_eq!(pending, 1);
             host.shutdown(&[]).await.unwrap();
             host.close().await.unwrap();
@@ -1137,7 +1257,8 @@ mod tests {
                 &f.data.join("engine.sqlite"),
                 &query.system_start_id,
                 &page.flow_invocation_id,
-            ).await;
+            )
+            .await;
             assert!(replay.ok, "{replay:?}");
             if reopening == 1 {
                 for (index, (mutation, expected)) in [

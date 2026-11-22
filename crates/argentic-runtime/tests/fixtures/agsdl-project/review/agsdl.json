@@ -1,0 +1,10 @@
+{
+  "projectFormat": "agsdl-project-1",
+  "contract": "agsdl-0.4.0",
+  "id": "portable-review",
+  "agents": {"reviewer": {"file": "agents/reviewer/agent.json"}},
+  "flow": {"file": "flows/review.json"},
+  "mcpServers": {"local": {"file": "mcp/server.json"}},
+  "secrets": {"file": "secrets/requirements.json"},
+  "mcpFiles": {"local": ["mcp/asset.txt"]}
+}
