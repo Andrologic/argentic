@@ -63,11 +63,22 @@ pub fn codex_registry(
                 .is_some_and(|skills| !skills.is_empty())
         })
     }) {
+        let workspace = scope["root"]
+            .as_str()
+            .ok_or_else(|| failure("CORRELATION", "skills", "Native project scope is absent"))?;
+        let snapshot_root = if scope.get("projectSnapshot").is_some() {
+            document_location
+                .as_ref()
+                .and_then(|uri| uri.to_file_path().ok())
+                .and_then(|path| path.parent().map(Path::to_owned))
+        } else {
+            None
+        };
         crate::agsdl_host_codex030::content::qualify_skill_folders(
             document,
-            Path::new(scope["root"].as_str().ok_or_else(|| {
-                failure("CORRELATION", "skills", "Native project scope is absent")
-            })?),
+            snapshot_root
+                .as_deref()
+                .unwrap_or_else(|| Path::new(workspace)),
             document_location.as_ref(),
         )?;
     }

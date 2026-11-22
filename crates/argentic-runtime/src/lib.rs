@@ -29,6 +29,8 @@ pub mod host;
 
 /// Native capture preparation shared with desktop and standalone hosts.
 pub mod capture;
+/// Open AgSDL documents, projects and portable archives.
+pub mod source;
 
 /// Small, explicitly configured single-process host.
 pub mod standalone;

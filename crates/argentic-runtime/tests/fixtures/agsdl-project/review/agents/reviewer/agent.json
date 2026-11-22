@@ -1,0 +1,6 @@
+{
+  "harness": "codex",
+  "permissions": "read-only",
+  "instructions": [{"uri": "instructions%20review.md", "mediaType": "text/markdown"}],
+  "resources": {"review": {"uri": "instructions%20review.md", "mediaType": "text/markdown"}}
+}

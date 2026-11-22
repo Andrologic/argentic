@@ -33,9 +33,12 @@ fn main() {
         .build()
         .unwrap()
         .block_on(async {
-            tokio::time::timeout(Duration::from_secs(15), exercise_reader())
-                .await
-                .expect("content-reader integration test timed out");
+            tokio::time::timeout(Duration::from_secs(15), async {
+                exercise_reader().await;
+                exercise_project_sources().await;
+            })
+            .await
+            .expect("content-reader integration test timed out");
         });
     println!("Native content reads passed on {}", std::env::consts::OS);
 }
@@ -190,4 +193,196 @@ async fn exercise_reader() {
             .await
             .is_err()
     );
+}
+
+async fn exercise_project_sources() {
+    use argentic_runtime::{
+        persistence::{dto::EngineSourceRevision, start030::StartCapture030},
+        source::OpenedSource,
+    };
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/agsdl-project");
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let workspace = root.join("workspace");
+    let data = root.join("data");
+    fs::create_dir_all(workspace.join("agents/reviewer")).unwrap();
+    fs::create_dir(&data).unwrap();
+    let review = root.join("original");
+    for name in [
+        "agsdl.json",
+        "agents/reviewer/agent.json",
+        "agents/reviewer/instructions review.md",
+        "flows/review.json",
+        "mcp/server.json",
+        "mcp/asset.txt",
+        "secrets/requirements.json",
+    ] {
+        let target = review.join(name);
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::copy(fixture.join("review").join(name), &target).unwrap();
+    }
+    let bytes = fs::read(review.join("agents/reviewer/instructions review.md")).unwrap();
+    fs::write(
+        workspace.join("agents/reviewer/instructions review.md"),
+        &bytes,
+    )
+    .unwrap();
+    let folder = OpenedSource::open_path(&review).unwrap();
+    let manifest = OpenedSource::open_path(&review.join("agsdl.json")).unwrap();
+    let upload = OpenedSource::open_archive_bytes(include_bytes!(
+        "fixtures/agsdl-project/review-history.agsdl"
+    ))
+    .unwrap();
+    let archive = OpenedSource::open_path(&fixture.join("review.agsdl")).unwrap();
+    let plain = workspace.join("document.json");
+    fs::write(&plain, folder.authored_json()).unwrap();
+    let plain = OpenedSource::open_path(&plain).unwrap();
+    let policy = normalize_requested(
+        serde_json::from_value(json!("read-only")).unwrap(),
+        PathContext {
+            workspace: workspace.clone(),
+            home: workspace.clone(),
+        },
+    )
+    .unwrap();
+    let mut compiled_flow = None;
+    let mut original = Some(review);
+    for input in [plain, folder, manifest, upload, archive] {
+        let authored = input.authored_json().to_owned();
+        let doc: serde_json::Value = serde_json::from_str(&authored).unwrap();
+        let resources = &doc["agents"]["reviewer"]["resources"];
+        let source: EngineSourceRevision = serde_json::from_value(json!({
+            "owner":{"projectId":"project","planId":"review","branch":"test"},
+            "revision":"1", "sourceSha256":input.source_sha256()
+        }))
+        .unwrap();
+        if let Some(mcp) = input.mcp_files() {
+            assert_eq!(mcp["local"], ["mcp/asset.txt"]);
+            assert_eq!(input.secrets().unwrap()["local"], ["FIXTURE_TOKEN"]);
+        }
+        let mut scope = json!({"root":workspace});
+        let retained = input.retain(&data).unwrap();
+        let resource = retained
+            .resource_root()
+            .join("agents/reviewer/instructions review.md");
+        retained.bind_scope(&mut scope).unwrap();
+        drop((retained, input));
+        if scope["projectSnapshot"].is_string() {
+            if let Some(original) = original.take() {
+                fs::remove_dir_all(original).unwrap();
+            }
+        }
+
+        #[cfg(feature = "dev-support")]
+        let (plan, registry) = {
+            let (harness, agents) = argentic_runtime::capture::codex_registry(
+                &doc,
+                &source.source_sha256,
+                &scope,
+                &argentic_runtime::api::synthetic_codex_observation(),
+            )
+            .unwrap();
+            let registry = json!({"format":"macro-agsdl-registry/030","version":"test",
+                "modules":[{"harness":"codex","moduleJson":argentic_runtime::api::codex_module()}],
+                "harnesses":[harness],"agents":agents,"hostCapabilities":[]});
+            let result = argentic_runtime::Engine::new()
+                .compile_document(source.clone(), authored.clone(), registry.to_string())
+                .await
+                .unwrap();
+            let report: serde_json::Value = serde_json::from_str(&result.result_json).unwrap();
+            assert_eq!(report["static"]["valid"], true, "{report}");
+            assert_eq!(report["runtime"]["supported"], true, "{report}");
+            (
+                serde_json::from_str::<serde_json::Value>(
+                    report["compiledPlanJson"].as_str().unwrap(),
+                )
+                .unwrap(),
+                registry.to_string(),
+            )
+        };
+        #[cfg(not(feature = "dev-support"))]
+        let (plan, registry) = (serde_json::Value::Null, String::new());
+
+        #[cfg(feature = "dev-support")]
+        let flow = json!({"entry":plan["entry"],"steps":plan["steps"]});
+        #[cfg(not(feature = "dev-support"))]
+        let flow = doc["flow"].clone();
+        assert!(!flow["steps"].is_null(), "{plan}");
+        assert_eq!(compiled_flow.get_or_insert(flow.clone()), &flow);
+        let versions = plan.get("versions").cloned().unwrap_or_else(|| {
+            json!({
+                "snapshot":"2","contract":"agsdl-0.4.0","compiler":"compiler",
+                "runtime":"runtime","registry":"registry","profile":"macro-agsdl-030-v1"
+            })
+        });
+        let capture = StartCapture030 {
+            identity: serde_json::from_value(json!({
+                "systemStartId":"system","flowInvocationId":"flow",
+                "snapshotId":"snapshot","epoch":"1"
+            }))
+            .unwrap(),
+            source,
+            versions: serde_json::from_value(versions).unwrap(),
+            authored_source: authored,
+            compiled_plan_json: plan.to_string(),
+            registry_json: registry,
+            private_capture_json: json!({"callScopeJson":scope.to_string()}).to_string(),
+        };
+        // Recreate a context from serialized capture data after the source
+        // handles have gone away, as an embedding host can do after reopening.
+        let capture: StartCapture030 =
+            serde_json::from_str(&serde_json::to_string(&capture).unwrap()).unwrap();
+        let read = async |policy: argentic_runtime::permissions::NormalizedPolicy| {
+            let context = ContentContext::capture(
+                capture.identity.snapshot_id.clone(),
+                capture.source.source_sha256.clone(),
+                capture.authored_source.clone(),
+                scope["documentLocation"].as_str(),
+                "reviewer".into(),
+                EffectivePolicy::new(policy.clone(), policy.clone(), policy),
+                ExecutionPurpose::Agent,
+                CancellationToken::new(),
+                Arc::new(|_| Box::pin(async { panic!("unexpected content approval") })),
+            )
+            .unwrap()
+            .with_captured_source(&data, &capture)
+            .unwrap();
+            resolve_content(
+                &context,
+                ContentUse {
+                    source_json: resources["review"].to_string(),
+                    usage: ContentUsage::Resource,
+                    pointer: "/agents/reviewer/resources/review".into(),
+                },
+            )
+            .await
+        };
+        let receipt = read(policy.clone()).await.unwrap();
+        assert!(matches!(receipt.payload, ContentPayload::Text {text} if text.as_bytes() == bytes));
+        if scope.get("projectSnapshot").is_some() {
+            let deny = normalize_requested(
+                serde_json::from_value(json!({"preset":"read-only","rules":[
+                    {"action":"read","effect":"deny","match":"agents/reviewer/**"}
+                ]}))
+                .unwrap(),
+                PathContext {
+                    workspace: workspace.clone(),
+                    home: workspace.clone(),
+                },
+            )
+            .unwrap();
+            assert_eq!(read(deny).await.unwrap_err().code, "PERMISSION");
+            fs::write(&resource, b"changed").unwrap();
+            assert_eq!(
+                read(policy.clone()).await.unwrap_err().code,
+                "CONTENT_UNAVAILABLE"
+            );
+            fs::remove_file(&resource).unwrap();
+            assert_eq!(
+                read(policy.clone()).await.unwrap_err().code,
+                "CONTENT_UNAVAILABLE"
+            );
+            fs::write(&resource, &bytes).unwrap();
+        }
+    }
 }

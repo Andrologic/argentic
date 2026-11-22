@@ -49,6 +49,7 @@ pub struct ContentContext {
     network: Arc<dyn crate::content_network::ContentNetwork>,
     resource_owner: Option<ContentResourceOwner>,
     read_scope: Option<ContentReadScope>,
+    project_snapshot: Option<(crate::source::Snapshot, std::path::PathBuf)>,
     capture_id: String,
     source_digest: String,
     document_json: String,
@@ -116,6 +117,46 @@ impl ContentContext {
     pub fn with_read_scope(mut self, scope: ContentReadScope) -> Self {
         self.read_scope = Some(scope);
         self
+    }
+
+    /// Apply the project snapshot recorded by a durable native Start capture.
+    /// Existing JSON captures keep their normal document-relative file reads.
+    pub fn with_captured_source(
+        mut self,
+        host_data: &std::path::Path,
+        capture: &crate::persistence::start030::StartCapture030,
+    ) -> ContentResult<Self> {
+        if self.capture_id != capture.identity.snapshot_id
+            || self.source_digest != capture.source.source_sha256
+            || self.document_location
+                != crate::capture::captured_document_location(capture)
+                    .map_err(|e| error(&e.code, e.message))?
+        {
+            return Err(error(
+                "CORRELATION",
+                "Project source differs from the content context.",
+            ));
+        }
+        if let Some(snapshot) = crate::source::Snapshot::from_capture(host_data, capture)
+            .map_err(|e| error(&e.code, e.message))?
+        {
+            let workspace = self
+                .policy
+                .policies()
+                .next()
+                .ok_or_else(|| error("PERMISSION", "Missing content policy."))?
+                .context()
+                .workspace
+                .clone();
+            self.project_snapshot = Some((snapshot, workspace));
+        }
+        Ok(self)
+    }
+
+    pub(crate) fn project_root(&self) -> Option<&std::path::Path> {
+        self.project_snapshot
+            .as_ref()
+            .map(|(snapshot, _)| snapshot.root.as_path())
     }
 
     fn permission(&self, request: &ActionRequest) -> ContentResult<PermissionDecision> {
@@ -202,6 +243,7 @@ impl ContentContext {
             network: Arc::new(crate::content_network::UnavailableNetwork),
             resource_owner: None,
             read_scope: None,
+            project_snapshot: None,
             capture_id,
             source_digest,
             document_json,

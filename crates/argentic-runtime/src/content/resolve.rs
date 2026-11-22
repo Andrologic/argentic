@@ -330,7 +330,32 @@ async fn read_uri(
     match uri.scheme() {
         "file" => {
             let path = path_from_local_uri(uri)?;
-            let logical = crate::permissions::native_request_path(&path)
+            // A captured project authorizes only declared members. Evaluate
+            // the same Read policy against the corresponding workspace path.
+            let snapshot_member = context
+                .project_snapshot
+                .as_ref()
+                .map(|(snapshot, workspace)| {
+                    snapshot
+                        .member(&path)
+                        .map(|(relative, sha)| {
+                            (workspace.join(relative), snapshot.root.join(relative), sha)
+                        })
+                        .ok_or_else(|| {
+                            error(
+                                "PERMISSION",
+                                "File is outside the captured project inventory.",
+                            )
+                        })
+                })
+                .transpose()?;
+            let policy_path = snapshot_member
+                .as_ref()
+                .map_or(path.as_path(), |(path, _, _)| path.as_path());
+            let expected_path = snapshot_member
+                .as_ref()
+                .map(|(_, expected, _)| expected.clone());
+            let logical = crate::permissions::native_request_path(policy_path)
                 .ok_or_else(|| error("CONTENT_URI", "Unsupported local file path."))?;
             let root_path = root
                 .map(|r| {
@@ -391,14 +416,16 @@ async fn read_uri(
                         .await
                     {
                         Ok(decision)
-                            if decision.resolved_path.as_deref() == resolved.to_str()
-                                && root_path
-                                    .as_deref()
-                                    .map(crate::content_io::admitted::workspace_root_identity)
-                                    .transpose()
-                                    .ok()
-                                    .flatten()
-                                    == root_identity =>
+                            if expected_path.as_ref().map_or_else(
+                                || decision.resolved_path.as_deref() == resolved.to_str(),
+                                |expected| expected == &resolved,
+                            ) && root_path
+                                .as_deref()
+                                .map(crate::content_io::admitted::workspace_root_identity)
+                                .transpose()
+                                .ok()
+                                .flatten()
+                                == root_identity =>
                         {
                             Ok(())
                         }
@@ -440,6 +467,12 @@ async fn read_uri(
                         "Activated skill root changed during resource read.",
                     ));
                 }
+            }
+            if snapshot_member.is_some_and(|(_, _, sha)| digest(&bytes) != sha) {
+                return Err(error(
+                    "CONTENT_UNAVAILABLE",
+                    "Captured project bytes changed.",
+                ));
             }
             let final_uri = Url::from_file_path(resolved)
                 .map_err(|_| error("CONTENT_URI", "Cannot form file URI."))?

@@ -104,6 +104,9 @@ impl Sources030 {
             .with_resource_owner(Arc::new(move |cleanup| {
                 tasks.attach_cleanup030(&parent, cleanup)
             }));
+        let context = context
+            .with_captured_source(config.root(), capture)
+            .map_err(content_error)?;
         let mut sources = Self::from_context(
             context,
             serde_json::from_str(&capture.authored_source)?,
@@ -291,7 +294,11 @@ impl Sources030 {
         } else {
             None
         };
-        qualify_skill_folders(&self.document, &self.root, self.context.document_location())?;
+        qualify_skill_folders(
+            &self.document,
+            self.context.project_root().unwrap_or(&self.root),
+            self.context.document_location(),
+        )?;
         for key in self.document["agents"][self.context.binding().map_err(content_error)?.agent]
             ["skills"]
             .as_array()
@@ -352,7 +359,11 @@ impl Sources030 {
                     "Native content file is unavailable",
                 )
             })?;
-            if !approved_data_path(&self.root, &self.private, &path) {
+            let allowed = match self.context.project_root() {
+                Some(root) => path.starts_with(root) && !private_project_path(root, &path),
+                None => approved_data_path(&self.root, &self.private, &path),
+            };
+            if !allowed {
                 return Err(failure("PERMISSION", pointer, CONTENT_SCOPE_REFUSAL));
             }
         }
