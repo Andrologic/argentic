@@ -59,8 +59,8 @@ async fn compile_project(
 `locate_error` relocates a failure whose pointer is a JSON pointer. Compiler
 diagnostics arrive inside `result_json` (`/static/diagnostics` and
 `/runtime/diagnostics`), not as an `Err`. Pass each error diagnostic's code,
-pointer and message to `locate_error` to name its component file, as the
-standalone host does.
+pointer and message to `locate_error` to name its component file. The
+standalone host locates the first error and appends the full compile report.
 
 Pass the bound scope to native registry preparation and save it unchanged as
 `callScopeJson` in the private Start capture. Build the registry with the same

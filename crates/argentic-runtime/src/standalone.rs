@@ -474,10 +474,11 @@ impl Host {
                         .as_str()
                         .or_else(|| diagnostic["path"].as_str())
                         .unwrap_or("");
-                    // Keep the JSON input's code. The located message names
-                    // the component file and the compiler's diagnostic code.
+                    // Keep the JSON input's code. The message locates the first
+                    // error in its component file, then carries the full
+                    // compile report that a JSON source receives.
                     let message = format!(
-                        "{}: {}",
+                        "{}: {}. Compile report: {result}",
                         diagnostic["code"].as_str().unwrap_or("UNSUPPORTED"),
                         diagnostic["message"]
                             .as_str()
