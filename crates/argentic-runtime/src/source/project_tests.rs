@@ -191,6 +191,10 @@ fn json_documents_keep_the_host_source_codes() {
         let link = temp.path().join("link.json");
         std::os::unix::fs::symlink(temp.path().join("real.json"), &link).unwrap();
         assert_eq!(code(&link), "SOURCE_UNAVAILABLE");
+        let folder = temp.path().join("linked-manifest");
+        std::fs::create_dir(&folder).unwrap();
+        std::os::unix::fs::symlink(temp.path().join("real.json"), folder.join(MANIFEST)).unwrap();
+        assert_eq!(code(&folder.join(MANIFEST)), "SOURCE_UNAVAILABLE");
     }
 }
 
@@ -231,4 +235,30 @@ fn retain_never_publishes_an_index_it_cannot_reopen() {
         .unwrap()
         .count();
     assert_eq!(published, 0);
+}
+
+#[test]
+fn archive_extension_is_case_insensitive() {
+    let temp = tempfile::tempdir().unwrap();
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/conformance-050/review-project.agsdl");
+    let upper = temp.path().join("REVIEW.AGSDL");
+    std::fs::copy(&fixture, &upper).unwrap();
+    assert_eq!(
+        OpenedSource::open_path(&upper).unwrap().authored_json(),
+        OpenedSource::open_path(&fixture).unwrap().authored_json()
+    );
+}
+
+#[test]
+fn only_json_pointers_are_located_in_a_component() {
+    let temp = tempfile::tempdir().unwrap();
+    project(temp.path(), "../notes.md", None);
+    let opened = OpenedSource::open_path(temp.path()).unwrap();
+    let located = opened.locate_error(failure("X", "/agents/a/resources/r", "Refused"));
+    assert_eq!(located.message, "agents/a.json#/resources/r: Refused");
+    for category in ["projectSnapshot", "skills", "source"] {
+        let error = opened.locate_error(failure("X", category, "Refused"));
+        assert_eq!(error.message, "Refused", "{category}");
+    }
 }

@@ -66,13 +66,17 @@ symbolic links in the workspace neither redirect nor refuse a member, and a
 deny rule for the path still applies. Inside the retained copy, only inventory
 members are readable. A file outside it, such as a workspace resource attached
 to an entry or steer message, follows the same workspace rules as for a JSON
-document.
+document. A relative URI in a message resolves against the document location,
+which for a project is the retained copy, so it reaches only inventory
+members. Attach workspace files to a project run with absolute `file:` URIs.
 
 A folder and its archive select the same files. Both apply the archive name
 rules, including the refusal of `.git`, `.env` and `.env.*` in skill trees,
 and refuse symbolic links in a selected path. A folder is also limited to an
 inventory of at most 2 MiB, the archive limit, which bounds the retained
-index. A reference may pass through
+index. As in the official v0.5.0 tool, a folder may select 8192 files and
+256 MiB, while an archive's 8192 entries and 256 MiB also count
+`archive.json` and any `history.bundle`. A reference may pass through
 `..` lexically, as in the official reader. A plain JSON source that cannot be
 read keeps the host codes `SOURCE_UNAVAILABLE` and `INPUT_LIMIT`. Project and
 archive diagnostics use `PROJECT` with the file and JSON pointer concerned.

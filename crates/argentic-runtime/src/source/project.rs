@@ -130,8 +130,15 @@ impl Reader {
                 .dir
                 .as_ref()
                 .ok_or_else(|| invalid(path, "", "File absent from archive inventory"))?;
-            let file = read_regular(dir, Path::new(path), limit.min(MAX_TOTAL - self.total))
-                .map_err(|e| invalid(path, "", &e.to_string()))?;
+            let remaining = MAX_TOTAL - self.total;
+            let file = read_regular(dir, Path::new(path), limit.min(remaining)).map_err(|e| {
+                let own_size = dir.symlink_metadata(path).map_or(0, |meta| meta.len());
+                if e.kind() == std::io::ErrorKind::FileTooLarge && own_size <= limit {
+                    invalid(path, "", "Project selection exceeds the 256 MiB total")
+                } else {
+                    invalid(path, "", &e.to_string())
+                }
+            })?;
             self.total += file.bytes.len() as u64;
             self.files.insert(path.to_owned(), file);
         }

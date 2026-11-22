@@ -59,19 +59,16 @@ impl OpenedSource {
         let name = path
             .file_name()
             .ok_or_else(|| invalid("", "", "Expected a source file"))?;
-        if path.extension().is_some_and(|ext| ext == "agsdl") {
+        if path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("agsdl"))
+        {
             return Self::archived(archive::read(
                 open_regular(&dir, Path::new(name)).map_err(|_| source_unavailable())?,
             )?);
         }
-        if name == MANIFEST
-            && dir
-                .symlink_metadata(name)
-                .is_ok_and(|meta| meta.is_symlink())
-        {
-            return Self::folder(path.parent().unwrap(), None);
-        }
         // Preserve the exact UTF-8 bytes and 8 MiB limit of the existing JSON input.
+        // A symlinked source, including a symlinked manifest, is not a regular file.
         let meta = dir
             .symlink_metadata(name)
             .map_err(|_| source_unavailable())?;
@@ -170,8 +167,14 @@ impl OpenedSource {
     }
 
     /// Translate a compiler or admission diagnostic to its declaring component.
+    /// Errors whose pointer is a host category, such as `projectSnapshot`,
+    /// name no component and are returned unchanged.
     pub fn locate_error(&self, mut error: EngineFailure) -> EngineFailure {
-        if let Some(project) = &self.project {
+        if let Some(project) = self
+            .project
+            .as_ref()
+            .filter(|_| error.pointer.starts_with('/'))
+        {
             error.message = format!("{}: {}", project.location(&error.pointer), error.message);
         }
         error

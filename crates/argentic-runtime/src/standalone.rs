@@ -457,12 +457,19 @@ impl Host {
                         .as_str()
                         .or_else(|| diagnostic["path"].as_str())
                         .unwrap_or("");
-                    return Err(inputs.opened.locate_error(failure(
+                    // Keep the JSON input's code. The located message names
+                    // the component file and the compiler's diagnostic code.
+                    let message = format!(
+                        "{}: {}",
                         diagnostic["code"].as_str().unwrap_or("UNSUPPORTED"),
-                        pointer,
                         diagnostic["message"]
                             .as_str()
-                            .unwrap_or("Source is unsupported"),
+                            .unwrap_or("Source is unsupported")
+                    );
+                    return Err(inputs.opened.locate_error(failure(
+                        "UNSUPPORTED",
+                        pointer,
+                        &message,
                     )));
                 }
             }
@@ -1106,20 +1113,24 @@ mod tests {
             // Stop can commit after the approval ticket is reserved while
             // evaluation of its clock output is still in flight.
             let lease = host.engine.start_lease().await.unwrap();
-            lease.clock_jobs030().approval_check_probe(Arc::new(|job, _| {
-                let job: Value = serde_json::from_str(job).unwrap();
-                let input: Value = serde_json::from_str(job["inputJson"].as_str().unwrap()).unwrap();
-                if input["operation"] != "humanClock" {
-                    return;
-                }
-                let event: Value =
-                    serde_json::from_str(input["input"]["eventJson"].as_str().unwrap()).unwrap();
-                if event["event"]["kind"] == "approval" {
-                    loop {
-                        std::thread::park();
+            lease
+                .clock_jobs030()
+                .approval_check_probe(Arc::new(|job, _| {
+                    let job: Value = serde_json::from_str(job).unwrap();
+                    let input: Value =
+                        serde_json::from_str(job["inputJson"].as_str().unwrap()).unwrap();
+                    if input["operation"] != "humanClock" {
+                        return;
                     }
-                }
-            }));
+                    let event: Value =
+                        serde_json::from_str(input["input"]["eventJson"].as_str().unwrap())
+                            .unwrap();
+                    if event["event"]["kind"] == "approval" {
+                        loop {
+                            std::thread::park();
+                        }
+                    }
+                }));
             drop(lease);
             let started = host.start("start".into(), entry(), false).await.unwrap();
             let scope = persistence::public030::HumanScope030 {
@@ -1127,11 +1138,22 @@ mod tests {
                 source: started.capture.source,
             };
             tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                while host.humans(scope.clone(), None).await.unwrap().requests.is_empty() {
+                while host
+                    .humans(scope.clone(), None)
+                    .await
+                    .unwrap()
+                    .requests
+                    .is_empty()
+                {
                     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                 }
-            }).await.unwrap();
-            let hook = host.engine.flow030().install_system_stop_commit_hook("stop");
+            })
+            .await
+            .unwrap();
+            let hook = host
+                .engine
+                .flow030()
+                .install_system_stop_commit_hook("stop");
             tokio::select! {
                 _ = hook.reached() => std::process::exit(0),
                 result = host.stop(EngineStopRequest {
@@ -1145,18 +1167,26 @@ mod tests {
         let child = tokio::time::timeout(
             std::time::Duration::from_secs(15),
             tokio::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "standalone::tests::reopening_finishes_a_committed_stop_of_a_local_approval"])
+                .args([
+                    "--exact",
+                    "standalone::tests::reopening_finishes_a_committed_stop_of_a_local_approval",
+                ])
                 .env(CHILD, f._temp.path())
                 .kill_on_drop(true)
                 .output(),
-        ).await.unwrap().unwrap();
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert!(child.status.success(), "{child:?}");
         for reopening in 0..2 {
             let host = f.open().await.unwrap();
             let runs = host.runs().await.unwrap();
             let query = api::RuntimeProjectionQuery030 {
                 system_start_id: runs[0]["receipt"]["identity"]["systemStartId"]
-                    .as_str().unwrap().into(),
+                    .as_str()
+                    .unwrap()
+                    .into(),
                 source: host.source().await,
                 snapshot_id: None,
             };
@@ -1165,7 +1195,10 @@ mod tests {
             assert!(!page.stopping && !page.termination_uncertain);
             let pending: i64 = sqlx::query_scalar(
                 "SELECT count(*) FROM engine_flow030_clock_events WHERE output_json IS NULL",
-            ).fetch_one(&host.pool).await.unwrap();
+            )
+            .fetch_one(&host.pool)
+            .await
+            .unwrap();
             assert_eq!(pending, 1);
             host.shutdown(&[]).await.unwrap();
             host.close().await.unwrap();
@@ -1173,7 +1206,8 @@ mod tests {
                 &f.data.join("engine.sqlite"),
                 &query.system_start_id,
                 &page.flow_invocation_id,
-            ).await;
+            )
+            .await;
             assert!(replay.ok, "{replay:?}");
             if reopening == 1 {
                 for (index, (mutation, expected)) in [
