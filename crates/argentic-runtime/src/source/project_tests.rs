@@ -315,3 +315,54 @@ fn retain_failures_name_neither_the_project_nor_host_paths() {
     let root = temp.path().to_str().unwrap();
     assert!(!error.message.contains(root), "{}", error.message);
 }
+
+/// As in the official reader, a component used only on the way to `..`
+/// still needs a portable name and no case collision, even when absent.
+#[test]
+fn components_before_dot_dot_follow_the_name_rules() {
+    for (reference, expected) in [
+        ("../CON/../notes.md", "Invalid portable path"),
+        ("../Agents/../notes.md", "Case collision"),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        project(temp.path(), reference, None);
+        let message = refused(OpenedSource::open_path(temp.path()));
+        assert!(message.contains(expected), "{reference}: {message}");
+        let mut selected = BTreeMap::new();
+        project(temp.path(), "../notes.md", None);
+        selected.extend(files(&OpenedSource::open_path(temp.path()).unwrap()));
+        let agent = json!({"harness":"codex","permissions":"read-only",
+            "resources":{"r":{"uri":reference}}});
+        selected.insert("agents/a.json".into(), agent.to_string().into_bytes());
+        let message = refused(OpenedSource::open_archive_bytes(&pack(&selected)));
+        assert!(message.contains(expected), "{reference}: {message}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_linked_project_root_or_snapshot_folder_is_refused() {
+    let temp = tempfile::tempdir().unwrap();
+    let real = temp.path().join("real");
+    project(&real, "../notes.md", None);
+    let link = temp.path().join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    for input in [link.clone(), link.join(MANIFEST)] {
+        let message = refused(OpenedSource::open_path(&input));
+        assert!(
+            message.contains("root cannot be a symbolic link"),
+            "{message}"
+        );
+    }
+    let data = temp.path().join("data");
+    std::fs::create_dir_all(temp.path().join("elsewhere")).unwrap();
+    std::fs::create_dir(&data).unwrap();
+    std::os::unix::fs::symlink(temp.path().join("elsewhere"), data.join("agsdl-snapshots"))
+        .unwrap();
+    let error = OpenedSource::open_path(&real)
+        .unwrap()
+        .retain(&data)
+        .err()
+        .unwrap();
+    assert_eq!(error.code, "STORAGE");
+}

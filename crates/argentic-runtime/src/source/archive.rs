@@ -56,7 +56,8 @@ pub(super) fn inventory_len(files: &Files) -> Result<u64> {
         })
         .collect::<serde_json::Map<_, _>>();
     let index = serde_json::json!({"archiveFormat":"agsdl-archive-1","files":rows});
-    Ok(serde_json::to_vec(&index)?.len() as u64)
+    // The official packer ends the inventory with a newline.
+    Ok(serde_json::to_vec(&index)?.len() as u64 + 1)
 }
 
 /// Collision key: case folding then NFC, as the archive format requires.

@@ -110,6 +110,14 @@ impl OpenedSource {
     }
 
     fn folder(root: &Path, manifest: Option<ProjectFile>) -> Result<Self> {
+        // The official tool refuses a project root that is a symbolic link.
+        if std::fs::symlink_metadata(root).is_ok_and(|meta| meta.is_symlink()) {
+            return Err(invalid(
+                MANIFEST,
+                "",
+                "The project root cannot be a symbolic link",
+            ));
+        }
         let project = project::assemble_folder(root, manifest)?;
         Self::assembled(project)
     }

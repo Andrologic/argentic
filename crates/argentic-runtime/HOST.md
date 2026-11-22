@@ -56,6 +56,12 @@ async fn compile_project(
 }
 ```
 
+`locate_error` relocates a failure whose pointer is a JSON pointer. Compiler
+diagnostics arrive inside `result_json` (`/static/diagnostics` and
+`/runtime/diagnostics`), not as an `Err`. Pass each error diagnostic's code,
+pointer and message to `locate_error` to name its component file, as the
+standalone host does.
+
 Pass the bound scope to native registry preparation and save it unchanged as
 `callScopeJson` in the private Start capture. Build the registry with the same
 scope and source digest used for admission. The engine's native reader uses
@@ -74,14 +80,19 @@ members. Attach workspace files to a project run with absolute `file:` URIs.
 
 A folder and its archive select the same files. Both apply the archive name
 rules, including the refusal of `.git`, `.env` and `.env.*` in skill trees,
-and refuse symbolic links in a selected path. A folder is also limited to an
+and refuse symbolic links in a selected path or as the project root. A
+component traversed only on the way to `..` needs a portable name without a
+case collision, even when it does not exist. A folder is also limited to an
 inventory of at most 2 MiB, the archive limit, which bounds the retained
-index. As in the official v0.5.0 tool, a folder may select 8192 files and
-256 MiB, while an archive's 8192 entries and 256 MiB also count
-`archive.json` and any `history.bundle`. A reference may pass through
-`..` lexically, as in the official reader. A plain JSON source that cannot be
-read keeps the host codes `SOURCE_UNAVAILABLE` and `INPUT_LIMIT`. Project and
-archive diagnostics use `PROJECT` with the file and JSON pointer concerned.
+index. As in the official v0.5.0 tool, a folder may select 8192 files and 256
+MiB, while an archive's 8192 entries and 256 MiB also count `archive.json` and
+any `history.bundle`. On Windows, a folder records no executable file. The
+official tool restores executables there from a `.agsdl-executables` sidecar,
+which Argentic does not read; open the archive instead to keep them. A
+reference may pass through `..` lexically, as in the official reader. A plain
+JSON source that cannot be read keeps the host codes `SOURCE_UNAVAILABLE` and
+`INPUT_LIMIT`. Project and archive diagnostics use `PROJECT` with the file and
+JSON pointer concerned.
 
 `secrets()` returns the names required by each declared MCP server.
 `mcp_files()` returns paths relative to `retained.resource_root()`. Opening

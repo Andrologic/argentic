@@ -574,10 +574,10 @@ impl Host {
                 )
                 .await
             {
-                session
-                    .interrupt_run(&self.pool, &retained.receipt.identity.system_start_id)
-                    .await?;
-                session.fail_reservation(&retained.receipt.identity.system_start_id, e.clone());
+                let id = &retained.receipt.identity.system_start_id;
+                let interrupted = session.interrupt_run(&self.pool, id).await;
+                session.fail_reservation(id, e.clone());
+                interrupted?;
                 return Err(e);
             }
         }

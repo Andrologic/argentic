@@ -92,7 +92,11 @@ pub(super) fn retain(
     let parent = data.join(SNAPSHOTS);
     fs::create_dir_all(&parent).map_err(|e| storage(&parent, e))?;
     if parent.canonicalize().map_err(|e| storage(&parent, e))? != parent {
-        return Err(unavailable());
+        return Err(failure(
+            "STORAGE",
+            "data",
+            "Host storage cannot retain the project: the snapshot folder is a link",
+        ));
     }
     let manifest = Manifest {
         document: authored_sha256.into(),

@@ -106,20 +106,7 @@ impl Reader {
             .match_indices('/')
             .chain(std::iter::once((path.len(), "")))
         {
-            let part = &path[..end];
-            let folded = archive::path_key(part);
-            if self
-                .spellings
-                .insert(folded, part.into())
-                .is_some_and(|before| before != part)
-                || self.spellings.len() > 16_384
-            {
-                return Err(invalid(
-                    path,
-                    "",
-                    "Case collision or too many project paths",
-                ));
-            }
+            self.spell(&path[..end], path)?;
         }
         self.selected.insert(path.to_owned());
         if self.selected.len() > MAX_FILES {
@@ -145,7 +132,25 @@ impl Reader {
         Ok(())
     }
 
-    fn resolve(&self, owner: &str, name: &str, pointer: &str) -> Result<String> {
+    /// Record one path's spelling. Names that differ only by case folding
+    /// or Unicode normalization collide, including directory names.
+    fn spell(&mut self, part: &str, path: &str) -> Result<()> {
+        if self
+            .spellings
+            .insert(archive::path_key(part), part.into())
+            .is_some_and(|before| before != part)
+            || self.spellings.len() > 16_384
+        {
+            return Err(invalid(
+                path,
+                "",
+                "Case collision or too many project paths",
+            ));
+        }
+        Ok(())
+    }
+
+    fn resolve(&mut self, owner: &str, name: &str, pointer: &str) -> Result<String> {
         let error = |detail| invalid(owner, pointer, &format!("{detail}: {name:?}"));
         if name.is_empty()
             || name.starts_with('/')
@@ -179,6 +184,12 @@ impl Reader {
                         return Err(error("Path traverses a regular file"));
                     }
                     parts.push(part);
+                    // As the official reader does, a component used only on
+                    // the way to `..` still needs a portable, consistent name.
+                    let walked = parts.join("/");
+                    archive::portable(&walked).map_err(|_| error("Invalid portable path"))?;
+                    self.spell(&walked, &walked)
+                        .map_err(|_| error("Case collision or too many project paths"))?;
                     if let Some((dir, _)) = &self.dir {
                         if dir
                             .symlink_metadata(parts.join("/"))
