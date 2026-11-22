@@ -1,6 +1,8 @@
 //! Local AgSDL input and portable archives. Opening never starts a provider,
 //! resolves secret values, executes a command or retrieves an external URI.
 mod archive;
+#[cfg(test)]
+mod conformance050_tests;
 mod project;
 mod snapshot;
 
