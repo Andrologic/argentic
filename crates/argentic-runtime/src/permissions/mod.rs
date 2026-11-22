@@ -383,11 +383,31 @@ pub fn evaluate_effective(
     request: &ActionRequest,
     purpose: ExecutionPurpose,
 ) -> Result<PermissionDecision> {
+    evaluate_with(policy, request, purpose, paths::Subject::new)
+}
+
+/// Evaluate a file action on the path's spelling without following links.
+/// The content reader uses it for a retained project member: the bytes come
+/// from the snapshot, and its workspace path only names the policy subject.
+pub(crate) fn evaluate_effective_lexical(
+    policy: &EffectivePolicy,
+    request: &ActionRequest,
+    purpose: ExecutionPurpose,
+) -> Result<PermissionDecision> {
+    evaluate_with(policy, request, purpose, paths::Subject::lexical)
+}
+
+fn evaluate_with(
+    policy: &EffectivePolicy,
+    request: &ActionRequest,
+    purpose: ExecutionPurpose,
+    subject: fn(&PathContext, &ActionRequest) -> Result<paths::Subject>,
+) -> Result<PermissionDecision> {
     let mut effect = Effect::Allow;
     let mut reviewer = None;
     let mut resolved_path = None;
     for ceiling in policy.policies() {
-        let subject = paths::Subject::new(&ceiling.context, request)?;
+        let subject = subject(&ceiling.context, request)?;
         if let Some(path) = &subject.physical {
             let path = paths::text(path)?;
             if resolved_path

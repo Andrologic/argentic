@@ -61,14 +61,18 @@ that capture to reopen project files. Custom content readers can bind the same
 capture with `ContentContext::with_captured_source`. Keep the existing workspace,
 permissions and approval checks. For packaged content, native Read policy is
 evaluated on the member's path relative to the approved workspace, while the
-bytes come from the retained project. Inside the retained copy, only inventory
+bytes come from the retained project. That path is evaluated as spelled:
+symbolic links in the workspace neither redirect nor refuse a member, and a
+deny rule for the path still applies. Inside the retained copy, only inventory
 members are readable. A file outside it, such as a workspace resource attached
 to an entry or steer message, follows the same workspace rules as for a JSON
 document.
 
 A folder and its archive select the same files. Both apply the archive name
 rules, including the refusal of `.git`, `.env` and `.env.*` in skill trees,
-and refuse symbolic links in a selected path. A reference may pass through
+and refuse symbolic links in a selected path. A folder is also limited to an
+inventory of at most 2 MiB, the archive limit, which bounds the retained
+index. A reference may pass through
 `..` lexically, as in the official reader. A plain JSON source that cannot be
 read keeps the host codes `SOURCE_UNAVAILABLE` and `INPUT_LIMIT`. Project and
 archive diagnostics use `PROJECT` with the file and JSON pointer concerned.

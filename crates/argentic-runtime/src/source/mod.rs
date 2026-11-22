@@ -122,6 +122,15 @@ impl OpenedSource {
     }
 
     fn assembled(project: project::Project) -> Result<Self> {
+        // A folder accepts only what its archive could list, which also bounds
+        // the retained index that a later run reopens.
+        if archive::inventory_len(&project.files)? > archive::INDEX_LIMIT {
+            return Err(invalid(
+                MANIFEST,
+                "",
+                "Project inventory exceeds the 2 MiB archive limit; select fewer or shorter paths",
+            ));
+        }
         let authored = serde_json::to_string(&project.document)?;
         Ok(Self {
             authored,

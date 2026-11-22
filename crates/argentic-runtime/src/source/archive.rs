@@ -9,7 +9,7 @@ use std::{
 use unicode_general_category::{get_general_category, GeneralCategory};
 use unicode_normalization::UnicodeNormalization;
 
-const INDEX_LIMIT: u64 = 2 * 1024 * 1024;
+pub(super) const INDEX_LIMIT: u64 = 2 * 1024 * 1024;
 const DIRECTORY_LIMIT: u64 = 8 * 1024 * 1024;
 
 #[derive(Deserialize)]
@@ -41,6 +41,22 @@ pub(super) fn hex(value: &str, len: usize) -> bool {
         && value
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Byte length of the `archive.json` inventory that would list these files.
+pub(super) fn inventory_len(files: &Files) -> Result<u64> {
+    let rows = files
+        .iter()
+        .map(|(name, file)| {
+            (
+                name.clone(),
+                serde_json::json!({"executable":file.executable,
+                    "sha256":sha256(&file.bytes),"size":file.bytes.len()}),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    let index = serde_json::json!({"archiveFormat":"agsdl-archive-1","files":rows});
+    Ok(serde_json::to_vec(&index)?.len() as u64)
 }
 
 /// Collision key: case folding then NFC, as the archive format requires.

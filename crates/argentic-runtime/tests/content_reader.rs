@@ -341,6 +341,9 @@ async fn exercise_project_sources() {
             serde_json::from_str(&serde_json::to_string(&capture).unwrap()).unwrap();
         let read_source = async |policy: argentic_runtime::permissions::NormalizedPolicy,
                                  source: &serde_json::Value| {
+            // The engine's agent reader also confines resolved targets to the
+            // approved workspace. Mirror that recipient scope here.
+            let approved = policy.context().workspace.clone();
             let context = ContentContext::capture(
                 capture.identity.snapshot_id.clone(),
                 capture.source.source_sha256.clone(),
@@ -354,7 +357,18 @@ async fn exercise_project_sources() {
             )
             .unwrap()
             .with_captured_source(&data, &capture)
-            .unwrap();
+            .unwrap()
+            .with_read_scope(Arc::new(move |target| {
+                if target.starts_with(&approved) {
+                    Ok(())
+                } else {
+                    Err(argentic_runtime::content::ContentError {
+                        code: "PERMISSION".into(),
+                        pointer: String::new(),
+                        message: "Outside the approved workspace".into(),
+                    })
+                }
+            }));
             resolve_content(
                 &context,
                 ContentUse {
@@ -385,6 +399,35 @@ async fn exercise_project_sources() {
             )
             .unwrap();
             assert_eq!(read(deny).await.unwrap_err().code, "PERMISSION");
+            // A workspace whose `agents` links elsewhere does not redirect or
+            // refuse a retained member: its workspace path only names it.
+            #[cfg(unix)]
+            {
+                let elsewhere = root.join("elsewhere/agents/reviewer");
+                let linked = root.join("linked-workspace");
+                if !linked.exists() {
+                    fs::create_dir_all(&elsewhere).unwrap();
+                    fs::write(elsewhere.join("instructions review.md"), "Other.\n").unwrap();
+                    fs::create_dir(&linked).unwrap();
+                    std::os::unix::fs::symlink(
+                        root.join("elsewhere/agents"),
+                        linked.join("agents"),
+                    )
+                    .unwrap();
+                }
+                let linked_policy = normalize_requested(
+                    serde_json::from_value(json!("read-only")).unwrap(),
+                    PathContext {
+                        workspace: linked.clone(),
+                        home: linked.clone(),
+                    },
+                )
+                .unwrap();
+                let receipt = read(linked_policy).await.unwrap();
+                assert!(
+                    matches!(receipt.payload, ContentPayload::Text {text} if text.as_bytes() == bytes)
+                );
+            }
             fs::write(&resource, b"changed").unwrap();
             assert_eq!(
                 read(policy.clone()).await.unwrap_err().code,

@@ -99,6 +99,15 @@ pub(super) fn retain(
             .collect(),
     };
     let bytes = serde_json::to_vec(&manifest)?;
+    // `Snapshot::open` reads the index under this limit. Never publish a
+    // snapshot that could not be reopened.
+    if bytes.len() as u64 > MAX_JSON_TOTAL {
+        return Err(invalid(
+            INDEX,
+            "",
+            "Retained project index exceeds its read limit",
+        ));
+    }
     let id = sha256(&bytes);
     let path = parent.join(&id);
     if !path.exists() {

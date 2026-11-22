@@ -358,6 +358,7 @@ async fn read_uri(
             let expected_path = snapshot_member
                 .as_ref()
                 .map(|(_, expected, _)| expected.clone());
+            let member_read = snapshot_member.is_some();
             let logical = crate::permissions::native_request_path(policy_path)
                 .ok_or_else(|| error("CONTENT_URI", "Unsupported local file path."))?;
             let root_path = root
@@ -415,7 +416,11 @@ async fn read_uri(
                         }
                     }
                     match context
-                        .admit(ActionRequest::Read { path: logical }, base_effect)
+                        .admit(
+                            ActionRequest::Read { path: logical },
+                            base_effect,
+                            member_read,
+                        )
                         .await
                     {
                         Ok(decision)
@@ -507,7 +512,7 @@ async fn read_uri(
                             .or_else(|| target.host_str().map(str::to_owned))
                             .unwrap_or_default();
                         context
-                            .admit(ActionRequest::Network { host }, effect)
+                            .admit(ActionRequest::Network { host }, effect, false)
                             .await
                             .map(|_| ())
                             .map_err(|e| {

@@ -159,8 +159,17 @@ impl ContentContext {
             .map(|(snapshot, _)| snapshot.root.as_path())
     }
 
-    fn permission(&self, request: &ActionRequest) -> ContentResult<PermissionDecision> {
-        let decision = evaluate_effective(&self.policy, request, self.purpose)
+    fn permission(
+        &self,
+        request: &ActionRequest,
+        lexical: bool,
+    ) -> ContentResult<PermissionDecision> {
+        let evaluate = if lexical {
+            crate::permissions::evaluate_effective_lexical
+        } else {
+            evaluate_effective
+        };
+        let decision = evaluate(&self.policy, request, self.purpose)
             .map_err(|e| error("PERMISSION", e.detail))?;
         if let (ActionRequest::Read { .. }, Some(scope)) = (request, &self.read_scope) {
             let path = decision
@@ -264,13 +273,16 @@ impl ContentContext {
         }
     }
 
+    /// `lexical` evaluates a retained project member by its workspace
+    /// spelling. Every other target follows the filesystem as before.
     async fn admit(
         &self,
         request: ActionRequest,
         effect: ContentEffect,
+        lexical: bool,
     ) -> ContentResult<PermissionDecision> {
         self.active()?;
-        let decision = self.permission(&request)?;
+        let decision = self.permission(&request, lexical)?;
         match decision.effect {
             Effect::Deny => {
                 return Err(error(
@@ -295,7 +307,7 @@ impl ContentContext {
             Effect::Allow => {}
         }
         self.active()?;
-        let current = self.permission(&request)?;
+        let current = self.permission(&request, lexical)?;
         if current.effect != decision.effect
             || current.resolved_path != decision.resolved_path
             || current.policy_digest != decision.policy_digest

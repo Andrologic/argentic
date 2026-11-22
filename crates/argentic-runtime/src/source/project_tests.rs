@@ -193,3 +193,42 @@ fn json_documents_keep_the_host_source_codes() {
         assert_eq!(code(&link), "SOURCE_UNAVAILABLE");
     }
 }
+
+#[test]
+fn a_folder_is_limited_to_an_inventory_its_archive_could_hold() {
+    let temp = tempfile::tempdir().unwrap();
+    project(temp.path(), "../notes.md", Some("skills/review/SKILL.md"));
+    write(temp.path(), "skills/review/SKILL.md", "Review.\n");
+    let deep = format!("skills/review/{}", "d".repeat(200));
+    std::fs::create_dir_all(temp.path().join(&deep)).unwrap();
+    for i in 0..4000 {
+        let name = format!("{deep}/{i:05}{}", "f".repeat(240));
+        std::fs::write(temp.path().join(name), "x").unwrap();
+    }
+    let message = refused(OpenedSource::open_path(temp.path()));
+    assert!(message.contains("2 MiB archive limit"), "{message}");
+}
+
+#[test]
+fn retain_never_publishes_an_index_it_cannot_reopen() {
+    let temp = tempfile::tempdir().unwrap();
+    let files: Files = (0..3000)
+        .map(|i| {
+            let name = format!("{}/{i:05}", "p".repeat(3000));
+            let file = ProjectFile {
+                bytes: b"x".to_vec(),
+                executable: false,
+            };
+            (name, file)
+        })
+        .collect();
+    let error = match snapshot::retain(temp.path(), &sha256(b"{}"), &files) {
+        Ok(_) => panic!("expected a refusal"),
+        Err(error) => error,
+    };
+    assert!(error.message.contains("read limit"), "{}", error.message);
+    let published = std::fs::read_dir(temp.path().join("agsdl-snapshots"))
+        .unwrap()
+        .count();
+    assert_eq!(published, 0);
+}
