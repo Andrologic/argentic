@@ -417,3 +417,26 @@ fn a_plain_document_needs_only_search_permission_on_its_parent() {
         r#"{"contract":"agsdl-0.4.0"}"#
     );
 }
+
+/// Filesystems with fixed modes cannot keep the executable bit. The index
+/// records it, so a retained copy whose mode differs still reopens.
+#[cfg(unix)]
+#[test]
+fn a_retained_copy_does_not_depend_on_file_modes() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempfile::tempdir().unwrap();
+    let files: Files = [("run.sh", true), ("notes.md", false)]
+        .into_iter()
+        .map(|(name, executable)| {
+            let file = ProjectFile {
+                bytes: b"x".to_vec(),
+                executable,
+            };
+            (name.to_owned(), file)
+        })
+        .collect();
+    let first = snapshot::retain(temp.path(), &sha256(b"{}"), &files).unwrap();
+    let script = first.resource_root().join("run.sh");
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o600)).unwrap();
+    snapshot::retain(temp.path(), &sha256(b"{}"), &files).unwrap();
+}

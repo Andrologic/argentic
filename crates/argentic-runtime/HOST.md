@@ -98,7 +98,11 @@ JSON pointer concerned.
 `mcp_files()` returns paths relative to `retained.resource_root()`. Opening
 a project works offline with a closed vault. The embedding host decides which
 MCP servers it can run and how to provide secret values. Opening either format
-does not start a server. When present, the ZIP's Git bundle is verified by size
+does not start a server. Argentic does not run MCP commands from the retained
+copy: as for a JSON document, a relative MCP program resolves against the
+workspace. To run a declared asset, the embedding host provides it from
+`resource_root()`. The retained index records each file's executable flag;
+the mode of the retained file is not checked. When present, the ZIP's Git bundle is verified by size
 and SHA-256. The current snapshot opens without Git. Importing and browsing
 historical revisions are outside the host profile.
 

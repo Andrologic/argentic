@@ -185,8 +185,9 @@ pub(super) fn retain(
         Dir::open_ambient_dir(&snapshot.root, ambient_authority()).map_err(|_| unavailable())?;
     for (name, entry) in &snapshot.manifest.files {
         let file = read_regular(&root, Path::new(name), entry.size).map_err(|_| unavailable())?;
-        if sha256(&file.bytes) != entry.sha256 || cfg!(unix) && file.executable != entry.executable
-        {
+        // The index records the executable flag. The disk mode depends on the
+        // umask and on filesystems with fixed modes, so only bytes are checked.
+        if sha256(&file.bytes) != entry.sha256 {
             return Err(unavailable());
         }
     }
