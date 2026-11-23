@@ -532,12 +532,19 @@ pub(crate) async fn drain_effects030(
                 host.flow030()
                     .operator_test_yield("supervisor.host.selected")
                     .await;
-                if let Err(error) = driver.start_host(inspection, effect).await {
+                if let Err(error) = driver.start_host(inspection, effect.clone()).await {
                     if error.code != "STALE_REFERENCE" {
                         return Err(error);
                     }
                     let fresh = flow::inspect_run(host.flow030(), host, pool, owner).await?;
-                    if !fresh.flow.state.stopping {
+                    // A steer receipt can close a join while its approval
+                    // Start is selected but still unclaimed.
+                    let withdrawn =
+                        !crate::persistence::flow_store030::eligible(&fresh.flow.state, &effect)
+                            && fresh.flow.effects.iter().any(|row| {
+                                row["status"] == "pending" && row["effect"]["id"] == effect.id
+                            });
+                    if !withdrawn {
                         return Err(error);
                     }
                 }

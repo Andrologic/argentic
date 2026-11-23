@@ -2,10 +2,13 @@ use super::*;
 use crate::agsdl_host_flow030::CommitTestHook030;
 use crate::api::OperatorAction as Action;
 
+#[path = "operator_boundary_schedules.rs"]
+mod boundaries;
+
 const WAIT: std::time::Duration = std::time::Duration::from_secs(15);
 
 fn exhaustive() -> bool {
-    std::env::var_os("ARGENTIC_OPERATOR_EXHAUSTIVE").is_some()
+    std::env::var_os("ARGENTIC_OPERATOR_EXHAUSTIVE").as_deref() == Some(std::ffi::OsStr::new("1"))
 }
 
 async fn reached(hook: &CommitTestHook030, name: &str) {

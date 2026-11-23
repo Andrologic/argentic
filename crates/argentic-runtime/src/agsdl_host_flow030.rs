@@ -50,7 +50,7 @@ pub(crate) struct FlowHost030 {
     controls: Mutex<BTreeMap<String, Arc<FlowControl030>>>,
     joined_diagnostics: Mutex<BTreeMap<(String, String, String), JoinedOwnedAgent030>>,
     #[cfg(test)]
-    operator_test_hooks: Mutex<BTreeMap<&'static str, Arc<CommitTestHook030>>>,
+    operator_test_hooks: Mutex<BTreeMap<&'static str, (usize, Arc<CommitTestHook030>)>>,
     #[cfg(test)]
     stop_commit_hooks: Mutex<BTreeMap<String, Arc<CommitTestHook030>>>,
     #[cfg(test)]
@@ -86,6 +86,15 @@ impl FlowWorkCommitMarker030 {
 #[cfg(test)]
 impl FlowHost030 {
     pub(crate) fn install_operator_test_hook(&self, point: &'static str) -> Arc<CommitTestHook030> {
+        self.install_nth_operator_test_hook(point, 1)
+    }
+
+    pub(crate) fn install_nth_operator_test_hook(
+        &self,
+        point: &'static str,
+        occurrence: usize,
+    ) -> Arc<CommitTestHook030> {
+        assert!(occurrence > 0);
         let hook = Arc::new(CommitTestHook030 {
             reached: tokio::sync::Semaphore::new(0),
             proceed: tokio::sync::Semaphore::new(0),
@@ -94,7 +103,7 @@ impl FlowHost030 {
             self.operator_test_hooks
                 .lock()
                 .unwrap()
-                .insert(point, hook.clone())
+                .insert(point, (occurrence, hook.clone()))
                 .is_none(),
             "{point}"
         );
@@ -102,7 +111,17 @@ impl FlowHost030 {
     }
 
     pub(crate) async fn operator_test_yield(&self, point: &'static str) {
-        let hook = self.operator_test_hooks.lock().unwrap().remove(point);
+        let hook = {
+            let mut hooks = self.operator_test_hooks.lock().unwrap();
+            let Some((remaining, _)) = hooks.get_mut(point) else {
+                return;
+            };
+            *remaining -= 1;
+            if *remaining != 0 {
+                return;
+            }
+            hooks.remove(point).map(|(_, hook)| hook)
+        };
         if let Some(hook) = hook {
             hook.reached.add_permits(1);
             hook.proceed.acquire().await.unwrap().forget();
@@ -1314,6 +1333,9 @@ pub(crate) async fn apply_native_event_transaction030(
     runtime.begin_event_commit(event)?;
     #[cfg(test)]
     let point = match &event.kind {
+        FlowEventKind030::Operator(crate::persistence::flow030::OperatorEvent030::Held {
+            ..
+        }) => ["operator.held.commit", "operator.held.ack"],
         FlowEventKind030::Operator(_) => ["operator.commit", "operator.ack"],
         FlowEventKind030::Deliver { .. } => ["delivery.commit", "delivery.ack"],
         _ => ["flow.commit", "flow.ack"],
@@ -3733,9 +3755,18 @@ impl FlowControl030 {
             .ok_or_else(refused)?;
         if activation.start_effect_id.as_deref() != Some(work.start_effect_id.as_str())
             || activation.instance_id != work.agent_instance_id
-            || !view.state.stopping
         {
             return Err(refused());
+        }
+        // Group Stop can release a continuation. Only the live owner may
+        // settle it; cleanup after revocation requires a whole-run Stop.
+        if !view.state.stopping {
+            let live: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM engine_flow030_owners WHERE system_id=? AND invocation_id=? AND owner_epoch=? AND generation=? AND status='live')")
+                .bind(&self.identity.system_start_id).bind(&self.identity.flow_invocation_id)
+                .bind(&self.owner.owner_epoch).bind(&self.generation).fetch_one(&mut *tx).await?;
+            if !live {
+                return Err(refused());
+            }
         }
         let row = sqlx::query("SELECT effect_json,status,owner_epoch FROM engine_flow030_outbox WHERE system_id=? AND invocation_id=? AND effect_id=?")
             .bind(&self.identity.system_start_id).bind(&self.identity.flow_invocation_id).bind(&work.start_effect_id).fetch_one(&mut *tx).await?;

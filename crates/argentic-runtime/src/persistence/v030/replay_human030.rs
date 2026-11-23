@@ -661,13 +661,29 @@ pub(super) async fn verify(
             let fenced_before_delivery = (stop.is_some() || interrupted)
                 && !r.acknowledged
                 && matches!(delivery, "pending" | "reserved");
+            // A terminal approval commits its physical proof before the
+            // clock acknowledges delivery. A restart fences that exact gap
+            // even when the run already has a verdict.
+            let terminal_before_ack = native_owner.get::<&str, _>("status") == "revoked"
+                && r.kind == "approval"
+                && !r.acknowledged
+                && delivery == "reserved"
+                && state.verdict.is_some()
+                && state.events.get(&format!("human:{}:terminal", r.id)).is_some_and(|record| {
+                    serde_json::from_str::<ReadEvent>(&record.event_json).is_ok_and(|ReadEvent(event)| {
+                        matches!(event.kind, FlowEventKind030::WorkResult { work, physical: Some(proof), .. }
+                            if r.works.as_slice() == [work.activation_id.as_str()] && proof.native_receipt_id == r.id
+                                && proof.descendants_joined)
+                    })
+                });
             require(
                 parsed(row, "resolution_json")? == expected
                     && row.get::<&str, _>("revision") == "1"
                     && (resolution["operatorCancelled"] == true
                         || (delivery == "acknowledged" && r.acknowledged)
                         || (delivery == "reserved" && closed_asks.contains(&r.id))
-                        || fenced_before_delivery),
+                        || fenced_before_delivery
+                        || terminal_before_ack),
                 "Resolution/readback differs",
             )?;
             let proof=sqlx::query("SELECT p.resolution_json,e.output_json FROM engine_flow030_human_resolution_proofs p JOIN engine_flow030_clock_events e USING(system_id,invocation_id,event_id) WHERE p.system_id=? AND p.invocation_id=? AND p.request_id=?")

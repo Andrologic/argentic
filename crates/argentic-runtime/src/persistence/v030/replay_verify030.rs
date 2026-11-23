@@ -687,7 +687,8 @@ async fn verify_physical_end(
     let handoff: i64 = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM engine_flow030_handoffs WHERE system_id=? AND invocation_id=? AND effect_id=?)")
         .bind(&id.system_start_id).bind(&id.flow_invocation_id).bind(&work.start_effect_id).fetch_one(&mut *db).await.map_err(storage)?;
     if handoff == 0 {
-        equal("physicalEnded.noAdmission.stopping", &true, &stopping)?;
+        // Replay already matched the physical end against the exact
+        // outstanding StopWork in its prefix, including for group stops.
         equal(
             "physicalEnded.noAdmission.eventId",
             &format!("no-admission:{}", work.start_effect_id),
@@ -696,7 +697,7 @@ async fn verify_physical_end(
         if stop_effect_id.is_none() {
             return Err(mismatch(
                 "physicalEnded.noAdmission.stopEffectId",
-                "StopWork from the native Stop",
+                "StopWork for the unadmitted Start",
                 Value::Null,
             ));
         }
