@@ -811,6 +811,7 @@ impl HumanBroker030 {
         &self,
         db: &mut SqliteConnection,
         before: &FlowState030,
+        event_id: &str,
     ) -> Result<()> {
         let raw: String = sqlx::query_scalar(
             "SELECT state_json FROM engine_flow030_runs WHERE system_id=? AND invocation_id=?",
@@ -838,22 +839,30 @@ impl HumanBroker030 {
         if held.is_empty() && released.is_empty() {
             return Ok(());
         }
-        let requests = sqlx::query("SELECT request_id,work_ids_json FROM engine_flow030_human_requests WHERE system_id=? AND invocation_id=? AND kind='ask' AND resolution_json IS NULL ORDER BY rowid")
+        let requests = sqlx::query("SELECT request_id,work_ids_json,resolution_json FROM engine_flow030_human_requests WHERE system_id=? AND invocation_id=? AND kind='ask' AND delivery='pending' ORDER BY rowid")
             .bind(&self.identity.system_start_id).bind(&self.identity.flow_invocation_id)
             .fetch_all(&mut *db).await?;
         let mut cancel_asks = Vec::new();
+        let mut close_asks = Vec::new();
         for request in requests {
             let works: Vec<String> = serde_json::from_str(request.get("work_ids_json"))?;
             if works.iter().any(|id| held.contains(id)) {
-                cancel_asks.push(request.get::<String, _>("request_id"));
+                let request_id: String = request.get("request_id");
+                if request.get::<Option<&str>, _>("resolution_json").is_some() {
+                    self.reserve_resolution(db, &request_id).await?;
+                    close_asks.push(request_id);
+                } else {
+                    cancel_asks.push(request_id);
+                }
             }
         }
-        self.reserve(
-            db,
-            json!({"kind":"operatorHold","held":held,"released":released,"cancelAsks":cancel_asks}),
-            &self.clock.now_ms().to_string(),
-        )
-        .await
+        let mut event =
+            json!({"kind":"operatorHold","held":held,"released":released,"cancelAsks":cancel_asks});
+        if !close_asks.is_empty() {
+            event["closedAsks"] = json!({"operatorEventId":event_id,"requestIds":close_asks});
+        }
+        self.reserve(db, event, &self.clock.now_ms().to_string())
+            .await
     }
 
     async fn operator_held(&self, db: &mut SqliteConnection, id: &str) -> Result<bool> {
@@ -1185,12 +1194,47 @@ impl HumanBroker030 {
         host: &HostState,
         request_id: &str,
     ) -> Result<ResolvedHumanDecision030> {
+        self.read_resolution(host, request_id, true).await
+    }
+
+    // Action policy lookup can wait. Leave the answer undelivered until the
+    // actual provider write takes admission and reserves it.
+    pub(crate) async fn action_resolution(
+        &self,
+        host: &HostState,
+        request_id: &str,
+    ) -> Result<ResolvedHumanDecision030> {
+        self.read_resolution(host, request_id, false).await
+    }
+
+    async fn read_resolution(
+        &self,
+        host: &HostState,
+        request_id: &str,
+        reserve: bool,
+    ) -> Result<ResolvedHumanDecision030> {
         let lease = host.start_lease().await?;
         let _gate = host.admission_lock().lock_owned().await;
         let mut connection = self.durable_connection().await?;
         let mut tx = connection.begin_with("BEGIN IMMEDIATE").await?;
         self.guard(&mut tx, &lease).await?;
         let row = self.request_row(&mut tx, request_id).await?;
+        if !reserve {
+            require(
+                row.get::<&str, _>("kind") == "ask",
+                "Expected action request",
+            )?;
+            let work_ids: Vec<String> = serde_json::from_str(row.get("work_ids_json"))?;
+            if let [id] = work_ids.as_slice() {
+                if self.operator_held(&mut tx, id).await? {
+                    return Err(failure(
+                        "OPERATOR_HOLD",
+                        "approval",
+                        "The turn is being interrupted",
+                    ));
+                }
+            }
+        }
         let raw: Option<String> = row.get("resolution_json");
         require(
             raw.is_some() && row.get::<&str, _>("delivery") == "pending",
@@ -1207,10 +1251,20 @@ impl HumanBroker030 {
             payload: serde_json::from_str(row.get("payload_json"))?,
             resolution: serde_json::from_str(raw.as_deref().unwrap())?,
         };
-        sqlx::query("UPDATE engine_flow030_human_requests SET delivery='reserved' WHERE system_id=? AND invocation_id=? AND request_id=? AND delivery='pending'")
-            .bind(&self.identity.system_start_id).bind(&self.identity.flow_invocation_id).bind(request_id).execute(&mut *tx).await?;
+        if reserve {
+            self.reserve_resolution(&mut tx, request_id).await?;
+        }
         tx.commit().await?;
         Ok(decision)
+    }
+
+    async fn reserve_resolution(&self, db: &mut SqliteConnection, request_id: &str) -> Result<()> {
+        let update = sqlx::query("UPDATE engine_flow030_human_requests SET delivery='reserved' WHERE system_id=? AND invocation_id=? AND request_id=? AND delivery='pending'")
+            .bind(&self.identity.system_start_id).bind(&self.identity.flow_invocation_id).bind(request_id).execute(db).await?;
+        require(
+            update.rows_affected() == 1,
+            "Resolution is no longer pending",
+        )
     }
     /// Exact protocol answer bytes come from the accepted native submission,
     /// never from the pure closure marker used to resume a question's clocks.
@@ -1302,10 +1356,9 @@ impl HumanBroker030 {
         )?;
         let row = self.request_row(&mut tx, &decision.request_id).await?;
         require(
-            row.get::<&str, _>("delivery") == "reserved"
-                && row.get::<Option<String>, _>("resolution_json").as_deref()
-                    == Some(decision.resolution.to_string().as_str()),
-            "Action decision is stale or already delivered",
+            row.get::<Option<String>, _>("resolution_json").as_deref()
+                == Some(decision.resolution.to_string().as_str()),
+            "Action decision is stale",
         )?;
         if self.operator_held(&mut tx, work.work_id()).await? {
             return Err(failure(
@@ -1314,6 +1367,8 @@ impl HumanBroker030 {
                 "The turn is being interrupted",
             ));
         }
+        self.reserve_resolution(&mut tx, &decision.request_id)
+            .await?;
         tx.commit().await?;
         lease.ensure_live()?;
         deliver(

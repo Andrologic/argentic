@@ -1005,6 +1005,7 @@ impl CodexExecutor030 {
         let mut prompt = mission.to_owned();
         let auto_plan = steer.as_ref().is_some_and(|s| s.auto_plan);
         let mut plan_presented = false;
+        let mut observed_plan = None;
         let mut native_requests = std::collections::BTreeSet::new();
         loop {
             let mut params = json!({"threadId":thread,"input":[{"type":"text","text":prompt,"text_elements":[]}],"permissions":"macro-agsdl","approvalPolicy":approval_policy,"approvalsReviewer":"user","outputSchema":output_schema030(),"additionalContext":additional_context030(resources)});
@@ -1309,7 +1310,11 @@ impl CodexExecutor030 {
                     // the fixed category until a correlated turn receipt ends.
                     continue;
                 }
-                if auto_plan && !plan_presented && method == "turn/plan/updated" {
+                if auto_plan
+                    && !plan_presented
+                    && observed_plan.is_none()
+                    && method == "turn/plan/updated"
+                {
                     if required(params, "threadId")? != thread
                         || required(params, "turnId")? != turn
                     {
@@ -1324,8 +1329,9 @@ impl CodexExecutor030 {
                     if text.trim().is_empty() {
                         return Err(missing("plan"));
                     }
-                    deferred_text.push(json!({"kind":"planPresented","planId":format!("codex:{turn}"),"text":text}));
-                    plan_presented = true;
+                    observed_plan = Some(
+                        json!({"kind":"planPresented","planId":format!("codex:{turn}"),"text":text}),
+                    );
                 }
                 if ["item/completed", "turn/completed"].contains(&method)
                     && required(params, "threadId")? != thread
@@ -1412,6 +1418,21 @@ impl CodexExecutor030 {
             }
             if !current_steer {
                 *current_turn = None;
+            }
+            if let Some(plan) = observed_plan.take() {
+                let receipt = between_turn_event030(
+                    events,
+                    plan,
+                    cancel,
+                    client,
+                    pending_steer,
+                    &thread,
+                    &turn,
+                    &mut steer,
+                )
+                .await?;
+                let decision: Value = serde_json::from_str(&receipt.receipt_json)?;
+                plan_presented = decision["decision"]["kind"] == "planAccepted";
             }
             for body in deferred_text {
                 between_turn_event030(
@@ -1820,6 +1841,9 @@ for line in sys.stdin:
    if envelope.pop('_waitForSteer', False):
     pending_envelope=envelope
     continue
+   if '_plan' in envelope:
+    native_plan=envelope.pop('_plan')
+    print(json.dumps({'method':'turn/plan/updated','params':{'threadId':thread if native_plan!='foreign' else 'another-thread','turnId':'turn'+str(count),'plan':[{'step':'Inspect, then perform the requested work','status':'inProgress'}]}}),flush=True)
    if '_approval' in envelope:
     native=envelope.pop('_approval')
     pending_envelope=envelope; pending_turn='turn'+str(count)
@@ -1827,9 +1851,6 @@ for line in sys.stdin:
     pending_file=native['params']['additionalPermissions']['fileSystem']['write'][0]
     print(json.dumps(native),flush=True)
     continue
-   if '_plan' in envelope:
-    native_plan=envelope.pop('_plan')
-    print(json.dumps({'method':'turn/plan/updated','params':{'threadId':thread if native_plan!='foreign' else 'another-thread','turnId':'turn'+str(count),'plan':[{'step':'Inspect, then perform the requested work','status':'inProgress'}]}}),flush=True)
    print(json.dumps({'method':'item/completed','params':{'threadId':thread,'turnId':'turn'+str(count),'item':{'id':'item'+str(count),'type':'agentMessage','phase':'final_answer','text':json.dumps(envelope)}}}),flush=True)
    print(json.dumps({'method':'turn/completed','params':{'threadId':thread,'turn':{'id':'turn'+str(count),'status':'completed'}}}),flush=True)
    continue

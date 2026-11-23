@@ -117,6 +117,8 @@ pub(super) async fn verify(
         json!({"systemStartId":id.system_start_id,"ownerEpoch":clock.get::<&str,_>("owner_epoch")});
     let mut works = Vec::<Work>::new();
     let mut requests = Vec::<Request>::new();
+    let mut closed_asks = std::collections::BTreeSet::new();
+    let mut operator_closures = std::collections::BTreeSet::new();
     let mut submissions = Vec::<Submission>::new();
     let mut previous = String::new();
     let mut observed = 0u64;
@@ -362,8 +364,53 @@ pub(super) async fn verify(
                 .iter_mut()
                 .find(|r| Some(r.id.as_str()) == event["requestId"].as_str())
                 .ok_or("Ack request absent")?;
-            require(r.resolution.is_some(), "Ack before resolution")?;
+            require(
+                r.resolution.is_some() && !closed_asks.contains(&r.id),
+                "Invalid request acknowledgment",
+            )?;
             r.acknowledged = true;
+        }
+        if kind == "operatorHold" && event.get("closedAsks").is_some() {
+            let closed = &event["closedAsks"];
+            let operator_id = closed["operatorEventId"]
+                .as_str()
+                .ok_or("Missing operator event")?;
+            let event_record = state
+                .events
+                .get(operator_id)
+                .ok_or("Missing operator event record")?;
+            let operator: Value = serde_json::from_str(&event_record.event_json)?;
+            let hold = &operator["kind"]["Operator"];
+            require(
+                operator["eventId"] == operator_id
+                    && operator["identity"] == json!(id)
+                    && operator_closures.insert(operator_id.to_owned()),
+                "Foreign or duplicate operator closure",
+            )?;
+            let affected = rows_json(closed, "requestIds")?;
+            require(!affected.is_empty(), "Missing closed action requests")?;
+            for request_id in affected {
+                let r = requests
+                    .iter()
+                    .find(|r| request_id == r.id)
+                    .ok_or("Unknown closed action request")?;
+                require(
+                    r.kind == "ask"
+                        && r.resolution
+                            .as_ref()
+                            .is_some_and(|value| value["operatorCancelled"] != true)
+                        && !r.acknowledged
+                        && r.works.len() == 1
+                        && rows_json(event, "held")?.contains(&json!(r.works[0]))
+                        && (hold.pointer("/Hold/activation_id") == Some(&json!(r.works[0]))
+                            || hold
+                                .pointer("/Pause/activation_ids")
+                                .and_then(Value::as_array)
+                                .is_some_and(|ids| ids.contains(&json!(r.works[0]))))
+                        && closed_asks.insert(r.id.clone()),
+                    "Invalid action closure",
+                )?;
+            }
         }
         let Some(output) = row.try_get::<Option<&str>, _>("output_json")? else {
             // Verify facts written at reservation above. A fenced Stop can
@@ -505,7 +552,9 @@ pub(super) async fn verify(
                 parsed(row, "resolution_json")? == expected
                     && row.get::<&str, _>("revision") == "1"
                     && (resolution["operatorCancelled"] == true
-                        || (row.get::<&str, _>("delivery") == "acknowledged" && r.acknowledged)),
+                        || (row.get::<&str, _>("delivery") == "acknowledged" && r.acknowledged)
+                        || (row.get::<&str, _>("delivery") == "reserved"
+                            && closed_asks.contains(&r.id))),
                 "Resolution/readback differs",
             )?;
             let proof=sqlx::query("SELECT p.resolution_json,e.output_json FROM engine_flow030_human_resolution_proofs p JOIN engine_flow030_clock_events e USING(system_id,invocation_id,event_id) WHERE p.system_id=? AND p.invocation_id=? AND p.request_id=?")

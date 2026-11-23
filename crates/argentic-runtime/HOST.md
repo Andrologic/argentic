@@ -325,8 +325,11 @@ with `scope`, `requestId` and `action`. The action takes one of these forms.
   The receipt records the request. Display `operatorWorks[activationId].kind`
   as `holding` until Codex confirms the end of the turn, then `held`. The
   activation stays open and retains its machine-time budget, conversation
-  and remaining corrections. An action approval for the interrupted turn
-  closes. Any effects already committed remain in place.
+  and remaining corrections. An observed automatic plan carries over to the
+  continued work. An action approval for the interrupted turn closes. When
+  a person already answered and delivery had yet to begin, the journal
+  retains the answer and records that the turn closed without receiving it.
+  Any effects already committed remain in place.
 - **Resume an agent.** Once held, use `resumeWork` to continue on the same
   Codex thread. A person can also use the existing `deliver` operation on a
   held shared or named instance. A `steer` attempts receipt by the continued

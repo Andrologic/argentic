@@ -462,10 +462,39 @@ impl crate::host::ActionPolicySource for UnusedActionPolicy {
     }
 }
 
+struct WaitingActionPolicy(Arc<Notify>);
+impl crate::host::ActionPolicySource for WaitingActionPolicy {
+    fn lock_current<'a>(
+        &'a self,
+        _: &'a StartCapture030,
+        _: &'a Value,
+    ) -> crate::host::PolicyFuture<'a, crate::host::ActionPolicyLease> {
+        self.0.notify_one();
+        Box::pin(std::future::pending())
+    }
+}
+
 #[tokio::test]
 async fn operator_interrupt_closes_a_codex_tool_approval_without_authorizing_it() {
+    interrupt_codex_ask(false, false).await;
+}
+
+#[tokio::test]
+async fn operator_interrupt_preserves_an_observed_plan_until_the_controller_accepts_it() {
+    interrupt_codex_ask(true, false).await;
+}
+
+#[tokio::test]
+async fn operator_interrupt_journals_an_accepted_answer_closed_before_delivery() {
+    interrupt_codex_ask(false, true).await;
+}
+
+async fn interrupt_codex_ask(auto_plan: bool, answer_first: bool) {
     use crate::api::{OperatorAction as Action, OperatorWorkState};
-    let document = json!({"contract":"agsdl-0.4.0","id":"operator-approval","agents":{"worker":{"harness":"codex","permissions":{"preset":"workspace","reviewer":"person","rules":[{"action":"write","effect":"ask"}]}}},"flow":{"entry":"work","steps":{"work":{"type":"agent","agent":"worker","timeoutMs":1000}}}});
+    let mut document = json!({"contract":"agsdl-0.4.0","id":"operator-approval","agents":{"worker":{"harness":"codex","permissions":{"preset":"workspace","reviewer":"person","rules":[{"action":"write","effect":"ask"}]}}},"flow":{"entry":"work","steps":{"work":{"type":"agent","agent":"worker","timeoutMs":1000}}}});
+    if auto_plan {
+        document["agents"]["worker"]["planFirst"] = json!("auto");
+    }
     let f = Fixture::with_document(document).await;
     approve_fixture_workspace(&f).await;
     let scope = operator_scope(&f).await;
@@ -474,6 +503,9 @@ async fn operator_interrupt_closes_a_codex_tool_approval_without_authorizing_it(
     std::fs::write(&path, "before").unwrap();
     let trace = f._temp.path().join("trace.jsonl");
     let mut result = envelope(json!({"results":{}}));
+    if auto_plan {
+        result["_plan"] = json!("current");
+    }
     result["_approval"] = json!({"method":"item/commandExecution/requestApproval","id":"native-approval","params":{"kind":"command","environmentId":"local","itemId":"command","command":"synthetic command","cwd":root,"additionalPermissions":{"network":null,"fileSystem":{"read":null,"write":[path],"entries":[{"path":{"type":"path","path":path},"access":"write"}]}}}});
     std::fs::write(
         trace.with_extension("jsonl.script"),
@@ -490,11 +522,17 @@ async fn operator_interrupt_closes_a_codex_tool_approval_without_authorizing_it(
     let tasks = StreamTasks::default();
     let registry = f.host.flow030().supervisor_registry();
     registry.reserve(&scope.system_start_id).unwrap();
+    let policy_entered = Arc::new(Notify::new());
+    let policy: Arc<dyn crate::host::ActionPolicySource> = if answer_first {
+        Arc::new(WaitingActionPolicy(policy_entered.clone()))
+    } else {
+        Arc::new(UnusedActionPolicy)
+    };
     let agent = executor(&f, &trace, None).with_approvals(Arc::new(
         crate::agsdl_host_action_approval030::AgentActionHumans030 {
             host: f.host.as_ref().clone(),
             pool: f.pool.clone(),
-            policy: Arc::new(UnusedActionPolicy),
+            policy,
         },
     ));
     start_operator_supervisor(&f, Arc::new(agent), &tasks);
@@ -502,15 +540,51 @@ async fn operator_interrupt_closes_a_codex_tool_approval_without_authorizing_it(
         sqlx::query_as::<_, (String, String)>("SELECT request_id, work_ids_json ->> '$[0]' FROM engine_flow030_human_requests WHERE kind='ask'")
             .fetch_optional(&f.pool).await.unwrap()
     }).await;
-    operator_control(
-        &f,
-        &scope,
-        "hold",
-        Action::InterruptWork {
-            activation_id: activation_id.clone(),
-        },
+    if answer_first {
+        let receipt = f
+            .host
+            .submit_person(
+                &f.pool,
+                crate::api::HumanSubmission {
+                    scope: crate::persistence::public030::HumanScope030 {
+                        system_start_id: scope.system_start_id.clone(),
+                        source: scope.source.clone(),
+                    },
+                    request_id: id.clone(),
+                    expected_revision: "0".into(),
+                    answer: crate::agsdl_host_human030::HumanAnswer030::Decision {
+                        decision: "yes".into(),
+                        comment: "Approved before interruption".into(),
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        let accepted: bool = sqlx::query_scalar(
+            "SELECT accepted FROM engine_flow030_human_submissions WHERE receipt_id=?",
+        )
+        .bind(receipt)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+        assert!(accepted);
+        tokio::time::timeout(std::time::Duration::from_secs(5), policy_entered.notified())
+            .await
+            .unwrap();
+    }
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        operator_control(
+            &f,
+            &scope,
+            "hold",
+            Action::InterruptWork {
+                activation_id: activation_id.clone(),
+            },
+        ),
     )
     .await
+    .unwrap()
     .unwrap();
     operator_wait(async || {
         (operator_view(&f, &scope)
@@ -524,14 +598,17 @@ async fn operator_interrupt_closes_a_codex_tool_approval_without_authorizing_it(
     let resolution: String = sqlx::query_scalar(
         "SELECT resolution_json FROM engine_flow030_human_requests WHERE request_id=?",
     )
-    .bind(id)
+    .bind(&id)
     .fetch_one(&f.pool)
     .await
     .unwrap();
-    assert_eq!(
-        serde_json::from_str::<Value>(&resolution).unwrap()["operatorCancelled"],
-        true
-    );
+    let resolution: Value = serde_json::from_str(&resolution).unwrap();
+    if answer_first {
+        assert_eq!(resolution["reason"], "answer");
+        assert_eq!(resolution["answer"]["decision"], "yes");
+    } else {
+        assert_eq!(resolution["operatorCancelled"], true);
+    }
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "before");
     clock.advance_to(5000).unwrap();
     let broker = f
@@ -572,6 +649,32 @@ async fn operator_interrupt_closes_a_codex_tool_approval_without_authorizing_it(
     )
     .await;
     assert!(replay.ok, "{:?}", replay.divergence);
+    if auto_plan {
+        let plans: Vec<String> = sqlx::query_scalar(
+            "SELECT json_extract(decision_json ->> '$.receiptJson', '$.decision.planId') FROM engine_flow030_work_events
+             WHERE json_extract(decision_json ->> '$.receiptJson', '$.decision.kind')='planAccepted'",
+        ).fetch_all(&f.pool).await.unwrap();
+        assert_eq!(plans, ["codex:turn1"]);
+    }
+    if answer_first {
+        sqlx::query(
+            "UPDATE engine_flow030_human_requests SET delivery='acknowledged' WHERE request_id=?",
+        )
+        .bind(id)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+        let forged = crate::persistence::replay_verify030::verify_path030(
+            &f._temp.path().join("run.db"),
+            &scope.system_start_id,
+            &f.identity.flow_invocation_id,
+        )
+        .await;
+        assert!(
+            !forged.ok,
+            "delivery without an acknowledgment was accepted"
+        );
+    }
 }
 
 #[tokio::test]

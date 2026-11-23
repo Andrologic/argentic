@@ -76,11 +76,10 @@ impl crate::agsdl_host_codex030::approvals::CommandApprovals030 for AgentActionH
                     _ = tokio::time::sleep(Duration::from_millis(25)) => {}
                 }
             }
-            let _operation = broker.operation.lock().await;
             let decision = diagnostics::at(
                 attempt,
                 Stage::BrokerResolution,
-                broker.take_resolution(host, &ticket).await,
+                broker.action_resolution(host, &ticket).await,
             )?;
             if decision.resolution()["operatorCancelled"] == true {
                 return Err(failure(
@@ -102,6 +101,7 @@ impl crate::agsdl_host_codex030::approvals::CommandApprovals030 for AgentActionH
                 self.policy.lock_current(&view.capture, &payload).await,
             )?;
             let allowed = policy.allows();
+            let _operation = broker.operation.lock().await;
             diagnostics::at(
                 attempt,
                 Stage::BrokerDeliver,

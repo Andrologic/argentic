@@ -1280,7 +1280,9 @@ pub(crate) async fn apply_native_event_transaction030(
         .await
         .map_err(store_error)?;
     if let Some((broker, before)) = clock.filter(|_| matches!(result, Apply030::Applied(_))) {
-        broker.reserve_operator_clock(&mut tx, before).await?;
+        broker
+            .reserve_operator_clock(&mut tx, before, &event.event_id)
+            .await?;
     }
     lease.ensure_live()?;
     runtime.begin_event_commit(event)?;

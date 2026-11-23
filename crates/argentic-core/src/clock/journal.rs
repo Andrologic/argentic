@@ -145,13 +145,25 @@ fn event(raw: &Value, expected_owner: &Value, decoder: &impl JsonDecoder) -> Res
             ("comment", b.get("comment").clone()),
         ])
     } else if kind.eq_str("operatorHold") {
-        keys(b, &["kind", "held", "released", "cancelAsks"])?;
-        o([
+        keys(b, &["kind", "held", "released", "cancelAsks", "closedAsks"])?;
+        let mut body = o([
             ("kind", kind.clone()),
             ("held", ids(b.get("held"))?),
             ("released", ids(b.get("released"))?),
             ("cancelAsks", ids(b.get("cancelAsks"))?),
-        ])
+        ]);
+        if b.has("closedAsks") {
+            let closed = b.get("closedAsks");
+            keys(closed, &["operatorEventId", "requestIds"])?;
+            body.set(
+                "closedAsks",
+                o([
+                    ("operatorEventId", id(closed.get("operatorEventId"))?),
+                    ("requestIds", ids(closed.get("requestIds"))?),
+                ]),
+            );
+        }
+        body
     } else if kind.eq_str("tick") {
         keys(b, &["kind"])?;
         o([("kind", kind.clone())])
