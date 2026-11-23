@@ -19,6 +19,17 @@ use sqlx::{Row, SqliteConnection};
 use std::collections::BTreeMap;
 
 type Object = BTreeMap<String, Box<RawValue>>;
+pub(crate) const DEFAULT_MCP_TOOL_MS: u64 = 60_000;
+
+pub(crate) fn remote_mcp_default_timeout(document: &Value, step: &Value) -> Option<String> {
+    if step["type"] != "call" {
+        return None;
+    }
+    let server = step["mcp"]["server"].as_str()?;
+    document["mcpServers"][server]["url"].as_str()?;
+    Some(DEFAULT_MCP_TOOL_MS.to_string())
+}
+
 pub(crate) fn denied(detail: &str) -> EngineFailure {
     failure("CORRELATION", "call", detail)
 }
@@ -453,27 +464,41 @@ impl CallStopCause030 {
             argentic_core::durable_json::positive_integer(timeout).is_some(),
             "Clock timeout budget is not a positive exact integer",
         )?;
-        let declaration: Object = serde_json::from_str(attempt.declaration_json())?;
-        let declared = declaration
-            .get("timeoutMs")
-            .ok_or_else(|| denied("Call has no authored timeoutMs"))?;
-        require(
-            argentic_core::durable_json::equal(declared.get(), timeout)?,
-            "Clock timeout differs from captured call budget",
-        )?;
+        let declaration: Value = serde_json::from_str(attempt.declaration_json())?;
         let capture: String=sqlx::query_scalar("SELECT capture_json FROM engine_start030_requests WHERE system_id=? AND invocation_id=?")
             .bind(&attempt.identity.system_start_id).bind(&attempt.identity.flow_invocation_id).fetch_one(&mut *db).await?;
         let capture: StartCapture030 = serde_json::from_str(&capture)?;
         let plan: FlowPlan030 = serde_json::from_str(&capture.compiled_plan_json)?;
-        let budget = plan
+        let step = plan
             .steps
             .iter()
             .find(|s| s.address == attempt.address())
-            .and_then(|s| s.timeout_ms_json.as_deref())
-            .ok_or_else(|| denied("Captured call has no machine timeout budget"))?;
+            .ok_or_else(|| denied("Captured call step is absent"))?;
+        let budget = match (
+            declaration.get("timeoutMs"),
+            step.timeout_ms_json.as_deref(),
+        ) {
+            (Some(authored), Some(compiled)) => {
+                require(
+                    argentic_core::durable_json::equal(&authored.to_string(), compiled)?,
+                    "Clock budget differs from native compiled admission",
+                )?;
+                compiled.to_owned()
+            }
+            (None, None) => {
+                let document = serde_json::from_str(&plan.document_json)?;
+                remote_mcp_default_timeout(&document, &declaration)
+                    .ok_or_else(|| denied("Captured call has no machine timeout budget"))?
+            }
+            _ => {
+                return Err(denied(
+                    "Clock budget differs from native compiled admission",
+                ))
+            }
+        };
         require(
-            argentic_core::durable_json::equal(budget, timeout)?,
-            "Clock budget differs from native compiled admission",
+            argentic_core::durable_json::equal(&budget, timeout)?,
+            "Clock timeout differs from captured call budget",
         )?;
         let receipt_id: &str = row.get("receipt_id");
         let observed: &str = row.get("observed_ms");

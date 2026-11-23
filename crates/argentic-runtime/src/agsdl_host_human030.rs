@@ -418,6 +418,12 @@ impl HumanBroker030 {
             .map(|s| serde_json::from_str(&s.declaration_json))
             .transpose()?
             .unwrap_or(Value::Null);
+        let timeout = timeout.or_else(|| {
+            crate::persistence::call_protocol030::remote_mcp_default_timeout(
+                &document,
+                &declaration,
+            )
+        });
         let answer_timeout = if let Some(agent) = agent {
             document["agents"][agent]
                 .get("answerTimeoutMs")

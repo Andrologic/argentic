@@ -840,6 +840,10 @@ impl CodexExecutor030 {
         if self.config.codex_auth_file().is_some() {
             external_account_capture(frozen, &profile)?;
         }
+        let authored_budget = plan.steps.iter().any(|step| {
+            Some(&step.address) == work.attempt.work().step.as_ref()
+                && step.timeout_ms_json.is_some()
+        });
         let equipment = mcp::Equipment::start(
             &self.config,
             &work,
@@ -847,6 +851,7 @@ impl CodexExecutor030 {
             &agent,
             &scope,
             read_only,
+            authored_budget,
             self.approvals.clone(),
             &cancel,
         )

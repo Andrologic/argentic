@@ -212,6 +212,10 @@ pub(crate) mod mcp {
         if !authorized {
             return StatusCode::UNAUTHORIZED.into_response();
         }
+        if request["method"].is_null() && request["id"] == "synthetic-form" {
+            assert_eq!(request["result"]["action"], "accept");
+            return StatusCode::ACCEPTED.into_response();
+        }
         let result = match request["method"].as_str().unwrap() {
             "initialize" => {
                 json!({"protocolVersion":"2025-03-26","capabilities":{"tools":{}},"serverInfo":{"name":"fixture","version":"1"}})
@@ -223,6 +227,21 @@ pub(crate) mod mcp {
                 calls.lock().unwrap().push((server.clone(), tool.into()));
                 if tool == "blocked" {
                     std::future::pending::<()>().await;
+                }
+                if tool == "form" {
+                    use futures::StreamExt;
+                    let form = json!({"jsonrpc":"2.0","id":"synthetic-form",
+                        "method":"elicitation/create",
+                        "params":{"message":"Continue?","requestedSchema":{"type":"object"}}
+                    });
+                    let frame = Ok::<_, std::io::Error>(format!("data: {form}\n\n"));
+                    let stream = futures::stream::once(async move { frame })
+                        .chain(futures::stream::pending());
+                    return (
+                        [("content-type", "text/event-stream")],
+                        axum::body::Body::from_stream(stream),
+                    )
+                        .into_response();
                 }
                 if tool == "echo" {
                     json!({"structuredContent":{"secret":FIRST},"content":[]})

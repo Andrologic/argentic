@@ -72,6 +72,8 @@ async fn http_handler(
         return axum::http::StatusCode::ACCEPTED.into_response();
     }
     let result: String = match method {
+        "initialize" if state.mode == "initialize-stall" => std::future::pending().await,
+        "tools/list" if state.mode == "list-stall" => std::future::pending().await,
         "initialize" if state.mode == "legacy-2025-06-18" => {
             r#"{"protocolVersion":"2025-06-18","capabilities":{},"serverInfo":{"name":"synthetic","version":"1"}}"#.into()
         }
@@ -319,6 +321,42 @@ async fn http_exact_receipts_human_waits_modern_continuation_and_no_replay() {
         task.abort();
         let _ = task.await;
     }
+}
+
+#[tokio::test]
+async fn http_mcp_discovery_bounds_initialize_and_tools_list() {
+    async fn assert_deadline(mode: &'static str) {
+        let (server, fixture, task) = http_fixture(mode).await;
+        let mut session = start(server).unwrap();
+        let host = dummy_host();
+        let error = tokio::time::timeout(HTTP_DISCOVERY_TIMEOUT + Duration::from_secs(3), async {
+            session
+                .initialize(host.clone(), &identity(), &host.control)
+                .await?;
+            session
+                .list_tools(host.as_ref(), &identity(), &host.control)
+                .await
+        })
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert_eq!(error.code, "TIMEOUT");
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+        let expected_method = if mode == "initialize-stall" {
+            "initialize"
+        } else {
+            "tools/list"
+        };
+        assert!(fixture.requests.lock().await.iter().any(|body| {
+            serde_json::from_str::<serde_json::Value>(body).unwrap()["method"] == expected_method
+        }));
+        let _ = session.shutdown(false).await;
+        task.abort();
+    }
+    tokio::join!(
+        assert_deadline("initialize-stall"),
+        assert_deadline("list-stall")
+    );
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

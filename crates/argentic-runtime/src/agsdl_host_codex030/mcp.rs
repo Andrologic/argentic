@@ -46,6 +46,7 @@ struct Bridge {
     stop: CancellationToken,
     auth: String,
     work: FlowWorkAttempt030,
+    authored_budget: bool,
     approvals: Option<Arc<dyn CommandApprovals030>>,
     admission: crate::agsdl_host_flow030::operator030::AgentOperator030,
     upstreams: BTreeMap<String, Upstream>,
@@ -66,11 +67,18 @@ impl Equipment {
         agent: &Value,
         scope: &Value,
         read_only: bool,
+        authored_budget: bool,
         approvals: Option<Arc<dyn CommandApprovals030>>,
         cancel: &CancellationToken,
     ) -> Result<Self> {
         let token = uuid::Uuid::new_v4().to_string();
-        let mut state = Bridge::new(work, approvals, cancel, format!("Bearer {token}"));
+        let mut state = Bridge::new(
+            work,
+            authored_budget,
+            approvals,
+            cancel,
+            format!("Bearer {token}"),
+        );
         let result = async {
             for name in agent["mcpServers"].as_array().into_iter().flatten() {
                 let name = name.as_str().ok_or_else(|| {
@@ -296,6 +304,7 @@ impl Upstream {
 impl Bridge {
     fn new(
         work: &AgentWork030,
+        authored_budget: bool,
         approvals: Option<Arc<dyn CommandApprovals030>>,
         cancel: &CancellationToken,
         auth: String,
@@ -304,6 +313,7 @@ impl Bridge {
             stop: cancel.child_token(),
             auth,
             work: work.attempt.clone(),
+            authored_budget,
             approvals,
             admission: work.operator.clone(),
             upstreams: BTreeMap::new(),
@@ -332,16 +342,17 @@ impl Bridge {
         tool: &str,
         args: &str,
         control: &Control,
-    ) -> Result<raw_mcp::PendingToolCall> {
+    ) -> Result<(raw_mcp::PendingToolCall, tokio::time::Instant)> {
         #[cfg(test)]
         self.admission.test_yield("mcp.dispatch.before").await;
+        let started = tokio::time::Instant::now();
         let pending = session
             .dispatch_tool(tool, args, control)
             .await
             .map_err(|error| mcp_error(&error.code, "Cannot deliver the admitted MCP tool call"))?;
         #[cfg(test)]
         self.admission.test_yield("mcp.dispatch.handed_off").await;
-        Ok(pending)
+        Ok((pending, started))
     }
 
     async fn call(&self, upstream: &Upstream, server: &str, params: &Value) -> Option<Value> {
@@ -366,7 +377,7 @@ impl Bridge {
         if session.tool_in_flight() || session.guard_secrets(&arguments_json).is_err() {
             return None;
         }
-        let pending = if *effect == Effect::Ask {
+        let (pending, started) = if *effect == Effect::Ask {
             let approvals = self.approvals.as_ref()?;
             let mut pending = None;
             let dispatched = &mut pending;
@@ -405,10 +416,17 @@ impl Bridge {
         };
         #[cfg(test)]
         self.admission.test_yield("mcp.dispatch.wait").await;
-        let receipt = session
-            .finish_tool_call(pending, &NoHuman, &upstream.identity, &control)
-            .await
-            .ok()?;
+        let result = session.finish_tool_call(pending, &NoHuman, &upstream.identity, &control);
+        let receipt = if self.authored_budget {
+            result.await
+        } else {
+            let budget =
+                Duration::from_millis(crate::persistence::call_protocol030::DEFAULT_MCP_TOOL_MS);
+            tokio::time::timeout_at(started + budget, result)
+                .await
+                .ok()?
+        }
+        .ok()?;
         serde_json::from_str(&receipt.raw_result_json).ok()
     }
 }
@@ -502,7 +520,7 @@ pub(crate) async fn call_test_session(
     cancel: &CancellationToken,
     session: raw_mcp::Session,
 ) -> Result<Option<Value>> {
-    let mut state = Bridge::new(work, Some(approvals), cancel, String::new());
+    let mut state = Bridge::new(work, false, Some(approvals), cancel, String::new());
     let mut upstream = Upstream::new(session, &work.attempt);
     upstream
         .tools

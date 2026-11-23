@@ -41,6 +41,7 @@ pub(super) async fn verify(
     plan: &FlowPlan030,
 ) -> Result<HumanProjection030> {
     let id = &state.identity;
+    let mut document = None;
     let exists: i64 = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='engine_flow030_clock')",
     )
@@ -259,7 +260,22 @@ pub(super) async fn verify(
                     None => return Err("Clock work has no captured declaration".into()),
                 };
                 let work_kind = step.map(|s| s.r#type.as_str()).unwrap_or("agent");
-                let timeout = step.and_then(|s| s.timeout_ms_json.clone());
+                let declaration: Value = step
+                    .map(|s| serde_json::from_str(&s.declaration_json))
+                    .transpose()?
+                    .unwrap_or(Value::Null);
+
+                let recorded_timeout: Option<String> = r.get("timeout_json");
+                let mut timeout = step.and_then(|s| s.timeout_ms_json.clone());
+                if work_kind == "call" && timeout.is_none() && recorded_timeout.is_some() {
+                    if document.is_none() {
+                        document = Some(serde_json::from_str(&plan.document_json)?);
+                    }
+                    timeout = crate::persistence::call_protocol030::remote_mcp_default_timeout(
+                        document.as_ref().expect("parsed call document"),
+                        &declaration,
+                    );
+                }
                 require(
                     r.get::<&str, _>("owner_epoch") == clock.get::<&str, _>("owner_epoch")
                         && r.get::<&str, _>("generation") == clock.get::<&str, _>("generation")
@@ -274,7 +290,7 @@ pub(super) async fn verify(
                     activation.start_effect_id.as_deref() == Some(start)
                         && work["reference"]
                             == json!({"activationId":activation.id,"startEffectId":start,"agentInstanceId":activation.instance_id})
-                        && r.get::<Option<String>, _>("timeout_json") == timeout,
+                        && recorded_timeout == timeout,
                     "Clock work reference/duration",
                 )?;
                 let origin=sqlx::query("SELECT started_ms FROM engine_flow030_handoff_clock WHERE system_id=? AND invocation_id=? AND start_effect_id=? AND owner_epoch=? AND generation=?")
@@ -286,10 +302,6 @@ pub(super) async fn verify(
                         && event["timeoutMs"] == json!(timeout),
                     "Clock origin/duration",
                 )?;
-                let declaration: Value = step
-                    .map(|s| serde_json::from_str(&s.declaration_json))
-                    .transpose()?
-                    .unwrap_or(Value::Null);
                 require(
                     (kind == "approval") == (work_kind == "approval"),
                     "Clock admission kind differs",
@@ -327,7 +339,7 @@ pub(super) async fn verify(
                     id: work_id.into(),
                     kind: work_kind.into(),
                     start: ms(started)?,
-                    timeout: r.get("timeout_json"),
+                    timeout: recorded_timeout,
                     answer_timeout: r.get("answer_timeout_json"),
                     snapshot: json!({}),
                     retired: false,

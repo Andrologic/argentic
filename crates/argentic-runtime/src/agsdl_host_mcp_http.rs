@@ -72,7 +72,9 @@ impl RemoteMcp {
                 let resolved = tokio::select! {
                     biased;
                     error = control.cancelled() => return Err(error),
-                    result = tokio::net::lookup_host((domain, port)) => result,
+                    result = tokio::time::timeout(raw_mcp::HTTP_CONNECT_TIMEOUT, tokio::net::lookup_host((domain, port))) => {
+                        result.map_err(|_| CallError::new("MCP_ENDPOINT_UNAVAILABLE", "MCP endpoint resolution timed out"))?
+                    },
                 }
                 .map_err(|_| {
                     CallError::new(

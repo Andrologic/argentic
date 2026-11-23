@@ -847,14 +847,26 @@ async fn native_http_mcp_isolates_server_secrets_and_rejects_echoes_before_persi
 #[cfg(unix)]
 #[tokio::test]
 async fn native_http_mcp_stop_leaves_unconfirmed_tool_in_stopping_state() {
+    remote_mcp_unconfirmed(false).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn native_http_mcp_default_deadline_pauses_for_forms() {
+    remote_mcp_unconfirmed(true).await;
+}
+
+#[cfg(unix)]
+async fn remote_mcp_unconfirmed(expire: bool) {
     use crate::test_context::mcp::*;
     let peer = Peer::start().await;
     let project = tempfile::tempdir().unwrap();
+    let tool = if expire { "form" } else { "blocked" };
     let doc = json!({
         "projectFormat":"agsdl-project-1","contract":"agsdl-0.4.0","id":"stop-remote","agents":{},
         "mcpServers":peer.servers(),"secrets":{"file":"requirements.json"},
         "flow":{"entry":"first","steps":{
-            "first":{"type":"call","mcp":{"server":"first","tool":"blocked"},"onError":"after","next":"after"},
+            "first":{"type":"call","mcp":{"server":"first","tool":tool},"onError":"after","next":"after"},
             "after":{"type":"call","mcp":{"server":"second","tool":"check"}}
         }}
     });
@@ -862,13 +874,31 @@ async fn native_http_mcp_stop_leaves_unconfirmed_tool_in_stopping_state() {
     std::fs::write(project.path().join("requirements.json"), REQUIREMENTS).unwrap();
     let f = Fixture::new_with_project(r#"{"entry":{},"timeline":[]}"#, false, Some(project.path()))
         .await;
+    let clock = if expire {
+        Some(
+            f.host
+                .flow030()
+                .human_runtime()
+                .virtual_clock()
+                .await
+                .unwrap(),
+        )
+    } else {
+        None
+    };
     let config = peer.configure(f.config.clone());
     let tasks = start_calls(
         &f,
         config.clone(),
         Arc::new(crate::agsdl_host_call_executor030::NativeCallTransport030 {
             config,
-            humans: None,
+            humans: expire.then(|| {
+                Arc::new(crate::agsdl_host_human_executor030::CallHumans030 {
+                    app: f.host.clone(),
+                    pool: f.pool.clone(),
+                    identity: f.identity.clone(),
+                }) as Arc<dyn crate::agsdl_host_calls::HostPort>
+            }),
         }),
     );
     tokio::time::timeout(std::time::Duration::from_secs(10), async {
@@ -878,18 +908,98 @@ async fn native_http_mcp_stop_leaves_unconfirmed_tool_in_stopping_state() {
     })
     .await
     .unwrap();
-    crate::agsdl_host_stop030::request(
-        f.host.flow030(),
-        &f.pool,
-        &tasks,
-        &crate::persistence::dto::EngineStopRequest {
-            system_start_id: f.owner.system_start_id.clone(),
-            request_id: "stop-remote".into(),
-            activation_id: None,
-        },
-    )
-    .await
-    .unwrap();
+    if let Some(clock) = clock {
+        let budget = crate::persistence::call_protocol030::DEFAULT_MCP_TOOL_MS;
+        let recorded: String = sqlx::query_scalar(
+            "SELECT timeout_json FROM engine_flow030_clock_works WHERE kind='call'",
+        )
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+        assert_eq!(recorded, budget.to_string());
+        let request =
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                loop {
+                    if let Some(request) = sqlx::query_scalar::<_, String>(
+                    "SELECT request_id FROM engine_flow030_human_requests WHERE kind='question'",
+                ).fetch_optional(&f.pool).await.unwrap() {
+                    break request;
+                }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+        let broker = f
+            .host
+            .flow030()
+            .humans
+            .broker(&f.host, &f.pool, &f.identity)
+            .await
+            .unwrap();
+        {
+            let _operation = broker.operation.lock().await;
+            clock.advance_to(budget + 1).unwrap();
+            broker.tick(&f.host).await.unwrap();
+            broker
+                .pump(&f.host, &CancellationToken::new())
+                .await
+                .unwrap();
+            assert!(broker.timeout_controls().await.unwrap().is_empty());
+        }
+        f.host
+            .submit_person(
+                &f.pool,
+                crate::api::HumanSubmission {
+                    scope: crate::persistence::public030::HumanScope030 {
+                        system_start_id: f.identity.system_start_id.clone(),
+                        source: serde_json::from_value(f.plan.source.clone()).unwrap(),
+                    },
+                    request_id: request.clone(),
+                    expected_revision: "0".into(),
+                    answer: crate::api::HumanAnswer030::Question {
+                        answer_json: r#"{"action":"accept","content":{}}"#.into(),
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let delivery: String = sqlx::query_scalar(
+                    "SELECT delivery FROM engine_flow030_human_requests WHERE request_id=?",
+                )
+                .bind(&request)
+                .fetch_one(&f.pool)
+                .await
+                .unwrap();
+                if delivery == "acknowledged" {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        clock.advance_to(2 * budget + 2).unwrap();
+        f.host
+            .flow030()
+            .supervisors
+            .wake(&f.identity.system_start_id);
+    } else {
+        crate::agsdl_host_stop030::request(
+            f.host.flow030(),
+            &f.pool,
+            &tasks,
+            &crate::persistence::dto::EngineStopRequest {
+                system_start_id: f.owner.system_start_id.clone(),
+                request_id: "stop-remote".into(),
+                activation_id: None,
+            },
+        )
+        .await
+        .unwrap();
+    }
     let error = tokio::time::timeout(
         std::time::Duration::from_secs(10),
         f.host.flow030().supervisors.wait(&f.owner.system_start_id),
@@ -911,10 +1021,27 @@ async fn native_http_mcp_stop_leaves_unconfirmed_tool_in_stopping_state() {
         )
         .await
         .unwrap();
-    assert!(projection.stopping);
+    assert_eq!(projection.stopping, !expire);
     assert!(projection.termination_uncertain);
-    assert!(projection.verdict.is_none());
-    assert_eq!(peer.calls(), [("first".into(), "blocked".into())]);
+    assert_eq!(
+        projection.verdict.as_deref(),
+        expire.then_some("interrupted")
+    );
+    assert_eq!(peer.calls(), [("first".into(), tool.into())]);
+    if expire {
+        let reason: String = sqlx::query_scalar("SELECT reason FROM engine_flow030_clock_controls")
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+        assert_eq!(reason, "TIMEOUT");
+        let replay = crate::persistence::replay_verify030::verify_path030(
+            &f._temp.path().join("run.db"),
+            &f.identity.system_start_id,
+            &f.identity.flow_invocation_id,
+        )
+        .await;
+        assert!(replay.ok, "{:?}", replay.divergence);
+    }
     f.pool.close().await;
     assert_no_secrets(&f._temp.path().join("run.db"));
 }

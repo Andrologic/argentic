@@ -2,6 +2,8 @@
 //! their formatting, connection selection and timeout behavior unchanged.
 //! Raw JSON tokens never pass through a floating-point representation.
 pub(crate) const MAX_MCP_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const HTTP_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
 const TOOL_HANDOFF_TIMEOUT: Duration = Duration::from_secs(5);
 const HTTP_SESSION_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -443,6 +445,7 @@ fn start_with_stdio(
                 address.set_port(0);
             }
             let client = reqwest::Client::builder()
+                .connect_timeout(HTTP_CONNECT_TIMEOUT)
                 .no_proxy()
                 .redirect(reqwest::redirect::Policy::none())
                 .retry(reqwest::retry::never())
@@ -509,8 +512,31 @@ pub(crate) fn can_set_header(name: &reqwest::header::HeaderName) -> bool {
         )
 }
 
+async fn discovery<T>(
+    remote: bool,
+    operation: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    if remote {
+        tokio::time::timeout(HTTP_DISCOVERY_TIMEOUT, operation)
+            .await
+            .map_err(|_| CallError::new("TIMEOUT", "MCP discovery timed out"))?
+    } else {
+        operation.await
+    }
+}
+
 impl Session {
     pub(crate) async fn initialize(
+        &mut self,
+        host: std::sync::Arc<dyn HostPort>,
+        identity: &CallIdentity,
+        control: &Control,
+    ) -> Result<()> {
+        let remote = self.is_remote();
+        discovery(remote, self.initialize_session(host, identity, control)).await
+    }
+
+    async fn initialize_session(
         &mut self,
         host: std::sync::Arc<dyn HostPort>,
         identity: &CallIdentity,
@@ -631,6 +657,16 @@ impl Session {
     }
 
     pub(crate) async fn list_tools(
+        &mut self,
+        host: &dyn HostPort,
+        identity: &CallIdentity,
+        control: &Control,
+    ) -> Result<Vec<serde_json::Value>> {
+        let remote = self.is_remote();
+        discovery(remote, self.list_tool_pages(host, identity, control)).await
+    }
+
+    async fn list_tool_pages(
         &mut self,
         host: &dyn HostPort,
         identity: &CallIdentity,
