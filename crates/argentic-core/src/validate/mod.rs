@@ -14,7 +14,7 @@ pub(crate) mod permissions;
 
 use super::{
     exact::{
-        quote,
+        quote, quote_to,
         scan::array_index,
         values::{compare_decimals, decimal_v030, is_integer_number, Num},
         Object, Value,
@@ -30,7 +30,10 @@ use super::{
 };
 use crate::{
     calculation::Failure,
-    resource::{excerpt, number_excerpt, value_excerpt, MAX_DIAGNOSTICS, MAX_DIAGNOSTIC_BYTES},
+    resource::{
+        encode_string, excerpt, number_excerpt, quoted_bytes, value_excerpt,
+        DIAGNOSTIC_LIMIT_MESSAGE, MAX_DIAGNOSTICS, MAX_DIAGNOSTIC_BYTES,
+    },
     SourceBudget,
 };
 use std::{
@@ -177,6 +180,9 @@ pub(crate) struct ReportJoin {
 }
 
 const MAX_MESSAGE_BYTES: usize = 2048;
+// Keep room for the report envelope and the final limit diagnostic.
+const REPORT_RESERVE: usize = 4608;
+const DIAGNOSTIC_OVERHEAD: usize = 64;
 /// The JS `Report`.
 #[derive(Default)]
 pub(crate) struct Report {
@@ -222,7 +228,12 @@ impl Report {
             let end = message.floor_char_boundary(MAX_MESSAGE_BYTES - '…'.len_utf8());
             message.truncate(end);
             message.push('…');
-            message.shrink_to_fit();
+        }
+        let text_bytes =
+            path.len() + message.len() + step.iter().flatten().map(String::len).sum::<usize>();
+        if let Err(error) = self.budget.work(text_bytes.div_ceil(8) + 1, &path) {
+            self.limit(path, error.message);
+            return;
         }
         let key = self.hash.hash_one((severity, code, &path, &message));
         if self.seen.get(&key).is_some_and(|indices| {
@@ -238,24 +249,27 @@ impl Report {
         }) {
             return;
         }
-        let bytes = path.len()
-            + message.len()
-            + step.iter().flatten().map(|s| s.len() + 24).sum::<usize>()
-            + 128;
+        let encoded = DIAGNOSTIC_OVERHEAD
+            + code.len()
+            + severity.len()
+            + quoted_bytes(&path)
+            + quoted_bytes(&message)
+            + step
+                .iter()
+                .flatten()
+                .map(|item| quoted_bytes(item) + 1)
+                .sum::<usize>();
         if self.diagnostics.len() >= MAX_DIAGNOSTICS
-            || bytes > MAX_DIAGNOSTIC_BYTES - self.diagnostic_bytes
+            || encoded > MAX_DIAGNOSTIC_BYTES - REPORT_RESERVE - self.diagnostic_bytes
         {
-            self.limit(
-                path,
-                "Maximum validation diagnostic count or bytes exceeded.".into(),
-            );
+            self.limit(path, DIAGNOSTIC_LIMIT_MESSAGE.into());
             return;
         }
-        if let Err(error) = self.budget.bytes(bytes, &path) {
+        if let Err(error) = self.budget.bytes(text_bytes + encoded * 2 + 160, &path) {
             self.limit(path, error.message);
             return;
         }
-        self.diagnostic_bytes += bytes;
+        self.diagnostic_bytes += encoded;
         self.seen
             .entry(key)
             .or_default()
@@ -269,8 +283,16 @@ impl Report {
         });
     }
 
-    fn limit(&mut self, path: String, message: String) {
+    fn limit(&mut self, mut path: String, message: String) {
+        if self.limited {
+            return;
+        }
         self.limited = true;
+        // Keep an ancestor pointer if a path alone would exceed the reserve.
+        if quoted_bytes(&path) > 4096 {
+            let end = path.floor_char_boundary(680);
+            path.truncate(path[..end].rfind('/').unwrap_or(0));
+        }
         self.diagnostics.push(Diagnostic {
             severity: "error",
             code: GRAPH_LIMIT_CODE,
@@ -308,6 +330,36 @@ impl Report {
         self.add("error", code, path.to_owned(), message, None);
     }
 
+    fn value_problem(
+        &mut self,
+        code: &'static str,
+        at: &str,
+        make: &dyn Fn() -> String,
+    ) -> Result<(), OutsideShape> {
+        if !self.limited {
+            let minimum = DIAGNOSTIC_OVERHEAD + quoted_bytes(at);
+            if self.diagnostics.len() >= MAX_DIAGNOSTICS
+                || minimum > MAX_DIAGNOSTIC_BYTES - REPORT_RESERVE - self.diagnostic_bytes
+            {
+                self.limit(at.into(), DIAGNOSTIC_LIMIT_MESSAGE.into());
+            } else if let Err(error) = self.budget.bytes(at.len() + 2048, at) {
+                self.limit(at.into(), error.message);
+            } else {
+                self.error_at(code, at, make());
+            }
+        }
+        if self.limited {
+            let diagnostic = self.diagnostics.last().expect("limit diagnostic");
+            return Err(Failure {
+                code: GRAPH_LIMIT_CODE.into(),
+                pointer: diagnostic.path.clone(),
+                message: diagnostic.message.clone(),
+            }
+            .into());
+        }
+        Ok(())
+    }
+
     /// `report.valid`.
     pub(crate) fn valid(&self) -> bool {
         !self.diagnostics.iter().any(|item| item.severity == "error")
@@ -315,59 +367,77 @@ impl Report {
 
     /// `JSON.stringify(report.as_json())`. `joins` is an ordinary JS object:
     /// array-index names first, ascending, then insertion order.
+    #[cfg(test)]
     pub(crate) fn to_json(&self) -> String {
-        let mut out = format!(
-            "{{\"contract\":{},\"valid\":{},\"diagnostics\":[",
-            quote(if self.current_edition {
-                crate::argentic_core::AGSDL_040
-            } else {
-                CONTRACT
-            }),
-            self.valid()
-        );
-        for (index, item) in self.diagnostics.iter().enumerate() {
-            if index > 0 {
-                out.push(',');
-            }
-            out.push_str(&format!(
-                "{{\"severity\":{},\"code\":{},\"path\":{},\"message\":{}",
-                quote(item.severity),
-                quote(item.code),
-                quote(&item.path),
-                quote(&item.message)
-            ));
-            if let Some(step) = &item.step {
-                out.push_str(",\"step\":");
-                out.push_str(&string_array(step));
-            }
-            out.push('}');
-        }
-        out.push_str("],\"joins\":{");
-        let mut names: Vec<&String> = self.joins.keys().collect();
-        let (mut indexed, named): (Vec<&String>, Vec<&String>) = names
-            .drain(..)
+        self.to_json_with_budget(&SourceBudget::default())
+            .expect("test report within budget")
+    }
+
+    pub(crate) fn to_json_with_budget(&self, budget: &SourceBudget) -> Result<String, Failure> {
+        budget.work(self.joins.len() * 16, "/flow")?;
+        budget.bytes(self.joins.len() * 40, "/flow")?;
+        let (mut indexed, named): (Vec<_>, Vec<_>) = self
+            .joins
+            .keys()
             .partition(|name| array_index(name).is_some());
         indexed.sort_by_key(|name| array_index(name));
-        for (index, name) in indexed.into_iter().chain(named).enumerate() {
-            if index > 0 {
-                out.push(',');
+        Ok(encode_string(budget, usize::MAX, "", |out| {
+            write!(
+                out,
+                "{{\"contract\":\"{}\",\"valid\":{},\"diagnostics\":[",
+                if self.current_edition {
+                    crate::argentic_core::AGSDL_040
+                } else {
+                    CONTRACT
+                },
+                self.valid()
+            )?;
+            for (index, item) in self.diagnostics.iter().enumerate() {
+                if index > 0 {
+                    out.write_char(',')?;
+                }
+                write!(
+                    out,
+                    "{{\"severity\":\"{}\",\"code\":\"{}\",\"path\":",
+                    item.severity, item.code
+                )?;
+                quote_to(out, &item.path)?;
+                out.write_str(",\"message\":")?;
+                quote_to(out, &item.message)?;
+                if let Some(step) = &item.step {
+                    out.write_str(",\"step\":")?;
+                    write_string_array(out, step)?;
+                }
+                out.write_char('}')?;
             }
-            let join = self.joins.get(name).expect("join name");
-            out.push_str(&format!(
-                "{}:{{\"origin\":{},\"branches\":{}}}",
-                quote(name),
-                quote(&join.origin),
-                string_array(&join.branches)
-            ));
-        }
-        out.push_str("}}");
-        out
+            out.write_str("],\"joins\":{")?;
+            for (index, name) in indexed.iter().chain(&named).enumerate() {
+                if index > 0 {
+                    out.write_char(',')?;
+                }
+                let join = self.joins.get(*name).expect("join name");
+                quote_to(out, name)?;
+                out.write_str(":{\"origin\":")?;
+                quote_to(out, &join.origin)?;
+                out.write_str(",\"branches\":")?;
+                write_string_array(out, &join.branches)?;
+                out.write_char('}')?;
+            }
+            out.write_str("}}")
+        })?
+        .expect("unlimited report writer"))
     }
 }
 
-fn string_array(values: &[String]) -> String {
-    let items: Vec<String> = values.iter().map(|value| quote(value)).collect();
-    format!("[{}]", items.join(","))
+fn write_string_array(out: &mut dyn std::fmt::Write, values: &[String]) -> std::fmt::Result {
+    out.write_char('[')?;
+    for (i, value) in values.iter().enumerate() {
+        if i > 0 {
+            out.write_char(',')?;
+        }
+        quote_to(out, value)?;
+    }
+    out.write_char(']')
 }
 
 /// `check_module(module)`: the module itself, or the first problem.
@@ -1510,13 +1580,13 @@ impl<'a, 'r> Checker<'a, 'r> {
                             format!("a schema needs a JSON media type, not {media}"),
                         );
                     }
-                    for (pointer, message) in valueschema::consistency_with_budget(
+                    let budget = self.report.budget.clone();
+                    valueschema::check_consistency(
                         schema,
                         &with(&at, [key("schema")]),
-                        &self.report.budget,
-                    )? {
-                        self.report.error_at("SCHEMA", &pointer, message);
-                    }
+                        &budget,
+                        &mut |at, make| self.report.value_problem("SCHEMA", at, make),
+                    )?;
                 }
             }
             let permissions = agent.get("permissions");
@@ -2255,7 +2325,9 @@ impl<'a, 'r> Checker<'a, 'r> {
                     ));
                 }
                 if let Some(schema) = member(Some(result), "schema") {
-                    if let Descent::Refused(reason) = valueschema::descend_checked(schema, rest)? {
+                    if let Descent::Refused(reason) =
+                        valueschema::descend_checked(schema, rest, &self.report.budget, "/flow")?
+                    {
                         return say(reason);
                     }
                 }
@@ -2336,7 +2408,12 @@ impl<'a, 'r> Checker<'a, 'r> {
                 }
                 if self.report.current_edition && part_is(path.get(1), "comments") {
                     return Ok(Done(
-                        match valueschema::descend_checked(approval_comments(), &path[2..])? {
+                        match valueschema::descend_checked(
+                            approval_comments(),
+                            &path[2..],
+                            &self.report.budget,
+                            "/flow",
+                        )? {
                             Descent::Refused(reason) => Some(reason),
                             _ => None,
                         },
@@ -2613,7 +2690,12 @@ impl<'a, 'r> Checker<'a, 'r> {
                     return kind("string");
                 }
                 match member(Some(result), "schema") {
-                    Some(schema) => Ok(valueschema::kind_at_checked(schema, &path[2..])?),
+                    Some(schema) => Ok(valueschema::kind_at_checked(
+                        schema,
+                        &path[2..],
+                        &self.report.budget,
+                        "/flow",
+                    )?),
                     None => Ok(None),
                 }
             }
@@ -2655,6 +2737,8 @@ impl<'a, 'r> Checker<'a, 'r> {
                     return Ok(valueschema::kind_at_checked(
                         approval_comments(),
                         &path[2..],
+                        &self.report.budget,
+                        "/flow",
                     )?);
                 }
                 Ok(None)
@@ -3178,6 +3262,9 @@ impl<'a, 'r> Checker<'a, 'r> {
                 used.push(("delivery.steer".to_owned(), parts.clone()));
             }
             for (property, at) in &used {
+                if self.report.limited {
+                    return Ok(());
+                }
                 self.check_property(module, harness, property, at, agent)?;
             }
             self.check_permissions(module, harness, agent, &parts)?;
@@ -3190,14 +3277,14 @@ impl<'a, 'r> Checker<'a, 'r> {
                         format!("module '{harness}' declares no settings"),
                     ),
                     Some(settings) => {
-                        for (pointer, message) in valueschema::validate_with_budget(
+                        let budget = self.report.budget.clone();
+                        valueschema::check_value(
                             settings_value,
                             settings,
                             &at,
-                            &self.report.budget,
-                        )? {
-                            self.report.error_at("HARNESS_SETTINGS", &pointer, message);
-                        }
+                            &budget,
+                            &mut |at, make| self.report.value_problem("HARNESS_SETTINGS", at, make),
+                        )?;
                     }
                 }
             }
@@ -3223,8 +3310,16 @@ impl<'a, 'r> Checker<'a, 'r> {
             )?,
         };
         let note = match member(entry, "note") {
-            Some(note) if truthy(note) => format!(" {}", text(note, "note")?),
-            _ => String::new(),
+            Some(note) if truthy(note) => text(note, "note")?,
+            _ => "",
+        };
+        // Retain the same truncated message prefix without cloning the full
+        // module note on every agent that uses this property.
+        let note = if note.is_empty() {
+            String::new()
+        } else {
+            let end = note.floor_char_boundary(note.len().min(MAX_MESSAGE_BYTES));
+            format!(" {}", &note[..end])
         };
         let label = property.replace('.', " ");
         if support == "absent" {
@@ -3249,10 +3344,10 @@ impl<'a, 'r> Checker<'a, 'r> {
                 "warning",
                 "HARNESS_VERSION",
                 path_pointer(at),
-                format!(
-                    "{harness} supports {label} only for versions {}.",
-                    text(versions, "versions")?
-                ),
+                format!("{harness} supports {label} only for versions {}.", {
+                    let versions = text(versions, "versions")?;
+                    &versions[..versions.floor_char_boundary(versions.len().min(MAX_MESSAGE_BYTES))]
+                }),
                 None,
             );
         }
@@ -3262,22 +3357,43 @@ impl<'a, 'r> Checker<'a, 'r> {
                     return internal("support values are not an array");
                 };
                 let effort = required(object(required(agent, "model")?, "model")?, "effort")?;
+                let at_ptr = path_pointer(at);
+                let effort_bytes = effort.as_str().map_or(0, str::len);
+                self.report.budget.work(
+                    values
+                        .iter()
+                        .map(|value| {
+                            1 + value
+                                .as_str()
+                                .map_or(0, str::len)
+                                .min(effort_bytes)
+                                .div_ceil(8)
+                        })
+                        .sum(),
+                    &at_ptr,
+                )?;
                 let accepted = values
                     .iter()
                     .any(|value| matches!((value, effort), (Value::String(a), Value::String(b)) if a == b));
                 if !accepted {
-                    let mut shown = Vec::with_capacity(values.len());
+                    let mut shown = String::new();
                     for value in values {
-                        shown.push(text(value, "support value")?.to_owned());
+                        if !shown.is_empty() {
+                            shown.push_str(", ");
+                        }
+                        let value = text(value, "support value")?;
+                        let remaining = MAX_MESSAGE_BYTES.saturating_sub(shown.len());
+                        shown.push_str(
+                            &value[..value.floor_char_boundary(value.len().min(remaining))],
+                        );
+                        if shown.len() + 4 >= MAX_MESSAGE_BYTES {
+                            break;
+                        }
                     }
                     self.report.error(
                         "HARNESS_VALUE",
                         at,
-                        format!(
-                            "{harness} accepts {}; got {}",
-                            shown.join(", "),
-                            repr_value(effort)
-                        ),
+                        format!("{harness} accepts {}; got {}", shown, repr_value(effort)),
                     );
                 }
             }

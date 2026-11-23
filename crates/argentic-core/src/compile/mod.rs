@@ -26,25 +26,5 @@ fn encode(
     max: usize,
     write: impl Fn(&mut dyn std::fmt::Write) -> std::fmt::Result,
 ) -> Result<Option<String>, crate::native::Error> {
-    struct Count(usize, usize);
-    impl std::fmt::Write for Count {
-        fn write_str(&mut self, text: &str) -> std::fmt::Result {
-            if text.len() > self.1 - self.0 {
-                return Err(std::fmt::Error);
-            }
-            self.0 += text.len();
-            Ok(())
-        }
-    }
-    let mut count = Count(0, max);
-    if write(&mut count).is_err() {
-        return Ok(None);
-    }
-    budget
-        .work(count.0.div_ceil(8), "/flow")
-        .map_err(limit_error)?;
-    budget.bytes(count.0, "/flow").map_err(limit_error)?;
-    let mut result = String::with_capacity(count.0);
-    write(&mut result).expect("writing to a String");
-    Ok(Some(result))
+    crate::resource::encode_string(budget, max, "/flow", write).map_err(limit_error)
 }

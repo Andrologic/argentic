@@ -75,54 +75,55 @@ fn optional(v: Option<&E>) -> Result<&Object> {
         v => Ok(exact::record(v, "")?),
     }
 }
-enum JsonWriter {
+enum JsonWriter<'a> {
     Count {
-        bytes: usize,
-        units: usize,
-        max: usize,
+        count: crate::resource::EncodeCount<crate::graph::Unshaped>,
+        budget: &'a ExpansionBudget,
+        composition: Option<&'a str>,
     },
     Text(Vec<u16>),
 }
 
-impl fmt::Write for JsonWriter {
+impl fmt::Write for JsonWriter<'_> {
     fn write_str(&mut self, text: &str) -> fmt::Result {
         match self {
-            Self::Count { bytes, units, max } => {
-                if text.len() > *max - *bytes {
-                    return Err(fmt::Error);
-                }
-                *bytes += text.len();
-                *units += if text.is_ascii() {
-                    text.len()
-                } else {
-                    text.encode_utf16().count()
-                };
+            Self::Count {
+                count,
+                budget,
+                composition,
+            } => count.write(text, true, |work| budget.work(work, *composition)),
+            Self::Text(output) => {
+                output.extend(text.encode_utf16());
+                Ok(())
             }
-            Self::Text(output) => output.extend(text.encode_utf16()),
         }
-        Ok(())
     }
 }
 
 fn budgeted_json(
     budget: &mut ExpansionBudget,
     composition: Option<&str>,
-    write: impl Fn(&mut JsonWriter) -> fmt::Result,
+    write: impl Fn(&mut JsonWriter<'_>) -> fmt::Result,
 ) -> Result<Value> {
-    // Reserve the serialized byte length, then write directly into the plan's
-    // native UTF-16 representation.
     let mut output = JsonWriter::Count {
-        bytes: 0,
-        units: 0,
-        max: budget.remaining_json(),
+        count: crate::resource::EncodeCount::new(budget.remaining_json()),
+        budget,
+        composition,
     };
-    write(&mut output).map_err(|_| budget.json_limit(composition))?;
-    let JsonWriter::Count { bytes, units, .. } = output else {
+    let measured = write(&mut output);
+    let JsonWriter::Count { mut count, .. } = output else {
         unreachable!()
     };
-    budget.work(bytes.div_ceil(8), composition)?;
-    budget.json(bytes, composition)?;
-    let mut output = JsonWriter::Text(Vec::with_capacity(units));
+    let finished = count.flush(|work| budget.work(work, composition));
+    if let Some(error) = count.error {
+        return Err(error.into());
+    }
+    if measured.is_err() || finished.is_err() {
+        return Err(budget.json_limit(composition).into());
+    }
+    budget.work(count.bytes.div_ceil(16), composition)?;
+    budget.json(count.bytes, composition)?;
+    let mut output = JsonWriter::Text(Vec::with_capacity(count.units));
     write(&mut output).expect("text writer");
     let JsonWriter::Text(text) = output else {
         unreachable!()
@@ -215,6 +216,7 @@ fn target_value(
     budget: &mut ExpansionBudget,
 ) -> Result<Value> {
     let composition = context.composition.as_deref();
+    budget.bytes(512, composition)?;
     Ok(match target {
         NormalizedTarget::Output { name } => o([
             ("kind", s("output")),
@@ -255,6 +257,10 @@ fn add_route<'a>(
     let (index, context) = scope;
     let composition = context.composition.as_deref();
     budget.route(raw, composition)?;
+    budget.bytes(
+        640 + step.iter().map(|part| part.len() * 4 + 64).sum::<usize>(),
+        composition,
+    )?;
     let declaration = encoded_json(Some(raw), budget, composition)?;
     let targets =
         route::normalize_targets(raw, &context.prefix, Some(&context.outputs), |address| {
@@ -316,7 +322,8 @@ pub(crate) fn compile_with_budget(
     let mut routes = vec![];
     let mut joins = vec![];
     let mut handlers = vec![];
-    let mut cache: OrderedMap<Option<String>, OrderedMap<String, JoinInfo>> = OrderedMap::new();
+    let mut cache: OrderedMap<Option<String>, (OrderedMap<String, JoinInfo>, usize)> =
+        OrderedMap::new();
     let mut covered = OrderedSet::new();
     if document.contains_key("flow") {
         let graph = Graph::for_scope(document, None, None, &mut ExpansionBudget::new(source))?;
@@ -397,7 +404,8 @@ pub(crate) fn compile_with_budget(
                     if !problems.is_empty() {
                         return fail("JOIN", "", "Validated graph disagrees with join analysis.");
                     }
-                    cache.set(composition.clone(), infos);
+                    let comparisons = infos.values().map(|info| 1 + info.branches.len()).sum();
+                    cache.set(composition.clone(), (infos, comparisons));
                 }
                 let ctx = contexts.len();
                 contexts.push(Context {
@@ -420,6 +428,14 @@ pub(crate) fn compile_with_budget(
             Task::Step(index, name, value) => {
                 let context = &contexts[index];
                 let composition = context.composition.as_deref();
+                // A step allocates a native row, its handler and their
+                // address fields, independently of the authored JSON size.
+                let address_bytes = context
+                    .prefix
+                    .iter()
+                    .map(|part| 6 * part.len() + 96)
+                    .sum::<usize>();
+                budget.bytes(1536 + address_bytes + name.len() * 8, composition)?;
                 let decl = exact::record(Some(value), "")?;
                 let step = addr(&context.prefix, name);
                 let kind = exact::text(decl.get("type"), "")?;
@@ -506,13 +522,15 @@ pub(crate) fn compile_with_budget(
                 }
                 step_contexts.push((index, first_route..routes.len()));
                 let mut containing = vec![];
-                let scope_joins = cache
+                let (scope_joins, comparisons) = cache
                     .get(&context.composition)
                     .expect("compiled scope joins");
+                budget.work(*comparisons, composition)?;
                 for (join, info) in scope_joins.iter() {
                     for (start, members) in info.branches.iter() {
                         if members.contains(name) {
                             budget.join_analysis(1, composition)?;
+                            budget.bytes(256 + address_bytes + join.len() * 8, composition)?;
                             containing.push((
                                 addr(&context.prefix, join),
                                 info.names.get(start).unwrap().clone(),
@@ -521,9 +539,10 @@ pub(crate) fn compile_with_budget(
                         }
                     }
                 }
+                // All these addresses share the scope prefix.
                 containing.sort_by(|(a, _, n), (b, _, m)| {
                     n.cmp(m)
-                        .then_with(|| compare_addresses_en(&a.join("/"), &b.join("/")))
+                        .then_with(|| compare_addresses_en(a.last().unwrap(), b.last().unwrap()))
                 });
                 handlers.push(o([
                     ("address", address(&step)),
@@ -552,6 +571,10 @@ pub(crate) fn compile_with_budget(
                     let mut branches = Vec::with_capacity(info.branches.len());
                     for (target, members) in info.branches.iter() {
                         budget.join_analysis(members.len() + 1, composition)?;
+                        budget.bytes(
+                            256 + (members.len() + 1) * (address_bytes + 96),
+                            composition,
+                        )?;
                         branches.push(o([
                             (
                                 "name",
@@ -653,6 +676,7 @@ pub(crate) fn compile_with_budget(
             }
         }
     }
+    budget.bytes(routes.len() * 64 + agents.len() * 64, None)?;
     let outward: HashMap<_, _> = routes
         .iter()
         .filter(|route| route.kind == "normal")

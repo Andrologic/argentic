@@ -47,12 +47,28 @@ pub fn compile(
     registry_json: &str,
     number: NativeNumber,
 ) -> Result<String, Failure> {
-    let budget = crate::SourceBudget::default();
+    compile_with_budget(
+        authored,
+        source_json,
+        registry_json,
+        number,
+        &crate::SourceBudget::default(),
+    )
+}
+
+/// Compile as part of a source operation with a shared budget.
+pub fn compile_with_budget(
+    authored: &str,
+    source_json: &str,
+    registry_json: &str,
+    number: NativeNumber,
+    budget: &crate::SourceBudget,
+) -> Result<String, Failure> {
     budget.json_input(registry_json.as_bytes(), "/registry")?;
     budget.json_input(source_json.as_bytes(), "/source")?;
     budget.bytes(authored.len().saturating_mul(2), "")?;
     let decoder = Decoder(number);
-    let registry = decoder.parse(&Text::from(registry_json)).map_err(syntax)?;
+    let registry = decoder.parse_source(registry_json, "/registry", budget)?;
     if !registry.get("format").eq_str("macro-agsdl-registry/030") {
         return Err(Failure {
             code: "CORRELATION".into(),
@@ -60,13 +76,13 @@ pub fn compile(
             message: "Invalid captured registry".into(),
         });
     }
-    let source = decoder.parse(&Text::from(source_json)).map_err(syntax)?;
+    let source = decoder.parse_source(source_json, "/source", budget)?;
     let source = compile::metadata::capture_source(&source)?;
     Ok(compile::host::compile(
         &native::s(authored),
         &source,
         &registry,
-        &budget,
+        budget,
     )?)
 }
 

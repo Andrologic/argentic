@@ -90,25 +90,24 @@ fn module_name(module: &Value) -> Result<&str, Internal> {
 }
 
 /// The detached pinned modules, computed once like the JS import.
-fn defaults() -> Result<&'static [Value], ReadError> {
-    static CELL: OnceLock<Result<Vec<Value>, ReadError>> = OnceLock::new();
+fn defaults() -> Result<&'static ModuleMap, ReadError> {
+    static CELL: OnceLock<Result<ModuleMap, ReadError>> = OnceLock::new();
     CELL.get_or_init(|| {
-        PINNED_MODULES
-            .iter()
-            .map(|(name, text)| {
-                // The JSON import is `JSON.parse`: ordinary JS member order.
-                let tree = parse_shared(text.as_bytes()).map_err(|error| {
-                    Internal::new(format!(
-                        "pinned module {name} is not exact JSON: {}",
-                        error.message()
-                    ))
-                })?;
-                copy_module(&tree.tree).map_err(ReadError::Module)
-            })
-            .collect()
+        let mut modules = ModuleMap::new();
+        for (name, text) in PINNED_MODULES {
+            // The JSON import is `JSON.parse`: ordinary JS member order.
+            let tree = parse_shared(text.as_bytes()).map_err(|error| {
+                Internal::new(format!(
+                    "pinned module {name} is not exact JSON: {}",
+                    error.message()
+                ))
+            })?;
+            let detached = copy_module(&tree.tree).map_err(ReadError::Module)?;
+            modules.set(name.into(), detached);
+        }
+        Ok(modules)
     })
     .as_ref()
-    .map(Vec::as_slice)
     .map_err(Clone::clone)
 }
 
@@ -123,13 +122,10 @@ fn registry_with_budget(
     budget: &SourceBudget,
 ) -> Result<ModuleMap, ReadError> {
     let source: Vec<(&str, &Value)> = match modules {
-        Modules::Pinned => {
-            let mut source = Vec::new();
-            for module in defaults()? {
-                source.push((module_name(module)?, module));
-            }
-            source
-        }
+        Modules::Pinned => defaults()?
+            .iter()
+            .map(|(name, module)| (name.as_str(), module))
+            .collect(),
         Modules::Explicit(map) => map
             .iter()
             .map(|(name, module)| (name.as_str(), module))
@@ -190,12 +186,71 @@ fn read_budgeted(
         Ok(parsed) => parsed,
         Err(error) => return Ok(parse_report(error.message())),
     };
-    let registry = registry_with_budget(modules, budget)?;
+    let detached;
+    let registry = match modules {
+        Modules::Pinned => defaults()?,
+        other => {
+            detached = registry_with_budget(other, budget)?;
+            &detached
+        }
+    };
     Ok(validate_document_with_budget(
         &parsed.tree,
-        &registry,
+        registry,
         budget,
     )?)
+}
+
+/// Check JSON syntax and unique property names within a source budget.
+pub fn check_source_json(text: &str, pointer: &str, budget: &SourceBudget) -> Result<(), Failure> {
+    budget.json_input(text.as_bytes(), pointer)?;
+    parse_v030(text.as_bytes())
+        .map(|_| ())
+        .map_err(|error| Failure {
+            code: "PARSE".into(),
+            pointer: pointer.into(),
+            message: error.message(),
+        })
+}
+
+/// Compare source values using exact numeric equality within the operation budget.
+pub fn source_json_equal(
+    a: &str,
+    b: &str,
+    at: &str,
+    budget: &SourceBudget,
+) -> Result<bool, Failure> {
+    compare_source(a, b, at, budget, false)
+}
+
+/// Compare source values while preserving authored number tokens.
+pub fn source_document_tokens_equal(
+    a: &str,
+    b: &str,
+    at: &str,
+    budget: &SourceBudget,
+) -> Result<bool, Failure> {
+    compare_source(a, b, at, budget, true)
+}
+
+fn compare_source(
+    a: &str,
+    b: &str,
+    at: &str,
+    budget: &SourceBudget,
+    tokens: bool,
+) -> Result<bool, Failure> {
+    let parse = |text: &str| {
+        budget.json_input(text.as_bytes(), at)?;
+        parse_v030(text.as_bytes()).map_err(|error| Failure {
+            code: "PARSE".into(),
+            pointer: at.into(),
+            message: error.message(),
+        })
+    };
+    let a = parse(a)?;
+    let b = parse(b)?;
+    crate::exact::values::equal_with_budget(&a.tree, &b.tree, budget, at, tokens)
 }
 
 /// Parse source-component JSON with exact numbers and unique object keys.
@@ -279,10 +334,18 @@ fn read_failure(error: ReadError) -> Failure {
 /// yield a report with `valid: false`. Configuration and internal errors
 /// return a [`Failure`]. Validation does not fetch content or observe a harness.
 pub fn validate_document_json(bytes: &[u8], modules: Option<&[&[u8]]>) -> Result<String, Failure> {
+    validate_document_json_with_budget(bytes, modules, &SourceBudget::default())
+}
+
+/// Validate and encode a report using the supplied operation budget.
+pub fn validate_document_json_with_budget(
+    bytes: &[u8],
+    modules: Option<&[&[u8]]>,
+    budget: &SourceBudget,
+) -> Result<String, Failure> {
     let modules = modules.map_or(Modules::Pinned, Modules::Encoded);
-    read(bytes, modules)
-        .map(|report| report.to_json())
-        .map_err(read_failure)
+    let report = read_budgeted(bytes, modules, budget).map_err(read_failure)?;
+    report.to_json_with_budget(budget)
 }
 
 #[cfg(test)]

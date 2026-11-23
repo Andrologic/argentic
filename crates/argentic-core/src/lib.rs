@@ -48,7 +48,10 @@ pub use graph::{
     GRAPH_LIMIT_CODE, MAX_COMPILED_GRAPH_JSON_BYTES, MAX_COMPOSITION_DEPTH,
     MAX_EXPANDED_GRAPH_EDGES, MAX_EXPANDED_GRAPH_NODES,
 };
-pub use reader::{parse_source_json, validate_document_json, validate_source};
+pub use reader::{
+    check_source_json, parse_source_json, source_document_tokens_equal, source_json_equal,
+    validate_document_json, validate_document_json_with_budget, validate_source,
+};
 pub use resource::{SourceBudget, MAX_SOURCE_BYTES, MAX_SOURCE_JSON_DEPTH, MAX_SOURCE_WORK};
 
 /// Exact bundled harness-module bytes. Descriptive support never grants an effect.

@@ -18,6 +18,7 @@ pub(crate) struct Prepared {
     budget: SourceBudget,
     modules: ModuleMap,
     registry: Option<Value>,
+    ranges: std::collections::HashMap<String, std::collections::HashSet<String>>,
     source: Option<Value>,
     bytes: Vec<u8>,
     ready: bool,
@@ -116,6 +117,7 @@ pub(crate) fn prepare(
         budget: budget.clone(),
         modules: ModuleMap::new(),
         registry: None,
+        ranges: Default::default(),
         source: None,
         bytes: vec![],
         ready: false,
@@ -148,7 +150,12 @@ pub(crate) fn prepare(
         let source = m::capture_source(source)?;
         state.runtime.set("source", source.clone());
         state.source = Some(source);
-        let (registry, modules) = c::capture_registry(input, budget)?;
+        let c::CapturedRegistry {
+            json: registry,
+            modules,
+            ranges,
+        } = c::capture_registry(input, budget)?;
+        state.ranges = ranges;
         state
             .runtime
             .set("registryVersion", registry.get("version").clone());
@@ -258,6 +265,7 @@ pub(crate) fn finish(state: &mut Prepared) -> Value {
                 &state.modules,
                 &uses,
                 &state.budget,
+                &state.ranges,
             )?;
             let observation = registry
                 .get("harnesses")

@@ -105,8 +105,8 @@ impl SourceBudget {
         self.bytes(slots.saturating_mul(192), pointer)
     }
 
-    #[cfg(test)]
-    pub(crate) fn usage(&self) -> (usize, usize) {
+    /// Cumulative work units and estimated allocation bytes already reserved.
+    pub fn usage(&self) -> (usize, usize) {
         (
             self.0.work.load(Ordering::Relaxed),
             self.0.bytes.load(Ordering::Relaxed),
@@ -116,6 +116,131 @@ impl SourceBudget {
 
 pub(crate) const MAX_DIAGNOSTICS: usize = 1024;
 pub(crate) const MAX_DIAGNOSTIC_BYTES: usize = 512 * 1024;
+
+/// Size of the string in JSON, including delimiters and escapes.
+pub(crate) fn quoted_bytes(text: &str) -> usize {
+    text.len()
+        + 2
+        + text
+            .bytes()
+            .map(|b| match b {
+                b'"' | b'\\' | 8 | 9 | 10 | 12 | 13 => 1,
+                0..=31 => 5,
+                _ => 0,
+            })
+            .sum::<usize>()
+}
+
+pub(crate) const DIAGNOSTIC_LIMIT_MESSAGE: &str =
+    "Maximum validation diagnostic count or bytes exceeded.";
+
+// Buffer a small amount of work to avoid a shared atomic update for every
+// punctuation mark and character emitted by the JSON encoders.
+pub(crate) struct EncodeCount<F> {
+    pub(crate) bytes: usize,
+    pub(crate) units: usize,
+    pub(crate) error: Option<F>,
+    pending: usize,
+    max: usize,
+}
+
+impl<F> EncodeCount<F> {
+    pub(crate) fn new(max: usize) -> Self {
+        Self {
+            bytes: 0,
+            units: 0,
+            error: None,
+            pending: 0,
+            max,
+        }
+    }
+
+    pub(crate) fn write(
+        &mut self,
+        text: &str,
+        count_utf16: bool,
+        charge: impl FnOnce(usize) -> Result<(), F>,
+    ) -> std::fmt::Result {
+        let fits = text.len() <= self.max - self.bytes;
+        self.pending += if fits {
+            text.len()
+        } else {
+            (self.max - self.bytes).min(text.len()) + 1
+        };
+        if !fits || self.pending >= 512 {
+            self.flush(charge)?;
+        }
+        if !fits {
+            return Err(std::fmt::Error);
+        }
+        self.bytes += text.len();
+        if count_utf16 {
+            self.units += if text.is_ascii() {
+                text.len()
+            } else {
+                text.encode_utf16().count()
+            };
+        }
+        Ok(())
+    }
+
+    pub(crate) fn flush(
+        &mut self,
+        charge: impl FnOnce(usize) -> Result<(), F>,
+    ) -> std::fmt::Result {
+        if self.error.is_some() {
+            return Err(std::fmt::Error);
+        }
+        let pending = std::mem::take(&mut self.pending);
+        if pending > 0 {
+            if let Err(error) = charge(pending.div_ceil(16)) {
+                self.error = Some(error);
+                return Err(std::fmt::Error);
+            }
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn encode_string(
+    budget: &SourceBudget,
+    max: usize,
+    pointer: &str,
+    write: impl Fn(&mut dyn std::fmt::Write) -> std::fmt::Result,
+) -> Result<Option<String>, Failure> {
+    struct Count<'a> {
+        count: EncodeCount<Failure>,
+        budget: &'a SourceBudget,
+        pointer: &'a str,
+    }
+
+    impl std::fmt::Write for Count<'_> {
+        fn write_str(&mut self, text: &str) -> std::fmt::Result {
+            self.count
+                .write(text, false, |work| self.budget.work(work, self.pointer))
+        }
+    }
+
+    let mut counter = Count {
+        count: EncodeCount::new(max),
+        budget,
+        pointer,
+    };
+    let measured = write(&mut counter);
+    let finished = counter.count.flush(|work| budget.work(work, pointer));
+    if let Some(error) = counter.count.error {
+        return Err(error);
+    }
+    if measured.is_err() || finished.is_err() {
+        return Ok(None);
+    }
+    let bytes = counter.count.bytes;
+    budget.work(bytes.div_ceil(16), pointer)?;
+    budget.bytes(bytes, pointer)?;
+    let mut result = String::with_capacity(bytes);
+    write(&mut result).expect("writing to a String");
+    Ok(Some(result))
+}
 
 pub(crate) fn limit(pointer: &str, label: &str, maximum: usize) -> Failure {
     Failure {

@@ -11,6 +11,13 @@ use crate::argentic_core::{
     SourceBudget,
 };
 type Result<T> = std::result::Result<T, Error>;
+use std::collections::{HashMap, HashSet};
+
+pub(crate) struct CapturedRegistry {
+    pub(crate) json: Value,
+    pub(crate) modules: ModuleMap,
+    pub(crate) ranges: HashMap<String, HashSet<String>>,
+}
 fn unique(names: impl IntoIterator<Item = Text>, pointer: &str) -> Result<()> {
     let mut seen = std::collections::HashSet::new();
     for (i, name) in names.into_iter().enumerate() {
@@ -25,6 +32,11 @@ fn unique(names: impl IntoIterator<Item = Text>, pointer: &str) -> Result<()> {
     Ok(())
 }
 fn json(value: &Value, p: &str, budget: &SourceBudget) -> Result<(String, E)> {
+    let units = value.text().map_or(0, |text| text.units().len());
+    budget
+        .work(units.div_ceil(8), p)
+        .map_err(super::limit_error)?;
+    budget.bytes(units * 8, p).map_err(super::limit_error)?;
     let raw = m::text(value, p, "UNSUPPORTED")?;
     let Some(raw) = raw.utf8() else {
         return fail("PARSE", p, "Invalid UTF-16 in JSON transport text.");
@@ -82,7 +94,12 @@ fn objects<'a>(v: &'a Value, p: &str) -> Result<Vec<(&'a Value, String)>> {
         })
         .collect()
 }
-fn capabilities(v: &Value, p: &str, budget: &SourceBudget) -> Result<Value> {
+fn capabilities(
+    v: &Value,
+    p: &str,
+    budget: &SourceBudget,
+    mut collect_range: impl FnMut(&E) -> Result<()>,
+) -> Result<Value> {
     let mut result = vec![];
     for (entry, p) in objects(v, p)? {
         let name = m::identity(entry.get("name"), &format!("{p}/name"), "UNSUPPORTED")?;
@@ -96,20 +113,18 @@ fn capabilities(v: &Value, p: &str, budget: &SourceBudget) -> Result<Value> {
                 "Unknown observed support level.",
             );
         }
-        let evidence = if entry.get("support").eq_str("absent") {
-            json(
-                entry.get("evidenceJson"),
-                &format!("{p}/evidenceJson"),
-                budget,
-            )?
-            .0
-        } else {
-            receipt(
-                entry.get("evidenceJson"),
-                &format!("{p}/evidenceJson"),
-                budget,
-            )?
-        };
+        let evidence_at = format!("{p}/evidenceJson");
+        let (evidence, parsed) = json(entry.get("evidenceJson"), &evidence_at, budget)?;
+        if !entry.get("support").eq_str("absent") && !nonempty(&parsed) {
+            return fail(
+                "CORRELATION",
+                evidence_at,
+                "A nonempty native authority receipt or envelope is required.",
+            );
+        }
+        if entry.get("support").eq_str("native") {
+            collect_range(&parsed)?;
+        }
         result.push(o([
             ("name", s(name)),
             ("support", entry.get("support").clone()),
@@ -122,12 +137,15 @@ fn capabilities(v: &Value, p: &str, budget: &SourceBudget) -> Result<Value> {
     )?;
     Ok(a(result))
 }
-pub(crate) fn no_credentials(value: &E, pointer: &str) -> Result<()> {
+fn no_credentials(value: &E, pointer: &str, budget: &SourceBudget) -> Result<()> {
     static PRIVATE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     static TOKEN: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let private = PRIVATE
-        .get_or_init(|| regex::Regex::new(r"-----BEGIN (?:[A-Z]+ )*PRIVATE KEY-----").unwrap());
-    let token=TOKEN.get_or_init(||regex::Regex::new(r"\A(?:(?i-u:Bearer)[\t\n\x0B\x0C\r \x{a0}\x{1680}\x{2000}-\x{200a}\x{2028}\x{2029}\x{202f}\x{205f}\x{3000}\x{feff}]+[^\t\n\x0B\x0C\r \x{a0}\x{1680}\x{2000}-\x{200a}\x{2028}\x{2029}\x{202f}\x{205f}\x{3000}\x{feff}]+|(?i-u:sk-(?:proj-|ant-)?[A-Za-z0-9_-]{16,}))\z").unwrap());
+    let patterns = || {
+        let private = PRIVATE
+            .get_or_init(|| regex::Regex::new(r"-----BEGIN (?:[A-Z]+ )*PRIVATE KEY-----").unwrap());
+        let token=TOKEN.get_or_init(||regex::Regex::new(r"\A(?:(?i-u:Bearer)[\t\n\x0B\x0C\r \x{a0}\x{1680}\x{2000}-\x{200a}\x{2028}\x{2029}\x{202f}\x{205f}\x{3000}\x{feff}]+[^\t\n\x0B\x0C\r \x{a0}\x{1680}\x{2000}-\x{200a}\x{2028}\x{2029}\x{202f}\x{205f}\x{3000}\x{feff}]+|(?i-u:sk-(?:proj-|ant-)?[A-Za-z0-9_-]{16,}))\z").unwrap());
+        (private, token)
+    };
     enum Task<'a> {
         Visit(&'a E, String),
         Field(String, &'a E, String),
@@ -136,7 +154,16 @@ pub(crate) fn no_credentials(value: &E, pointer: &str) -> Result<()> {
     while let Some(task) = todo.pop() {
         match task {
             Task::Visit(v, p) => {
+                budget.work(1, &p).map_err(super::limit_error)?;
                 if let E::String(v) = v {
+                    budget
+                        .work(v.len().div_ceil(8), &p)
+                        .map_err(super::limit_error)?;
+                    if PRIVATE.get().is_none() || TOKEN.get().is_none() {
+                        budget.work(2_048, &p).map_err(super::limit_error)?;
+                        budget.bytes(512 * 1024, &p).map_err(super::limit_error)?;
+                    }
+                    let (private, token) = patterns();
                     if private.is_match(v) || token.is_match(v) {
                         return fail(
                             "SECRET_SETTINGS",
@@ -146,12 +173,26 @@ pub(crate) fn no_credentials(value: &E, pointer: &str) -> Result<()> {
                     }
                 }
                 let fields: Vec<(String, &E)> = match v {
-                    E::Object(v) => v.iter().map(|(k, v)| (k.to_owned(), v)).collect(),
-                    E::Array(v) => v
-                        .iter()
-                        .enumerate()
-                        .map(|(i, v)| (i.to_string(), v))
-                        .collect(),
+                    E::Object(v) => {
+                        let keys = v.iter().map(|(k, _)| k.len()).sum::<usize>();
+                        budget
+                            .work(keys.div_ceil(8) + v.len(), &p)
+                            .map_err(super::limit_error)?;
+                        budget
+                            .bytes(keys * 8 + v.len() * (p.len() + 128), &p)
+                            .map_err(super::limit_error)?;
+                        v.iter().map(|(k, v)| (k.to_owned(), v)).collect()
+                    }
+                    E::Array(v) => {
+                        budget.work(v.len(), &p).map_err(super::limit_error)?;
+                        budget
+                            .bytes(v.len() * (p.len() + 144), &p)
+                            .map_err(super::limit_error)?;
+                        v.iter()
+                            .enumerate()
+                            .map(|(i, v)| (i.to_string(), v))
+                            .collect()
+                    }
                     _ => vec![],
                 };
                 for (k, v) in fields.into_iter().rev() {
@@ -192,10 +233,10 @@ pub(crate) fn no_credentials(value: &E, pointer: &str) -> Result<()> {
 fn settings(v: &Value, p: &str, budget: &SourceBudget) -> Result<String> {
     let (captured, value) = json(v, p, budget)?;
     exact::record(Some(&value), p)?;
-    no_credentials(&value, p)?;
+    no_credentials(&value, p, budget)?;
     Ok(captured)
 }
-pub(crate) fn capture_registry(input: &Value, budget: &SourceBudget) -> Result<(Value, ModuleMap)> {
+pub(crate) fn capture_registry(input: &Value, budget: &SourceBudget) -> Result<CapturedRegistry> {
     m::object(input, "/registry", "UNSUPPORTED")?;
     if !input.get("format").eq_str("macro-agsdl-registry/030") {
         return fail(
@@ -260,9 +301,11 @@ pub(crate) fn capture_registry(input: &Value, budget: &SourceBudget) -> Result<(
             input.get("hostCapabilities"),
             "/registry/hostCapabilities",
             budget,
+            |_| Ok(()),
         )?)
     };
     let mut harnesses = vec![];
+    let mut ranges = HashMap::new();
     for (entry, p) in objects(input.get("harnesses"), "/registry/harnesses")? {
         let harness = m::identity(entry.get("harness"), &format!("{p}/harness"), "UNSUPPORTED")?;
         if !entry.get("installation").eq_str("available")
@@ -281,11 +324,45 @@ pub(crate) fn capture_registry(input: &Value, budget: &SourceBudget) -> Result<(
                 "Expected a qualification observation.",
             );
         }
+        let mut verified_ranges = HashSet::new();
         let caps = capabilities(
             entry.get("capabilities"),
             &format!("{p}/capabilities"),
             budget,
+            |proof| {
+                let Some(proof) = proof.as_object() else {
+                    return Ok(());
+                };
+                if proof.get("kind").and_then(E::as_str) == Some("harness-version-range")
+                    && proof
+                        .get("harness")
+                        .and_then(E::as_str)
+                        .is_some_and(|s| harness.eq_str(s))
+                    && proof
+                        .get("version")
+                        .and_then(E::as_str)
+                        .is_some_and(|s| entry.get("version").eq_str(s))
+                    && matches!(proof.get("satisfied"), Some(E::Bool(true)))
+                {
+                    if let Some(range) = proof.get("range").and_then(E::as_str) {
+                        if proof.get("receipt").is_some_and(nonempty)
+                            && !verified_ranges.contains(range)
+                        {
+                            budget
+                                .bytes(range.len() + 128, &p)
+                                .map_err(super::limit_error)?;
+                            verified_ranges.insert(range.to_owned());
+                        }
+                    }
+                }
+                Ok(())
+            },
         )?;
+        if !verified_ranges.is_empty() {
+            if let Some(harness) = harness.utf8() {
+                ranges.insert(harness, verified_ranges);
+            }
+        }
         let mut models = vec![];
         for (model, p) in objects(entry.get("models"), &format!("{p}/models"))? {
             let name = m::identity(model.get("name"), &format!("{p}/name"), "UNSUPPORTED")?;
@@ -354,7 +431,11 @@ pub(crate) fn capture_registry(input: &Value, budget: &SourceBudget) -> Result<(
         )?;
         let declaration = exact::record(Some(&value), &format!("{p}/agentDeclarationJson"))?;
         if let Some(v) = declaration.get("harnessSettings") {
-            no_credentials(v, &format!("{p}/agentDeclarationJson/harnessSettings"))?;
+            no_credentials(
+                v,
+                &format!("{p}/agentDeclarationJson/harnessSettings"),
+                budget,
+            )?;
         }
         agents.push(o([
             (
@@ -424,7 +505,11 @@ pub(crate) fn capture_registry(input: &Value, budget: &SourceBudget) -> Result<(
     if let Some(host) = host {
         captured.set("hostCapabilities", host);
     }
-    Ok((captured, module_map))
+    Ok(CapturedRegistry {
+        json: captured,
+        modules: module_map,
+        ranges,
+    })
 }
 fn capability(observation: &Value, name: &str, p: &str, native: bool) -> Result<()> {
     let cap = observation
@@ -448,32 +533,22 @@ fn capability(observation: &Value, name: &str, p: &str, native: bool) -> Result<
     }
     Ok(())
 }
-fn range(observation: &Value, range: &str, p: &str) -> Result<()> {
-    for cap in observation.get("capabilities").array().unwrap() {
-        if !cap.get("support").eq_str("native") {
-            continue;
-        }
-        let raw = cap.get("evidenceJson").text().and_then(Text::utf8).unwrap();
-        let value = exact::decode(&raw)?;
-        let Some(proof) = value.as_object() else {
-            continue;
-        };
-        if proof.get("kind").and_then(E::as_str) == Some("harness-version-range")
-            && proof
-                .get("harness")
-                .and_then(E::as_str)
-                .is_some_and(|s| observation.get("harness").eq_str(s))
-            && proof
-                .get("version")
-                .and_then(E::as_str)
-                .is_some_and(|s| observation.get("version").eq_str(s))
-            && proof.get("range").and_then(E::as_str) == Some(range)
-            && matches!(proof.get("satisfied"), Some(E::Bool(true)))
-            && proof.get("receipt").is_some_and(nonempty)
-        {
-            return Ok(());
-        }
+fn range(
+    observation: &Value,
+    verified: Option<&HashSet<String>>,
+    range: &str,
+    p: &str,
+    budget: &SourceBudget,
+) -> Result<()> {
+    budget
+        .work(range.len().div_ceil(8) + 1, p)
+        .map_err(super::limit_error)?;
+    if verified.is_some_and(|ranges| ranges.contains(range)) {
+        return Ok(());
     }
+    budget
+        .bytes(range.len() * 4 + 512, p)
+        .map_err(super::limit_error)?;
     let mut message = Text::from("No native range evaluation binds harness ");
     message.push(observation.get("harness").text().unwrap());
     message.push(&Text::from(", version "));
@@ -704,6 +779,7 @@ pub(crate) fn capture_agent(
     modules: &ModuleMap,
     uses: &[Use],
     budget: &SourceBudget,
+    ranges: &HashMap<String, HashSet<String>>,
 ) -> Result<Value> {
     let name = m::identity(agent_name, "/agentName", "UNSUPPORTED")?;
     let pointer = m::at(&Text::from("/agents"), &name);
@@ -733,6 +809,10 @@ pub(crate) fn capture_agent(
     }
     let proof = proof.unwrap();
     let harness = exact::text(agent.get("harness"), &format!("{p}/harness"))?;
+    let harnesses = captured.get("harnesses").array().unwrap();
+    budget
+        .work(harnesses.len() * (1 + harness.len().div_ceil(8)), &p)
+        .map_err(super::limit_error)?;
     let observation = captured
         .get("harnesses")
         .array()
@@ -768,6 +848,13 @@ pub(crate) fn capture_agent(
             "The installed harness version was not observed.",
         );
     }
+    let verified_ranges = ranges.get(harness);
+    budget
+        .work(
+            observation.get("capabilities").array().unwrap().len() * (uses.len() + 10),
+            &p,
+        )
+        .map_err(super::limit_error)?;
     for name in [
         "result-submission",
         "continuity",
@@ -789,8 +876,10 @@ pub(crate) fn capture_agent(
     if let Some(v) = agent.get("harnessVersion") {
         range(
             observation,
+            verified_ranges,
             exact::text(Some(v), "")?,
             &format!("{p}/harnessVersion"),
+            budget,
         )?;
     }
     let module = modules.get(harness);
@@ -809,7 +898,13 @@ pub(crate) fn capture_agent(
             .and_then(E::as_object)
         {
             if let Some(v) = support.get("versions") {
-                range(observation, exact::text(Some(v), "")?, where_)?;
+                range(
+                    observation,
+                    verified_ranges,
+                    exact::text(Some(v), "")?,
+                    where_,
+                    budget,
+                )?;
             }
         }
     }
@@ -818,10 +913,10 @@ pub(crate) fn capture_agent(
         &format!("{p}/harnessSettings"),
     )?;
     if let Some(v) = agent.get("harnessSettings") {
-        no_credentials(v, &format!("{p}/harnessSettings"))?;
+        no_credentials(v, &format!("{p}/harnessSettings"), budget)?;
     }
-    let (_, effective) = json(proof.get("settingsJson"), &p, budget)?;
-    let effective = exact::record(Some(&effective), "")?;
+    let (_, effective_value) = json(proof.get("settingsJson"), &p, budget)?;
+    let effective = exact::record(Some(&effective_value), "")?;
     if agent.contains_key("harnessSettings") || effective.len() > 0 {
         capability(
             observation,
@@ -833,13 +928,8 @@ pub(crate) fn capture_agent(
             .and_then(E::as_object)
             .and_then(|m| m.get("settings"))
         {
-            let value = E::Object(exact::Object::from_entries(
-                effective
-                    .iter()
-                    .map(|(k, v)| (k.to_owned(), exact::values::clone(v))),
-            ));
             let problems = valueschema::validate_with_budget(
-                &value,
+                &effective_value,
                 schema,
                 &[
                     PointerPart::Key("agents".into()),
@@ -880,6 +970,13 @@ pub(crate) fn capture_agent(
     } else {
         observation.get("defaultModel").clone()
     };
+    let model_units = model_name.text().map_or(0, |name| name.units().len());
+    budget
+        .work(
+            observation.get("models").array().unwrap().len() * (1 + model_units.div_ceil(8)),
+            &p,
+        )
+        .map_err(super::limit_error)?;
     let model = observation
         .get("models")
         .array()
@@ -912,7 +1009,7 @@ pub(crate) fn capture_agent(
             "The requested or default effort is not advertised by the observed model.",
         );
     }
-    let mut frozen = proof.clone();
+    let mut frozen = proof.clone_with_budget(budget, &p)?;
     frozen.set("harness", s(harness));
     frozen.set("harnessVersion", observation.get("version").clone());
     frozen.set("adapterId", observation.get("adapterId").clone());

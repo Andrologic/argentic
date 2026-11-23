@@ -22,6 +22,11 @@ fn empty() -> &'static Object {
 }
 fn host_message(raw: &Value, document: &Object, budget: &SourceBudget) -> Result<Value, Error> {
     let result = (|| -> Result<Value, Error> {
+        let units = raw.text().map_or(0, |text| text.units().len());
+        budget.bytes(units * 4, "/message").map_err(limit_error)?;
+        budget
+            .work(units.div_ceil(8), "/message")
+            .map_err(limit_error)?;
         let Some(raw) = raw.text().and_then(Text::utf8) else {
             return Ok(invalid());
         };
@@ -31,6 +36,15 @@ fn host_message(raw: &Value, document: &Object, budget: &SourceBudget) -> Result
         let value = exact::decode(&raw)?;
         let message = exact::record(Some(&value), "")?;
         static ROOT: std::sync::OnceLock<SchemaChecker> = std::sync::OnceLock::new();
+        if ROOT.get().is_none() {
+            // The first entry check compiles a root over the bundled definitions.
+            budget
+                .json_input(schema::DOCUMENT_SCHEMA_JSON.as_bytes(), "/message")
+                .map_err(limit_error)?;
+            budget
+                .bytes(schema::DOCUMENT_SCHEMA_JSON.len() * 16, "/message")
+                .map_err(limit_error)?;
+        }
         let root=ROOT.get_or_init(||SchemaChecker::new(schema::root_with_document_defs(r##""type":"object","additionalProperties":false,"properties":{"prompt":{"$ref":"#/$defs/instructions"},"resources":{"$ref":"#/$defs/resources"}}"##).expect("code-defined host message schema")));
         if !root
             .check_with_budget(&value, budget)
@@ -192,12 +206,19 @@ pub(crate) fn compile(
 ) -> Result<String, Error> {
     let mut registry = o([]);
     for field in ["format", "version", "modules", "harnesses", "agents"] {
-        registry.set(field, observation.get(field).clone());
+        registry.set(
+            field,
+            observation
+                .get(field)
+                .clone_with_budget(budget, "/registry")?,
+        );
     }
     if !matches!(observation.get("hostCapabilities"), Value::Undefined) {
         registry.set(
             "hostCapabilities",
-            observation.get("hostCapabilities").clone(),
+            observation
+                .get("hostCapabilities")
+                .clone_with_budget(budget, "/registry")?,
         );
     }
     let mut prepared = plan::prepare(authored, source, &registry, budget);
@@ -261,7 +282,7 @@ pub(crate) fn compile(
     } else {
         invalid()
     };
-    if let (Some(_document), Some(graph)) = (document, graph) {
+    if let (Some(document), Some(graph)) = (document, graph) {
         if let Some(step) = graph.get("steps").array().unwrap().iter().find(|step| {
             crate::argentic_core::native::equal(step.get("address"), graph.get("entry"))
         }) {
@@ -278,7 +299,22 @@ pub(crate) fn compile(
                     .iter()
                     .map(|v| v.text().unwrap().utf8().unwrap())
                     .collect();
-                let raw = step.get("declarationJson").text().unwrap().utf8().unwrap();
+                let declaration = step.get("declarationJson").text().unwrap();
+                let output = entry.text().unwrap();
+                budget
+                    .bytes(
+                        declaration.units().len() * 8 + output.units().len() * 4,
+                        "/flow",
+                    )
+                    .map_err(limit_error)?;
+                let raw = declaration.utf8().unwrap();
+                let output = output.utf8().unwrap();
+                budget
+                    .json_input(raw.as_bytes(), "/flow")
+                    .map_err(limit_error)?;
+                budget
+                    .json_input(output.as_bytes(), "/message")
+                    .map_err(limit_error)?;
                 let target = RouteTarget::Step {
                     address: parts,
                     step_json: raw.clone(),
@@ -293,15 +329,15 @@ pub(crate) fn compile(
                     terminal_id: "".into(),
                     producer_step: None,
                     producer_agent: None,
-                    output_json: entry.text().unwrap().utf8().unwrap(),
+                    output_json: output,
                     provenance: Provenance {
                         instructions: vec![],
                         results: None,
                         prompt: None,
                     },
                 };
-                if messages::resolve_route_message(
-                    &authored.text().unwrap().utf8().unwrap(),
+                if messages::resolve_route_message_in_document(
+                    document,
                     &target,
                     &source,
                     &ItemContext::Absent,
@@ -346,14 +382,14 @@ pub(crate) fn compile(
     };
     let mut validations = o([]);
     if observation.has("startEntry") {
-        let mut validation = o([("messageJson", entry.clone())]);
+        let mut validation = o([("messageJson", entry.clone_with_budget(budget, "/message")?)]);
         for (k, v) in check.object().unwrap() {
             validation.set(k.clone(), v.clone());
         }
         validations.set("entryValidation", validation);
     }
     if observation.has("deliveryInput") {
-        let mut validation = o([("input", input.clone())]);
+        let mut validation = o([("input", input.clone_with_budget(budget, "/message")?)]);
         for (k, v) in delivery_check.object().unwrap() {
             validation.set(k.clone(), v.clone());
         }
@@ -363,7 +399,12 @@ pub(crate) fn compile(
         validations.set(
             "callValidation",
             o([
-                ("input", observation.get("callInput").clone()),
+                (
+                    "input",
+                    observation
+                        .get("callInput")
+                        .clone_with_budget(budget, "/registry/callInput")?,
+                ),
                 ("prepared", Value::Null),
             ]),
         );

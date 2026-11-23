@@ -18,7 +18,13 @@ use super::exact::{
     values::{compare_numbers, equal_v030_with_budget, json_type_matches, Num},
     Object, Value,
 };
-use crate::{calculation::Failure, resource::excerpt, SourceBudget};
+use crate::{
+    calculation::Failure,
+    resource::{
+        excerpt, quoted_bytes, DIAGNOSTIC_LIMIT_MESSAGE, MAX_DIAGNOSTICS, MAX_DIAGNOSTIC_BYTES,
+    },
+    SourceBudget,
+};
 use regex::Regex;
 use std::{
     cmp::Ordering,
@@ -59,6 +65,41 @@ pub(crate) const DOCUMENT_SCHEMA_JSON: &str =
     include_str!("../../assets/schema/agsdl-030.schema.json");
 pub(crate) const MODULE_SCHEMA_JSON: &str =
     include_str!("../../assets/schema/harness-module-030.schema.json");
+
+#[derive(Default)]
+struct Problems {
+    items: Vec<Problem>,
+    bytes: usize,
+}
+
+impl Problems {
+    fn add(
+        &mut self,
+        at: &str,
+        budget: &SourceBudget,
+        make: &mut dyn FnMut() -> Problem,
+    ) -> Result<(), SchemaError> {
+        if self.items.len() >= MAX_DIAGNOSTICS
+            || self.bytes + quoted_bytes(at) + 64 > MAX_DIAGNOSTIC_BYTES
+        {
+            return Err(SchemaError {
+                limit_pointer: Some(at.into()),
+                message: DIAGNOSTIC_LIMIT_MESSAGE.into(),
+            });
+        }
+        let problem = make();
+        self.bytes += quoted_bytes(&problem.0) + quoted_bytes(&problem.1) + 64;
+        if self.bytes > MAX_DIAGNOSTIC_BYTES {
+            return Err(SchemaError {
+                limit_pointer: Some(problem.0),
+                message: DIAGNOSTIC_LIMIT_MESSAGE.into(),
+            });
+        }
+        budget.bytes(problem.0.len() + problem.1.len() + 96, &problem.0)?;
+        self.items.push(problem);
+        Ok(())
+    }
+}
 
 /// JS truthiness of a JSON value. A `NumberToken` is an object, so truthy.
 pub(crate) fn truthy(value: &Value) -> bool {
@@ -171,7 +212,7 @@ impl SchemaChecker {
         value: &Value,
         budget: &SourceBudget,
     ) -> Result<Vec<Problem>, SchemaError> {
-        let mut sinks: Vec<Vec<Problem>> = vec![Vec::new()];
+        let mut sinks = vec![Problems::default()];
         let mut stack = vec![Frame {
             subject: Subject::Borrowed(value),
             schema: &self.root,
@@ -186,7 +227,7 @@ impl SchemaChecker {
                 stack.push(child);
             }
         }
-        Ok(sinks.swap_remove(0))
+        Ok(sinks.swap_remove(0).items)
     }
 
     fn resolve(&self, reference: &Value) -> Result<&Value, SchemaError> {
@@ -219,12 +260,22 @@ impl SchemaChecker {
         Ok(node)
     }
 
-    fn matches(&self, source: &str, text: &str) -> Result<bool, SchemaError> {
+    fn matches(
+        &self,
+        source: &str,
+        text: &str,
+        at: &str,
+        budget: &SourceBudget,
+    ) -> Result<bool, SchemaError> {
         let mut cache = self
             .patterns
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if !cache.contains_key(source) {
+            // Pinned and code-defined patterns compile once. The counted
+            // repetitions in the URI pattern dominate cold-start allocation.
+            budget.work(512 + source.len() * 8, at)?;
+            budget.bytes(64 * 1024 + source.len() * 1024, at)?;
             let compiled = pattern::compile(source).map_err(|message| SchemaError {
                 message: format!("Invalid regular expression /{source}/u: {message}"),
                 limit_pointer: None,
@@ -239,7 +290,7 @@ impl SchemaChecker {
     fn advance<'v, 's>(
         &'s self,
         frame: &mut Frame<'v, 's>,
-        sinks: &mut Vec<Vec<Problem>>,
+        sinks: &mut Vec<Problems>,
         budget: &SourceBudget,
     ) -> Result<Option<Frame<'v, 's>>, SchemaError> {
         let subject = frame.subject.clone();
@@ -247,18 +298,15 @@ impl SchemaChecker {
         budget.bytes(frame.path.len() * 2, &frame.path)?;
         let at = frame.path.clone();
         let sink = frame.sink;
-        let record = |items: &mut Vec<Problem>, problem: Problem| -> Result<(), SchemaError> {
-            budget.bytes(problem.0.len() + problem.1.len() + 64, &problem.0)?;
-            items.push(problem);
-            Ok(())
-        };
+        let record = |items: &mut Problems,
+                      make: &mut dyn FnMut() -> Problem|
+         -> Result<(), SchemaError> { items.add(&at, budget, make) };
         let schema: &'s Object = match frame.schema {
             Value::Bool(true) => return Ok(None),
             Value::Bool(false) => {
-                record(
-                    &mut sinks[sink],
-                    (at, "no value is allowed here".to_owned()),
-                )?;
+                record(&mut sinks[sink], &mut || {
+                    (at.clone(), "no value is allowed here".to_owned())
+                })?;
                 return Ok(None);
             }
             Value::Object(object) => object,
@@ -304,19 +352,17 @@ impl SchemaChecker {
                             }
                         }
                         if !texts.iter().any(|name| json_type_matches(value, name)) {
-                            record(
-                                &mut sinks[sink],
-                                (at, format!("expected {}", texts.join(" or "))),
-                            )?;
+                            record(&mut sinks[sink], &mut || {
+                                (at.clone(), format!("expected {}", texts.join(" or ")))
+                            })?;
                             return Ok(None);
                         }
                     }
                     if let Some(constant) = schema.get("const") {
                         if !equal_v030_with_budget(value, constant, budget, &at)? {
-                            record(
-                                &mut sinks[sink],
-                                (at.clone(), format!("expected {}", stringify(constant))),
-                            )?;
+                            record(&mut sinks[sink], &mut || {
+                                (at.clone(), format!("expected {}", stringify(constant)))
+                            })?;
                         }
                     }
                     if let Some(options) = schema.get("enum") {
@@ -332,10 +378,9 @@ impl SchemaChecker {
                         }
                         if !matched {
                             let shown: Vec<String> = options.iter().map(stringify).collect();
-                            record(
-                                &mut sinks[sink],
-                                (at.clone(), format!("expected one of {}", shown.join(", "))),
-                            )?;
+                            record(&mut sinks[sink], &mut || {
+                                (at.clone(), format!("expected one of {}", shown.join(", ")))
+                            })?;
                         }
                     }
                     if let Value::String(text) = value {
@@ -345,42 +390,39 @@ impl SchemaChecker {
                         if let Some(minimum) = schema.get("minLength") {
                             let length = Num::Host(text.chars().count());
                             if compare_numbers(length, number(minimum)?) == Ordering::Less {
-                                record(
-                                    &mut sinks[sink],
-                                    (at.clone(), "the string is too short".to_owned()),
-                                )?;
+                                record(&mut sinks[sink], &mut || {
+                                    (at.clone(), "the string is too short".to_owned())
+                                })?;
                             }
                         }
                         if let Some(source) = schema.get("pattern") {
                             let Value::String(source) = source else {
                                 return refuse("pattern must be a string");
                             };
-                            if !self.matches(source, text)? {
+                            if !self.matches(source, text, &at, budget)? {
                                 let shown = if source.encode_utf16().count() <= 80 {
                                     source.as_str()
                                 } else {
                                     "the expected syntax"
                                 };
-                                record(
-                                    &mut sinks[sink],
+                                record(&mut sinks[sink], &mut || {
                                     (
                                         at.clone(),
                                         format!("{} does not match {shown}", quote(excerpt(text))),
-                                    ),
-                                )?;
+                                    )
+                                })?;
                             }
                         }
                     }
                     if let (Value::Number(token), Some(minimum)) = (value, schema.get("minimum")) {
                         budget.work(token.raw().len().div_ceil(8), &at)?;
                         if compare_numbers(Num::Token(token), number(minimum)?) == Ordering::Less {
-                            record(
-                                &mut sinks[sink],
+                            record(&mut sinks[sink], &mut || {
                                 (
                                     at.clone(),
                                     format!("expected at least {}", stringify(minimum)),
-                                ),
-                            )?;
+                                )
+                            })?;
                         }
                     }
                     if let Value::Array(items) = value {
@@ -388,36 +430,33 @@ impl SchemaChecker {
                             if compare_numbers(Num::Host(items.len()), number(minimum)?)
                                 == Ordering::Less
                             {
-                                record(
-                                    &mut sinks[sink],
+                                record(&mut sinks[sink], &mut || {
                                     (
                                         at.clone(),
                                         format!("expected at least {} items", stringify(minimum)),
-                                    ),
-                                )?;
+                                    )
+                                })?;
                             }
                         }
                         if let Some(maximum) = schema.get("maxItems") {
                             if compare_numbers(Num::Host(items.len()), number(maximum)?)
                                 == Ordering::Greater
                             {
-                                record(
-                                    &mut sinks[sink],
+                                record(&mut sinks[sink], &mut || {
                                     (
                                         at.clone(),
                                         format!("expected at most {} items", stringify(maximum)),
-                                    ),
-                                )?;
+                                    )
+                                })?;
                             }
                         }
                         if schema.get("uniqueItems").is_some_and(truthy) {
                             for i in 0..items.len() {
                                 for j in 0..i {
                                     if equal_v030_with_budget(&items[i], &items[j], budget, &at)? {
-                                        record(
-                                            &mut sinks[sink],
-                                            (format!("{at}/{i}"), "duplicate item".to_owned()),
-                                        )?;
+                                        record(&mut sinks[sink], &mut || {
+                                            (format!("{at}/{i}"), "duplicate item".to_owned())
+                                        })?;
                                         break;
                                     }
                                 }
@@ -471,10 +510,9 @@ impl SchemaChecker {
                             for name in required {
                                 let present = matches!(name, Value::String(name) if object.contains_key(name));
                                 if !present {
-                                    record(
-                                        &mut sinks[sink],
-                                        (at.clone(), format!("missing field {}", stringify(name))),
-                                    )?;
+                                    record(&mut sinks[sink], &mut || {
+                                        (at.clone(), format!("missing field {}", stringify(name)))
+                                    })?;
                                 }
                             }
                         }
@@ -491,7 +529,7 @@ impl SchemaChecker {
                     if let Some(names) = schema.get("propertyNames") {
                         budget.bytes(64, &at)?;
                         let probe = sinks.len();
-                        sinks.push(Vec::new());
+                        sinks.push(Problems::default());
                         frame.stage = Stage::AfterNames(i, probe);
                         let name = Subject::Key(Rc::new(Value::String(key.to_owned())));
                         return Ok(child(name, names, child_path(&at, key), probe));
@@ -501,15 +539,14 @@ impl SchemaChecker {
                 Stage::AfterNames(i, probe) => {
                     let (i, probe) = (*i, *probe);
                     let (key, _) = frame.entries[i];
-                    let has_problem = !std::mem::take(&mut sinks[probe]).is_empty();
+                    let has_problem = !std::mem::take(&mut sinks[probe]).items.is_empty();
                     if has_problem {
-                        record(
-                            &mut sinks[sink],
+                        record(&mut sinks[sink], &mut || {
                             (
                                 child_path(&at, key),
                                 format!("invalid name {}", quote(excerpt(key))),
-                            ),
-                        )?;
+                            )
+                        })?;
                         frame.stage = Stage::Entry(i + 1);
                     } else {
                         frame.stage = Stage::Property(i);
@@ -533,10 +570,12 @@ impl SchemaChecker {
                     }
                     match schema.get("additionalProperties") {
                         Some(Value::Bool(false)) => {
-                            record(
-                                &mut sinks[sink],
-                                (path, format!("unknown field {}", quote(excerpt(key)))),
-                            )?;
+                            record(&mut sinks[sink], &mut || {
+                                (
+                                    path.clone(),
+                                    format!("unknown field {}", quote(excerpt(key))),
+                                )
+                            })?;
                         }
                         Some(Value::Bool(true)) | None => {}
                         Some(additional) => {
@@ -548,7 +587,7 @@ impl SchemaChecker {
                     if let Some(negated) = schema.get("not") {
                         budget.bytes(64, &at)?;
                         let probe = sinks.len();
-                        sinks.push(Vec::new());
+                        sinks.push(Problems::default());
                         frame.stage = Stage::AfterNot(probe);
                         return Ok(child(subject.clone(), negated, at, probe));
                     }
@@ -559,14 +598,13 @@ impl SchemaChecker {
                     };
                 }
                 Stage::AfterNot(probe) => {
-                    if std::mem::take(&mut sinks[*probe]).is_empty() {
-                        record(
-                            &mut sinks[sink],
+                    if std::mem::take(&mut sinks[*probe]).items.is_empty() {
+                        record(&mut sinks[sink], &mut || {
                             (
                                 at.clone(),
                                 "this combination of fields is not allowed".to_owned(),
-                            ),
-                        )?;
+                            )
+                        })?;
                     }
                     frame.stage = Stage::Combinator {
                         keyword: 0,
@@ -592,7 +630,7 @@ impl SchemaChecker {
                     if *option < options.len() {
                         budget.bytes(64, &at)?;
                         let probe = sinks.len();
-                        sinks.push(Vec::new());
+                        sinks.push(Problems::default());
                         results.push(probe);
                         let target = &options[*option];
                         *option += 1;
@@ -600,19 +638,23 @@ impl SchemaChecker {
                     }
                     let outcomes: Vec<Vec<Problem>> = results
                         .iter()
-                        .map(|&probe| std::mem::take(&mut sinks[probe]))
+                        .map(|&probe| std::mem::take(&mut sinks[probe]).items)
                         .collect();
                     let passing = outcomes.iter().filter(|result| result.is_empty()).count();
                     if passing == 0 {
-                        sinks[sink].extend(best(outcomes));
+                        for (at, message) in best(outcomes) {
+                            let mut problem = Some((at, message));
+                            record(&mut sinks[sink], &mut || {
+                                problem.take().expect("selected problem")
+                            })?;
+                        }
                     } else if *keyword == 1 && passing > 1 {
-                        record(
-                            &mut sinks[sink],
+                        record(&mut sinks[sink], &mut || {
                             (
                                 at.clone(),
                                 "the value matches several alternatives".to_owned(),
-                            ),
-                        )?;
+                            )
+                        })?;
                     }
                     *keyword += 1;
                     *option = 0;

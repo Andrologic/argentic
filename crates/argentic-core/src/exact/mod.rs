@@ -180,7 +180,7 @@ pub(crate) fn quote(text: &str) -> String {
     out
 }
 
-pub(super) fn quote_to(out: &mut (impl std::fmt::Write + ?Sized), text: &str) -> std::fmt::Result {
+pub(crate) fn quote_to(out: &mut (impl std::fmt::Write + ?Sized), text: &str) -> std::fmt::Result {
     out.write_char('"')?;
     let mut start = 0;
     for (index, byte) in text.bytes().enumerate() {
@@ -188,6 +188,9 @@ pub(super) fn quote_to(out: &mut (impl std::fmt::Write + ?Sized), text: &str) ->
             out.write_str(&text[start..index])?;
             quote_char(out, char::from(byte))?;
             start = index + 1;
+        } else if index - start >= 512 && text.is_char_boundary(index) {
+            out.write_str(&text[start..index])?;
+            start = index;
         }
     }
     out.write_str(&text[start..])?;

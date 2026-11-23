@@ -84,7 +84,9 @@ impl Text {
 }
 impl From<&str> for Text {
     fn from(s: &str) -> Self {
-        Self(s.encode_utf16().collect())
+        let mut units = Vec::with_capacity(s.len());
+        units.extend(s.encode_utf16());
+        Self(units)
     }
 }
 impl From<String> for Text {
@@ -239,8 +241,17 @@ impl Value {
     }
     /// JS property order, with duplicate keys replaced in their original slot.
     pub(crate) fn from_entries(entries: impl IntoIterator<Item = (Text, Value)>) -> Self {
-        let mut positions = std::collections::HashMap::<Text, usize>::new();
-        let mut fields: Vec<(Text, Value)> = Vec::new();
+        let entries = entries.into_iter();
+        let size = entries.size_hint().0;
+        if entries.size_hint().1.is_some_and(|max| max <= 16) {
+            let mut value = Self::Object(Vec::with_capacity(size));
+            for (key, entry) in entries {
+                value.set(key, entry);
+            }
+            return value;
+        }
+        let mut positions = std::collections::HashMap::<Text, usize>::with_capacity(size);
+        let mut fields: Vec<(Text, Value)> = Vec::with_capacity(size);
         for (key, value) in entries {
             if let Some(&position) = positions.get(&key) {
                 fields[position].1 = value;
@@ -249,8 +260,62 @@ impl Value {
                 fields.push((key, value));
             }
         }
-        fields.sort_by_cached_key(|(key, _)| index(key).unwrap_or(u32::MAX));
+        if fields.iter().any(|(key, _)| index(key).is_some()) {
+            fields.sort_by_cached_key(|(key, _)| index(key).unwrap_or(u32::MAX));
+        }
         Self::Object(fields)
+    }
+
+    pub(crate) fn clone_with_budget(
+        &self,
+        budget: &crate::SourceBudget,
+        at: &str,
+    ) -> Result<Self, Error> {
+        use crate::compile::limit_error;
+        budget.work(1, at).map_err(limit_error)?;
+        match self {
+            Self::Array(values) => {
+                budget
+                    .bytes(std::mem::size_of_val(values.as_slice()), at)
+                    .map_err(limit_error)?;
+                Ok(Self::Array(
+                    values
+                        .iter()
+                        .map(|value| value.clone_with_budget(budget, at))
+                        .collect::<Result<_, _>>()?,
+                ))
+            }
+            Self::Object(fields) => {
+                budget
+                    .bytes(std::mem::size_of_val(fields.as_slice()), at)
+                    .map_err(limit_error)?;
+                Ok(Self::Object(
+                    fields
+                        .iter()
+                        .map(|(key, value)| {
+                            budget
+                                .bytes(std::mem::size_of_val(key.units()), at)
+                                .map_err(limit_error)?;
+                            Ok((key.clone(), value.clone_with_budget(budget, at)?))
+                        })
+                        .collect::<Result<_, Error>>()?,
+                ))
+            }
+            Self::String(text) => {
+                budget
+                    .bytes(std::mem::size_of_val(text.units()), at)
+                    .map_err(limit_error)?;
+                budget
+                    .work(text.units().len().div_ceil(16), at)
+                    .map_err(limit_error)?;
+                Ok(Self::String(text.clone()))
+            }
+            Self::Number(Number::Finite(number)) => {
+                budget.bytes(number.len(), at).map_err(limit_error)?;
+                Ok(Self::Number(Number::Finite(number.clone())))
+            }
+            scalar => Ok(scalar.clone()),
+        }
     }
 
     pub(crate) fn set(&mut self, key: impl Into<Text>, value: Value) {
@@ -261,13 +326,13 @@ impl Value {
         if let Some((_, v)) = entries.iter_mut().find(|(k, _)| k == &key) {
             *v = value;
         } else {
-            entries.push((key, value));
-            entries.sort_by(|(a, _), (b, _)| match (index(a), index(b)) {
-                (Some(a), Some(b)) => a.cmp(&b),
-                (Some(_), None) => std::cmp::Ordering::Less,
-                (None, Some(_)) => std::cmp::Ordering::Greater,
-                _ => std::cmp::Ordering::Equal,
-            });
+            if let Some(order) = index(&key) {
+                let position =
+                    entries.partition_point(|(key, _)| index(key).is_some_and(|key| key < order));
+                entries.insert(position, (key, value));
+            } else {
+                entries.push((key, value));
+            }
         }
     }
     pub(crate) fn stringify(&self) -> String {
@@ -282,43 +347,60 @@ impl Value {
     ) -> std::fmt::Result {
         enum Task<'a> {
             Value(&'a Value),
-            Text(&'static str),
-            Key(&'a Text),
+            Array(std::slice::Iter<'a, Value>),
+            Object(std::slice::Iter<'a, (Text, Value)>),
         }
         let mut tasks = vec![Task::Value(self)];
         while let Some(task) = tasks.pop() {
             match task {
-                Task::Text(s) => out.write_str(s)?,
-                Task::Key(k) => k.quote_to(out)?,
+                Task::Array(mut items) => {
+                    if let Some(item) = items.next() {
+                        out.write_char(',')?;
+                        tasks.push(Task::Array(items));
+                        tasks.push(Task::Value(item));
+                    } else {
+                        out.write_char(']')?;
+                    }
+                }
+                Task::Object(mut fields) => {
+                    if let Some((key, value)) = fields.find(|(_, v)| !matches!(v, Self::Undefined))
+                    {
+                        out.write_char(',')?;
+                        key.quote_to(out)?;
+                        out.write_char(':')?;
+                        tasks.push(Task::Object(fields));
+                        tasks.push(Task::Value(value));
+                    } else {
+                        out.write_char('}')?;
+                    }
+                }
                 Task::Value(v) => match v {
                     Self::Undefined | Self::Null => out.write_str("null")?,
                     Self::Bool(b) => out.write_str(if *b { "true" } else { "false" })?,
                     Self::String(t) => t.quote_to(out)?,
                     Self::Number(n) => out.write_str(n.json())?,
-                    Self::Array(v) => {
-                        out.write_char('[')?;
-                        tasks.push(Task::Text("]"));
-                        for (i, v) in v.iter().enumerate().rev() {
-                            tasks.push(Task::Value(v));
-                            if i > 0 {
-                                tasks.push(Task::Text(","));
-                            }
+                    Self::Array(values) => {
+                        let mut items = values.iter();
+                        if let Some(first) = items.next() {
+                            out.write_char('[')?;
+                            tasks.push(Task::Array(items));
+                            tasks.push(Task::Value(first));
+                        } else {
+                            out.write_str("[]")?;
                         }
                     }
-                    Self::Object(v) => {
-                        out.write_char('{')?;
-                        tasks.push(Task::Text("}"));
-                        let fields: Vec<_> = v
-                            .iter()
-                            .filter(|(_, v)| !matches!(v, Self::Undefined))
-                            .collect();
-                        for (i, (k, v)) in fields.into_iter().enumerate().rev() {
-                            tasks.push(Task::Value(v));
-                            tasks.push(Task::Text(":"));
-                            tasks.push(Task::Key(k));
-                            if i > 0 {
-                                tasks.push(Task::Text(","));
-                            }
+                    Self::Object(values) => {
+                        let mut fields = values.iter();
+                        if let Some((key, first)) =
+                            fields.find(|(_, v)| !matches!(v, Self::Undefined))
+                        {
+                            out.write_char('{')?;
+                            key.quote_to(out)?;
+                            out.write_char(':')?;
+                            tasks.push(Task::Object(fields));
+                            tasks.push(Task::Value(first));
+                        } else {
+                            out.write_str("{}")?;
                         }
                     }
                 },
@@ -335,19 +417,20 @@ pub(crate) fn s(value: impl Into<Text>) -> Value {
     Value::String(value.into())
 }
 pub(crate) fn o<const N: usize>(fields: [(&str, Value); N]) -> Value {
-    let mut v = Value::Object(vec![]);
-    for (k, value) in fields {
-        v.set(k, value);
-    }
-    v
+    Value::from_entries(
+        fields
+            .into_iter()
+            .map(|(key, value)| (Text::from(key), value)),
+    )
 }
 pub(crate) fn a(values: impl IntoIterator<Item = Value>) -> Value {
     Value::Array(values.into_iter().collect())
 }
 /// Structural equality for native DTO fields, separate from exact token equality.
 pub(crate) fn equal(left: &Value, right: &Value) -> bool {
-    let mut todo = vec![(left, right)];
-    while let Some((l, r)) = todo.pop() {
+    let mut todo = Vec::new();
+    let mut first = Some((left, right));
+    while let Some((l, r)) = first.take().or_else(|| todo.pop()) {
         match (l, r) {
             (Value::Undefined, Value::Undefined) | (Value::Null, Value::Null) => {}
             (Value::Bool(a), Value::Bool(b)) if a == b => {}

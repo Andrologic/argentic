@@ -242,16 +242,35 @@ pub(crate) fn stringify_to(
 ) -> std::fmt::Result {
     enum Task<'a> {
         Value(&'a Value),
-        Text(&'static str),
-        Key(&'a str),
+        Array(std::slice::Iter<'a, Value>),
+        Object(std::slice::Iter<'a, (String, Value)>),
     }
     let mut pending = vec![Task::Value(value)];
     while let Some(task) = pending.pop() {
         match task {
-            Task::Text(text) => out.write_str(text)?,
-            Task::Key(key) => {
-                quote_to(out, key)?;
-                out.write_char(':')?;
+            Task::Array(mut items) => {
+                let first = items.as_slice().len();
+                if let Some(item) = items.next() {
+                    // The opening delimiter and the first item were emitted
+                    // together when the frame was created.
+                    debug_assert!(first > 0);
+                    out.write_char(',')?;
+                    pending.push(Task::Array(items));
+                    pending.push(Task::Value(item));
+                } else {
+                    out.write_char(']')?;
+                }
+            }
+            Task::Object(mut members) => {
+                if let Some((key, value)) = members.next() {
+                    out.write_char(',')?;
+                    quote_to(out, key)?;
+                    out.write_char(':')?;
+                    pending.push(Task::Object(members));
+                    pending.push(Task::Value(value));
+                } else {
+                    out.write_char('}')?;
+                }
             }
             Task::Value(value) => match value {
                 Value::Null => out.write_str("null")?,
@@ -259,25 +278,26 @@ pub(crate) fn stringify_to(
                 Value::Bool(false) => out.write_str("false")?,
                 Value::Number(token) => out.write_str(token.raw())?,
                 Value::String(text) => quote_to(out, text)?,
-                Value::Array(items) => {
-                    out.write_char('[')?;
-                    pending.push(Task::Text("]"));
-                    for (index, item) in items.iter().enumerate().rev() {
-                        pending.push(Task::Value(item));
-                        if index > 0 {
-                            pending.push(Task::Text(","));
-                        }
+                Value::Array(values) => {
+                    let mut items = values.iter();
+                    if let Some(first) = items.next() {
+                        out.write_char('[')?;
+                        pending.push(Task::Array(items));
+                        pending.push(Task::Value(first));
+                    } else {
+                        out.write_str("[]")?;
                     }
                 }
                 Value::Object(object) => {
-                    out.write_char('{')?;
-                    pending.push(Task::Text("}"));
-                    for (index, (key, item)) in object.iter().enumerate().rev() {
-                        pending.push(Task::Value(item));
-                        pending.push(Task::Key(key));
-                        if index > 0 {
-                            pending.push(Task::Text(","));
-                        }
+                    let mut members = object.entries.iter();
+                    if let Some((key, first)) = members.next() {
+                        out.write_char('{')?;
+                        quote_to(out, key)?;
+                        out.write_char(':')?;
+                        pending.push(Task::Object(members));
+                        pending.push(Task::Value(first));
+                    } else {
+                        out.write_str("{}")?;
                     }
                 }
             },
@@ -407,14 +427,31 @@ pub(crate) fn equal_v030_with_budget(
     budget: &crate::SourceBudget,
     pointer: &str,
 ) -> Result<bool, crate::calculation::Failure> {
+    equal_with_budget(left, right, budget, pointer, false)
+}
+
+pub(crate) fn equal_with_budget(
+    left: &Value,
+    right: &Value,
+    budget: &crate::SourceBudget,
+    pointer: &str,
+    tokens: bool,
+) -> Result<bool, crate::calculation::Failure> {
     let mut pending = vec![(left, right)];
     while let Some((a, b)) = pending.pop() {
         budget.work(1, pointer)?;
         match (a, b) {
             (Value::Number(a), Value::Number(b)) => {
-                budget.work((a.raw().len() + b.raw().len()).div_ceil(8), pointer)?;
-                if compare_numbers(Num::Token(a), Num::Token(b)) != Ordering::Equal {
-                    return Ok(false);
+                let len = a.raw().len() + b.raw().len();
+                budget.work(len.div_ceil(8), pointer)?;
+                if a.raw() != b.raw() {
+                    if tokens {
+                        return Ok(false);
+                    }
+                    budget.bytes(len * 6 + 128, pointer)?;
+                    if compare_numbers(Num::Token(a), Num::Token(b)) != Ordering::Equal {
+                        return Ok(false);
+                    }
                 }
             }
             (Value::Array(a), Value::Array(b)) => {
