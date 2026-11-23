@@ -164,8 +164,9 @@ document above that limit. `Engine::compile_document` then returns
 separate 8,000,000-byte transport limit.
 
 Expansion allows 8,192 graph nodes, 32,768 route targets and 32 nested
-composition bodies. Join analysis allows 131,072 branch records, memberships
-and diagnostics per pass. Validation retains up to 1,024 diagnostics and
+composition bodies. Join analysis allows 131,072 branch and membership
+records per pass. Join diagnostics have their own limit of 1,024.
+Validation retains up to 1,024 diagnostics and
 reserves space for a final limit diagnostic within 512 KiB of encoded
 diagnostics. The limit includes JSON escapes. Join metadata has its own
 expansion limits. Messages retain up to 2 KiB, with short excerpts of long
