@@ -97,6 +97,24 @@ fn symlinks_in_a_selected_path_are_refused() {
     assert!(refused(OpenedSource::open_path(temp.path())).contains("symbolic link"));
 }
 
+#[cfg(unix)]
+#[test]
+fn member_open_requires_real_directories_at_each_component() {
+    let temp = tempfile::tempdir().unwrap();
+    write(temp.path(), "real/nested/notes.md", "Notes.\n");
+    let root = open_project_root(temp.path()).unwrap();
+    let path = Path::new("real/nested/notes.md");
+    assert_eq!(
+        read_regular(&root, path, MAX_TOTAL).unwrap().bytes,
+        b"Notes.\n"
+    );
+
+    std::os::unix::fs::symlink("real", temp.path().join("alias")).unwrap();
+    assert!(read_regular(&root, Path::new("alias/nested/notes.md"), MAX_TOTAL).is_err());
+    std::os::unix::fs::symlink("nested", temp.path().join("real/alias")).unwrap();
+    assert!(member::with_directory(&root, Path::new("real/alias"), Dir::entries).is_err());
+}
+
 #[test]
 fn folders_refuse_the_names_archives_refuse() {
     for hidden in [

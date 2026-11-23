@@ -1,6 +1,6 @@
 use super::{
-    archive, invalid, io, open_regular, parse_json, project_failure, read_regular, Files, MANIFEST,
-    MAX_FILES, MAX_JSON, MAX_JSON_TOTAL, MAX_TOTAL,
+    archive, invalid, io, member, open_regular, parse_json, project_failure, read_regular, Files,
+    MANIFEST, MAX_FILES, MAX_JSON, MAX_JSON_TOTAL, MAX_TOTAL,
 };
 use crate::persistence::{dto::SourceErrorKind, Result};
 use cap_std::fs::Dir;
@@ -202,7 +202,7 @@ impl<'a> Reader<'a> {
                 .ok_or_else(|| invalid(path, "", "File absent from archive inventory"))?;
             let remaining = MAX_TOTAL - self.total;
             let file = read_regular(dir, Path::new(path), limit.min(remaining)).map_err(|e| {
-                let own_size = dir.symlink_metadata(path).map_or(0, |meta| meta.len());
+                let own_size = member::metadata(dir, Path::new(path)).map_or(0, |meta| meta.len());
                 match e.kind() {
                     std::io::ErrorKind::FileTooLarge if own_size <= limit => {
                         invalid(path, "", "Project selection exceeds the 256 MiB total")
@@ -278,9 +278,8 @@ impl<'a> Reader<'a> {
                     self.spell(&walked, &walked)
                         .map_err(|_| error("Case collision or too many project paths"))?;
                     if let Some(dir) = &self.dir {
-                        if dir
-                            .symlink_metadata(parts.join("/"))
-                            .is_ok_and(|meta| meta.is_symlink())
+                        if member::metadata(dir, Path::new(&walked))
+                            .is_ok_and(|meta| member::is_link(&meta))
                         {
                             return Err(error("Path contains a symbolic link"));
                         }
@@ -300,7 +299,7 @@ impl<'a> Reader<'a> {
 
     fn is_file(&self, path: &str) -> bool {
         match &self.dir {
-            Some(dir) => dir.symlink_metadata(path).is_ok_and(|meta| meta.is_file()),
+            Some(dir) => member::metadata(dir, Path::new(path)).is_ok_and(|meta| meta.is_file()),
             None => self.files.contains_key(path),
         }
     }
@@ -682,7 +681,9 @@ impl<'a> Reader<'a> {
             let mut names = Vec::new();
             let mut directories = Vec::new();
             while let Some(path) = pending.pop() {
-                for item in dir.read_dir(&path).map_err(|e| io(&path, e))? {
+                for item in
+                    member::with_directory(dir, &path, Dir::entries).map_err(|e| io(&path, e))?
+                {
                     let item = item.map_err(|e| io(&path, e))?;
                     let relative = path.join(item.file_name());
                     entries += 1;

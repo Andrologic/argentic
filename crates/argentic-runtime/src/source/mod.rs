@@ -5,6 +5,7 @@ mod archive;
 mod archive_writer_tests;
 #[cfg(test)]
 mod conformance050_tests;
+mod member;
 mod project;
 #[cfg(test)]
 mod project_tests;
@@ -18,6 +19,7 @@ use crate::persistence::{
     failure, Result,
 };
 use cap_std::fs::Dir;
+use member::open_regular;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
@@ -405,48 +407,6 @@ fn open_project_root(path: &Path) -> Result<Dir> {
         return Err(invalid(MANIFEST, "", "Expected a project directory"));
     }
     Ok(Dir::from_std_file(file))
-}
-
-fn open_regular(dir: &Dir, path: &Path) -> std::io::Result<cap_std::fs::File> {
-    if !dir.symlink_metadata(path)?.is_file() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "Expected a regular file",
-        ));
-    }
-    let mut options = cap_std::fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use cap_std::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
-    }
-    #[cfg(windows)]
-    {
-        use cap_std::fs::OpenOptionsExt;
-        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
-        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-    }
-    let file = dir.open_with(path, &options)?;
-    let meta = file.metadata()?;
-    #[cfg(windows)]
-    {
-        use cap_std::fs::MetadataExt;
-        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
-        if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "Expected a regular file",
-            ));
-        }
-    }
-    if !meta.is_file() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "Expected a regular file",
-        ));
-    }
-    Ok(file)
 }
 
 /// Open one regular local file without listing its directory.
