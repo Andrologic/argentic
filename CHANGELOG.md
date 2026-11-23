@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Native local stdio MCP call steps can launch verified project assets from
+  a retained snapshot. `HostContext::with_mcp_secrets` supplies each server's
+  declared environment variables at spawn.
+
 - Project opening and compilation share work and allocation budgets across
   parsing, expansion, validation and output. `GRAPH_LIMIT` locates refusals,
   including when diagnostics or the retained compiled plan exceed their limits.

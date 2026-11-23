@@ -40,6 +40,7 @@ pub(crate) struct StdioServer {
     pub program: PathBuf,
     pub arguments: Vec<String>,
     pub grant: CommandGrant,
+    pub secret_values: Vec<String>,
 }
 pub(crate) enum ServerTransport {
     Stdio(StdioServer),
@@ -268,6 +269,7 @@ pub(crate) struct Session {
     server: String,
     protocol: Protocol,
     next_id: u64,
+    secret_values: Vec<String>,
     wire: Wire,
 }
 enum Wire {
@@ -305,23 +307,58 @@ struct Body {
 }
 
 pub(crate) fn start(server: CapturedServer) -> Result<Session> {
+    start_with_stdio(server, |config| {
+        config.grant.sandbox.command(
+            &config.program,
+            &config.arguments,
+            &config.grant.workspace,
+            &config.grant.environment,
+        )
+    })
+}
+
+/// Linux exercises the real stdio protocol and process ownership with a local
+/// test peer. The production spawn still requires the qualified sandbox.
+#[cfg(all(test, unix))]
+pub(crate) fn start_test_stdio(server: CapturedServer) -> Result<Session> {
+    if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        return start(server);
+    }
+    start_with_stdio(server, |config| {
+        let mut command = crate::process::background_tokio_command("/bin/sh");
+        command
+            .args([
+                "-c",
+                "printf 'MACRO_SEATBELT_STARTED_V1\n'; exec \"$@\"",
+                "mcp-test",
+            ])
+            .arg(&config.program)
+            .args(&config.arguments)
+            .current_dir(&config.grant.workspace)
+            .env_clear()
+            .envs(&config.grant.environment)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        Ok(command)
+    })
+}
+
+fn start_with_stdio(
+    server: CapturedServer,
+    stdio: impl FnOnce(&StdioServer) -> std::result::Result<tokio::process::Command, String>,
+) -> Result<Session> {
     if server.document_name.is_empty() || server.capture_digest.is_empty() {
         return Err(CallError::new(
             "CORRELATION",
             "MCP server is not a captured document definition",
         ));
     }
+    let mut secret_values = Vec::new();
     let wire = match server.transport {
         ServerTransport::Stdio(config) => {
+            let mut command = stdio(&config).map_err(CallError::transport)?;
+            secret_values = config.secret_values;
             let policy = &config.grant.sandbox;
-            let mut command = policy
-                .command(
-                    &config.program,
-                    &config.arguments,
-                    &config.grant.workspace,
-                    &config.grant.environment,
-                )
-                .map_err(CallError::transport)?;
             command.stdin(Stdio::piped());
             let mut process = ContainedBackgroundProcess::spawn(command)
                 .map_err(|e| CallError::transport(e.to_string()))?;
@@ -449,6 +486,7 @@ pub(crate) fn start(server: CapturedServer) -> Result<Session> {
         server: server.document_name,
         protocol: server.protocol,
         next_id: 1,
+        secret_values,
         wire,
     })
 }
@@ -616,6 +654,9 @@ impl Session {
                                 return Err(CallError::transport("Only MCP form elicitation is supported"));
                             }
                         }
+                        if !self.secret_values.is_empty() {
+                            reject_secret_echo(&raw, &self.secret_values)?;
+                        }
                         let answers = wait_human(host.as_ref(), identity, &self.server, &raw, control).await?;
                         let answers_map = object(&answers)?;
                         if answers_map.len() != requests.len() || requests.keys().any(|id| !answers_map.contains_key(id)) {
@@ -626,7 +667,18 @@ impl Session {
                     params = format!("{{{base}{extra}}}");
                 }
                 Some("task") => return Err(CallError::new("UNCERTAIN", "MCP task requires a captured task completion adapter; remote effect may remain active")),
-                None | Some("complete") => return receipt(raw),
+                None | Some("complete") => {
+                    let result = receipt(raw)?;
+                    if !self.secret_values.is_empty() {
+                        if self.secret_values.iter().any(|secret| result.text.contains(secret)) {
+                            return Err(secret_echo());
+                        }
+                        if let Some(json) = &result.structured_content_json {
+                            reject_secret_echo(json, &self.secret_values)?;
+                        }
+                    }
+                    return Ok(result);
+                },
                 Some(_) => return Err(CallError::transport("Unknown MCP resultType")),
             }
         }
@@ -699,6 +751,9 @@ impl Session {
                         ));
                     }
                     let response = if method == "elicitation/create" {
+                        if !self.secret_values.is_empty() {
+                            reject_secret_echo(&raw, &self.secret_values)?;
+                        }
                         let answer =
                             wait_human(host, identity, &self.server, &raw, control).await?;
                         object(&answer)?;
@@ -796,6 +851,33 @@ impl Session {
             }
         }
     }
+}
+
+fn reject_secret_echo(raw: &str, secrets: &[String]) -> Result<()> {
+    use serde_json::Value;
+    fn contains(value: &Value, secrets: &[String]) -> bool {
+        let matches = |value: &str| secrets.iter().any(|secret| value.contains(secret));
+        match value {
+            Value::String(value) => matches(value),
+            Value::Array(items) => items.iter().any(|value| contains(value, secrets)),
+            Value::Object(fields) => fields
+                .iter()
+                .any(|(key, value)| matches(key) || contains(value, secrets)),
+            _ => false,
+        }
+    }
+    // Inspect both raw and decoded text (e.g. an escaped Unicode string).
+    // Fail before processing server requests or building a durable receipt.
+    let value: Value = serde_json::from_str(raw)
+        .map_err(|_| CallError::transport("Invalid secret-bearing MCP message"))?;
+    if secrets.iter().any(|secret| raw.contains(secret)) || contains(&value, secrets) {
+        return Err(secret_echo());
+    }
+    Ok(())
+}
+
+fn secret_echo() -> CallError {
+    CallError::transport("MCP message echoed a server secret")
 }
 
 async fn wait_human(

@@ -295,6 +295,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":"2","result":{"structuredContent":{"n":9007
         capture_digest: "capture".into(),
         protocol: Protocol::Legacy,
         transport: ServerTransport::Stdio(StdioServer {
+            secret_values: Vec::new(),
             program: "/bin/sh".into(),
             arguments: vec!["-c".into(), script.into()],
             grant: grant(root.path()),
@@ -456,4 +457,13 @@ async fn stop_during_legacy_get_human_closes_request_without_call_replay() {
     ));
     task.abort();
     let _ = task.await;
+}
+
+#[test]
+fn secret_echoes_in_raw_and_decoded_structured_values_are_refused() {
+    let secrets = vec!["secret-marker".to_owned()];
+    assert!(reject_secret_echo(r#"{"value":"secret-marker"}"#, &secrets).is_err());
+    assert!(reject_secret_echo(r#"{"value":"secret\u002dmarker"}"#, &secrets).is_err());
+    assert!(reject_secret_echo(r#"{"secret\u002dmarker":true}"#, &secrets).is_err());
+    assert!(reject_secret_echo(r#"{"value":"normal response"}"#, &secrets).is_ok());
 }

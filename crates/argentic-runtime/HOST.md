@@ -193,17 +193,66 @@ Use `code` to identify refusals that apply to the whole input, including
 remain available. If there is no source location, the serialized failure
 omits `source`.
 
-`secrets()` returns the names required by each declared MCP server.
-`mcp_files()` returns paths relative to `retained.resource_root()`. Opening
-a project works offline with a closed vault. The embedding host decides which
-MCP servers it can run and how to provide secret values. Opening either format
-does not start a server. Argentic does not run MCP commands from the retained
-copy: as for a JSON document, a relative MCP program resolves against the
-workspace. To run a declared asset, the embedding host provides it from
-`resource_root()`. The retained index records each file's executable flag;
-the mode of the retained file is not checked. When present, the ZIP's Git bundle is verified by size
-and SHA-256. The current snapshot opens without Git. Importing and browsing
-historical revisions are outside the host profile.
+`secrets()` returns the environment variable names declared for each MCP
+server. `mcp_files()` returns its file paths relative to
+`RetainedSource::resource_root()`. Opening and retaining the project works
+offline with a closed vault.
+
+For local stdio MCP call steps in a native embedding, configure Macro's
+`HostContext` with the same private data root passed to `OpenedSource::retain`.
+Call `retained.bind_scope(&mut scope)?` before preparing the registry and
+persist that scope unchanged in `callScopeJson`. It binds the retained root,
+the declared paths and the secret names. Use the existing local call
+capability and current host and project policy checks. The native local call
+backend uses Seatbelt on macOS ARM64 and requires the existing workspace
+permissions. Codex agent MCP equipment and remote MCP still require separate
+adapter qualification.
+
+The process runs with the captured workspace (`scope.root`) as its working
+directory. A relative program with a path separator must be listed in that
+server's `mcpFiles`. A listed bare program name also selects the retained
+file, which must have its executable flag set. An argument that matches a
+declared path, such as `mcp/server.sh` in `["sh", "mcp/server.sh"]`, becomes
+the absolute path to that retained file. Remaining arguments pass through
+as written. Bare system programs use `/usr/bin:/bin`. For a plain JSON
+source a relative program path still resolves against the workspace.
+
+Set the provider on the context passed to `StartSession::attach_committed_start`.
+
+```rust
+use argentic_runtime::host::{HostContext, McpSecretProvider};
+use std::sync::Arc;
+
+fn configure_mcp(context: HostContext, vault: Arc<McpSecretProvider>) -> HostContext {
+    context.with_mcp_secrets(vault)
+}
+```
+
+`McpSecretProvider` is a `Send + Sync` callback with arguments
+`(&EngineSourceRevision, &str, &[String])` and return type
+`Option<BTreeMap<String, String>>`. Macro looks up the values by source,
+server ID and requested names. Return exactly those names, or `None` to
+refuse spawn. The synchronous callback runs under the native launch gate.
+Keep it short and use a host-owned vault handle. It runs afresh on each
+physical spawn for a server that declares secrets. The subprocess gets a
+cleared environment with the fixed runtime PATH and that server's values.
+Argentic keeps values in memory and in the child environment. It discards
+stderr and rejects literal secret echoes in tool results and MCP requests
+for human input before retaining them. Macro must approve the server code
+and ensure it keeps credentials out of files, derived output and child
+command lines. Restart fences interrupted work and does not respawn an
+earlier MCP call.
+
+Argentic checks the declared assets against the retained index before launch.
+The confined MCP process has read access to its declared assets and a write
+ceiling that excludes the retained project. Keep the entire private data
+directory outside all agent write grants. Macro must protect it from changes
+by other processes and from replacement between validation and launch,
+including when Macro provides its own sandbox or workspace mounts.
+
+When present, the ZIP's Git bundle is verified by size and SHA-256. The
+current snapshot opens without Git. Importing and browsing historical
+revisions are outside the host profile.
 
 Retain packages under the same private data root used by `HostContext`.
 Argentic publishes a content-addressed copy of the selected files and records

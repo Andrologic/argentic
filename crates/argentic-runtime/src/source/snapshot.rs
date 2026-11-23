@@ -8,7 +8,7 @@ use serde_json::Value;
 use std::{
     collections::BTreeMap,
     fs,
-    io::Write,
+    io::{Read, Write},
     path::{Path, PathBuf},
 };
 
@@ -22,6 +22,14 @@ const PROJECT: &str = "project";
 pub struct RetainedSource {
     pub(super) location: PathBuf,
     pub(super) id: Option<String>,
+    pub(super) mcp: McpDeclarations,
+}
+
+#[derive(Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct McpDeclarations {
+    pub files: BTreeMap<String, Vec<String>>,
+    pub secrets: BTreeMap<String, Vec<String>>,
 }
 
 impl RetainedSource {
@@ -45,8 +53,10 @@ impl RetainedSource {
         );
         if let Some(id) = &self.id {
             object.insert("projectSnapshot".into(), Value::from(id.as_str()));
+            object.insert("projectMcp".into(), serde_json::to_value(&self.mcp)?);
         } else {
             object.remove("projectSnapshot");
+            object.remove("projectMcp");
         }
         Ok(())
     }
@@ -197,6 +207,7 @@ pub(super) fn retain(
     Ok(RetainedSource {
         location: snapshot.root.join(super::MANIFEST),
         id: Some(id),
+        mcp: McpDeclarations::default(),
     })
 }
 
@@ -278,6 +289,31 @@ impl Snapshot {
             return Err(unavailable());
         }
         Ok(Some(snapshot))
+    }
+
+    /// Verify a member before exposing its path to a confined process. The
+    /// host protects the directory against renames and writes through spawn.
+    pub(crate) fn verify_member(&self, name: &str) -> Result<()> {
+        use sha2::Digest;
+        let entry = self.manifest.files.get(name).ok_or_else(unavailable)?;
+        let dir =
+            Dir::open_ambient_dir(&self.root, ambient_authority()).map_err(|_| unavailable())?;
+        let file = super::open_regular(&dir, Path::new(name)).map_err(|_| unavailable())?;
+        let mut hash = sha2::Sha256::new();
+        let size =
+            std::io::copy(&mut file.take(entry.size + 1), &mut hash).map_err(|_| unavailable())?;
+        if size != entry.size || format!("{:x}", hash.finalize()) != entry.sha256 {
+            return Err(unavailable());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn executable(&self, path: &Path) -> bool {
+        path.strip_prefix(&self.root)
+            .ok()
+            .and_then(Path::to_str)
+            .and_then(|name| self.manifest.files.get(name))
+            .is_some_and(|entry| entry.executable)
     }
 
     /// Whether a path names a location inside the retained project.

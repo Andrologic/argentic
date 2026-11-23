@@ -380,6 +380,7 @@ impl StartSession<'_> {
                     tasks: tasks.clone(),
                     transport: Arc::new(
                         crate::agsdl_host_call_executor030::NativeCallTransport030 {
+                            config: context.clone(),
                             humans: Some(Arc::new(
                                 crate::agsdl_host_human_executor030::CallHumans030 {
                                     app: self.engine.clone(),

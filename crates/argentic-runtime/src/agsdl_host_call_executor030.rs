@@ -13,6 +13,7 @@ use crate::{
     persistence::{
         dto::EngineOwner, failure, flow030::FlowEffect030, start030::StartCapture030, Result,
     },
+    source::{McpDeclarations, Snapshot},
     tasks::StreamTasks,
 };
 use futures::future::BoxFuture;
@@ -110,6 +111,7 @@ impl HostExecutor030 for CallExecutor030 {
                                 failure("PERMISSION", "call", "Project permissions unavailable")
                             })?;
                         let mut grant = grant(
+                            config.root(),
                             &inspection.capture,
                             &serde_json::to_value(global.permissions())?,
                             &project.tools,
@@ -214,7 +216,8 @@ async fn prepared(pool: &SqlitePool, attempt: &CallAttempt030) -> Result<Prepare
 
 /// Calls have no agent permissions to borrow. Both captured and current host
 /// ceilings must explicitly allow local work; project read-only remains a ceiling.
-pub(crate) fn grant(
+fn grant(
+    data: &Path,
     capture: &StartCapture030,
     current_host: &Value,
     tools: &Value,
@@ -261,9 +264,32 @@ pub(crate) fn grant(
             "Workspace changed since capture",
         ));
     }
-    let _ = prepared;
     let mut read = vec![PathScope::Subtree(root.clone())];
     let mut write = vec![PathScope::Subtree(root.clone())];
+    let mut block = Vec::new();
+    if let PreparedCall030::Mcp { server, .. } = prepared {
+        if let Some(project) = RetainedMcp::open(data, capture, &scope, server)? {
+            if root.starts_with(&project.snapshot.root) || project.snapshot.root.starts_with(&root)
+            {
+                return Err(failure(
+                    "PERMISSION",
+                    "call",
+                    "Workspace overlaps the retained project",
+                ));
+            }
+            for (name, path) in project.files {
+                project.snapshot.verify_member(&name)?;
+                read.push(PathScope::Literal(path.clone()));
+                read.extend(
+                    path.ancestors()
+                        .skip(1)
+                        .take_while(|path| path.starts_with(&project.snapshot.root))
+                        .map(|path| PathScope::Literal(path.to_owned())),
+                );
+            }
+            block.push(PathScope::Subtree(project.snapshot.root));
+        }
+    }
     // Explicit native runtime dependencies. User home and application profiles
     // are outside these roots; the environment inherits no credentials.
     if cfg!(unix) {
@@ -293,7 +319,7 @@ pub(crate) fn grant(
             },
             write: FileAccess {
                 allow: write,
-                block: vec![],
+                block,
             },
             network: false,
         }],
@@ -321,6 +347,7 @@ pub(crate) trait CallTransport030: Send + Sync {
     >;
 }
 pub(crate) struct NativeCallTransport030 {
+    pub config: HostContext,
     pub humans: Option<std::sync::Arc<dyn transport::HostPort>>,
 }
 impl CallTransport030 for NativeCallTransport030 {
@@ -334,7 +361,7 @@ impl CallTransport030 for NativeCallTransport030 {
     ) -> transport::Result<
         BoxFuture<'static, Result<crate::persistence::call_protocol030::CallEnd030>>,
     > {
-        let started = start_transport(grant, &prepared, &capture)?;
+        let started = start_transport(&self.config, grant, &prepared, &capture)?;
         let humans = self
             .humans
             .clone()
@@ -345,11 +372,12 @@ impl CallTransport030 for NativeCallTransport030 {
     }
 }
 
-enum StartedTransport {
+pub(crate) enum StartedTransport {
     Command(crate::process::ContainedBackgroundProcess, SandboxPolicy),
     Mcp(raw_mcp::Session),
 }
 fn start_transport(
+    config: &HostContext,
     grant: CommandGrant,
     prepared: &PreparedCall030,
     capture: &StartCapture030,
@@ -368,57 +396,166 @@ fn start_transport(
             Ok(StartedTransport::Command(child, grant.sandbox))
         }
         PreparedCall030::Mcp { server, .. } => {
-            let document: Value = serde_json::from_str(&capture.authored_source)
-                .map_err(|e| transport::CallError::transport(e.to_string()))?;
-            let command = document["mcpServers"][server]["command"]
-                .as_array()
-                .ok_or_else(|| {
-                    transport::CallError::transport("Only local stdio MCP servers are supported")
-                })?;
-            let program = command
-                .first()
-                .and_then(Value::as_str)
-                .ok_or_else(|| transport::CallError::transport("MCP program missing"))?;
-            // Resolve bare program names only within the fixed native PATH.
-            let program = if Path::new(program).is_absolute() {
-                PathBuf::from(program)
-            } else if program.contains('/') {
-                grant.workspace.join(program)
-            } else {
-                ["/usr/bin", "/bin"]
-                    .iter()
-                    .map(|dir| Path::new(dir).join(program))
-                    .find(|path| path.is_file())
-                    .ok_or_else(|| {
-                        transport::CallError::transport(
-                            "MCP executable not found in the confined PATH",
-                        )
-                    })?
-            };
-            let arguments = command
-                .iter()
-                .skip(1)
-                .map(|v| {
-                    v.as_str()
-                        .map(str::to_owned)
-                        .ok_or_else(|| transport::CallError::transport("MCP argument is not text"))
-                })
-                .collect::<transport::Result<Vec<_>>>()?;
-            raw_mcp::start(raw_mcp::CapturedServer {
-                document_name: server.clone(),
-                capture_digest: capture.source.source_sha256.clone(),
-                protocol: raw_mcp::Protocol::Legacy,
-                transport: raw_mcp::ServerTransport::Stdio(raw_mcp::StdioServer {
-                    program,
-                    arguments,
-                    grant,
-                }),
-            })
-            .map(StartedTransport::Mcp)
+            raw_mcp::start(mcp_server(config, grant, capture, server)?).map(StartedTransport::Mcp)
         }
     }
 }
-async fn run_transport(
+
+struct RetainedMcp {
+    snapshot: Snapshot,
+    files: BTreeMap<String, PathBuf>,
+    names: Vec<String>,
+}
+
+impl RetainedMcp {
+    fn open(
+        data: &Path,
+        capture: &StartCapture030,
+        scope: &Value,
+        server: &str,
+    ) -> Result<Option<Self>> {
+        let Some(snapshot) = Snapshot::from_capture(data, capture)? else {
+            return Ok(None);
+        };
+        let mut declarations: McpDeclarations = serde_json::from_value(scope["projectMcp"].clone())
+            .map_err(|_| {
+                failure(
+                    "CORRELATION",
+                    "projectSnapshot",
+                    "Retain and bind the project MCP declarations before Start",
+                )
+            })?;
+        let mut files = BTreeMap::new();
+        for name in declarations.files.remove(server).unwrap_or_default() {
+            files.insert(name.clone(), snapshot.root.join(name));
+        }
+        Ok(Some(Self {
+            snapshot,
+            files,
+            names: declarations.secrets.remove(server).unwrap_or_default(),
+        }))
+    }
+
+    fn file(&self, argument: &str) -> Option<&Path> {
+        if argument.contains('\\') {
+            return None;
+        }
+        let mut parts = Vec::new();
+        for part in Path::new(argument).components() {
+            match part {
+                std::path::Component::Normal(part) => parts.push(part.to_str()?),
+                std::path::Component::CurDir => (),
+                std::path::Component::ParentDir => {
+                    parts.pop()?;
+                }
+                _ => return None,
+            }
+        }
+        self.files.get(&parts.join("/")).map(PathBuf::as_path)
+    }
+}
+
+pub(crate) fn mcp_server(
+    config: &HostContext,
+    mut grant: CommandGrant,
+    capture: &StartCapture030,
+    server: &str,
+) -> transport::Result<raw_mcp::CapturedServer> {
+    let private: Value = serde_json::from_str(&capture.private_capture_json)
+        .map_err(|_| transport::CallError::transport("MCP capture is invalid"))?;
+    let scope: Value = serde_json::from_str(private["callScopeJson"].as_str().unwrap_or(""))
+        .map_err(|_| transport::CallError::transport("MCP scope is invalid"))?;
+    let project = RetainedMcp::open(config.root(), capture, &scope, server)
+        .map_err(|error| transport::CallError::new(&error.code, error.message))?;
+    let document: Value = serde_json::from_str(&capture.authored_source)
+        .map_err(|e| transport::CallError::transport(e.to_string()))?;
+    let command = document["mcpServers"][server]["command"]
+        .as_array()
+        .ok_or_else(|| {
+            transport::CallError::transport("Only local stdio MCP servers are supported")
+        })?;
+    let program = command
+        .first()
+        .and_then(Value::as_str)
+        .ok_or_else(|| transport::CallError::transport("MCP program missing"))?;
+    // Resolve bare program names only within the fixed native PATH.
+    let retained_program = project
+        .as_ref()
+        .and_then(|project| project.file(program).map(|path| (&project.snapshot, path)));
+    let program = if let Some((snapshot, path)) = retained_program {
+        if !snapshot.executable(path) {
+            return Err(transport::CallError::transport(
+                "Retained MCP program is not executable",
+            ));
+        }
+        path.to_owned()
+    } else if Path::new(program).is_absolute() {
+        PathBuf::from(program)
+    } else if program.contains('/') {
+        if project.is_some() {
+            return Err(transport::CallError::transport(
+                "Declare the relative MCP program in mcpFiles",
+            ));
+        }
+        grant.workspace.join(program)
+    } else {
+        ["/usr/bin", "/bin"]
+            .iter()
+            .map(|dir| Path::new(dir).join(program))
+            .find(|path| path.is_file())
+            .ok_or_else(|| {
+                transport::CallError::transport("MCP executable not found in the confined PATH")
+            })?
+    };
+    let arguments = command
+        .iter()
+        .skip(1)
+        .map(|v| {
+            v.as_str()
+                .ok_or_else(|| transport::CallError::transport("MCP argument is not text"))
+                .and_then(|argument| {
+                    match project.as_ref().and_then(|project| project.file(argument)) {
+                        Some(path) => path.to_str().map(str::to_owned).ok_or_else(|| {
+                            transport::CallError::transport("MCP asset path is not UTF-8")
+                        }),
+                        None => Ok(argument.to_owned()),
+                    }
+                })
+        })
+        .collect::<transport::Result<Vec<_>>>()?;
+    let mut secret_values = Vec::new();
+    if let Some(project) = project.filter(|project| !project.names.is_empty()) {
+        let unavailable = || {
+            transport::CallError::new(
+                "MCP_SECRETS_UNAVAILABLE",
+                "MCP secret environment is unavailable",
+            )
+        };
+        let secrets = config
+            .mcp_secrets(&capture.source, server, &project.names)
+            .ok_or_else(unavailable)?;
+        if secrets.len() != project.names.len()
+            || project.names.iter().any(|name| !secrets.contains_key(name))
+            || secrets.values().any(|value| value.as_bytes().contains(&0))
+        {
+            return Err(unavailable());
+        }
+        secret_values.extend(secrets.values().filter(|value| !value.is_empty()).cloned());
+        grant.environment.extend(secrets);
+    }
+    Ok(raw_mcp::CapturedServer {
+        document_name: server.to_owned(),
+        capture_digest: capture.source.source_sha256.clone(),
+        protocol: raw_mcp::Protocol::Legacy,
+        transport: raw_mcp::ServerTransport::Stdio(raw_mcp::StdioServer {
+            program,
+            arguments,
+            grant,
+            secret_values,
+        }),
+    })
+}
+pub(crate) async fn run_transport(
     started: StartedTransport,
     prepared: &PreparedCall030,
     attempt: &CallAttempt030,
@@ -508,7 +645,7 @@ fn failure_fn(message: &str) -> crate::persistence::dto::EngineFailure {
 
 // The transport's human callbacks fail explicitly until lot 3.2. No implicit
 // approval/decline, fixed watchdog or historical work protocol is introduced.
-struct NoHuman;
+pub(crate) struct NoHuman;
 #[async_trait::async_trait]
 impl transport::HostPort for NoHuman {
     fn supports_human_requests(&self) -> bool {

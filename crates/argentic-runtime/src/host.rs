@@ -1,7 +1,11 @@
 //! Approved host policy inputs. These leases freeze inputs, never grant work.
-use crate::{permissions::RequestedPermissions, persistence::Result};
+use crate::{
+    permissions::RequestedPermissions,
+    persistence::{dto::EngineSourceRevision, Result},
+};
 use serde_json::Value;
 use std::{
+    collections::BTreeMap,
     future::Future,
     path::{Path, PathBuf},
     pin::Pin,
@@ -61,12 +65,19 @@ pub trait PolicySource: Send + Sync {
     fn lock_ceiling(&self) -> PolicyFuture<'_, HostPolicyLease>;
 }
 
+/// Resolves one server's declared environment variables just before spawn.
+/// Return exactly the requested names, or None if they cannot be supplied.
+pub type McpSecretProvider = dyn Fn(&EngineSourceRevision, &str, &[String]) -> Option<BTreeMap<String, String>>
+    + Send
+    + Sync;
+
 #[derive(Clone)]
 pub struct HostContext {
     root: PathBuf,
     policy: Arc<dyn PolicySource>,
     network: Arc<dyn crate::content_network::ContentNetwork>,
     codex_auth_file: Option<PathBuf>,
+    mcp_secrets: Option<Arc<McpSecretProvider>>,
 }
 impl HostContext {
     pub fn new(root: PathBuf, policy: Arc<dyn PolicySource>) -> Self {
@@ -75,6 +86,7 @@ impl HostContext {
             policy,
             network: Arc::new(crate::content_network::UnavailableNetwork),
             codex_auth_file: None,
+            mcp_secrets: None,
         }
     }
     pub fn with_network(
@@ -96,6 +108,18 @@ impl HostContext {
     }
     pub(crate) fn codex_auth_file(&self) -> Option<&Path> {
         self.codex_auth_file.as_deref()
+    }
+    pub fn with_mcp_secrets(mut self, provider: Arc<McpSecretProvider>) -> Self {
+        self.mcp_secrets = Some(provider);
+        self
+    }
+    pub(crate) fn mcp_secrets(
+        &self,
+        source: &EngineSourceRevision,
+        server: &str,
+        names: &[String],
+    ) -> Option<BTreeMap<String, String>> {
+        self.mcp_secrets.as_ref()?(source, server, names)
     }
     pub fn root(&self) -> &Path {
         &self.root

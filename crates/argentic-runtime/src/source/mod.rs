@@ -12,7 +12,7 @@ mod project_tests;
 mod snapshot;
 
 pub use snapshot::RetainedSource;
-pub(crate) use snapshot::Snapshot;
+pub(crate) use snapshot::{McpDeclarations, Snapshot};
 
 use crate::persistence::{
     dto::{EngineFailure, SourceDiagnostic, SourceErrorKind},
@@ -301,10 +301,19 @@ impl OpenedSource {
     /// same directory as [crate::host::HostContext::root] when executing a run.
     pub fn retain(&self, host_data: &Path) -> Result<RetainedSource> {
         match &self.project {
-            Some(project) => snapshot::retain(host_data, &self.source_sha256(), &project.files),
+            Some(project) => {
+                let mut retained =
+                    snapshot::retain(host_data, &self.source_sha256(), &project.files)?;
+                retained.mcp = McpDeclarations {
+                    files: project.mcp_files.clone(),
+                    secrets: project.secrets.clone(),
+                };
+                Ok(retained)
+            }
             None => Ok(RetainedSource {
                 location: self.origin.clone().unwrap(),
                 id: None,
+                mcp: McpDeclarations::default(),
             }),
         }
     }

@@ -12,6 +12,26 @@ async fn host_fixture_with_entry(
 ) -> (Fixture, crate::tasks::StreamTasks) {
     let f =
         Fixture::new(&json!({"document":document,"entry":entry,"timeline":[]}).to_string()).await;
+    let transport = Arc::new(crate::agsdl_host_call_executor030::NativeCallTransport030 {
+        config: f.config.clone(),
+        humans: Some(Arc::new(
+            crate::agsdl_host_human_executor030::CallHumans030 {
+                app: f.host.clone(),
+                pool: f.pool.clone(),
+                identity: f.identity.clone(),
+            },
+        )),
+    });
+    let tasks = start_calls(&f, f.config.clone(), transport);
+    (f, tasks)
+}
+
+#[cfg(unix)]
+fn start_calls(
+    f: &Fixture,
+    config: crate::host::HostContext,
+    transport: Arc<dyn crate::agsdl_host_call_executor030::CallTransport030>,
+) -> crate::tasks::StreamTasks {
     let tasks = crate::tasks::StreamTasks::default();
     let host = &f.host;
     host.flow030()
@@ -21,7 +41,7 @@ async fn host_fixture_with_entry(
     spawn_supervisor030(
         f.host.clone(),
         f.pool.clone(),
-        f.config.clone(),
+        config.clone(),
         tasks.clone(),
         f.owner.clone(),
         Executors030 {
@@ -35,21 +55,11 @@ async fn host_fixture_with_entry(
             }),
             calls: Some(Arc::new(
                 crate::agsdl_host_call_executor030::CallExecutor030 {
-                    config: f.config.clone(),
+                    config,
                     pool: f.pool.clone(),
                     tasks: tasks.clone(),
                     owner: f.owner.clone(),
-                    transport: Arc::new(
-                        crate::agsdl_host_call_executor030::NativeCallTransport030 {
-                            humans: Some(Arc::new(
-                                crate::agsdl_host_human_executor030::CallHumans030 {
-                                    app: f.host.clone(),
-                                    pool: f.pool.clone(),
-                                    identity: f.identity.clone(),
-                                },
-                            )),
-                        },
-                    ),
+                    transport,
                 },
             )),
             humans: Some(Arc::new(
@@ -69,9 +79,9 @@ async fn host_fixture_with_entry(
         },
     )
     .unwrap();
-    (f, tasks)
+    tasks
 }
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(unix)]
 async fn finish(f: &Fixture) -> crate::persistence::flow_store030::FlowView030 {
     let host = &f.host;
     let result = tokio::time::timeout(
@@ -540,4 +550,155 @@ async fn nested_entry_approval_keeps_host_prompt_provenance_through_its_output()
     };
     let output: Value = serde_json::from_str(output_json).unwrap();
     assert_eq!(output["message"]["prompt"], "Synthetic entry");
+}
+
+#[cfg(unix)]
+struct RetainedStdio(crate::host::HostContext);
+
+#[cfg(unix)]
+impl crate::agsdl_host_call_executor030::CallTransport030 for RetainedStdio {
+    fn start(
+        &self,
+        grant: crate::agsdl_host_calls::CommandGrant,
+        prepared: crate::agsdl_host_calls030::PreparedCall030,
+        capture: StartCapture030,
+        attempt: crate::agsdl_host_calls030::CallAttempt030,
+        control: crate::agsdl_host_calls::Control,
+    ) -> crate::agsdl_host_calls::Result<
+        BoxFuture<'static, Result<crate::persistence::call_protocol030::CallEnd030>>,
+    > {
+        use crate::agsdl_host_call_executor030::{
+            mcp_server, run_transport, NoHuman, StartedTransport,
+        };
+        let crate::agsdl_host_calls030::PreparedCall030::Mcp { server, .. } = &prepared else {
+            unreachable!();
+        };
+        let config = mcp_server(&self.0, grant, &capture, server)?;
+        let started = crate::agsdl_host_calls::raw_mcp::start_test_stdio(config)?;
+        Ok(Box::pin(async move {
+            run_transport(
+                StartedTransport::Mcp(started),
+                &prepared,
+                &attempt,
+                &control,
+                Arc::new(NoHuman),
+            )
+            .await
+        }))
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn retained_stdio_uses_workspace_and_isolates_secrets_across_servers_and_reopen() {
+    use std::{fs, os::unix::fs::PermissionsExt};
+    const FIRST: &str = "runtime-test-first-secret";
+    const SECOND: &str = "runtime-test-second-secret";
+    let project = tempfile::tempdir().unwrap();
+    fs::create_dir(project.path().join("mcp")).unwrap();
+    let doc = json!({
+        "projectFormat":"agsdl-project-1","contract":"agsdl-0.4.0","id":"retained-mcp","agents":{},
+        "mcpServers":{"first":{"command":["./mcp/first.sh"]},"second":{"command":["sh","mcp/second.sh"]}},
+        "mcpFiles":{"first":["mcp/first.sh"],"second":["mcp/second.sh"]},
+        "secrets":{"file":"requirements.json"},
+        "flow":{"entry":"first","steps":{
+            "first":{"type":"call","mcp":{"server":"first","tool":"check"},"next":"second"},
+            "second":{"type":"call","mcp":{"server":"second","tool":"check"}}
+        }}
+    });
+    fs::write(project.path().join("agsdl.json"), doc.to_string()).unwrap();
+    fs::write(
+        project.path().join("requirements.json"),
+        r#"{"first":["FIRST_TOKEN"],"second":["SECOND_TOKEN"]}"#,
+    )
+    .unwrap();
+    for (server, name, other, size) in [
+        ("first", "FIRST_TOKEN", "SECOND_TOKEN", FIRST.len()),
+        ("second", "SECOND_TOKEN", "FIRST_TOKEN", SECOND.len()),
+    ] {
+        let script = format!(
+            r#"#!/bin/sh
+set -eu
+test -f cwd-marker
+test "${{#{name}}}" = "{size}"
+test -z "${{{other}+set}}"
+printf '%s\n' "${{{name}}}" >&2
+IFS= read -r init
+printf '%s\n' '{{"jsonrpc":"2.0","id":"1","result":{{"protocolVersion":"2025-11-25","capabilities":{{}},"serverInfo":{{"name":"fixture","version":"1"}}}}}}'
+IFS= read -r initialized
+IFS= read -r call
+printf '%s\n' '{{"jsonrpc":"2.0","id":"2","result":{{"structuredContent":{{"checked":"{server}"}},"content":[]}}}}'
+"#
+        );
+        let path = project.path().join(format!("mcp/{server}.sh"));
+        fs::write(&path, script).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let f = Fixture::new_with_project(r#"{"entry":{},"timeline":[]}"#, false, Some(project.path()))
+        .await;
+    let unstarted =
+        Fixture::new_with_project(r#"{"entry":{},"timeline":[]}"#, false, Some(project.path()))
+            .await;
+    project.close().unwrap();
+    fs::write(f._temp.path().join("workspace/cwd-marker"), "").unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let observed = seen.clone();
+    let config = f
+        .config
+        .clone()
+        .with_mcp_secrets(Arc::new(move |source, server, names| {
+            assert_eq!(source.owner.project_id, "project");
+            observed.lock().unwrap().push(server.to_owned());
+            let (key, value) = match server {
+                "first" => ("FIRST_TOKEN", FIRST),
+                "second" => ("SECOND_TOKEN", SECOND),
+                _ => unreachable!(),
+            };
+            assert_eq!(names, [key]);
+            Some(BTreeMap::from([(key.into(), value.into())]))
+        }));
+    let _tasks = start_calls(&f, config.clone(), Arc::new(RetainedStdio(config)));
+    let view = finish(&f).await;
+    assert_eq!(view.state.verdict.as_deref(), Some("succeeded"));
+    assert_eq!(*seen.lock().unwrap(), ["first", "second"]);
+    for (index, name) in ["first", "second"].into_iter().enumerate() {
+        assert_eq!(
+            serde_json::from_str::<Value>(
+                serde_json::to_value(&view.state.activations[index].result).unwrap()["outputJson"]
+                    .as_str()
+                    .unwrap()
+            )
+            .unwrap(),
+            json!({"outcome":"passed","data":{"checked":name}}),
+        );
+    }
+    for (fixture, expected) in [(&f, "succeeded"), (&unstarted, "interrupted")] {
+        fixture.pool.close().await;
+        let path = fixture._temp.path().join("run.db");
+        let options = sqlx::sqlite::SqliteConnectOptions::new().filename(&path);
+        let pool = SqlitePool::connect_with(options).await.unwrap();
+        crate::api::interrupt_previous_runs(&pool).await.unwrap();
+        let projection = fixture
+            .host
+            .runtime_projection(
+                &pool,
+                crate::api::RuntimeProjectionQuery030 {
+                    system_start_id: fixture.identity.system_start_id.clone(),
+                    source: serde_json::from_value(fixture.plan.source.clone()).unwrap(),
+                    snapshot_id: Some(fixture.identity.snapshot_id.clone()),
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(projection.verdict.as_deref(), Some(expected));
+        pool.close().await;
+        let db = fs::read(path).unwrap();
+        for secret in [FIRST, SECOND] {
+            assert!(!db
+                .windows(secret.len())
+                .any(|window| window == secret.as_bytes()));
+        }
+    }
+    assert_eq!(*seen.lock().unwrap(), ["first", "second"]);
 }

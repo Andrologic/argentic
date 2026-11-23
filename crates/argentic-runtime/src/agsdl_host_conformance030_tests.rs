@@ -205,6 +205,9 @@ impl Fixture {
         Self::new_mode(raw, false).await
     }
     async fn new_mode(raw: &str, memory: bool) -> Self {
+        Self::new_with_project(raw, memory, None).await
+    }
+    async fn new_with_project(raw: &str, memory: bool, project: Option<&std::path::Path>) -> Self {
         let fixture: Value = serde_json::from_str(raw).unwrap();
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
@@ -217,12 +220,24 @@ impl Fixture {
         // Read exact source text from the fixture, preserving numeric tokens.
         let fields: BTreeMap<String, Box<serde_json::value::RawValue>> =
             serde_json::from_str(raw).unwrap();
-        let authored = scenarios::fixture_document(fields["document"].get())
-            .unwrap()
-            .to_owned();
+        let opened = project.map(|path| crate::source::OpenedSource::open_path(path).unwrap());
+        let authored = match &opened {
+            Some(source) => source.authored_json().to_owned(),
+            None => scenarios::fixture_document(fields["document"].get())
+                .unwrap()
+                .to_owned(),
+        };
         let document: Value = serde_json::from_str(&authored).unwrap();
         let source = json!({"owner":{"projectId":"project","planId":"source","branch":"develop"},"revision":"1","sourceSha256":format!("{:x}",Sha256::digest(authored.as_bytes()))});
-        let scope = json!({"projectId":"project","root":workspace,"rootIdentity":crate::content_io::admitted::workspace_root_identity(&workspace).unwrap().observation_key().unwrap(),"sourceOwner":source["owner"]});
+        let mut scope = json!({"projectId":"project","root":workspace,"rootIdentity":crate::content_io::admitted::workspace_root_identity(&workspace).unwrap().observation_key().unwrap(),"sourceOwner":source["owner"]});
+        if let Some(opened) = opened {
+            std::fs::create_dir_all(config.root()).unwrap();
+            opened
+                .retain(config.root())
+                .unwrap()
+                .bind_scope(&mut scope)
+                .unwrap();
+        }
         let mut registry = if document["agents"].as_object().unwrap().is_empty() {
             json!({"format":"macro-agsdl-registry/030", "version":"fixture", "modules":[], "harnesses":[], "agents":[], "hostCapabilities":[{"name":"call.command","support":"native","evidenceJson":"{\"transport\":\"native-call-test\"}"},{"name":"call.mcp","support":"native","evidenceJson":"{\"transport\":\"native-call-test\"}"},{"name":"approval","support":"native","evidenceJson":"{\"transport\":\"native-human-test\"}"}]})
         } else if document["agents"]
