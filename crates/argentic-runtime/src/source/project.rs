@@ -76,15 +76,6 @@ pub(super) fn assemble_folder(
         reader.files.insert(canonical, file);
     }
     let mut project = reader.assemble()?;
-    for (name, file) in &project.files {
-        if sidecar_name(name) && file.bytes.starts_with(MODE_HEADER) {
-            return Err(invalid(
-                name,
-                "",
-                "Executable metadata cannot be a selected project file",
-            ));
-        }
-    }
     if !native_modes {
         for file in project.files.values_mut() {
             file.executable = false;
@@ -107,6 +98,8 @@ fn sidecar_name(name: &str) -> bool {
 
 fn restore_executable_modes(dir: &Dir, files: &mut Files) -> Result<()> {
     let root = Path::new(MANIFEST);
+    // Both folder and archive assembly preserve the project's selection.
+    // Only a root file outside it can carry unpacker metadata.
     let selected = files
         .keys()
         .filter(|name| sidecar_name(name))

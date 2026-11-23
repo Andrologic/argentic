@@ -572,24 +572,27 @@ fn folder_sidecar_round_trip_preserves_archive_modes() {
 }
 
 #[test]
-fn reserved_sidecar_contents_cannot_become_a_project_member() {
+fn a_selected_sidecar_name_is_ordinary_content_in_folder_and_archive() {
     let temp = tempfile::tempdir().unwrap();
     project(temp.path(), "../.agsdl-executables", None);
-    write(
-        temp.path(),
-        ".agsdl-executables",
-        "ordinary project content",
-    );
-    assert!(
-        files(&OpenedSource::open_path(temp.path()).unwrap()).contains_key(".agsdl-executables")
-    );
-    write(
-        temp.path(),
-        ".agsdl-executables",
-        "AgSDL executable paths v1\nnotes.md",
-    );
-    assert!(refused(OpenedSource::open_path(temp.path()))
-        .contains("Executable metadata cannot be a selected"));
+    let mut agent: Value =
+        serde_json::from_slice(&std::fs::read(temp.path().join("agents/a.json")).unwrap()).unwrap();
+    agent["resources"]["notes"] = json!({"uri":"../notes.md"});
+    write(temp.path(), "agents/a.json", agent.to_string());
+    let metadata = b"AgSDL executable paths v1\nnotes.md";
+    write(temp.path(), ".agsdl-executables", metadata);
+
+    let dir = open_project_root(temp.path()).unwrap();
+    let folder =
+        OpenedSource::assembled(project::assemble_folder(dir, None, false).unwrap()).unwrap();
+    let archived = OpenedSource::open_archive_bytes(&pack(&files(&folder))).unwrap();
+    for opened in [folder, archived] {
+        assert_eq!(files(&opened)[".agsdl-executables"], metadata);
+        assert!(opened
+            .selected_files()
+            .unwrap()
+            .all(|file| !file.executable));
+    }
 }
 
 #[test]

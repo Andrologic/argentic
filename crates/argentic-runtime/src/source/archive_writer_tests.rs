@@ -212,6 +212,17 @@ fn archive_interchanges_with_reference_tool() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("project");
     project(&root);
+    // A selected sidecar name carries project data, even with the metadata header.
+    let component = root.join("agents/review.json");
+    let mut doc: serde_json::Value =
+        serde_json::from_slice(&fs::read(&component).unwrap()).unwrap();
+    doc["resources"]["modes"] = serde_json::json!({"uri":"../.agsdl-executables"});
+    fs::write(component, doc.to_string()).unwrap();
+    fs::write(
+        root.join(".agsdl-executables"),
+        "AgSDL executable paths v1\nnotes.md",
+    )
+    .unwrap();
     let folder = OpenedSource::open_path(&root).unwrap();
 
     let packed = temp.path().join("python.agsdl");

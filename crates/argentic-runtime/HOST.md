@@ -135,10 +135,10 @@ restores flags from a regular root file named `.agsdl-executables` or
 `AgSDL executable paths v1\n`. The body is limited to 2 MiB and lists
 portable project-relative paths separated by LF. An optional final LF is
 accepted. Portable paths outside the current selection are ignored.
-Recognized metadata cannot be a selected file. Argentic refuses more than
-one recognized sidecar outside the selection. A candidate without the
-header can be ordinary project content. ZIP exports record the restored
-flags in `archive.json`.
+Only files outside the project selection are considered for metadata.
+A selected file with the same name and header is ordinary project content.
+Argentic refuses more than one recognized sidecar outside the selection.
+ZIP exports record the restored flags in `archive.json`.
 
 A folder can select at most 8192 files and 256 MiB, and its inventory must
 fit in 2 MiB. An archive's 8192 entries and 256 MiB also count
