@@ -527,6 +527,35 @@ async fn operator_request(
     }
 }
 
+fn observe_plan030(
+    observed: Option<&mut Option<Value>>,
+    event: &Value,
+    thread: &str,
+    turn: &str,
+) -> HostResult<()> {
+    let Some(observed) = observed else {
+        return Ok(());
+    };
+    if observed.is_some() || event["method"] != "turn/plan/updated" {
+        return Ok(());
+    }
+    let params = &event["params"];
+    if required(params, "threadId")? != thread || required(params, "turnId")? != turn {
+        return Err(missing("planOwner"));
+    }
+    let steps = params["plan"].as_array().ok_or_else(|| missing("plan"))?;
+    let text = steps
+        .iter()
+        .map(|step| required(step, "step"))
+        .collect::<HostResult<Vec<_>>>()?
+        .join("\n");
+    if text.trim().is_empty() {
+        return Err(missing("plan"));
+    }
+    *observed = Some(json!({"kind":"planPresented","planId":format!("codex:{turn}"),"text":text}));
+    Ok(())
+}
+
 async fn interrupt_turn030(
     client: &mut Client,
     thread: &str,
@@ -534,6 +563,7 @@ async fn interrupt_turn030(
     pending: &mut PendingSteer030,
     steer: &mut Option<&mut SteerContext030>,
     mut deferred: std::collections::VecDeque<Value>,
+    mut observed_plan: Option<&mut Option<Value>>,
 ) -> HostResult<()> {
     let observe = async {
         client
@@ -549,6 +579,7 @@ async fn interrupt_turn030(
             {
                 continue;
             }
+            observe_plan030(observed_plan.as_deref_mut(), &event, thread, turn)?;
             let params = &event["params"];
             if event["method"] == "turn/completed"
                 && params["threadId"] == thread
@@ -1310,29 +1341,12 @@ impl CodexExecutor030 {
                     // the fixed category until a correlated turn receipt ends.
                     continue;
                 }
-                if auto_plan
-                    && !plan_presented
-                    && observed_plan.is_none()
-                    && method == "turn/plan/updated"
-                {
-                    if required(params, "threadId")? != thread
-                        || required(params, "turnId")? != turn
-                    {
-                        return Err(missing("planOwner"));
-                    }
-                    let steps = params["plan"].as_array().ok_or_else(|| missing("plan"))?;
-                    let text = steps
-                        .iter()
-                        .map(|s| required(s, "step"))
-                        .collect::<HostResult<Vec<_>>>()?
-                        .join("\n");
-                    if text.trim().is_empty() {
-                        return Err(missing("plan"));
-                    }
-                    observed_plan = Some(
-                        json!({"kind":"planPresented","planId":format!("codex:{turn}"),"text":text}),
-                    );
-                }
+                observe_plan030(
+                    (auto_plan && !plan_presented).then_some(&mut observed_plan),
+                    &event,
+                    &thread,
+                    &turn,
+                )?;
                 if ["item/completed", "turn/completed"].contains(&method)
                     && required(params, "threadId")? != thread
                 {
@@ -1409,6 +1423,7 @@ impl CodexExecutor030 {
                     pending_steer,
                     &mut steer,
                     deferred_native,
+                    (auto_plan && !plan_presented).then_some(&mut observed_plan),
                 )
                 .await?;
                 *current_turn = None;
@@ -1681,6 +1696,7 @@ process.stdout.write(JSON.stringify({...result,check:null}));
 import json,sys,subprocess,os,base64,time
 settings=json.loads(sys.argv[1]); bootstrap=sys.argv[2]; mode=sys.argv[3]
 count=0
+interrupt_plan=None
 thread='thread'
 external_auth='-auth' in mode
 auth_refreshed=False
@@ -1763,6 +1779,9 @@ for line in sys.stdin:
  elif method=='turn/interrupt':
   open(sys.argv[4]+'.interrupted','w').write('yes')
   if mode=='continuity':
+   if interrupt_plan is not None:
+    print(json.dumps(interrupt_plan),flush=True)
+    interrupt_plan=None
    print(json.dumps({'method':'turn/completed','params':{'threadId':thread,'turn':{'id':p['turnId'],'status':'interrupted'}}}),flush=True)
   if mode=='steer-stop-040':
    print(json.dumps({'id':pending_steer_id,'result':{'turnId':'turn1'}}),flush=True)
@@ -1843,7 +1862,9 @@ for line in sys.stdin:
     continue
    if '_plan' in envelope:
     native_plan=envelope.pop('_plan')
-    print(json.dumps({'method':'turn/plan/updated','params':{'threadId':thread if native_plan!='foreign' else 'another-thread','turnId':'turn'+str(count),'plan':[{'step':'Inspect, then perform the requested work','status':'inProgress'}]}}),flush=True)
+    plan={'method':'turn/plan/updated','params':{'threadId':thread if native_plan!='foreign' else 'another-thread','turnId':'turn'+str(count),'plan':[{'step':'Inspect, then perform the requested work','status':'inProgress'}]}}
+    if native_plan=='interrupt': interrupt_plan=plan
+    else: print(json.dumps(plan),flush=True)
    if '_approval' in envelope:
     native=envelope.pop('_approval')
     pending_envelope=envelope; pending_turn='turn'+str(count)

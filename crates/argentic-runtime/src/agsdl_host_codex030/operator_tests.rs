@@ -476,23 +476,28 @@ impl crate::host::ActionPolicySource for WaitingActionPolicy {
 
 #[tokio::test]
 async fn operator_interrupt_closes_a_codex_tool_approval_without_authorizing_it() {
-    interrupt_codex_ask(false, false).await;
+    interrupt_codex_ask(None, false).await;
 }
 
 #[tokio::test]
 async fn operator_interrupt_preserves_an_observed_plan_until_the_controller_accepts_it() {
-    interrupt_codex_ask(true, false).await;
+    interrupt_codex_ask(Some("current"), false).await;
+}
+
+#[tokio::test]
+async fn operator_interrupt_retains_the_first_plan_reported_during_interrupt() {
+    interrupt_codex_ask(Some("interrupt"), false).await;
 }
 
 #[tokio::test]
 async fn operator_interrupt_journals_an_accepted_answer_closed_before_delivery() {
-    interrupt_codex_ask(false, true).await;
+    interrupt_codex_ask(None, true).await;
 }
 
-async fn interrupt_codex_ask(auto_plan: bool, answer_first: bool) {
+async fn interrupt_codex_ask(plan: Option<&str>, answer_first: bool) {
     use crate::api::{OperatorAction as Action, OperatorWorkState};
     let mut document = json!({"contract":"agsdl-0.4.0","id":"operator-approval","agents":{"worker":{"harness":"codex","permissions":{"preset":"workspace","reviewer":"person","rules":[{"action":"write","effect":"ask"}]}}},"flow":{"entry":"work","steps":{"work":{"type":"agent","agent":"worker","timeoutMs":1000}}}});
-    if auto_plan {
+    if plan.is_some() {
         document["agents"]["worker"]["planFirst"] = json!("auto");
     }
     let f = Fixture::with_document(document).await;
@@ -503,8 +508,8 @@ async fn interrupt_codex_ask(auto_plan: bool, answer_first: bool) {
     std::fs::write(&path, "before").unwrap();
     let trace = f._temp.path().join("trace.jsonl");
     let mut result = envelope(json!({"results":{}}));
-    if auto_plan {
-        result["_plan"] = json!("current");
+    if let Some(plan) = plan {
+        result["_plan"] = json!(plan);
     }
     result["_approval"] = json!({"method":"item/commandExecution/requestApproval","id":"native-approval","params":{"kind":"command","environmentId":"local","itemId":"command","command":"synthetic command","cwd":root,"additionalPermissions":{"network":null,"fileSystem":{"read":null,"write":[path],"entries":[{"path":{"type":"path","path":path},"access":"write"}]}}}});
     std::fs::write(
@@ -649,7 +654,7 @@ async fn interrupt_codex_ask(auto_plan: bool, answer_first: bool) {
     )
     .await;
     assert!(replay.ok, "{:?}", replay.divergence);
-    if auto_plan {
+    if plan.is_some() {
         let plans: Vec<String> = sqlx::query_scalar(
             "SELECT json_extract(decision_json ->> '$.receiptJson', '$.decision.planId') FROM engine_flow030_work_events
              WHERE json_extract(decision_json ->> '$.receiptJson', '$.decision.kind')='planAccepted'",
