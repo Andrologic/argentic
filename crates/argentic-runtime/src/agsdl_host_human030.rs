@@ -850,10 +850,10 @@ impl HumanBroker030 {
                 let request_id: String = request.get("request_id");
                 if request.get::<Option<&str>, _>("resolution_json").is_some() {
                     self.reserve_resolution(db, &request_id).await?;
-                    close_asks.push(request_id);
                 } else {
-                    cancel_asks.push(request_id);
+                    cancel_asks.push(request_id.clone());
                 }
+                close_asks.push(request_id);
             }
         }
         let mut event =
@@ -1027,6 +1027,20 @@ impl HumanBroker030 {
             });
             sqlx::query("UPDATE engine_flow030_human_requests SET resolution_json=?,revision='1' WHERE system_id=? AND invocation_id=? AND request_id=? AND resolution_json IS NULL")
                 .bind(durable_resolution.to_string()).bind(&self.identity.system_start_id).bind(&self.identity.flow_invocation_id).bind(request).execute(&mut *db).await?;
+            // The deadline can win inside the hold projection. Keep the timeout
+            // resolution, but close its delivery to the turn that is ending.
+            if resolution["expired"] == true
+                && event
+                    .pointer("/event/cancelAsks")
+                    .and_then(Value::as_array)
+                    .is_some_and(|ids| ids.contains(&json!(request)))
+                && event
+                    .pointer("/event/closedAsks/requestIds")
+                    .and_then(Value::as_array)
+                    .is_some_and(|ids| ids.contains(&json!(request)))
+            {
+                self.reserve_resolution(db, request).await?;
+            }
             sqlx::query("INSERT INTO engine_flow030_human_resolution_proofs(system_id,invocation_id,request_id,event_id,resolution_json) VALUES(?,?,?,?,?) ON CONFLICT DO NOTHING")
                 .bind(&self.identity.system_start_id).bind(&self.identity.flow_invocation_id).bind(request)
                 .bind(&input.event_id).bind(durable_resolution.to_string()).execute(&mut *db).await?;

@@ -571,29 +571,37 @@ impl crate::host::ActionPolicySource for WaitingActionPolicy {
 
 #[tokio::test]
 async fn operator_interrupt_closes_a_codex_tool_approval_without_authorizing_it() {
-    interrupt_codex_ask(None, false).await;
+    interrupt_codex_ask(None, false, false).await;
 }
 
 #[tokio::test]
 async fn operator_interrupt_preserves_an_observed_plan_until_the_controller_accepts_it() {
-    interrupt_codex_ask(Some("current"), false).await;
+    interrupt_codex_ask(Some("current"), false, false).await;
 }
 
 #[tokio::test]
 async fn operator_interrupt_retains_the_first_plan_reported_during_interrupt() {
-    interrupt_codex_ask(Some("interrupt"), false).await;
+    interrupt_codex_ask(Some("interrupt"), false, false).await;
 }
 
 #[tokio::test]
 async fn operator_interrupt_journals_an_accepted_answer_closed_before_delivery() {
-    interrupt_codex_ask(None, true).await;
+    interrupt_codex_ask(None, true, false).await;
 }
 
-async fn interrupt_codex_ask(plan: Option<&str>, answer_first: bool) {
+#[tokio::test]
+async fn operator_interrupt_closes_an_action_approval_that_expires_in_its_clock_event() {
+    interrupt_codex_ask(None, false, true).await;
+}
+
+async fn interrupt_codex_ask(plan: Option<&str>, answer_first: bool, expire_on_hold: bool) {
     use crate::api::{OperatorAction as Action, OperatorWorkState};
     let mut document = json!({"contract":"agsdl-0.4.0","id":"operator-approval","agents":{"worker":{"harness":"codex","permissions":{"preset":"workspace","reviewer":"person","rules":[{"action":"write","effect":"ask"}]}}},"flow":{"entry":"work","steps":{"work":{"type":"agent","agent":"worker","timeoutMs":1000}}}});
     if plan.is_some() {
         document["agents"]["worker"]["planFirst"] = json!("auto");
+    }
+    if expire_on_hold {
+        document["agents"]["worker"]["answerTimeoutMs"] = json!(100);
     }
     let f = Fixture::with_document(document).await;
     approve_fixture_workspace(&f).await;
@@ -672,20 +680,26 @@ async fn interrupt_codex_ask(plan: Option<&str>, answer_first: bool) {
             .await
             .unwrap();
     }
-    tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        operator_control(
-            &f,
-            &scope,
-            "hold",
-            Action::InterruptWork {
-                activation_id: activation_id.clone(),
-            },
-        ),
-    )
-    .await
-    .unwrap()
-    .unwrap();
+    let hold = operator_control(
+        &f,
+        &scope,
+        "hold",
+        Action::InterruptWork {
+            activation_id: activation_id.clone(),
+        },
+    );
+    tokio::pin!(hold);
+    if expire_on_hold {
+        let (dispatch, _) = registry.dispatcher(&scope.system_start_id).unwrap();
+        let gate = dispatch.lock().await;
+        assert!(futures::poll!(&mut hold).is_pending());
+        clock.advance_to(100).unwrap();
+        drop(gate);
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(5), hold)
+        .await
+        .unwrap()
+        .unwrap();
     operator_wait(async || {
         (operator_view(&f, &scope)
             .await
@@ -695,8 +709,8 @@ async fn interrupt_codex_ask(plan: Option<&str>, answer_first: bool) {
         .then_some(())
     })
     .await;
-    let resolution: String = sqlx::query_scalar(
-        "SELECT resolution_json FROM engine_flow030_human_requests WHERE request_id=?",
+    let (resolution, delivery): (String, String) = sqlx::query_as(
+        "SELECT resolution_json,delivery FROM engine_flow030_human_requests WHERE request_id=?",
     )
     .bind(&id)
     .fetch_one(&f.pool)
@@ -706,6 +720,22 @@ async fn interrupt_codex_ask(plan: Option<&str>, answer_first: bool) {
     if answer_first {
         assert_eq!(resolution["reason"], "answer");
         assert_eq!(resolution["answer"]["decision"], "yes");
+    } else if expire_on_hold {
+        assert_eq!(resolution["expired"], true);
+        assert_eq!(resolution["resolvedAtMs"], "100");
+        assert_eq!(resolution["reason"], "answerTimeout");
+        assert_eq!(delivery, "reserved");
+        let kind: String = sqlx::query_scalar(
+            "SELECT json_extract(e.ticket_json ->> '$.eventJson', '$.event.kind')
+             FROM engine_flow030_human_resolution_proofs p
+             JOIN engine_flow030_clock_events e USING(system_id,invocation_id,event_id)
+             WHERE p.request_id=?",
+        )
+        .bind(&id)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+        assert_eq!(kind, "operatorHold");
     } else {
         assert_eq!(resolution["operatorCancelled"], true);
     }

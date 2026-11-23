@@ -394,11 +394,16 @@ pub(super) async fn verify(
                     .iter()
                     .find(|r| request_id == r.id)
                     .ok_or("Unknown closed action request")?;
+                let cancelled_here = rows_json(event, "cancelAsks")?.contains(&request_id);
                 require(
                     r.kind == "ask"
-                        && r.resolution
-                            .as_ref()
-                            .is_some_and(|value| value["operatorCancelled"] != true)
+                        && (if cancelled_here {
+                            r.resolution.is_none()
+                        } else {
+                            r.resolution
+                                .as_ref()
+                                .is_some_and(|value| value["operatorCancelled"] != true)
+                        })
                         && !r.acknowledged
                         && r.works.len() == 1
                         && rows_json(event, "held")?.contains(&json!(r.works[0]))
