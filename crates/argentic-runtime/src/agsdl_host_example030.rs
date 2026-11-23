@@ -350,7 +350,8 @@ async fn quiesce_scenario030(
         &mut driver,
         cancelled,
     )
-    .await
+    .await?
+    .ok_or_else(|| failure("UNCERTAIN", "runtime", "A flow event commit is unresolved"))
 }
 
 struct ScenarioDriver030<'a> {

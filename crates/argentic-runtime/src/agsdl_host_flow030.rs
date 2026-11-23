@@ -1322,9 +1322,22 @@ async fn resolve_native_event_commit_tx(
     mut tx: sqlx::Transaction<'_, sqlx::Sqlite>,
     event: &FlowEvent030,
 ) -> Result<Option<Apply030>> {
+    let result = read_event_commit_tx(&mut tx, event).await?;
+    tx.commit().await?;
+    lease.ensure_live()?;
+    if result.is_some() {
+        runtime.acknowledge_event_commit(event);
+    }
+    Ok(result)
+}
+
+async fn read_event_commit_tx(
+    db: &mut SqliteConnection,
+    event: &FlowEvent030,
+) -> Result<Option<Apply030>> {
     let row = sqlx::query("SELECT event_json,receipt_json,diagnostic_json FROM engine_flow030_events WHERE system_id=? AND invocation_id=? AND event_id=?")
-        .bind(&event.identity.system_start_id).bind(&event.identity.flow_invocation_id).bind(&event.event_id).fetch_optional(&mut *tx).await?;
-    let result = match row {
+        .bind(&event.identity.system_start_id).bind(&event.identity.flow_invocation_id).bind(&event.event_id).fetch_optional(db).await?;
+    Ok(match row {
         None => None,
         Some(row) => {
             if row.get::<String, _>("event_json") != serde_json::to_string(event)? {
@@ -1340,13 +1353,66 @@ async fn resolve_native_event_commit_tx(
                 },
             )
         }
+    })
+}
+
+/// Resolve durable event commits before clock processing or effect dispatch.
+pub(crate) async fn reconcile_dispatch_events030(
+    host: &HostState,
+    pool: &SqlitePool,
+    owner: &EngineOwner,
+) -> Result<bool> {
+    let runtime = host.flow030();
+    let lease = host.start_lease().await?;
+    let _admission = host.admission_lock().lock_owned().await;
+    let pending = runtime
+        .event_committing
+        .lock()
+        .map_err(|_| unavailable())?
+        .values()
+        .filter(|event| event.identity.system_start_id == owner.system_start_id)
+        .cloned()
+        .collect::<Vec<_>>();
+    if pending.is_empty() {
+        return Ok(true);
+    }
+    let authority = Authority {
+        runtime,
+        lease: &lease,
+        owner: owner.clone(),
     };
+    let mut db = pool.acquire().await?;
+    let mut tx = db.begin_with("BEGIN IMMEDIATE").await?;
+    for event in &pending {
+        authority
+            .owner(&mut tx, &event.identity)
+            .await
+            .map_err(store_error)?;
+        let committed = if let Some(request_id) = event.event_id.strip_prefix("system-stop:") {
+            let request = EngineStopRequest {
+                system_start_id: owner.system_start_id.clone(),
+                request_id: request_id.into(),
+                activation_id: None,
+            };
+            let control = system_stop_control(runtime, &request)?;
+            match stored_system_stop(&mut tx, &control, &request).await? {
+                Some(receipt) if stop_marker(&receipt) == *event => true,
+                Some(_) => return Err(refused()),
+                None => false,
+            }
+        } else {
+            read_event_commit_tx(&mut tx, event).await?.is_some()
+        };
+        if !committed {
+            return Ok(false);
+        }
+    }
     tx.commit().await?;
     lease.ensure_live()?;
-    if result.is_some() {
+    for event in &pending {
         runtime.acknowledge_event_commit(event);
     }
-    Ok(result)
+    Ok(true)
 }
 
 /// Supplied only by the native receipt resolver. JSON fields are data, never grants.

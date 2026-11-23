@@ -156,6 +156,101 @@ async fn operator_and_message_retries_clear_only_their_exact_committed_event() {
     assert!(!operator_view(&f, &scope).await.paused);
 }
 
+#[tokio::test]
+async fn supervisor_reconciles_lost_operator_and_delivery_commit_acks_before_retry() {
+    use crate::api::OperatorAction as Action;
+    use crate::persistence::flow030::{
+        FlowEvent030, FlowEventKind030, Instance030, OperatorEvent030,
+    };
+
+    for lose_resume_ack in [false, true] {
+        let f = Fixture::with_document(json!({
+            "contract":"agsdl-0.4.0","id":"supervisor-commit-readback",
+            "agents":{"worker":{"harness":"codex","permissions":"read-only"}}
+        }))
+        .await;
+        let scope = operator_scope(&f).await;
+        let tasks = StreamTasks::default();
+        let runtime = f.host.flow030();
+        let registry = runtime.supervisor_registry();
+        registry.reserve(&scope.system_start_id).unwrap();
+        let trace = f._temp.path().join("trace.jsonl");
+        std::fs::write(
+            trace.with_extension("jsonl.script"),
+            json!([envelope(json!({"results":{}}))]).to_string(),
+        )
+        .unwrap();
+        let (expected_revision, event_id, kind) = if lose_resume_ack {
+            operator_control(&f, &scope, "pause", Action::PauseRun)
+                .await
+                .unwrap();
+            let delivery = deliver_operator(&f, &scope, "queued", "queue")
+                .await
+                .unwrap();
+            let resume = operator_control(&f, &scope, "resume", Action::ResumeRun)
+                .await
+                .unwrap();
+            (
+                delivery.revision,
+                resume.event_id,
+                FlowEventKind030::Operator(OperatorEvent030::ResumeRun),
+            )
+        } else {
+            let before = flow::inspect_run(runtime, &f.host, &f.pool, &f.owner)
+                .await
+                .unwrap();
+            let delivery = deliver_operator(&f, &scope, "queued", "queue")
+                .await
+                .unwrap();
+            (
+                before.flow.state.revision,
+                delivery.event_id,
+                FlowEventKind030::Deliver {
+                    agent: "worker".into(),
+                    instance: Instance030::Shared,
+                    delivery: "queue".into(),
+                    message_json: json!({"prompt":"queued"}).to_string(),
+                    sender: "host".into(),
+                },
+            )
+        };
+        runtime
+            .begin_event_commit(&FlowEvent030 {
+                identity: f.identity.clone(),
+                event_id: event_id.clone(),
+                expected_revision,
+                kind,
+            })
+            .unwrap();
+        // Dispatch has to start and complete the work before either caller retries.
+        start_operator_supervisor(&f, Arc::new(executor(&f, &trace, None)), &tasks);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            registry.wait(&scope.system_start_id),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            operator_view(&f, &scope).await.verdict.as_deref(),
+            Some("succeeded")
+        );
+        let retried = if lose_resume_ack {
+            operator_control(&f, &scope, "resume", Action::ResumeRun)
+                .await
+                .unwrap()
+                .event_id
+        } else {
+            deliver_operator(&f, &scope, "queued", "queue")
+                .await
+                .unwrap()
+                .event_id
+        };
+        assert_eq!(retried, event_id);
+        assert_eq!(requests(&trace, "turn/start").len(), 1);
+    }
+}
+
 fn start_operator_supervisor(f: &Fixture, agents: Arc<dyn AgentExecutor030>, tasks: &StreamTasks) {
     let (pool, app, identity) = (f.pool.clone(), f.host.as_ref().clone(), f.identity.clone());
     let executors = Executors030 {

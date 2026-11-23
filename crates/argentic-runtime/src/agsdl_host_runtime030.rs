@@ -476,7 +476,7 @@ pub(crate) async fn drain_effects030(
     owner: &EngineOwner,
     driver: &mut dyn EffectDriver030,
     cancel: &CancellationToken,
-) -> Result<FlowView030> {
+) -> Result<Option<FlowView030>> {
     // Yield after a bounded batch; the supervisor immediately runs another
     // batch when effects remain, allowing Stop/completions between batches.
     let dispatcher = host
@@ -495,13 +495,16 @@ pub(crate) async fn drain_effects030(
                 "Supervisor was cancelled",
             ));
         }
+        if !flow::reconcile_dispatch_events030(host, pool, owner).await? {
+            return Ok(None);
+        }
         driver.before_pass().await?;
         let inspection = flow::inspect_run(host.flow030(), host, pool, owner).await?;
         if !inspection.flow.state.stopping && driver.unpark_pending() {
-            return Ok(inspection.flow);
+            return Ok(Some(inspection.flow));
         }
         let Some(effect) = next_effect030(&inspection, |id| driver.owns_effect(id))? else {
-            return Ok(inspection.flow);
+            return Ok(Some(inspection.flow));
         };
         match &effect.kind {
             FlowEffectKind030::Start { agent: Some(_), .. } => {
@@ -562,7 +565,7 @@ pub(crate) async fn drain_effects030(
     }
     flow::inspect_run(host.flow030(), host, pool, owner)
         .await
-        .map(|value| value.flow)
+        .map(|value| Some(value.flow))
 }
 
 /// Host extensions must start their work and return promptly. They own their
@@ -1375,7 +1378,7 @@ pub(crate) async fn supervise_with_steer_port030(
         // Subscribe/mark observed BEFORE reading state. A wake during the read
         // remains unseen and changed() returns immediately on the next select.
         wake.borrow_and_update();
-        let view = drain_effects030(
+        let Some(view) = drain_effects030(
             host,
             pool,
             tasks,
@@ -1383,7 +1386,13 @@ pub(crate) async fn supervise_with_steer_port030(
             &mut driver,
             &CancellationToken::new(),
         )
-        .await?;
+        .await? else {
+            tokio::select! {
+                _ = cancel.cancelled() => return Err(failure("INTERRUPTED", "runtime", "Supervisor was cancelled")),
+                changed = wake.changed() => changed.map_err(|_| failure("INTERRUPTED", "runtime", "Supervisor wake channel closed"))?,
+            }
+            continue;
+        };
         let mut completed = false;
         for key in driver.ready.keys().cloned().collect::<Vec<_>>() {
             let joined = driver.ready.get(&key).unwrap().clone();
