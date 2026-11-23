@@ -657,17 +657,18 @@ async fn idle(
                 .fetch_all(&f.pool)
                 .await
                 .unwrap();
-        let pending_clock: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM engine_flow030_clock_events WHERE output_json IS NULL",
-        )
-        .fetch_one(&f.pool)
-        .await
-        .unwrap();
-        let pending_controls: i64 =
-            sqlx::query_scalar("SELECT count(*) FROM engine_flow030_clock_controls WHERE joined=0")
-                .fetch_one(&f.pool)
-                .await
-                .unwrap();
+        let (clock_revision, pending_clock, pending_controls): (Option<String>, i64, i64) =
+            sqlx::query_as(
+                "SELECT
+                    (SELECT revision FROM engine_flow030_clock WHERE system_id=? AND invocation_id=?),
+                    (SELECT count(*) FROM engine_flow030_clock_events WHERE output_json IS NULL),
+                    (SELECT count(*) FROM engine_flow030_clock_controls WHERE joined=0)",
+            )
+            .bind(&f.identity.system_start_id)
+            .bind(&f.identity.flow_invocation_id)
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
         let agents = running.lock().unwrap();
         let ready = pending_clock == 0
             && pending_controls == 0
@@ -738,9 +739,7 @@ async fn idle(
                 .iter()
                 .filter(|row| row["status"] == "settled")
                 .count(),
-            clock_works.len(),
-            pending_clock,
-            pending_controls,
+            clock_revision,
         );
         if previous_progress.as_ref() != Some(&progress) {
             deadline = tokio::time::Instant::now() + stall_limit;
