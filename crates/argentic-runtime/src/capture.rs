@@ -26,8 +26,9 @@ pub fn apply_model_overrides(
     if overrides.is_empty() {
         return Ok(());
     }
-    let agents = registry["agents"]
-        .as_array_mut()
+    let agents = registry
+        .get_mut("agents")
+        .and_then(Value::as_array_mut)
         .ok_or_else(model_correlation)?;
     let mut entries = Vec::with_capacity(overrides.len());
     let mut seen = BTreeSet::new();
@@ -302,6 +303,23 @@ pub fn codex_registry(
 mod tests {
     use super::*;
     use sha2::{Digest, Sha256};
+
+    #[test]
+    fn model_overrides_refuse_invalid_registries_without_mutating_them() {
+        let overrides = BTreeMap::from([(
+            "worker".into(),
+            ModelOverride {
+                name: "replacement".into(),
+                effort: None,
+            },
+        )]);
+        for original in [json!([]), json!({}), Value::Null, json!({"agents":{}})] {
+            let mut registry = original.clone();
+            let error = apply_model_overrides(&mut registry, &overrides).unwrap_err();
+            assert_eq!(error.code, "CORRELATION", "{original}");
+            assert_eq!(registry, original);
+        }
+    }
 
     /// The comparison in `qualify_skill_folders` uses canonical paths. A
     /// document URL that differs only in spelling still selects its skill.
