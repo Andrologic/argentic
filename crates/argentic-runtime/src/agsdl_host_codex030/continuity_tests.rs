@@ -986,13 +986,16 @@ async fn codex_mcp_enforces_tool_grants_and_routes_ask_through_the_human_broker(
     use crate::test_context::mcp::*;
     let peer = Peer::start().await;
     let project = tempfile::tempdir().unwrap();
+    let mut servers = peer.servers();
+    servers["issues"] = json!({"url":format!("http://{}/issues", peer.addr)});
     let document = json!({"projectFormat":"agsdl-project-1","contract":"agsdl-0.4.0","id":"agent-mcp",
-        "mcpServers":peer.servers(),"secrets":{"file":"requirements.json"},
+        "mcpServers":servers,"secrets":{"file":"requirements.json"},
         "agents":{"worker":{"harness":"codex","permissions":{"preset":"read-only","reviewer":"person","rules":[
             {"action":"mcp","match":"*/check","effect":"allow"},
             {"action":"mcp","match":"first/approve","effect":"ask"},
-            {"action":"mcp","match":"second/blocked","effect":"deny"}
-        ]},"mcpServers":["first","second"]}},
+            {"action":"mcp","match":"second/blocked","effect":"deny"},
+            {"action":"mcp","match":"issues/*","effect":"deny"}
+        ]},"mcpServers":["first","issues","second"]}},
         "flow":{"entry":"work","steps":{"work":{"type":"agent","agent":"worker"}}}});
     std::fs::write(project.path().join("agsdl.json"), document.to_string()).unwrap();
     std::fs::write(project.path().join("requirements.json"), REQUIREMENTS).unwrap();

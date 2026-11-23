@@ -388,14 +388,18 @@ pub(crate) fn may_equip_mcp(policy: &EffectivePolicy, server: &str) -> Result<bo
     for ceiling in policy.policies() {
         let subject = paths::Subject::new(ceiling.context(), &request)?;
         for rule in ceiling.rules() {
-            if rule.action == Action::Mcp
-                && rule.effect == Effect::Deny
-                && rule
-                    .pattern
-                    .as_ref()
-                    .is_none_or(|pattern| !pattern.contains('/'))
-                && rule.matches(Action::Mcp, &subject)?
-            {
+            if rule.action != Action::Mcp || rule.effect != Effect::Deny {
+                continue;
+            }
+            let all_tools = match rule.pattern.as_deref().and_then(|p| p.split_once('/')) {
+                Some((server_pattern, tool_pattern)) => {
+                    !tool_pattern.is_empty()
+                        && tool_pattern.bytes().all(|byte| byte == b'*')
+                        && paths::glob(server_pattern, server, false, false)?
+                }
+                None => rule.matches(Action::Mcp, &subject)?,
+            };
+            if all_tools {
                 return Ok(false);
             }
         }
