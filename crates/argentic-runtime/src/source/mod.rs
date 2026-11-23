@@ -114,15 +114,14 @@ impl OpenedSource {
                 source_unavailable()
             }
         })?;
-        let authored = std::str::from_utf8(&file.bytes)
-            .map_err(|_| failure("PARSE", "source", "Source must be UTF-8"))?;
         if let Some(dir) = dir {
-            if serde_json::from_str::<Value>(authored)
-                .is_ok_and(|doc| doc.get("projectFormat").is_some())
-            {
+            let manifest = parse_json(&file.bytes, MANIFEST, false)?;
+            if manifest.get("projectFormat").is_some() {
                 return Self::folder(dir, Some(file));
             }
         }
+        let authored = std::str::from_utf8(&file.bytes)
+            .map_err(|_| failure("PARSE", "source", "Source must be UTF-8"))?;
         crate::persistence::validate_json(authored)?;
         let authored = authored.to_owned();
         Ok(Self {

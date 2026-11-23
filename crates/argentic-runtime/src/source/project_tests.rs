@@ -222,6 +222,36 @@ fn json_documents_keep_the_host_source_codes() {
 }
 
 #[test]
+fn direct_manifest_parse_errors_match_folder_diagnostics() {
+    let temp = tempfile::tempdir().unwrap();
+    let manifest = temp.path().join(MANIFEST);
+    for bytes in [
+        b"{".as_slice(),
+        br#"{"projectFormat":"agsdl-project-1","projectFormat":null}"#,
+        b"\xff",
+    ] {
+        std::fs::write(&manifest, bytes).unwrap();
+        let folder = OpenedSource::open_path(temp.path()).err().unwrap();
+        let direct = OpenedSource::open_path(&manifest).err().unwrap();
+        assert_eq!(direct, folder);
+        assert_eq!(direct.code, "PROJECT");
+        assert_eq!(
+            direct.source.as_deref(),
+            Some(&SourceDiagnostic {
+                path: MANIFEST.into(),
+                pointer: String::new(),
+                kind: SourceErrorKind::InvalidContent,
+            })
+        );
+    }
+    let standalone = "{ \"contract\": \"agsdl-0.4.0\", \"id\": \"standalone\", \"agents\": {} }\n";
+    std::fs::write(&manifest, standalone).unwrap();
+    let opened = OpenedSource::open_path(&manifest).unwrap();
+    assert!(opened.is_document());
+    assert_eq!(opened.authored_json(), standalone);
+}
+
+#[test]
 fn a_folder_is_limited_to_an_inventory_its_archive_could_hold() {
     let temp = tempfile::tempdir().unwrap();
     project(temp.path(), "../notes.md", Some("skills/review/SKILL.md"));
