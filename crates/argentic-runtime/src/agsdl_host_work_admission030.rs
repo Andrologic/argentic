@@ -313,7 +313,11 @@ pub(crate) fn validate_codex_document_at030(
                     )
                 })?;
                 if !crate::content::file_helper::qualified_platform() {
-                    return Err(failure("CONTENT_SOURCE_UNSUPPORTED",&format!("{pointer}/uri"),"Local file content is unavailable on this platform"));
+                    return Err(failure(
+                        "CONTENT_SOURCE_UNSUPPORTED",
+                        &format!("{pointer}/uri"),
+                        "Local file content is unavailable on this platform",
+                    ));
                 }
             }
             if (object.contains_key("uri") || object.contains_key("value"))
