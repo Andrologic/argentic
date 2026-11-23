@@ -46,10 +46,24 @@ pub(super) async fn verify(
     )
     .fetch_one(&mut *db)
     .await?;
+    let admitted = sqlx::query_scalar::<_, String>(
+        "SELECT effect_id FROM engine_flow030_handoffs
+         WHERE system_id=? AND invocation_id=? AND receipt_json ->> '$.kind'='nativeOwnedHandoff030'",
+    )
+    .bind(&id.system_start_id)
+    .bind(&id.flow_invocation_id)
+    .fetch_all(&mut *db)
+    .await?
+    .into_iter()
+    .collect::<std::collections::BTreeSet<_>>();
     let requires_clock = state
         .activations
         .iter()
-        .filter(|a| a.start_effect_id.is_some())
+        .filter(|a| {
+            a.start_effect_id
+                .as_ref()
+                .is_some_and(|effect| admitted.contains(effect))
+        })
         .any(|a| {
             let step = plan
                 .steps

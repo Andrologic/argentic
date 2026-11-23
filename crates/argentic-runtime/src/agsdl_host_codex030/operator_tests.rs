@@ -1778,3 +1778,75 @@ async fn operator_stop_during_clock_retirement_preserves_the_prior_result() {
     .await;
     assert!(replay.ok, "{:?}", replay.divergence);
 }
+
+#[tokio::test]
+async fn supervisor_cancels_an_unadmitted_approval_when_stop_wins_before_dispatch() {
+    let f = Fixture::with_document(json!({
+        "contract":"agsdl-0.4.0","id":"stop-before-approval-admission",
+        "agents":{},
+        "flow":{"entry":"approval","steps":{
+            "approval":{"type":"approval","next":{"yes":[],"no":[]}}
+        }}
+    }))
+    .await;
+    let scope = operator_scope(&f).await;
+    let tasks = StreamTasks::default();
+    let runtime = f.host.flow030();
+    let registry = runtime.supervisor_registry();
+    registry.reserve(&scope.system_start_id).unwrap();
+    let stopped = flow::request_system_stop030(
+        runtime,
+        &f.pool,
+        &EngineStopRequest {
+            system_start_id: scope.system_start_id.clone(),
+            request_id: "stop".into(),
+            activation_id: None,
+        },
+    )
+    .await
+    .unwrap();
+    // Dispatch sees the durable Stop before the caller's cleanup can run.
+    assert!(
+        stopped
+            .control()
+            .read(&f.pool)
+            .await
+            .unwrap()
+            .state
+            .activations[0]
+            .physical
+    );
+
+    let clock = crate::agsdl_host_human_executor030::HumanClockRuntime030 {
+        app: f.host.as_ref().clone(),
+        pool: f.pool.clone(),
+        tasks: tasks.clone(),
+        identity: f.identity.clone(),
+    };
+    assert!(
+        crate::agsdl_host_runtime030::RuntimeClock030::next_wake(&clock)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    start_operator_supervisor(&f, Arc::new(PausableAgent::default()), &tasks);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        registry.wait(&scope.system_start_id),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        operator_view(&f, &scope).await.verdict.as_deref(),
+        Some("cancelled")
+    );
+    let replay = crate::persistence::replay_verify030::verify_path030(
+        &f._temp.path().join("run.db"),
+        &scope.system_start_id,
+        &f.identity.flow_invocation_id,
+    )
+    .await;
+    assert!(replay.ok, "{:?}", replay.divergence);
+}

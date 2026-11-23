@@ -125,13 +125,13 @@ impl RuntimeClock030 for HumanClockRuntime030 {
     }
     fn next_wake(&self) -> BoxFuture<'_, Result<Option<Duration>>> {
         Box::pin(async move {
-            let host = self.app.clone();
-            let broker = host
+            Ok(self
+                .app
                 .flow030()
                 .humans
-                .broker(&host, &self.pool, &self.identity)
-                .await?;
-            Ok(broker.next_wake_ms().await?.map(Duration::from_millis))
+                .next_wake_ms(&self.identity)
+                .await?
+                .map(Duration::from_millis))
         })
     }
 }

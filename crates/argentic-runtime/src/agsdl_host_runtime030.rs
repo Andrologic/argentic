@@ -774,6 +774,9 @@ impl EffectDriver030 for NativeDriver030<'_> {
                 let fresh =
                     flow::inspect_run(self.host.flow030(), self.host, self.pool, self.owner)
                         .await?;
+                if fresh.flow.state.stopping || fresh.flow.state.verdict.is_some() {
+                    return Ok(());
+                }
                 for (work, effect) in self.approvals.clone() {
                     if fresh
                         .flow
@@ -1070,6 +1073,23 @@ impl EffectDriver030 for NativeDriver030<'_> {
                 return Ok(());
             }
             if self.executors.humans.is_some() && work.agent_instance_id.is_none() {
+                let lease = self.host.start_lease().await?;
+                let control = self
+                    .host
+                    .flow030()
+                    .retiring_controls(lease.generation())?
+                    .into_iter()
+                    .find(|control| control.identity() == &effect.identity)
+                    .ok_or_else(|| failure("INTERRUPTED", "approval", "Flow owner absent"))?;
+                drop(lease);
+                if !self.approvals.contains_key(&work.activation_id)
+                    && control
+                        .settle_unadmitted(self.host.flow030(), self.pool, work)
+                        .await?
+                        .is_some()
+                {
+                    return Ok(());
+                }
                 let Some(claim) = flow::claim_expected(
                     self.host.flow030(),
                     self.host,
@@ -1116,15 +1136,6 @@ impl EffectDriver030 for NativeDriver030<'_> {
                 {
                     return Err(failure("INTERRUPTED", "approval", "Approval owner absent"));
                 }
-                let lease = self.host.start_lease().await?;
-                let control = self
-                    .host
-                    .flow030()
-                    .retiring_controls(lease.generation())?
-                    .into_iter()
-                    .find(|control| control.identity() == &effect.identity)
-                    .ok_or_else(|| failure("INTERRUPTED", "approval", "Flow owner absent"))?;
-                drop(lease);
                 let view = control.read(self.pool).await?;
                 control
                     .apply(
