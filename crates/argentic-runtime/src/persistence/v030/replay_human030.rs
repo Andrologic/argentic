@@ -1,5 +1,6 @@
 //! Readback of 040 uses the same native deadline and pause checks as COMMIT.
 use super::*;
+use crate::agsdl_host_flow030::{NativeSystemStopReceipt030, SupersededClockTicket030};
 use std::collections::BTreeMap;
 type NativeError = Box<dyn std::error::Error + Send + Sync>;
 type Result<T> = std::result::Result<T, NativeError>;
@@ -92,11 +93,6 @@ pub(super) async fn verify(
     let retained_observed = ms(clock.try_get("observed_ms")?)?;
     let native_owner = sqlx::query(
         "SELECT o.owner_epoch,o.generation,o.status,EXISTS (
-            SELECT 1 FROM engine_flow030_system_stop_requests s
-            WHERE s.system_id=o.system_id AND s.invocation_id=o.invocation_id
-              AND s.owner_epoch=o.owner_epoch AND s.generation=o.generation
-              AND s.event_id IS NOT NULL
-        ) AS stopped, EXISTS (
             SELECT 1 FROM engine_flow030_interruptions i WHERE i.system_id=o.system_id
         ) AS interrupted FROM engine_flow030_owners o WHERE o.system_id=? AND o.invocation_id=?",
     )
@@ -104,10 +100,58 @@ pub(super) async fn verify(
     .bind(&id.flow_invocation_id)
     .fetch_one(&mut *db)
     .await?;
+    let stops = sqlx::query(
+        "SELECT request_id,request_json,receipt_json,event_id
+         FROM engine_flow030_system_stop_requests
+         WHERE system_id=? AND invocation_id=? AND owner_epoch=? AND generation=? AND event_id IS NOT NULL",
+    )
+    .bind(&id.system_start_id)
+    .bind(&id.flow_invocation_id)
+    .bind(native_owner.get::<&str, _>("owner_epoch"))
+    .bind(native_owner.get::<&str, _>("generation"))
+    .fetch_all(&mut *db)
+    .await?;
+    require(stops.len() <= 1, "Duplicate native Stop")?;
+    let stop = if let Some(row) = stops.first() {
+        let receipt: NativeSystemStopReceipt030 =
+            serde_json::from_str(row.try_get("receipt_json")?)?;
+        let request: Value = parsed(row, "request_json")?;
+        let event_id: &str = row.try_get("event_id")?;
+        let record = state
+            .events
+            .get(event_id)
+            .ok_or("Missing native Stop event")?;
+        let event: Value = serde_json::from_str(&record.event_json)?;
+        require(
+            state.stopping
+                && receipt.identity == *id
+                && receipt.owner_epoch == native_owner.get::<&str, _>("owner_epoch")
+                && receipt.generation == native_owner.get::<&str, _>("generation")
+                && receipt.request_id == row.get::<&str, _>("request_id")
+                && request["requestId"] == receipt.request_id
+                && request["systemStartId"] == id.system_start_id
+                && request["activationId"].is_null()
+                && receipt.flow_event_id.as_deref() == Some(event_id)
+                && event_id == format!("system-stop:{}", receipt.request_id)
+                && event["kind"] == "Stop"
+                && event["expectedRevision"] == receipt.before_revision
+                && record.receipt.revision == receipt.revision
+                && receipt.stopping,
+            "Native Stop differs",
+        )?;
+        Some(receipt)
+    } else {
+        None
+    };
+    let superseded = stop
+        .as_ref()
+        .and_then(|stop| stop.superseded_clock_ticket.as_ref());
     let fenced_stop = plan.versions.contract == argentic_core::AGSDL_040
-        && state.stopping
         && native_owner.get::<&str, _>("status") == "revoked"
-        && native_owner.get::<bool, _>("stopped");
+        && stop.is_some()
+        && superseded.is_none();
+    let mut observed_supersession = false;
+    let mut superseded_retirement = None;
     require(
         clock.get::<&str, _>("owner_epoch") == native_owner.get::<&str, _>("owner_epoch")
             && clock.get::<&str, _>("generation") == native_owner.get::<&str, _>("generation"),
@@ -420,11 +464,20 @@ pub(super) async fn verify(
         let Some(output) = row.try_get::<Option<&str>, _>("output_json")? else {
             // Verify facts written at reservation above. A fenced Stop can
             // retain an undecided tail, but it contributes no clock output.
+            observed_supersession = superseded
+                == Some(&SupersededClockTicket030::new(
+                    &ticket.event_id,
+                    row.try_get("ticket_json")?,
+                ));
+            if observed_supersession && kind == "retire" {
+                superseded_retirement = event["workId"].as_str().map(str::to_owned);
+            }
             let fenced_operator = kind == "operatorHold"
                 && native_owner.get::<&str, _>("status") == "revoked"
                 && native_owner.get::<bool, _>("interrupted");
             require(
-                (fenced_stop || fenced_operator) && index + 1 == events.len(),
+                (observed_supersession || fenced_stop || fenced_operator)
+                    && index + 1 == events.len(),
                 "Uncommitted clock ticket",
             )?;
             require(
@@ -491,6 +544,10 @@ pub(super) async fn verify(
         last = receipt;
     }
     require(
+        superseded.is_none() || observed_supersession,
+        "Superseded clock ticket differs",
+    )?;
+    require(
         clock.get::<&str, _>("revision") == journal.len().to_string()
             && clock.get::<&str, _>("state_json") == previous
             && parsed(clock, "receipt_json")? == last
@@ -528,7 +585,10 @@ pub(super) async fn verify(
         )?;
         let a = state.activations.iter().find(|a| a.id == w.id).unwrap();
         require(
-            w.kind == "approval" || a.result.is_none() || w.retired,
+            w.kind == "approval"
+                || a.result.is_none()
+                || w.retired
+                || superseded_retirement.as_ref() == Some(&w.id),
             "Terminal clock remains active",
         )?;
     }
@@ -553,13 +613,16 @@ pub(super) async fn verify(
             } else {
                 "answerTimeout"
             });
+            let delivery: &str = row.get("delivery");
+            let stopped_before_delivery =
+                stop.is_some() && !r.acknowledged && matches!(delivery, "pending" | "reserved");
             require(
                 parsed(row, "resolution_json")? == expected
                     && row.get::<&str, _>("revision") == "1"
                     && (resolution["operatorCancelled"] == true
-                        || (row.get::<&str, _>("delivery") == "acknowledged" && r.acknowledged)
-                        || (row.get::<&str, _>("delivery") == "reserved"
-                            && closed_asks.contains(&r.id))),
+                        || (delivery == "acknowledged" && r.acknowledged)
+                        || (delivery == "reserved" && closed_asks.contains(&r.id))
+                        || stopped_before_delivery),
                 "Resolution/readback differs",
             )?;
             let proof=sqlx::query("SELECT p.resolution_json,e.output_json FROM engine_flow030_human_resolution_proofs p JOIN engine_flow030_clock_events e USING(system_id,invocation_id,event_id) WHERE p.system_id=? AND p.invocation_id=? AND p.request_id=?")
@@ -620,7 +683,8 @@ pub(super) async fn verify(
                     json!(WorkResultRecord030::Completed {output_json:json!({"choice":resolution["answer"]["choice"],"comment":resolution["answer"]["comment"],"message":payload["message"]}).to_string(), route_key:resolution["answer"]["choice"].as_str().map(str::to_owned)})
                 };
                 require(
-                    serde_json::to_value(&a.result)? == expected,
+                    serde_json::to_value(&a.result)? == expected
+                        || (stopped_before_delivery && a.result.is_none()),
                     "Approval terminal differs",
                 )?;
             } else if resolution["expired"] == true {

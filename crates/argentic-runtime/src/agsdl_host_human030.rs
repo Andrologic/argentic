@@ -1395,16 +1395,28 @@ impl HumanBroker030 {
         self.acknowledge(host, decision).await
     }
     pub(crate) async fn retire_finished(&self, host: &HostState, id: &str) -> Result<()> {
-        self.settle_pending_flow_clock(host).await?;
-        let row = sqlx::query("SELECT work_json,retired FROM engine_flow030_clock_works WHERE system_id=? AND invocation_id=? AND activation_id=?")
-            .bind(&self.identity.system_start_id).bind(&self.identity.flow_invocation_id).bind(id).fetch_one(&self.pool).await?;
-        if row.get::<bool, _>("retired") {
-            return Ok(());
+        let result = async {
+            self.settle_pending_flow_clock(host).await?;
+            let row = sqlx::query("SELECT work_json,retired FROM engine_flow030_clock_works WHERE system_id=? AND invocation_id=? AND activation_id=?")
+                .bind(&self.identity.system_start_id).bind(&self.identity.flow_invocation_id).bind(id).fetch_one(&self.pool).await?;
+            if row.get::<bool, _>("retired") {
+                return Ok(());
+            }
+            let work: OwnedHumanWork030 = serde_json::from_str(row.get("work_json"))?;
+            self.retire(host, &work).await?;
+            self.pump(host, &CancellationToken::new()).await?;
+            Ok(())
+        }.await;
+        if result.is_err() {
+            let stopping: bool = sqlx::query_scalar(
+                "SELECT json_extract(state_json,'$.stopping') FROM engine_flow030_runs WHERE system_id=? AND invocation_id=?",
+            ).bind(&self.identity.system_start_id).bind(&self.identity.flow_invocation_id)
+                .fetch_one(&self.pool).await?;
+            if stopping {
+                return Ok(());
+            }
         }
-        let work: OwnedHumanWork030 = serde_json::from_str(row.get("work_json"))?;
-        self.retire(host, &work).await?;
-        self.pump(host, &CancellationToken::new()).await?;
-        Ok(())
+        result
     }
     pub(crate) async fn reserve_agent_retirement_tx(
         &self,

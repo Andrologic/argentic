@@ -2789,6 +2789,24 @@ pub(crate) struct NativeSystemStopReceipt030 {
     pub stopping: bool,
     pub verdict: Option<String>,
     pub flow_event_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_clock_ticket: Option<SupersededClockTicket030>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct SupersededClockTicket030 {
+    event_id: String,
+    ticket_sha256: String,
+}
+
+impl SupersededClockTicket030 {
+    pub(crate) fn new(event_id: &str, ticket_json: &str) -> Self {
+        Self {
+            event_id: event_id.into(),
+            ticket_sha256: format!("{:x}", Sha256::digest(ticket_json.as_bytes())),
+        }
+    }
 }
 
 /// Logical acknowledgement plus a genuine cleanup capability. This wrapper is
@@ -2923,6 +2941,7 @@ pub(crate) async fn request_system_stop030(
         stopping: view.state.stopping,
         verdict: view.state.verdict,
         flow_event_id: None,
+        superseded_clock_ticket: None,
     };
     let marker = stop_marker(&receipt);
     if !receipt.stopping && receipt.verdict.is_none() {
@@ -2945,6 +2964,12 @@ pub(crate) async fn request_system_stop030(
         receipt.stopping = after.stopping;
         receipt.verdict = after.verdict;
         receipt.flow_event_id = Some(marker.event_id.clone());
+        let pending = sqlx::query("SELECT event_id,ticket_json FROM engine_flow030_clock_events WHERE system_id=? AND invocation_id=? AND output_json IS NULL")
+            .bind(&control.identity.system_start_id).bind(&control.identity.flow_invocation_id)
+            .fetch_optional(&mut *tx).await?;
+        receipt.superseded_clock_ticket = pending.map(|ticket| {
+            SupersededClockTicket030::new(ticket.get("event_id"), ticket.get("ticket_json"))
+        });
     }
     sqlx::query("INSERT INTO engine_flow030_system_stop_requests(request_id,system_id,invocation_id,owner_epoch,generation,request_json,receipt_json,event_id) VALUES(?,?,?,?,?,?,?,?)")
         .bind(&request.request_id).bind(&control.identity.system_start_id).bind(&control.identity.flow_invocation_id).bind(&control.owner.owner_epoch).bind(&control.generation)

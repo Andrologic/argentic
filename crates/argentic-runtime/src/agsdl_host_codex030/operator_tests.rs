@@ -1464,3 +1464,282 @@ async fn operator_resume_routes_join_failure_from_a_steer_settled_during_pause()
     .await;
     assert!(replay.ok, "{:?}", replay.divergence);
 }
+
+#[tokio::test]
+async fn operator_stop_supersedes_the_exact_pending_pause_clock_ticket() {
+    use crate::api::OperatorAction as Action;
+    let f = Fixture::with_document(json!({
+        "contract":"agsdl-0.4.0","id":"stop-before-pause-clock",
+        "agents":{"worker":{"harness":"codex","permissions":"read-only"}},
+        "flow":{"entry":"work","steps":{"work":{"type":"agent","agent":"worker","timeoutMs":1000}}}
+    }))
+    .await;
+    let scope = operator_scope(&f).await;
+    let tasks = StreamTasks::default();
+    let registry = f.host.flow030().supervisor_registry();
+    registry.reserve(&scope.system_start_id).unwrap();
+    let agent = Arc::new(PausableAgent::default());
+    start_operator_supervisor(&f, agent.clone(), &tasks);
+    operator_wait(async || (!agent.starts.lock().unwrap().is_empty()).then_some(())).await;
+
+    // After Pause commits, another waiter holds dispatch before the supervisor
+    // can evaluate the reserved ticket. Stop is independent of dispatch.
+    let (dispatch, _) = registry.dispatcher(&scope.system_start_id).unwrap();
+    let gate = dispatch.lock().await;
+    let pause = operator_control(&f, &scope, "pause", Action::PauseRun);
+    tokio::pin!(pause);
+    assert!(futures::poll!(&mut pause).is_pending());
+    let block = dispatch.lock();
+    tokio::pin!(block);
+    assert!(futures::poll!(&mut block).is_pending());
+    drop(gate);
+    pause.await.unwrap();
+    let block = block.await;
+    let (ticket, raw): (String, String) = sqlx::query_as(
+        "SELECT event_id,ticket_json FROM engine_flow030_clock_events WHERE output_json IS NULL
+         AND json_extract(ticket_json ->> '$.eventJson', '$.event.kind')='operatorHold'",
+    )
+    .fetch_one(&f.pool)
+    .await
+    .unwrap();
+    f.host
+        .request_stop(
+            &f.pool,
+            &tasks,
+            &EngineStopRequest {
+                system_start_id: scope.system_start_id.clone(),
+                request_id: "stop".into(),
+                activation_id: None,
+            },
+        )
+        .await
+        .unwrap();
+    drop(block);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        registry.wait(&scope.system_start_id),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        operator_view(&f, &scope).await.verdict.as_deref(),
+        Some("cancelled")
+    );
+    let stop_receipt: String = sqlx::query_scalar(
+        "SELECT receipt_json FROM engine_flow030_system_stop_requests WHERE request_id='stop'",
+    )
+    .fetch_one(&f.pool)
+    .await
+    .unwrap();
+    let stop_receipt: Value = serde_json::from_str(&stop_receipt).unwrap();
+    assert_eq!(
+        stop_receipt["supersededClockTicket"],
+        json!(crate::agsdl_host_flow030::SupersededClockTicket030::new(
+            &ticket, &raw
+        ))
+    );
+    let verify = async || {
+        crate::persistence::replay_verify030::verify_path030(
+            &f._temp.path().join("run.db"),
+            &scope.system_start_id,
+            &f.identity.flow_invocation_id,
+        )
+        .await
+    };
+    let replay = verify().await;
+    assert!(replay.ok, "{:?}", replay.divergence);
+
+    sqlx::query("DROP TRIGGER engine_flow030_clock_ticket_immutable")
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE engine_flow030_clock_events SET ticket_json=? WHERE event_id=?")
+        .bind(format!("{raw} "))
+        .bind(ticket)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    let replay = verify().await;
+    assert!(!replay.ok, "Replay accepted a different clock ticket");
+}
+
+#[tokio::test]
+async fn operator_stop_preserves_an_accepted_approval_that_has_not_routed() {
+    let f = Fixture::with_document(json!({
+        "contract":"agsdl-0.4.0","id":"stop-before-approval-result",
+        "agents":{"worker":{"harness":"codex","permissions":"read-only"}},
+        "flow":{"entry":"approval","steps":{
+            "approval":{"type":"approval","next":{"yes":"handler","no":"handler"}},
+            "handler":{"type":"agent","agent":"worker"}
+        }}
+    }))
+    .await;
+    let scope = operator_scope(&f).await;
+    let tasks = StreamTasks::default();
+    let registry = f.host.flow030().supervisor_registry();
+    registry.reserve(&scope.system_start_id).unwrap();
+    let agent = Arc::new(PausableAgent::default());
+    start_operator_supervisor(&f, agent.clone(), &tasks);
+    let id = operator_wait(async || {
+        sqlx::query_scalar::<_, String>(
+            "SELECT request_id FROM engine_flow030_human_requests WHERE kind='approval'",
+        )
+        .fetch_optional(&f.pool)
+        .await
+        .unwrap()
+    })
+    .await;
+    let (dispatch, _) = registry.dispatcher(&scope.system_start_id).unwrap();
+    let block = dispatch.lock().await;
+    let receipt = f
+        .host
+        .submit_person(
+            &f.pool,
+            crate::api::HumanSubmission {
+                scope: crate::persistence::public030::HumanScope030 {
+                    system_start_id: scope.system_start_id.clone(),
+                    source: scope.source.clone(),
+                },
+                request_id: id,
+                expected_revision: "0".into(),
+                answer: crate::agsdl_host_human030::HumanAnswer030::Approval {
+                    choice: "yes".into(),
+                    comment: "Reviewed".into(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let accepted: bool = sqlx::query_scalar(
+        "SELECT accepted FROM engine_flow030_human_submissions WHERE receipt_id=?",
+    )
+    .bind(receipt)
+    .fetch_one(&f.pool)
+    .await
+    .unwrap();
+    assert!(accepted);
+    f.host
+        .request_stop(
+            &f.pool,
+            &tasks,
+            &EngineStopRequest {
+                system_start_id: scope.system_start_id.clone(),
+                request_id: "stop".into(),
+                activation_id: None,
+            },
+        )
+        .await
+        .unwrap();
+    drop(block);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        registry.wait(&scope.system_start_id),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        operator_view(&f, &scope).await.verdict.as_deref(),
+        Some("cancelled")
+    );
+    assert!(agent.starts.lock().unwrap().is_empty());
+    let replay = crate::persistence::replay_verify030::verify_path030(
+        &f._temp.path().join("run.db"),
+        &scope.system_start_id,
+        &f.identity.flow_invocation_id,
+    )
+    .await;
+    assert!(replay.ok, "{:?}", replay.divergence);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn operator_stop_during_clock_retirement_preserves_the_prior_result() {
+    let f = Fixture::with_document(json!({
+        "contract":"agsdl-0.4.0","id":"stop-during-clock-retirement",
+        "agents":{"worker":{"harness":"codex","permissions":"read-only"}},
+        "flow":{"entry":"work","steps":{
+            "work":{"type":"agent","agent":"worker","timeoutMs":10000,"next":"handler"},
+            "handler":{"type":"agent","agent":"worker"}
+        }}
+    }))
+    .await;
+    let scope = operator_scope(&f).await;
+    let tasks = StreamTasks::default();
+    let registry = f.host.flow030().supervisor_registry();
+    registry.reserve(&scope.system_start_id).unwrap();
+    let trace = f._temp.path().join("trace.jsonl");
+    std::fs::write(
+        trace.with_extension("jsonl.script"),
+        json!([envelope(json!({"results":{}}))]).to_string(),
+    )
+    .unwrap();
+
+    let (retiring, wait_for_retirement) = tokio::sync::oneshot::channel();
+    let retiring = std::sync::Mutex::new(Some(retiring));
+    let (release, stop_committed) = std::sync::mpsc::sync_channel(1);
+    let stop_committed = std::sync::Mutex::new(stop_committed);
+    f.host
+        .start_lease()
+        .await
+        .unwrap()
+        .clock_jobs030()
+        .approval_check_probe(Arc::new(move |raw, _| {
+            let job: crate::agsdl_host_route030::HostRouteJob030 =
+                serde_json::from_str(raw).unwrap();
+            let request: Value = serde_json::from_str(&job.input_json).unwrap();
+            if request["operation"] == "humanClock" {
+                let clock: crate::agsdl_host_clock030::HostClockInput030 =
+                    serde_json::from_value(request["input"].clone()).unwrap();
+                let event: Value = serde_json::from_str(&clock.event_json).unwrap();
+                if event["event"]["kind"] == "retire" {
+                    if let Some(signal) = retiring.lock().unwrap().take() {
+                        signal.send(()).unwrap();
+                        stop_committed
+                            .lock()
+                            .unwrap()
+                            .recv_timeout(std::time::Duration::from_secs(10))
+                            .unwrap();
+                    }
+                }
+            }
+        }));
+    start_operator_supervisor(&f, Arc::new(executor(&f, &trace, None)), &tasks);
+    tokio::time::timeout(std::time::Duration::from_secs(10), wait_for_retirement)
+        .await
+        .unwrap()
+        .unwrap();
+    f.host
+        .request_stop(
+            &f.pool,
+            &tasks,
+            &EngineStopRequest {
+                system_start_id: scope.system_start_id.clone(),
+                request_id: "stop".into(),
+                activation_id: None,
+            },
+        )
+        .await
+        .unwrap();
+    release.send(()).unwrap();
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        registry.wait(&scope.system_start_id),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        operator_view(&f, &scope).await.verdict.as_deref(),
+        Some("cancelled")
+    );
+    assert_eq!(requests(&trace, "turn/start").len(), 1);
+    let replay = crate::persistence::replay_verify030::verify_path030(
+        &f._temp.path().join("run.db"),
+        &scope.system_start_id,
+        &f.identity.flow_invocation_id,
+    )
+    .await;
+    assert!(replay.ok, "{:?}", replay.divergence);
+}
