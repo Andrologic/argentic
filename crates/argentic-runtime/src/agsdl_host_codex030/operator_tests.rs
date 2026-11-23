@@ -844,10 +844,17 @@ async fn operator_pause_defers_a_pending_start_and_stop_withdraws_it() {
 }
 
 #[derive(Default)]
+struct DeferredSteer {
+    sent: Notify,
+    report: Notify,
+}
+
+#[derive(Default)]
 struct PausableAgent {
     starts: std::sync::Mutex<Vec<String>>,
     finish_work: Arc<Notify>,
     disconnect_on_hold: bool,
+    deferred_steer: Option<Arc<DeferredSteer>>,
 }
 impl AgentExecutor030 for PausableAgent {
     fn supports_operator_hold(&self) -> bool {
@@ -878,9 +885,24 @@ impl AgentExecutor030 for PausableAgent {
         self.starts.lock().unwrap().push(step.clone());
         let finish = self.finish_work.clone();
         let disconnect = self.disconnect_on_hold;
+        let deferred_steer = self.deferred_steer.clone();
         Box::pin(async move {
             let sibling = disconnect && step == "sibling";
             if step == "work" || sibling {
+                if let Some(deferred) = deferred_steer {
+                    let steer = work.steer.receive().await.unwrap();
+                    drop(steer.wire_admission().await?.unwrap());
+                    let report = deferred.clone();
+                    steer.handoff_observation(&work.tasks, &work.attempt, async move {
+                        report.report.notified().await;
+                        Err(crate::persistence::failure(
+                            "CORRELATION",
+                            "steer",
+                            "Scripted receipt named another work",
+                        ))
+                    })?;
+                    deferred.sent.notify_one();
+                }
                 let hold = tokio::select! {
                     id = work.operator.requested() => id,
                     _ = cancel.cancelled() => return Ok(()),
@@ -1298,4 +1320,117 @@ async fn operator_resume_routes_a_join_failure_with_the_original_result_evidence
         .await;
         assert!(replay.ok, "{:?}", replay.divergence);
     }
+}
+
+#[tokio::test]
+async fn operator_resume_routes_join_failure_from_a_steer_settled_during_pause() {
+    use crate::api::OperatorAction as Action;
+    use crate::persistence::flow030::FlowEffectKind030;
+
+    let f = Fixture::with_document(json!({
+        "contract":"agsdl-0.4.0","id":"deferred-steer-failure",
+        "agents":{"worker":{"harness":"codex","permissions":"read-only"}},
+        "flow":{"entry":"seed","steps":{
+            "seed":{"type":"agent","agent":"worker","next":["work","nudge","sibling"]},
+            "work":{"type":"agent","agent":"worker"},
+            "nudge":{"type":"agent","agent":"worker","delivery":"steer","next":"join"},
+            "sibling":{"type":"agent","agent":"worker","instance":"new","next":"join"},
+            "join":{"type":"join","next":[],"onError":"handler"},
+            "handler":{"type":"agent","agent":"worker"}
+        }}
+    }))
+    .await;
+    let scope = operator_scope(&f).await;
+    let tasks = StreamTasks::default();
+    let registry = f.host.flow030().supervisor_registry();
+    registry.reserve(&scope.system_start_id).unwrap();
+    let steer = Arc::new(DeferredSteer::default());
+    let agent = Arc::new(PausableAgent {
+        deferred_steer: Some(steer.clone()),
+        ..Default::default()
+    });
+    start_operator_supervisor(&f, agent.clone(), &tasks);
+    tokio::time::timeout(std::time::Duration::from_secs(10), steer.sent.notified())
+        .await
+        .unwrap();
+    operator_wait(async || {
+        let view = flow::inspect_run(f.host.flow030(), &f.host, &f.pool, &f.owner)
+            .await
+            .unwrap();
+        view.flow
+            .state
+            .activations
+            .iter()
+            .any(|activation| {
+                activation.step.as_deref() == Some(&["sibling".into()])
+                    && matches!(
+                        activation.result,
+                        Some(crate::persistence::flow030::WorkResultRecord030::Completed { .. })
+                    )
+            })
+            .then_some(())
+    })
+    .await;
+    operator_control(&f, &scope, "pause", Action::PauseRun)
+        .await
+        .unwrap();
+    steer.report.notify_one();
+    let (activation_id, origin_event_id) = operator_wait(async || {
+        let view = flow::inspect_run(f.host.flow030(), &f.host, &f.pool, &f.owner)
+            .await
+            .unwrap();
+        let state = &view.flow.state;
+        let delivery = state.steer_deliveries.first()?;
+        (delivery.status == "failed" && state.operator_holds.values().all(|hold| hold.ready)).then(
+            || {
+                assert_eq!(delivery.reason.as_deref(), Some("HARNESS_REFUSED"));
+                (
+                    delivery.delivery_activation_id.clone(),
+                    delivery.resolved_event_id.clone().unwrap(),
+                )
+            },
+        )
+    })
+    .await;
+    assert!(!agent
+        .starts
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|step| step == "handler"));
+    let resume = operator_control(&f, &scope, "resume", Action::ResumeRun)
+        .await
+        .unwrap();
+    agent.finish_work.notify_one();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        registry.wait(&scope.system_start_id),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let done = flow::inspect_run(f.host.flow030(), &f.host, &f.pool, &f.owner)
+        .await
+        .unwrap()
+        .flow;
+    assert_eq!(done.state.verdict.as_deref(), Some("succeeded"));
+    assert!(agent
+        .starts
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|step| step == "handler"));
+    assert!(done.effects.iter().any(|row| {
+        let effect: crate::persistence::flow030::FlowEffect030 = serde_json::from_value(row["effect"].clone()).unwrap();
+        resume.effect_ids.contains(&effect.id) && matches!(effect.kind,
+            FlowEffectKind030::Failure {activation_id: id, origin_event_id: Some(origin), counted: true, ..}
+                if id == activation_id && origin == origin_event_id)
+    }));
+    let replay = crate::persistence::replay_verify030::verify_path030(
+        &f._temp.path().join("run.db"),
+        &scope.system_start_id,
+        &f.identity.flow_invocation_id,
+    )
+    .await;
+    assert!(replay.ok, "{:?}", replay.divergence);
 }

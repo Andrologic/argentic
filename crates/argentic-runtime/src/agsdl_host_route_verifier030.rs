@@ -1177,7 +1177,8 @@ fn verify_failed_group_tx<'a>(
                     PathFailureOrigin030::AdmissionLimit
                         if origin_event_id.is_none()
                             && event.pointer("/kind/Operator") == Some(&json!("ResumeRun")) => {}
-                    PathFailureOrigin030::PreparedFailure
+                    PathFailureOrigin030::Steer
+                    | PathFailureOrigin030::PreparedFailure
                     | PathFailureOrigin030::AdmissionLimit => {
                         verify_preparation_origin_tx(
                             db,
