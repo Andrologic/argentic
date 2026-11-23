@@ -67,20 +67,60 @@ unsafe impl GlobalAlloc for Counting {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn cpu_now() -> Duration {
     let mut time: libc::timespec = unsafe { std::mem::zeroed() };
     assert_eq!(
-        unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut time) },
+        unsafe { libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, &mut time) },
         0
     );
     Duration::new(time.tv_sec as u64, time.tv_nsec as u32)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(windows)]
 fn cpu_now() -> Duration {
-    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-    START.get_or_init(std::time::Instant::now).elapsed()
+    use windows_sys::Win32::{
+        Foundation::FILETIME,
+        System::Threading::{GetCurrentProcess, GetProcessTimes},
+    };
+    let [mut created, mut exited, mut kernel, mut user] = [FILETIME::default(); 4];
+    assert_ne!(
+        unsafe {
+            GetProcessTimes(
+                GetCurrentProcess(),
+                &mut created,
+                &mut exited,
+                &mut kernel,
+                &mut user,
+            )
+        },
+        0
+    );
+    let ticks =
+        |time: FILETIME| u64::from(time.dwHighDateTime) << 32 | u64::from(time.dwLowDateTime);
+    Duration::from_nanos((ticks(kernel) + ticks(user)) * 100)
+}
+
+struct AllocationSample {
+    total: usize,
+    peak: usize,
+    cpu: Duration,
+}
+
+fn allocation_sample<T>(operation: impl FnOnce() -> T) -> (T, AllocationSample) {
+    TOTAL.store(0, Relaxed);
+    let base = LIVE.load(Relaxed);
+    PEAK.store(base, Relaxed);
+    let start = cpu_now();
+    ACTIVE.store(true, Relaxed);
+    let result = operation();
+    ACTIVE.store(false, Relaxed);
+    let sample = AllocationSample {
+        total: TOTAL.load(Relaxed),
+        peak: PEAK.load(Relaxed).saturating_sub(base),
+        cpu: cpu_now() - start,
+    };
+    (result, sample)
 }
 
 struct Sample {
@@ -96,17 +136,9 @@ fn measure<T>(name: &str, operation: impl Fn(&SourceBudget) -> T) -> (T, Sample)
     // reduces noise from scheduling and first-use initialization.
     for attempt in 0..3 {
         let budget = SourceBudget::default();
-        TOTAL.store(0, Relaxed);
-        let base = LIVE.load(Relaxed);
-        PEAK.store(base, Relaxed);
-        let start = cpu_now();
-        ACTIVE.store(true, Relaxed);
-        let result = operation(&budget);
-        ACTIVE.store(false, Relaxed);
-        let cpu = cpu_now() - start;
+        let (result, AllocationSample { total, peak, cpu }) =
+            allocation_sample(|| operation(&budget));
         let (work, charged) = budget.usage();
-        let total = TOTAL.load(Relaxed);
-        let peak = PEAK.load(Relaxed).saturating_sub(base);
         // k=2 allows allocator request growth and bookkeeping estimates.
         // The peak live check uses the budget itself, with no multiplier.
         assert!(
@@ -220,21 +252,16 @@ fn pipeline(sections: usize, evidence_bytes: usize) -> (String, String) {
     (authored, registry)
 }
 
-fn asset_project(root: &Path, attachment_size: usize) {
+fn asset_project(root: &Path, attachment_size: usize, mut document: Value) {
     let mut content = Map::new();
     for i in 0..4 {
         let path = format!("attachment-{i}.txt");
         std::fs::write(root.join(&path), vec![b'x'; attachment_size]).unwrap();
         content.insert(format!("asset{i}"), json!({"uri":path}));
     }
-    std::fs::write(
-        root.join("agsdl.json"),
-        json!({"projectFormat":"agsdl-project-1",
-        "contract":"agsdl-0.4.0","id":"assets","content":content,
-        "agents":{"a":{"harness":"codex","permissions":"read-only"}}})
-        .to_string(),
-    )
-    .unwrap();
+    document["projectFormat"] = "agsdl-project-1".into();
+    document["content"] = Value::Object(content);
+    std::fs::write(root.join("agsdl.json"), document.to_string()).unwrap();
 }
 
 fn deflated_archive(project: &OpenedSource) -> Vec<u8> {
@@ -486,14 +513,8 @@ fn measure_skill_tree() {
     const REMAINING: usize = 256 * 1024;
     let budget = SourceBudget::default();
     budget.bytes(MAX_SOURCE_BYTES - REMAINING, "").unwrap();
-    TOTAL.store(0, Relaxed);
-    let base = LIVE.load(Relaxed);
-    PEAK.store(base, Relaxed);
-    ACTIVE.store(true, Relaxed);
-    let result = OpenedSource::open_path_with_budget(project.path(), budget);
-    ACTIVE.store(false, Relaxed);
-    let total = TOTAL.load(Relaxed);
-    let peak = PEAK.load(Relaxed).saturating_sub(base);
+    let (result, AllocationSample { total, peak, .. }) =
+        allocation_sample(|| OpenedSource::open_path_with_budget(project.path(), budget));
     let error = result.err().expect("the walk exceeds the remaining budget");
     assert_eq!(error.code, GRAPH_LIMIT_CODE);
     assert_eq!(error.source.as_ref().unwrap().path, "skills/review");
@@ -508,6 +529,100 @@ fn measure_skill_tree() {
         peak <= REMAINING,
         "{peak} peak bytes with {REMAINING} available"
     );
+}
+
+fn measure_public_pipeline(engine: &Engine, runtime: &tokio::runtime::Runtime) {
+    let measure_size = |sections, asset_bytes| {
+        let project = tempfile::tempdir().unwrap();
+        let (authored, registry) = pipeline(sections, 16 * 1024);
+        asset_project(
+            project.path(),
+            asset_bytes,
+            serde_json::from_str(&authored).unwrap(),
+        );
+        let manifest = project.path().join("agsdl.json");
+        let mut archive = Vec::new();
+        OpenedSource::open_path(project.path())
+            .unwrap()
+            .write_archive(&mut archive)
+            .unwrap();
+        [
+            ("folder", Some(project.path())),
+            ("manifest", Some(manifest.as_path())),
+            ("archive", None),
+        ]
+        .map(|(kind, path)| {
+            let mut sample = AllocationSample {
+                total: 0,
+                peak: 0,
+                cpu: Duration::MAX,
+            };
+            for _ in 0..3 {
+                let (result, actual) = allocation_sample(|| {
+                    let opened = match path {
+                        Some(path) => OpenedSource::open_path(path),
+                        None => OpenedSource::open_archive_bytes(&archive),
+                    }
+                    .unwrap();
+                    let authored = opened.authored_json();
+                    runtime
+                        .block_on(engine.compile_document(
+                            source_revision(authored),
+                            authored.to_owned(),
+                            registry.clone(),
+                        ))
+                        .unwrap()
+                });
+                let result: Value = serde_json::from_str(&result.result_json).unwrap();
+                assert_eq!(
+                    result["runtime"]["supported"], true,
+                    "{kind}: {}",
+                    result["runtime"]
+                );
+                assert_eq!(
+                    result["plan"]["steps"].as_array().unwrap().len(),
+                    sections * 12
+                );
+                sample.cpu = sample.cpu.min(actual.cpu);
+                sample.total = sample.total.max(actual.total);
+                sample.peak = sample.peak.max(actual.peak);
+            }
+            // The public methods each have their own allocation budget.
+            assert!(
+                sample.total <= 2 * MAX_SOURCE_BYTES,
+                "{kind}: {} allocated",
+                sample.total
+            );
+            assert!(
+                sample.peak <= 2 * MAX_SOURCE_BYTES,
+                "{kind}: {} peak",
+                sample.peak
+            );
+            eprintln!(
+                "public {kind}, {sections} sections: {} allocated, {} peak, {:?} process CPU",
+                sample.total, sample.peak, sample.cpu
+            );
+            (kind, sample)
+        })
+    };
+    runtime.block_on(async { tokio::task::spawn_blocking(|| ()).await.unwrap() });
+    let small = measure_size(2, 64 * 1024);
+    let large = measure_size(20, 640 * 1024);
+    for ((kind, small), (_, large)) in small.into_iter().zip(large) {
+        // Both the workflow and attachments grow by a factor of ten.
+        assert!(
+            large.total > small.total && large.total <= 15 * small.total,
+            "{kind}: {} -> {} allocation bytes",
+            small.total,
+            large.total
+        );
+        assert!(
+            large.cpu <= 40 * small.cpu,
+            "{kind}: {:?} -> {:?} process CPU",
+            small.cpu,
+            large.cpu
+        );
+    }
 }
 
 fn has_limit(report: &str) -> bool {
@@ -530,7 +645,14 @@ fn source_operations_keep_allocation_and_work_proportional() {
     let large = tempfile::tempdir().unwrap();
     let sizes = [256 * 1024, 2560 * 1024];
     for (root, size) in [small.path(), large.path()].into_iter().zip(sizes) {
-        asset_project(root, size);
+        asset_project(
+            root,
+            size,
+            json!({
+                "contract":"agsdl-0.4.0","id":"assets",
+                "agents":{"a":{"harness":"codex","permissions":"read-only"}}
+            }),
+        );
     }
     let assets = |path, label| {
         let (opened, stats) = measure(label, |budget| {
@@ -672,6 +794,8 @@ fn source_operations_keep_allocation_and_work_proportional() {
         .enable_all()
         .build()
         .unwrap();
+    measure_public_pipeline(&engine, &runtime);
+
     let (doc, registry) = pipeline(1, 32);
     let mut invalid: Value = serde_json::from_str(&registry).unwrap();
     invalid["x".repeat(4097)] = true.into();
