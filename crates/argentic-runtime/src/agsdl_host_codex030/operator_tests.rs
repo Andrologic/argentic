@@ -715,8 +715,17 @@ impl AgentExecutor030 for PausableAgent {
 
 #[tokio::test]
 async fn operator_pause_defers_delivery_and_routing_while_approval_expires() {
+    check_operator_pause_approval(false).await;
+}
+
+#[tokio::test]
+async fn operator_pause_settles_its_clock_ticket_before_a_parallel_approval_answer() {
+    check_operator_pause_approval(true).await;
+}
+
+async fn check_operator_pause_approval(answer: bool) {
     use crate::api::{OperatorAction as Action, OperatorWorkState, RuntimeProjectionItem030};
-    for stop in [false, true] {
+    for stop in [false, true].into_iter().filter(|stop| !answer || !stop) {
         let document = json!({"contract":"agsdl-0.4.0","id":"operator-approval-deadline",
         "agents":{"seed":{"harness":"codex","permissions":"read-only"},"worker":{"harness":"codex","permissions":"read-only"}},
         "flow":{"entry":"seed","steps":{
@@ -756,9 +765,85 @@ async fn operator_pause_defers_delivery_and_routing_while_approval_expires() {
                 _ => None,
             })
             .unwrap();
-        operator_control(&f, &scope, "pause", Action::PauseRun)
+        if answer {
+            // Queue the pause, then reacquire dispatch before the supervisor
+            // can pump the clock ticket. The product entry point must settle it.
+            let (dispatch, _) = registry.dispatcher(&scope.system_start_id).unwrap();
+            let gate = dispatch.lock().await;
+            let pause = operator_control(&f, &scope, "pause", Action::PauseRun);
+            tokio::pin!(pause);
+            assert!(futures::poll!(&mut pause).is_pending());
+            let block = dispatch.lock();
+            tokio::pin!(block);
+            assert!(futures::poll!(&mut block).is_pending());
+            drop(gate);
+            pause.await.unwrap();
+            let _block = block.await;
+            let pending: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM engine_flow030_clock_events WHERE output_json IS NULL
+                 AND json_extract(ticket_json ->> '$.eventJson', '$.event.kind')='operatorHold'",
+            )
+            .fetch_one(&f.pool)
             .await
             .unwrap();
+            assert_eq!(pending, 1);
+            clock.advance_to(799).unwrap();
+            let evaluation_clock = clock.clone();
+            f.host
+                .start_lease()
+                .await
+                .unwrap()
+                .clock_jobs030()
+                .approval_check_probe(Arc::new(move |raw, _| {
+                    let job: crate::agsdl_host_route030::HostRouteJob030 =
+                        serde_json::from_str(raw).unwrap();
+                    let request: Value = serde_json::from_str(&job.input_json).unwrap();
+                    if request["operation"] != "humanClock" {
+                        return;
+                    }
+                    let clock: crate::agsdl_host_clock030::HostClockInput030 =
+                        serde_json::from_value(request["input"].clone()).unwrap();
+                    let event: Value = serde_json::from_str(&clock.event_json).unwrap();
+                    if event["event"]["kind"] == "operatorHold" {
+                        evaluation_clock.advance_to(801).unwrap();
+                    }
+                }));
+            let receipt = f
+                .host
+                .submit_person(
+                    &f.pool,
+                    crate::api::HumanSubmission {
+                        scope: crate::persistence::public030::HumanScope030 {
+                            system_start_id: scope.system_start_id.clone(),
+                            source: scope.source.clone(),
+                        },
+                        request_id: approval_id.clone(),
+                        expected_revision: "0".into(),
+                        answer: crate::agsdl_host_human030::HumanAnswer030::Approval {
+                            choice: "yes".into(),
+                            comment: "Before the deadline".into(),
+                        },
+                    },
+                )
+                .await
+                .unwrap();
+            let accepted: bool = sqlx::query_scalar(
+                "SELECT accepted FROM engine_flow030_human_submissions WHERE receipt_id=?",
+            )
+            .bind(receipt)
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+            assert!(accepted);
+            assert_eq!(
+                crate::agsdl_host_clock030::Clock030::now_ms(clock.as_ref()),
+                801
+            );
+        } else {
+            operator_control(&f, &scope, "pause", Action::PauseRun)
+                .await
+                .unwrap();
+        }
         operator_wait(async || {
             (operator_view(&f, &scope).await.operator_works.get(&held_id)
                 == Some(&OperatorWorkState::Held))
@@ -788,13 +873,15 @@ async fn operator_pause_defers_delivery_and_routing_while_approval_expires() {
             source: scope.source.clone(),
         };
         let humans = f.host.human_page(&f.pool, human_scope, None).await.unwrap();
-        let human = humans
-            .requests
-            .iter()
-            .find(|r| r.id == approval_id)
-            .unwrap();
-        let facts: Value = serde_json::from_str(human.flow_json.as_deref().unwrap()).unwrap();
-        assert_eq!(facts["clock"]["value"]["timeoutMs"], "800");
+        if !answer {
+            let human = humans
+                .requests
+                .iter()
+                .find(|r| r.id == approval_id)
+                .unwrap();
+            let facts: Value = serde_json::from_str(human.flow_json.as_deref().unwrap()).unwrap();
+            assert_eq!(facts["clock"]["value"]["timeoutMs"], "800");
+        }
         clock.advance_to(801).unwrap();
         registry.wake(&scope.system_start_id);
         operator_wait(async || {
@@ -813,9 +900,9 @@ async fn operator_pause_defers_delivery_and_routing_while_approval_expires() {
         assert!(view.paused && view.verdict.is_none());
         assert!(view.items.iter().any(|item| matches!(item, RuntimeProjectionItem030::Activation {value}
             if value.phase == "deferred" && value.message.as_ref().is_some_and(|m| m.message_json.contains("delayed")))));
-        let code: String = sqlx::query_scalar("SELECT resolution_json ->> '$.failure' FROM engine_flow030_human_requests WHERE request_id=?")
+        let code: Option<String> = sqlx::query_scalar("SELECT resolution_json ->> '$.failure' FROM engine_flow030_human_requests WHERE request_id=?")
             .bind(approval_id).fetch_one(&f.pool).await.unwrap();
-        assert_eq!(code, "APPROVAL_TIMEOUT");
+        assert_eq!(code.as_deref(), (!answer).then_some("APPROVAL_TIMEOUT"));
 
         if stop {
             f.host
@@ -834,20 +921,22 @@ async fn operator_pause_defers_delivery_and_routing_while_approval_expires() {
             operator_control(&f, &scope, "resume-run", Action::ResumeRun)
                 .await
                 .unwrap();
-            operator_wait(async || {
-                agent
-                    .starts
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .any(|step| step == "expired")
-                    .then_some(())
-            })
-            .await;
-            assert_eq!(
-                agent.starts.lock().unwrap().as_slice(),
-                ["seed", "work", "expired"]
-            );
+            if !answer {
+                operator_wait(async || {
+                    agent
+                        .starts
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|step| step == "expired")
+                        .then_some(())
+                })
+                .await;
+                assert_eq!(
+                    agent.starts.lock().unwrap().as_slice(),
+                    ["seed", "work", "expired"]
+                );
+            }
             agent.finish_work.notify_one();
         }
         tokio::time::timeout(
@@ -867,6 +956,8 @@ async fn operator_pause_defers_delivery_and_routing_while_approval_expires() {
             agent.starts.lock().unwrap().as_slice(),
             if stop {
                 &["seed", "work"][..]
+            } else if answer {
+                &["seed", "work", "queued", "message"][..]
             } else {
                 &["seed", "work", "expired", "queued", "message"][..]
             }

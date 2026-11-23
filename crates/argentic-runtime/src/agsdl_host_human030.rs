@@ -321,7 +321,7 @@ impl HumanBroker030 {
         effect_id: &str,
         attempt: Option<&FlowWorkAttempt030>,
     ) -> Result<OwnedHumanWork030> {
-        self.settle_pending_retirement(host).await?;
+        self.settle_pending_flow_clock(host).await?;
         let lease = host.start_lease().await?;
         let _gate = host.admission_lock().lock_owned().await;
         let mut connection = self.durable_connection().await?;
@@ -539,7 +539,7 @@ impl HumanBroker030 {
                 "Plan content absent",
             )?;
         }
-        self.settle_pending_retirement(host).await?;
+        self.settle_pending_flow_clock(host).await?;
         let lease = host.start_lease().await?;
         let _gate = host.admission_lock().lock_owned().await;
         let mut connection = self.durable_connection().await?;
@@ -612,7 +612,7 @@ impl HumanBroker030 {
         request_id: &str,
         works: &[OwnedHumanWork030],
     ) -> Result<()> {
-        self.settle_pending_retirement(host).await?;
+        self.settle_pending_flow_clock(host).await?;
         let lease = host.start_lease().await?;
         let _gate = host.admission_lock().lock_owned().await;
         let mut connection = self.durable_connection().await?;
@@ -655,7 +655,8 @@ impl HumanBroker030 {
             .await
     }
     /// Same entry point for product IPC and the gated QA driver. Native receipt
-    /// and timestamp are allocated only after scope/revision authentication.
+    /// is allocated only after scope/revision authentication. Capture the
+    /// broker's arrival time before evaluating any earlier flow clock ticket.
     pub(crate) async fn submit(
         &self,
         host: &HostState,
@@ -672,7 +673,8 @@ impl HumanBroker030 {
             ));
         }
         validate_json(&answer_json)?;
-        self.settle_pending_retirement(host).await?;
+        let received_ms = self.clock.now_ms().to_string();
+        self.settle_pending_flow_clock(host).await?;
         let lease = host.start_lease().await?;
         let _gate = host.admission_lock().lock_owned().await;
         let mut connection = self.durable_connection().await?;
@@ -760,18 +762,17 @@ impl HumanBroker030 {
                 json!({"kind":"answer","requestId":input.request_id,"nativeReceiptId":receipt_id,"answer":null})
             }
         };
-        let now = self.clock.now_ms().to_string();
         sqlx::query("INSERT INTO engine_flow030_human_submissions VALUES(?,?,?,?,?,?,?,NULL)")
             .bind(&self.identity.system_start_id)
             .bind(&self.identity.flow_invocation_id)
             .bind(&receipt_id)
             .bind(&input.request_id)
-            .bind(&now)
+            .bind(&received_ms)
             .bind(origin.name())
             .bind(&answer_json)
             .execute(&mut *tx)
             .await?;
-        self.reserve(&mut tx, event, &now).await?;
+        self.reserve(&mut tx, event, &received_ms).await?;
         tx.commit().await?;
         Ok(receipt_id)
     }
@@ -870,14 +871,14 @@ impl HumanBroker030 {
     pub(crate) async fn tick(&self, host: &HostState) -> Result<()> {
         self.event(host, json!({"kind":"tick"})).await
     }
-    // The work transaction can reserve a retirement asynchronously. Clock
-    // writers hold the broker operation lock and must apply that exact
+    // Flow transactions can reserve retirements and operator clock changes.
+    // Clock writers hold the broker operation lock and apply that exact
     // reservation before appending their own event.
-    async fn settle_pending_retirement(&self, host: &HostState) -> Result<()> {
+    async fn settle_pending_flow_clock(&self, host: &HostState) -> Result<()> {
         let pending: bool = sqlx::query_scalar(
             "SELECT EXISTS (SELECT 1 FROM engine_flow030_clock_events
               WHERE system_id=? AND invocation_id=? AND output_json IS NULL
-                AND json_extract(ticket_json ->> '$.eventJson', '$.event.kind')='retire')",
+                AND json_extract(ticket_json ->> '$.eventJson', '$.event.kind') IN ('retire','operatorHold'))",
         )
         .bind(&self.identity.system_start_id)
         .bind(&self.identity.flow_invocation_id)
@@ -890,7 +891,7 @@ impl HumanBroker030 {
     }
 
     async fn event(&self, host: &HostState, event: Value) -> Result<()> {
-        self.settle_pending_retirement(host).await?;
+        self.settle_pending_flow_clock(host).await?;
         let lease = host.start_lease().await?;
         let _gate = host.admission_lock().lock_owned().await;
         let mut connection = self.durable_connection().await?;
@@ -1253,7 +1254,7 @@ impl HumanBroker030 {
                 && decision.generation == self.generation,
             "Foreign delivery acknowledgment",
         )?;
-        self.settle_pending_retirement(host).await?;
+        self.settle_pending_flow_clock(host).await?;
         let lease = host.start_lease().await?;
         let _gate = host.admission_lock().lock_owned().await;
         let mut connection = self.durable_connection().await?;
@@ -1325,7 +1326,7 @@ impl HumanBroker030 {
         self.acknowledge(host, decision).await
     }
     pub(crate) async fn retire_finished(&self, host: &HostState, id: &str) -> Result<()> {
-        self.settle_pending_retirement(host).await?;
+        self.settle_pending_flow_clock(host).await?;
         let row = sqlx::query("SELECT work_json,retired FROM engine_flow030_clock_works WHERE system_id=? AND invocation_id=? AND activation_id=?")
             .bind(&self.identity.system_start_id).bind(&self.identity.flow_invocation_id).bind(id).fetch_one(&self.pool).await?;
         if row.get::<bool, _>("retired") {
