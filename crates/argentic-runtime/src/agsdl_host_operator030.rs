@@ -252,6 +252,7 @@ fn operator_receipt(applied: Apply030) -> Result<FlowReceipt030> {
 
 /// The executor acknowledges only after the native turn has ended. The
 /// activation, attempt and agent instance continue to belong to the run.
+#[derive(Clone)]
 pub(crate) struct AgentOperator030 {
     host: HostState,
     pool: SqlitePool,

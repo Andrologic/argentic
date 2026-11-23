@@ -214,6 +214,7 @@ mod tests {
     #[test]
     fn frozen_write_denials_make_native_tools_read_only() {
         let profile = Profile {
+            mcp: None,
             runtime: None,
             executable: "/synthetic/bin/codex".into(),
             directory: "/synthetic/private".into(),

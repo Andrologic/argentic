@@ -346,6 +346,10 @@ pub(crate) async fn start_agent_work030(
                     result = &mut running => result,
                 };
                 if let Err(error) = &result {
+                    if error.code == "MCP_TERMINATION_UNCERTAIN" {
+                        returned.send_replace(Some(Err(error.clone())));
+                        return;
+                    }
                     if !work_cancel.is_cancelled() {
                         // A fixed diagnostic is independent of the work protocol's
                         // closed failure enum. No raw provider fields are emitted.
@@ -1530,6 +1534,9 @@ pub(crate) async fn supervise_with_steer_port030(
             Some((key, result)) = driver.joining.next(), if !driver.joining.is_empty() => {
                 let AgentJoin030 { joined, returned } = result?;
                 if let Err(error) = returned {
+                    if error.code == "MCP_TERMINATION_UNCERTAIN" {
+                        return Err(error);
+                    }
                     // An executor can lose its last work event to Stop before
                     // it sees cancellation. Preserve the physical join for
                     // StopWork. Acquire admission only after selection, since

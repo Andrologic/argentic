@@ -219,6 +219,7 @@ fn executor_access(
 ) -> CodexExecutor030 {
     let root = f._temp.path().canonicalize().unwrap();
     let profile = crate::agsdl_host_codex::profile::Profile {
+        mcp: None,
         runtime: None,
         executable: root.join("fake-codex"),
         directory: root.join("profile"),
@@ -232,7 +233,7 @@ fn executor_access(
         .unwrap();
     // Reuse the existing protocol peer, including config/layer verification.
     let script = format!(
-        "#!/usr/bin/env python3\nimport sys\nsys.argv=['fake', {}, {}, 'continuity', {}]\n{SERVER}",
+        "#!/usr/bin/env python3\nimport sys\nnative_flags=sys.argv[1:]\nsys.argv=['fake', {}, {}, 'continuity', {}]\n{SERVER}",
         serde_json::to_string(&settings.to_string()).unwrap(),
         serde_json::to_string(&profile.bootstrap).unwrap(),
         serde_json::to_string(trace).unwrap(),
@@ -346,7 +347,7 @@ async fn run(
 
 async fn run_with_clock(
     f: &Fixture,
-    executor: Arc<CodexExecutor030>,
+    executor: Arc<dyn AgentExecutor030>,
     clock: Option<Arc<dyn RuntimeClock030>>,
 ) -> crate::persistence::flow_store030::FlowView030 {
     let capture = flow::inspect_run(f.host.flow030(), &f.host, &f.pool, &f.owner)
@@ -906,3 +907,178 @@ async fn codex_authorized_missions_keep_permanent_instructions_permissions_and_d
 
 #[path = "operator_tests.rs"]
 mod operator;
+
+struct ScriptedReviewer;
+
+impl AgentExecutor030 for ScriptedReviewer {
+    fn prepare(&self, work: PreparedEffectiveAgentWork030) -> HostResult<AttestedWorkPolicy030> {
+        AttestedWorkPolicy030::from_codex(work)
+    }
+
+    fn run(
+        &self,
+        work: AgentWork030,
+        events: WorkEventSink030,
+        cancel: CancellationToken,
+    ) -> BoxFuture<'static, HostResult<()>> {
+        Box::pin(async move {
+            assert_eq!(work.attempt.agent(), "reviewer");
+            assert!(!crate::permissions::may_equip_mcp(&work.policy, "issues").unwrap());
+            let document: Value = serde_json::from_str(&work.capture.authored_source)?;
+            assert_eq!(
+                document["agents"]["reviewer"]["harnessSettings"]["webSearch"],
+                "disabled"
+            );
+            assert_eq!(
+                document["agents"]["reviewer"]["instructions"][0]["uri"],
+                "agents/reviewer/instructions.md"
+            );
+            events
+                .emit(
+                    json!({"kind":"submit","callId":"review-1","argumentsJson":"{\"results\":{}}"}),
+                    &cancel,
+                )
+                .await?;
+            Ok(())
+        })
+    }
+}
+
+#[tokio::test]
+async fn official_review_project_runs_with_a_scripted_reviewer_without_granting_issues() {
+    let project = std::env::var_os("AGSDL_REFERENCE_CHECKOUT").map_or_else(
+        || {
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/conformance-050/review-project")
+        },
+        |path| std::path::PathBuf::from(path).join("examples/review-project"),
+    );
+    let f = Fixture::from_project(&project).await;
+    let view = run_with_clock(&f, Arc::new(ScriptedReviewer), None).await;
+    assert_eq!(view.state.verdict.as_deref(), Some("succeeded"));
+    assert_eq!(view.state.activations.len(), 1);
+}
+
+struct ApproveMcp;
+
+impl crate::host::ActionPolicySource for ApproveMcp {
+    fn lock_current<'a>(
+        &'a self,
+        _: &'a StartCapture030,
+        payload: &'a Value,
+    ) -> crate::host::PolicyFuture<'a, crate::host::ActionPolicyLease> {
+        Box::pin(async move {
+            assert_eq!(
+                payload["nativeRequest"]["method"],
+                "mcp/tool/requestApproval"
+            );
+            let call = &payload["nativeRequest"]["params"];
+            assert_eq!(call["server"], "first");
+            assert_eq!(call["tool"], "approve");
+            assert_eq!(call["arguments"]["value"], json!(9007199254740993u64));
+            Ok(crate::host::ActionPolicyLease::new(true, ()))
+        })
+    }
+}
+
+#[tokio::test]
+async fn codex_mcp_enforces_tool_grants_and_routes_ask_through_the_human_broker() {
+    use crate::test_context::mcp::*;
+    let peer = Peer::start().await;
+    let project = tempfile::tempdir().unwrap();
+    let document = json!({"projectFormat":"agsdl-project-1","contract":"agsdl-0.4.0","id":"agent-mcp",
+        "mcpServers":peer.servers(),"secrets":{"file":"requirements.json"},
+        "agents":{"worker":{"harness":"codex","permissions":{"preset":"read-only","reviewer":"person","rules":[
+            {"action":"mcp","match":"*/check","effect":"allow"},
+            {"action":"mcp","match":"first/approve","effect":"ask"},
+            {"action":"mcp","match":"second/blocked","effect":"deny"}
+        ]},"mcpServers":["first","second"]}},
+        "flow":{"entry":"work","steps":{"work":{"type":"agent","agent":"worker"}}}});
+    std::fs::write(project.path().join("agsdl.json"), document.to_string()).unwrap();
+    std::fs::write(project.path().join("requirements.json"), REQUIREMENTS).unwrap();
+    for yes in [false, true] {
+        let mut f = Fixture::from_project(project.path()).await;
+        f.config = peer.configure(f.config.clone());
+        f.policy.workspace().await;
+        let trace = f._temp.path().join("mcp.jsonl");
+        let mut scripted = envelope(json!({"results":{}}));
+        scripted["_mcp"] = json!({
+            "first":{"tools":["approve","check"],"calls":{"approve":if yes { Some("first") } else { None },"check":"first","blocked":null}},
+            "second":{"tools":["check"],"calls":{"check":"second","approve":null,"blocked":null}}
+        });
+        std::fs::write(
+            trace.with_extension("jsonl.script"),
+            json!([scripted]).to_string(),
+        )
+        .unwrap();
+        let agent = executor(&f, &trace, None).with_approvals(Arc::new(
+            crate::agsdl_host_action_approval030::AgentActionHumans030 {
+                host: f.host.as_ref().clone(),
+                pool: f.pool.clone(),
+                policy: Arc::new(ApproveMcp),
+            },
+        ));
+        let clock = Arc::new(crate::agsdl_host_human_executor030::HumanClockRuntime030 {
+            app: f.host.as_ref().clone(),
+            pool: f.pool.clone(),
+            tasks: StreamTasks::default(),
+            identity: f.identity.clone(),
+        });
+        let answer = async {
+            let request = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                loop {
+                    if let Some(id) = sqlx::query_scalar::<_, String>(
+                        "SELECT request_id FROM engine_flow030_human_requests WHERE kind='ask'",
+                    )
+                    .fetch_optional(&f.pool)
+                    .await
+                    .unwrap()
+                    {
+                        break id;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("MCP approval was not exposed");
+            assert!(!peer.calls().iter().any(|(_, tool)| tool == "approve"));
+            let capture = flow::inspect_run(f.host.flow030(), &f.host, &f.pool, &f.owner)
+                .await
+                .unwrap()
+                .capture;
+            f.host
+                .submit_person(
+                    &f.pool,
+                    crate::api::HumanSubmission {
+                        scope: crate::persistence::public030::HumanScope030 {
+                            system_start_id: f.identity.system_start_id.clone(),
+                            source: capture.source,
+                        },
+                        request_id: request,
+                        expected_revision: "0".into(),
+                        answer: crate::api::HumanAnswer030::Decision {
+                            decision: if yes { "yes" } else { "no" }.into(),
+                            comment: String::new(),
+                        },
+                    },
+                )
+                .await
+                .unwrap();
+        };
+        let (view, ()) = tokio::join!(run_with_clock(&f, Arc::new(agent), Some(clock)), answer);
+        assert_eq!(view.state.verdict.as_deref(), Some("succeeded"));
+        f.pool.close().await;
+        assert_no_secrets(&f._temp.path().join("run.db"));
+        assert_no_secrets(&trace);
+    }
+    assert_eq!(
+        peer.calls(),
+        [
+            ("first".into(), "check".into()),
+            ("second".into(), "check".into()),
+            ("first".into(), "approve".into()),
+            ("first".into(), "check".into()),
+            ("second".into(), "check".into())
+        ]
+    );
+}

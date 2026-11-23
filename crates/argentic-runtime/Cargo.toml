@@ -12,6 +12,7 @@ agsdl-engine-qa = []
 agsdl-content-qa = []
 
 [dependencies]
+axum = "0.8"
 tempfile = "3"
 argentic-core = { version = "0.1.0", path = "../argentic-core" }
 serde_json = { version = "1", features = ["raw_value", "arbitrary_precision"] }
@@ -49,7 +50,6 @@ libc = "0.2"
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_System_SystemInformation", "Win32_System_WindowsProgramming", "Wdk_Foundation", "Wdk_Storage_FileSystem", "Wdk_System_SystemInformation", "Wdk_System_SystemServices"] }
 
 [dev-dependencies]
-axum = "0.8"
 tempfile = "3"
 
 [build-dependencies]

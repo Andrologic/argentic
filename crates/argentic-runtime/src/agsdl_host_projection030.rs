@@ -165,7 +165,7 @@ fn page(
 }
 
 pub(crate) async fn read(
-    _host: &HostState,
+    host: &HostState,
     pool: &SqlitePool,
     query: RuntimeProjectionQuery030,
     continuation: Option<RuntimeProjectionContinuation030>,
@@ -249,7 +249,15 @@ pub(crate) async fn read(
                 (id.clone(), status)
             })
             .collect();
-        page.termination_uncertain = (interrupted || (revoked && page.verdict.is_none()))
+        let mcp_uncertain = host
+            .flow030()
+            .supervisor_registry()
+            .outcome(&page.scope.system_start_id)
+            .is_some_and(|outcome| {
+                outcome.is_err_and(|error| error.code == "MCP_TERMINATION_UNCERTAIN")
+            });
+        page.termination_uncertain = (interrupted
+            || ((revoked || mcp_uncertain) && page.verdict.is_none()))
             && state
                 .activations
                 .iter()

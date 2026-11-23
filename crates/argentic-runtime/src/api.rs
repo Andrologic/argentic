@@ -349,6 +349,7 @@ impl StartSession<'_> {
                     .any(|agent| agent.get("answerTimeoutMs").is_some())
             });
         let agents = crate::agsdl_host_codex030::CodexExecutor030::new(context.clone())
+            .with_mcp_equipment(&document)
             .with_approvals(Arc::new(
                 crate::agsdl_host_action_approval030::AgentActionHumans030 {
                     host: self.engine.clone(),

@@ -1,7 +1,7 @@
 //! Dedicated captured-server transport for AgSDL030. Existing UI clients keep
 //! their formatting, connection selection and timeout behavior unchanged.
 //! Raw JSON tokens never pass through a floating-point representation.
-const MAX_MCP_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const MAX_MCP_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -33,6 +33,7 @@ pub(crate) struct HttpServer {
     pub url: url::Url,
     pub addresses: Vec<SocketAddr>,
     pub headers: reqwest::header::HeaderMap,
+    pub secret_values: Vec<String>,
     /// Captured tools/list schema, bound by the native host to this exact tool.
     pub tool_schema: Option<(String, String)>,
 }
@@ -269,6 +270,7 @@ pub(crate) struct Session {
     server: String,
     protocol: Protocol,
     next_id: u64,
+    tool_in_flight: bool,
     secret_values: Vec<String>,
     wire: Wire,
 }
@@ -353,7 +355,7 @@ fn start_with_stdio(
             "MCP server is not a captured document definition",
         ));
     }
-    let mut secret_values = Vec::new();
+    let secret_values;
     let wire = match server.transport {
         ServerTransport::Stdio(config) => {
             let mut command = stdio(&config).map_err(CallError::transport)?;
@@ -434,30 +436,15 @@ fn start_with_stdio(
             let client = reqwest::Client::builder()
                 .no_proxy()
                 .redirect(reqwest::redirect::Policy::none())
+                .retry(reqwest::retry::never())
                 .resolve_to_addrs(host, &pinned)
                 .build()
                 .map_err(|e| CallError::transport(e.to_string()))?;
+            secret_values = config.secret_values;
             let mut headers = config.headers;
-            // Prevent capture headers from overriding protocol-controlled values.
-            for key in [
-                "host",
-                "content-length",
-                "accept",
-                "content-type",
-                "mcp-session-id",
-                "mcp-protocol-version",
-                "last-event-id",
-                "connection",
-                "transfer-encoding",
-                "upgrade",
-                "mcp-method",
-                "mcp-name",
-            ] {
-                headers.remove(key);
-            }
             let reserved: Vec<_> = headers
                 .keys()
-                .filter(|name| name.as_str().starts_with("mcp-param-"))
+                .filter(|name| !can_set_header(name))
                 .cloned()
                 .collect();
             for name in reserved {
@@ -486,21 +473,40 @@ fn start_with_stdio(
         server: server.document_name,
         protocol: server.protocol,
         next_id: 1,
+        tool_in_flight: false,
         secret_values,
         wire,
     })
 }
 
+pub(crate) fn can_set_header(name: &reqwest::header::HeaderName) -> bool {
+    !name.as_str().starts_with("mcp-")
+        && !matches!(
+            name.as_str(),
+            "host"
+                | "content-length"
+                | "accept"
+                | "content-type"
+                | "last-event-id"
+                | "connection"
+                | "transfer-encoding"
+                | "upgrade"
+                | "proxy-authorization"
+                | "proxy-connection"
+                | "te"
+                | "trailer"
+                | "expect"
+                | "keep-alive"
+        )
+}
+
 impl Session {
-    pub(crate) async fn call(
+    pub(crate) async fn initialize(
         &mut self,
-        tool: &str,
-        args: &str,
         host: std::sync::Arc<dyn HostPort>,
         identity: &CallIdentity,
         control: &Control,
-    ) -> Result<McpReceipt> {
-        object(args)?;
+    ) -> Result<()> {
         if let Wire::Stdio { stdout, .. } = &mut self.wire {
             tokio::select! {
                 biased;
@@ -590,6 +596,97 @@ impl Session {
             )
             .await?;
         }
+        if matches!(self.protocol, Protocol::Legacy) && host.supports_human_requests() {
+            if let Wire::Http(http) = &mut self.wire {
+                http.start_listener(
+                    host.clone(),
+                    identity.clone(),
+                    control.clone(),
+                    self.server.clone(),
+                    self.secret_values.clone(),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn guard_secrets(&self, raw: &str) -> Result<()> {
+        if self.secret_values.is_empty() {
+            return Ok(());
+        }
+        reject_secret_echo(raw, &self.secret_values)
+    }
+
+    pub(crate) fn is_remote(&self) -> bool {
+        matches!(self.wire, Wire::Http(_))
+    }
+
+    pub(crate) async fn list_tools(
+        &mut self,
+        host: &dyn HostPort,
+        identity: &CallIdentity,
+        control: &Control,
+    ) -> Result<Vec<serde_json::Value>> {
+        use serde_json::{json, Value};
+        let mut tools = Vec::new();
+        let mut params = "{}".to_owned();
+        let mut bytes = 0;
+        for _ in 0..64 {
+            let raw = self
+                .rpc("tools/list", &params, host, identity, control)
+                .await?;
+            self.guard_secrets(&raw)?;
+            bytes += raw.len();
+            let invalid = || {
+                CallError::new(
+                    "MCP_TOOL_LIST",
+                    "MCP tool discovery returned an invalid or oversized list",
+                )
+            };
+            if bytes > MAX_MCP_MESSAGE_BYTES {
+                return Err(invalid());
+            }
+            let mut page: Value = serde_json::from_str(&raw).map_err(|_| invalid())?;
+            let batch = page["tools"].as_array_mut().ok_or_else(invalid)?;
+            tools.append(batch);
+            if tools.len() > 1024 {
+                return Err(invalid());
+            }
+            if page["nextCursor"].is_null() {
+                return Ok(tools);
+            }
+            let cursor = page["nextCursor"].as_str().ok_or_else(invalid)?;
+            params = json!({"cursor":cursor}).to_string();
+        }
+        Err(CallError::new(
+            "MCP_TOOL_LIST",
+            "MCP tool discovery exceeded the page limit",
+        ))
+    }
+
+    pub(crate) async fn call(
+        &mut self,
+        tool: &str,
+        args: &str,
+        host: std::sync::Arc<dyn HostPort>,
+        identity: &CallIdentity,
+        control: &Control,
+    ) -> Result<McpReceipt> {
+        object(args)?;
+        self.initialize(host.clone(), identity, control).await?;
+        self.call_tool(tool, args, host.as_ref(), identity, control)
+            .await
+    }
+
+    pub(crate) async fn call_tool(
+        &mut self,
+        tool: &str,
+        args: &str,
+        host: &dyn HostPort,
+        identity: &CallIdentity,
+        control: &Control,
+    ) -> Result<McpReceipt> {
+        object(args)?;
         if matches!(self.protocol, Protocol::Modern) {
             if let Wire::Http(http) = &mut self.wire {
                 let (captured_tool, schema) = http.tool_schema.as_ref().ok_or_else(|| {
@@ -607,24 +704,20 @@ impl Session {
                 http.parameter_headers = parameter_headers(schema, args)?;
             }
         }
-        if matches!(self.protocol, Protocol::Legacy) {
-            if let Wire::Http(http) = &mut self.wire {
-                http.start_listener(
-                    host.clone(),
-                    identity.clone(),
-                    control.clone(),
-                    self.server.clone(),
-                );
-            }
-        }
         let base = format!("\"name\":{},\"arguments\":{args}", encode(&tool)?);
         let mut params = format!("{{{base}}}");
         let mut continuations = 0;
         loop {
             let raw = self
-                .rpc("tools/call", &params, host.as_ref(), identity, control)
+                .rpc("tools/call", &params, host, identity, control)
                 .await?;
             let fields = object(&raw)?;
+            if fields.contains_key("task") {
+                return Err(CallError::new(
+                    "UNCERTAIN",
+                    "MCP task termination is unavailable",
+                ));
+            }
             match fields.get("resultType").map(|v| string(v)).transpose()?.as_deref() {
                 Some("input_required") => {
                     if !matches!(self.protocol, Protocol::Modern) || continuations >= 4 {
@@ -657,7 +750,7 @@ impl Session {
                         if !self.secret_values.is_empty() {
                             reject_secret_echo(&raw, &self.secret_values)?;
                         }
-                        let answers = wait_human(host.as_ref(), identity, &self.server, &raw, control).await?;
+                        let answers = wait_human(host, identity, &self.server, &raw, control).await?;
                         let answers_map = object(&answers)?;
                         if answers_map.len() != requests.len() || requests.keys().any(|id| !answers_map.contains_key(id)) {
                             return Err(CallError::new("CORRELATION", "MCP form answers do not match requests"));
@@ -668,14 +761,13 @@ impl Session {
                 }
                 Some("task") => return Err(CallError::new("UNCERTAIN", "MCP task requires a captured task completion adapter; remote effect may remain active")),
                 None | Some("complete") => {
-                    let result = receipt(raw)?;
+                    self.tool_in_flight = false;
                     if !self.secret_values.is_empty() {
-                        if self.secret_values.iter().any(|secret| result.text.contains(secret)) {
-                            return Err(secret_echo());
-                        }
-                        if let Some(json) = &result.structured_content_json {
-                            reject_secret_echo(json, &self.secret_values)?;
-                        }
+                        reject_secret_echo(&raw, &self.secret_values)?;
+                    }
+                    let result = receipt(raw)?;
+                    if self.secret_values.iter().any(|secret| result.text.contains(secret)) {
+                        return Err(secret_echo());
                     }
                     return Ok(result);
                 },
@@ -717,6 +809,10 @@ impl Session {
         } else {
             params.to_owned()
         };
+        control.check()?;
+        if method == "tools/call" {
+            self.tool_in_flight = true;
+        }
         self.send(
             &format!(
                 "{{\"jsonrpc\":\"2.0\",\"id\":{},\"method\":{},\"params\":{params}}}",
@@ -750,7 +846,9 @@ impl Session {
                             "Modern MCP forbids server-initiated requests",
                         ));
                     }
-                    let response = if method == "elicitation/create" {
+                    let response = if method == "elicitation/create"
+                        && host.supports_human_requests()
+                    {
                         if !self.secret_values.is_empty() {
                             reject_secret_echo(&raw, &self.secret_values)?;
                         }
@@ -780,7 +878,15 @@ impl Session {
                     "MCP response belongs to another request",
                 ));
             }
+            if let Wire::Http(http) = &mut self.wire {
+                // Each request owns its POST response. A server may leave the
+                // SSE connection open after delivering the matching result.
+                http.responses.pop_front();
+            }
             if fields.contains_key("error") {
+                if method == "tools/call" {
+                    self.tool_in_flight = false;
+                }
                 return Err(CallError::transport("MCP returned a JSON-RPC error"));
             }
             return fields
@@ -788,6 +894,10 @@ impl Session {
                 .map(|v| v.get().to_owned())
                 .ok_or_else(|| CallError::transport("MCP response has no result"));
         }
+    }
+
+    pub(crate) fn tool_in_flight(&self) -> bool {
+        self.tool_in_flight
     }
 
     pub(crate) async fn shutdown(self, received: bool) -> (PhysicalEvidence, Option<CallError>) {
@@ -912,6 +1022,7 @@ impl HttpWire {
         identity: CallIdentity,
         control: Control,
         server: String,
+        secret_values: Vec<String>,
     ) {
         if self.listener.is_some() {
             return;
@@ -991,6 +1102,7 @@ impl HttpWire {
                                 &identity,
                                 &server,
                                 &message,
+                                &secret_values,
                                 &control,
                             )
                             .await;
@@ -1034,8 +1146,12 @@ async fn process_listener_message(
     identity: &CallIdentity,
     server: &str,
     raw: &str,
+    secret_values: &[String],
     control: &Control,
 ) -> Result<()> {
+    if !secret_values.is_empty() {
+        reject_secret_echo(raw, secret_values)?;
+    }
     let fields = object(raw)?;
     if fields
         .get("jsonrpc")

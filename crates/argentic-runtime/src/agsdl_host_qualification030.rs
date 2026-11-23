@@ -67,8 +67,15 @@ pub(crate) fn product_slice030(
         .into_iter()
         .flatten()
     {
-        if server.get("url").is_some() {
-            return issue(format!("/mcpServers/{name}/url"), "Remote MCP calls are not supported because their physical cancellation cannot be confirmed. Use a local stdio server.");
+        if let Some(url) = server["url"].as_str() {
+            if let Err(error) = crate::agsdl_host_mcp_http::endpoint(url) {
+                let name = name.replace('~', "~0").replace('/', "~1");
+                return Some(PreflightDiagnostic {
+                    code: error.code,
+                    pointer: format!("/mcpServers/{name}/url"),
+                    message: error.detail,
+                });
+            }
         }
     }
     for (name, agent) in document.get("agents")?.as_object()? {
@@ -78,18 +85,6 @@ pub(crate) fn product_slice030(
                 format!("{pointer}/harness"),
                 "Only the Codex harness is supported for this run.",
             );
-        }
-        for field in ["mcpServers"] {
-            if agent
-                .get(field)
-                .and_then(Value::as_array)
-                .is_some_and(|values| !values.is_empty())
-            {
-                return issue(
-                    format!("{pointer}/{field}"),
-                    "Agent MCP equipment is not qualified for correlated human waits and physical completion in this Codex adapter. Local MCP call steps remain available.",
-                );
-            }
         }
         if let Err(refusal) = crate::agsdl_host_work_admission030::codex_permissions030(
             &agent["permissions"],

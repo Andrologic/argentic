@@ -76,6 +76,7 @@ pub(crate) struct Profile {
     pub home: PathBuf,
     pub bootstrap: PathBuf,
     pub digest: String,
+    pub mcp: Option<crate::agsdl_host_codex030::mcp::SessionConfig>,
     pub runtime: Option<std::sync::Arc<tempfile::TempDir>>,
 }
 fn unavailable(code: &str) -> CodexStatus {
@@ -321,6 +322,7 @@ fn environment(manager: &HostContext) -> Result<Profile> {
         home,
         bootstrap,
         digest: String::new(),
+        mcp: None,
         runtime: None,
     })
 }
@@ -465,7 +467,10 @@ impl Profile {
         root: &Path,
         read_only: bool,
     ) -> Result<tokio::process::Command> {
-        let settings = self.settings(root, read_only)?;
+        let mut settings = self.settings(root, read_only)?;
+        if let Some(mcp) = &self.mcp {
+            settings["mcp_servers"] = mcp.servers.clone();
+        }
         let mut flags = Vec::new();
         fn inline_toml(value: &Value) -> Result<String> {
             if let Some(object) = value.as_object() {
@@ -488,6 +493,9 @@ impl Profile {
             flags.push(format!("{key}={}", inline_toml(value)?));
         }
         let mut command = self.command();
+        if let Some(mcp) = &self.mcp {
+            command.env(crate::agsdl_host_codex030::mcp::TOKEN_ENV, mcp.token());
+        }
         for flag in &flags {
             command.args(["-c", flag]);
         }
@@ -650,15 +658,40 @@ pub(crate) fn verify_layers(
         layer["name"]["type"] == "sessionFlags"
             && layer["config"].pointer("/tools/update_plan/enabled") == Some(&json!(true))
     });
+    let actual_mcp = config["mcp_servers"].as_object();
+    let valid_mcp = match &profile.mcp {
+        Some(mcp) => actual_mcp.is_some_and(|servers| {
+            servers.len() == mcp.servers.as_object().expect("prepared MCP servers").len()
+                && contains(&config["mcp_servers"], &mcp.servers)
+                && servers.values().all(|server| {
+                    server["enabled"].as_bool().unwrap_or(true)
+                        && server["environment_id"]
+                            .as_str()
+                            .is_none_or(|id| id == "local")
+                        && [
+                            "command",
+                            "args",
+                            "env",
+                            "env_vars",
+                            "http_headers",
+                            "env_http_headers",
+                            "disabled_tools",
+                            "tools",
+                            "oauth_resource",
+                            "scopes",
+                        ]
+                        .into_iter()
+                        .all(|key| server[key].is_null())
+                })
+        }),
+        None => actual_mcp.is_none_or(serde_json::Map::is_empty),
+    };
     let mut comparable = expected.clone();
     comparable.as_object_mut().unwrap().remove("tools");
     if !plan_enabled
         || !contains(config, &comparable)
         || without_null_defaults(&config["permissions"]) != expected["permissions"]
-        || config
-            .get("mcp_servers")
-            .and_then(Value::as_object)
-            .is_some_and(|servers| !servers.is_empty())
+        || !valid_mcp
     {
         return Err(failure(
             "CODEX_PROFILE_UNQUALIFIED",
@@ -758,6 +791,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         let profile = Profile {
+            mcp: None,
             runtime: None,
             executable: root.join("bin/codex"),
             directory: root.join("profile"),

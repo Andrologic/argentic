@@ -83,6 +83,7 @@ mod agsdl_host_harness030;
 mod agsdl_host_human030;
 mod agsdl_host_human_executor030;
 mod agsdl_host_human_projection030;
+mod agsdl_host_mcp_http;
 mod agsdl_host_projection030;
 mod agsdl_host_qualification030;
 mod agsdl_host_route030;

@@ -157,6 +157,7 @@ async fn http_fixture(
                 Protocol::Legacy
             },
             transport: ServerTransport::Http(HttpServer {
+                secret_values: Vec::new(),
                 url: format!("http://127.0.0.1:{}/mcp", address.port())
                     .parse()
                     .unwrap(),
@@ -186,6 +187,7 @@ fn dummy_host() -> Arc<TestHost> {
         capture_digest: "unused".into(),
         protocol: Protocol::Legacy,
         transport: ServerTransport::Http(HttpServer {
+            secret_values: Vec::new(),
             url: "http://127.0.0.1:1/mcp".parse().unwrap(),
             addresses: vec!["127.0.0.1:1".parse().unwrap()],
             headers: Default::default(),
@@ -320,6 +322,7 @@ async fn literal_endpoint_must_match_every_captured_address_and_port() {
             capture_digest: "native-capture".into(),
             protocol: Protocol::Legacy,
             transport: ServerTransport::Http(HttpServer {
+                secret_values: Vec::new(),
                 url: url.parse().unwrap(),
                 addresses: addresses
                     .iter()
@@ -420,6 +423,7 @@ async fn stop_during_legacy_get_human_closes_request_without_call_replay() {
         capture_digest: "unused".into(),
         protocol: Protocol::Legacy,
         transport: ServerTransport::Http(HttpServer {
+            secret_values: Vec::new(),
             url: "http://127.0.0.1:1/mcp".parse().unwrap(),
             addresses: vec!["127.0.0.1:1".parse().unwrap()],
             headers: Default::default(),

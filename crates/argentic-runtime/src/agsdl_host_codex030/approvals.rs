@@ -27,7 +27,7 @@ pub(crate) fn module030() -> String {
     module["permissions"]["write"]["ask"] = json!("sandbox");
     module["permissions"]["write"]["note"] = json!("Macro's qualified profile keeps workspace writes denied by the native sandbox. A person may grant one command access to one existing regular workspace file, after native request correlation and ceiling checks. Other write grants and rule shapes are refused by native preflight and admission.");
     module["properties"]["skills"]["note"]=json!("Macro admits selected single-file local skills through scoped native reads. The native agsdl_load_skill tool returns captured bytes only for the current work's selected names, without extra filesystem grants. Folders with resources, scripts or links remain unsupported.");
-    module["properties"]["mcpServers"] = json!({"support":"absent","note":"Agent MCP equipment is not qualified for correlated human waits and physical completion in this adapter. Local stdio MCP flow calls use the separate confined native call port."});
+    module["properties"]["mcpServers"]["note"] = json!("Argentic filters MCP tools and brokers calls through a private host-owned connection. The same host action approval path handles tool permissions with effect ask.");
     module.to_string()
 }
 

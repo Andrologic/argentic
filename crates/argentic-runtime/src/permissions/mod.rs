@@ -378,6 +378,55 @@ impl EffectivePolicy {
     }
 }
 
+/// Avoid discovery for servers denied by an entire ceiling. Tool-specific
+/// grants can still override a deny-by-default preset for a candidate server.
+pub(crate) fn may_equip_mcp(policy: &EffectivePolicy, server: &str) -> Result<bool> {
+    let request = ActionRequest::Mcp {
+        server: server.to_owned(),
+        tool: None,
+    };
+    for ceiling in policy.policies() {
+        let subject = paths::Subject::new(ceiling.context(), &request)?;
+        for rule in ceiling.rules() {
+            if rule.action == Action::Mcp
+                && rule.effect == Effect::Deny
+                && rule
+                    .pattern
+                    .as_ref()
+                    .is_none_or(|pattern| !pattern.contains('/'))
+                && rule.matches(Action::Mcp, &subject)?
+            {
+                return Ok(false);
+            }
+        }
+        if evaluate_requested(ceiling, &request)? != Effect::Deny {
+            continue;
+        }
+        let mut tool_grant = false;
+        for rule in ceiling.rules() {
+            let Some((pattern, tool_pattern)) = rule
+                .pattern
+                .as_deref()
+                .and_then(|pattern| pattern.split_once('/'))
+            else {
+                continue;
+            };
+            if rule.action == Action::Mcp
+                && rule.effect != Effect::Deny
+                && !tool_pattern.contains('/')
+                && paths::glob(pattern, server, false, false)?
+            {
+                tool_grant = true;
+                break;
+            }
+        }
+        if !tool_grant {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 pub fn evaluate_effective(
     policy: &EffectivePolicy,
     request: &ActionRequest,

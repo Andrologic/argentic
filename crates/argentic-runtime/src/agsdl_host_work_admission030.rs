@@ -164,7 +164,10 @@ pub(crate) fn codex_permissions030(value: &serde_json::Value, pointer: &str) -> 
                 && p.outside.is_none_or(|o| o == Outside::Deny)
                 && p.reviewer != Some(Reviewer::Model)
                 && p.rules.iter().all(|r| {
-                    r.action == Action::Write && r.effect == Effect::Ask && r.pattern.is_none()
+                    r.action == Action::Mcp
+                        || (r.action == Action::Write
+                            && r.effect == Effect::Ask
+                            && r.pattern.is_none())
                 })
         }
         _ => false,
@@ -201,7 +204,8 @@ pub(crate) fn codex_read_only030(policy: &crate::permissions::EffectivePolicy) -
     for ceiling in policy.policies() {
         if !matches!(ceiling.preset(), Some(Preset::ReadOnly | Preset::Workspace))
             || ceiling.rules().iter().any(|r| {
-                r.action != Action::Write || r.effect != Effect::Ask || r.pattern.is_some()
+                r.action != Action::Mcp
+                    && (r.action != Action::Write || r.effect != Effect::Ask || r.pattern.is_some())
             })
             || !ceiling.directories().is_empty()
             || ceiling.reviewer() == Some(Reviewer::Model)
@@ -213,7 +217,11 @@ pub(crate) fn codex_read_only030(policy: &crate::permissions::EffectivePolicy) -
                 "The effective Codex permission ceiling cannot be represented by this slice",
             ));
         }
-        read_only |= ceiling.preset() == Some(Preset::ReadOnly) || !ceiling.rules().is_empty();
+        read_only |= ceiling.preset() == Some(Preset::ReadOnly)
+            || ceiling
+                .rules()
+                .iter()
+                .any(|rule| rule.action == Action::Write);
     }
     Ok(read_only)
 }
@@ -272,20 +280,15 @@ pub(crate) fn validate_codex_document_at030(
                     ));
                 }
             }
-            for key in ["mcpServers", "harnessSettings"] {
-                if agent.get(key).is_some_and(|value| {
-                    value.as_array().is_some_and(|v| !v.is_empty())
-                        || value.as_object().is_some_and(|v| !v.is_empty())
-                }) {
-                    return Err(failure(
-                        "HARNESS_CAPABILITY",
-                        &format!("{pointer}/{key}"),
-                        if key == "mcpServers" {
-                            "Agent MCP equipment is not qualified for correlated human waits and physical completion in this Codex adapter. Local MCP call steps remain available."
-                        } else {
-                            "This Codex option is not connected"
-                        },
-                    ));
+            if let Some(settings) = agent["harnessSettings"].as_object() {
+                for (key, value) in settings {
+                    if key != "webSearch" || value != "disabled" {
+                        return Err(failure(
+                            "HARNESS_CAPABILITY",
+                            &format!("{pointer}/harnessSettings/{}", pointer_token030(key)),
+                            "Only the isolated profile's disabled web search setting is supported",
+                        ));
+                    }
                 }
             }
             if agent["plan"] == true {

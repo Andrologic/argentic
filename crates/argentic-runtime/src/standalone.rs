@@ -218,6 +218,24 @@ impl ActionPolicySource for Policies {
                     "Approved policy cannot be normalized",
                 )
             })?;
+            let native = &payload["nativeRequest"];
+            if native["method"] == "mcp/tool/requestApproval" {
+                let params = &native["params"];
+                let allowed = params["server"]
+                    .as_str()
+                    .zip(params["tool"].as_str())
+                    .is_some_and(|(server, tool)| {
+                        evaluate_requested(
+                            &policy,
+                            &ActionRequest::Mcp {
+                                server: server.into(),
+                                tool: Some(tool.into()),
+                            },
+                        )
+                        .is_ok_and(|effect| effect != Effect::Deny)
+                    });
+                return Ok(ActionPolicyLease::new(allowed, guard));
+            }
             let path = payload
                 .pointer("/nativeRequest/params/additionalPermissions/fileSystem/write/0")
                 .and_then(Value::as_str)
@@ -278,6 +296,14 @@ impl Host {
     /// Native host configuration, before preflight/Start. Never a document input.
     pub fn with_codex_auth_file(mut self, path: PathBuf) -> Self {
         self.context = self.context.with_codex_auth_file(path);
+        self
+    }
+    pub fn with_mcp_secrets(mut self, provider: Arc<crate::host::McpSecretProvider>) -> Self {
+        self.context = self.context.with_mcp_secrets(provider);
+        self
+    }
+    pub fn with_mcp_http(mut self, authorize: Arc<crate::host::McpHttpAuthorizer>) -> Self {
+        self.context = self.context.with_mcp_http(authorize);
         self
     }
     /// Opens only this runtime's standalone schema. The data directory must be

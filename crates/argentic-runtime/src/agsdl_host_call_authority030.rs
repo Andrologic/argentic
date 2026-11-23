@@ -114,10 +114,8 @@ impl CallAuthority030 for NativeCallAuthority030<'_> {
             }
             if let Some(mcp) = step.get("mcp") {
                 let server = mcp["server"].as_str().ok_or(StoreError030::Authority)?;
-                if document["mcpServers"][server]["command"]
-                    .as_array()
-                    .is_none()
-                {
+                let declaration = &document["mcpServers"][server];
+                if !declaration["command"].is_array() && !declaration["url"].is_string() {
                     return Err(StoreError030::Authority);
                 }
             }

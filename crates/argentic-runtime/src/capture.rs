@@ -236,7 +236,7 @@ pub fn codex_registry(
     }
     let adapter = crate::agsdl_host_codex::ADAPTER;
     let evidence = json!({"adapterId":adapter,"version":observed.version,"profileDigest":observed.profile.digest,"accountDigest":observed.account_digest,"kind":"native-codex"}).to_string();
-    let mut capabilities = ["result-submission", "continuity", "permission-enforcement", "contained-stop", "response-attribution", "instructions", "resources", "model.name", "model.effort", "instance.new", "delivery.queue", "delivery.steer", "answer-timeout", "reviewer.person", "planFirst.auto", "completion-check", "skills"]
+    let mut capabilities = ["result-submission", "continuity", "permission-enforcement", "contained-stop", "response-attribution", "instructions", "resources", "model.name", "model.effort", "instance.new", "delivery.queue", "delivery.steer", "answer-timeout", "reviewer.person", "planFirst.auto", "completion-check", "skills", "mcpServers", "harness-settings"]
         .into_iter().filter(|name| match *name {
             "completion-check" => cfg!(all(target_os = "macos", target_arch = "aarch64")),
             "skills" => observed.version == "0.167.0" && crate::content_io::file_helper::qualified_platform(),
@@ -289,7 +289,7 @@ pub fn codex_registry(
         .and_then(|model| model["name"].as_str());
     let models = observed.models.iter().map(|model| json!({"name":model["name"],"efforts":model["efforts"],"defaultEffort":model["defaultEffort"]})).collect::<Vec<_>>();
     let agents = document["agents"].as_object().into_iter().flatten().filter(|(_, agent)| agent["harness"] == "codex").map(|(name, agent)| {
-        json!({"agentName":name,"agentDeclarationJson":agent.to_string(),"settingsJson":"{}",
+        json!({"agentName":name,"agentDeclarationJson":agent.to_string(),"settingsJson":agent.get("harnessSettings").cloned().unwrap_or_else(|| json!({})).to_string(),
             "permissionsJson":json!({"requested":agent["permissions"],"authority":"native-03-at-handoff"}).to_string(),
             "scopeJson":scope.to_string(),"evidenceJson":evidence,"provenanceJson":json!({"sourceSha256":source_sha256,"agent":name}).to_string()})
     }).collect();
@@ -375,6 +375,7 @@ mod tests {
                 "sourceOwner":source["owner"]});
             let observed = crate::agsdl_host_codex::CodexObservation030 {
                 profile: crate::agsdl_host_codex::profile::Profile {
+                    mcp: None,
                     runtime: None,
                     executable: root.join("bin/codex"),
                     directory: root.join("profile"),

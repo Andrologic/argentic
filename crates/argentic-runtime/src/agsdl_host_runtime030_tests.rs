@@ -140,6 +140,20 @@ impl Fixture {
         Self::with_capabilities(document, run, &[]).await
     }
     async fn with_capabilities(document: Value, run: &str, capabilities: &[&str]) -> Self {
+        Self::start_fixture(document, run, capabilities, None).await
+    }
+    #[cfg(unix)]
+    async fn from_project(project: &std::path::Path) -> Self {
+        let opened = crate::source::OpenedSource::open_path(project).unwrap();
+        let document = serde_json::from_str(opened.authored_json()).unwrap();
+        Self::start_fixture(document, "system", &[], Some(opened)).await
+    }
+    async fn start_fixture(
+        document: Value,
+        run: &str,
+        capabilities: &[&str],
+        opened: Option<crate::source::OpenedSource>,
+    ) -> Self {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         let workspace = root.join("workspace");
@@ -147,11 +161,26 @@ impl Fixture {
         std::fs::create_dir(&workspace).unwrap();
         std::fs::create_dir(&metadata).unwrap();
         let (config, policy) = crate::test_context::context_with_policy(root.join("config"));
-        let authored = document.to_string();
+        let authored = opened.as_ref().map_or_else(
+            || document.to_string(),
+            |source| source.authored_json().to_owned(),
+        );
         let source = json!({"owner":{"projectId":"project","planId":"source","branch":"develop"},"revision":"1","sourceSha256":format!("{:x}",Sha256::digest(authored.as_bytes()))});
         let scope = json!({"projectId":"project","root":workspace,"rootIdentity":crate::content_io::admitted::workspace_root_identity(&workspace).unwrap().observation_key().unwrap(),"sourceOwner":source["owner"]});
+        let scope = if let Some(opened) = opened.as_ref() {
+            let mut scope = scope;
+            opened
+                .retain(config.root())
+                .unwrap()
+                .bind_scope(&mut scope)
+                .unwrap();
+            scope
+        } else {
+            scope
+        };
         let observed = crate::agsdl_host_codex::CodexObservation030 {
             profile: crate::agsdl_host_codex::Profile {
+                mcp: None,
                 runtime: None,
                 executable: root.join("synthetic-codex"),
                 directory: root.join("profile"),
@@ -165,12 +194,12 @@ impl Fixture {
             ],
             account_digest: "synthetic-account".into(),
         };
-        let (harness, agents) = crate::test_context::codex_registry030(
-            &document,
-            source["sourceSha256"].as_str().unwrap(),
-            &scope,
-            &observed,
-        )
+        let digest = source["sourceSha256"].as_str().unwrap();
+        let (harness, agents) = if opened.is_some() {
+            crate::capture::codex_registry(&document, digest, &scope, &observed.into())
+        } else {
+            crate::test_context::codex_registry030(&document, digest, &scope, &observed)
+        }
         .unwrap();
         let mut registry = json!({"format":"macro-agsdl-registry/030","version":"fixture","modules":[{"harness":"codex","moduleJson":crate::agsdl_host_codex030::approvals::module030()}],"harnesses":[harness],"agents":agents,"hostCapabilities":[{"name":"approval","support":"native","evidenceJson":"{\"runtime\":\"synthetic-human-clock\"}"}]});
         for name in capabilities {

@@ -254,6 +254,7 @@ impl Fixture {
             }
             let observed = crate::agsdl_host_codex::CodexObservation030 {
                 profile: crate::agsdl_host_codex::profile::Profile {
+                    mcp: None,
                     runtime: None,
                     executable: workspace.join("bin/codex"),
                     directory: workspace.join("profile"),
@@ -1757,12 +1758,12 @@ fn agsdl030_conformance_runs_with_only_bun_removed_from_path() {
     );
     assert_eq!(
         String::from_utf8_lossy(&output.stderr)
-            .matches("CONFORMANCE TOTAL: N=33 M=4 K=0")
+            .matches("CONFORMANCE TOTAL: N=34 M=3 K=0")
             .count(),
         2,
         "Both file and memory must retain the official qualification"
     );
-    eprintln!("NATIVE_WITHOUT_BUN: 37 complete base projections, N33/M4/K0; all other PATH entries retained");
+    eprintln!("NATIVE_WITHOUT_BUN: 37 complete base projections, N34/M3/K0; all other PATH entries retained");
 }
 
 #[tokio::test]
@@ -1982,8 +1983,8 @@ async fn run_all_37(compare_ts: bool, memory: bool) {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
     assert_eq!(
         (native, scripted),
-        (33, 4),
-        "Pinned qualification is unchanged"
+        (34, 3),
+        "Remote MCP qualifies the published call-answer-timeout scenario"
     );
     assert_eq!(
         capture_manifest.len(),

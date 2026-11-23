@@ -65,9 +65,28 @@ pub trait PolicySource: Send + Sync {
     fn lock_ceiling(&self) -> PolicyFuture<'_, HostPolicyLease>;
 }
 
-/// Resolves one server's declared environment variables just before spawn.
+/// Resolves one server's declared secrets just before connecting or spawning.
 /// Return exactly the requested names, or None if they cannot be supplied.
 pub type McpSecretProvider = dyn Fn(&EngineSourceRevision, &str, &[String]) -> Option<BTreeMap<String, String>>
+    + Send
+    + Sync;
+
+/// Where to send one declared secret on a remote MCP connection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum McpHttpSecret {
+    Bearer,
+    Header(String),
+}
+
+/// Authorizes the exact source, server, URL and frozen destination addresses.
+/// Return the delivery rule for each declared secret, or None to refuse.
+pub type McpHttpAuthorizer = dyn Fn(
+        &EngineSourceRevision,
+        &str,
+        &url::Url,
+        &[std::net::SocketAddr],
+        &[String],
+    ) -> Option<BTreeMap<String, McpHttpSecret>>
     + Send
     + Sync;
 
@@ -78,6 +97,7 @@ pub struct HostContext {
     network: Arc<dyn crate::content_network::ContentNetwork>,
     codex_auth_file: Option<PathBuf>,
     mcp_secrets: Option<Arc<McpSecretProvider>>,
+    mcp_http: Option<Arc<McpHttpAuthorizer>>,
 }
 impl HostContext {
     pub fn new(root: PathBuf, policy: Arc<dyn PolicySource>) -> Self {
@@ -87,6 +107,7 @@ impl HostContext {
             network: Arc::new(crate::content_network::UnavailableNetwork),
             codex_auth_file: None,
             mcp_secrets: None,
+            mcp_http: None,
         }
     }
     pub fn with_network(
@@ -112,6 +133,14 @@ impl HostContext {
     pub fn with_mcp_secrets(mut self, provider: Arc<McpSecretProvider>) -> Self {
         self.mcp_secrets = Some(provider);
         self
+    }
+    /// Enables remote MCP with per-connection endpoint consent and secret routing.
+    pub fn with_mcp_http(mut self, authorize: Arc<McpHttpAuthorizer>) -> Self {
+        self.mcp_http = Some(authorize);
+        self
+    }
+    pub(crate) fn mcp_http(&self) -> Option<&McpHttpAuthorizer> {
+        self.mcp_http.as_deref()
     }
     pub(crate) fn mcp_secrets(
         &self,
