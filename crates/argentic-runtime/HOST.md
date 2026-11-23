@@ -201,15 +201,15 @@ server. `mcp_files()` returns its file paths relative to
 `RetainedSource::resource_root()`. Opening and retaining the project works
 offline with a closed vault.
 
-For local stdio MCP call steps in a native embedding, configure Macro's
-`HostContext` with the same private data root passed to `OpenedSource::retain`.
-Call `retained.bind_scope(&mut scope)?` before preparing the registry and
-persist that scope unchanged in `callScopeJson`. It binds the retained root,
-the declared paths and the secret names. Use the existing local call
-capability and current host and project policy checks. The native local call
-backend uses Seatbelt on macOS ARM64 and requires the existing workspace
-permissions. Codex agent MCP equipment and remote MCP still require separate
-adapter qualification.
+For MCP in a native embedding, configure Macro's `HostContext` with the same
+private data root passed to `OpenedSource::retain`. Call
+`retained.bind_scope(&mut scope)?` before preparing the registry and persist that
+scope unchanged in `callScopeJson`. It binds the retained root, the declared
+paths and the secret names. For an approved MCP call step, report the native
+`call.mcp` capability in the registry. Direct calls require the existing
+workspace host and project permissions. Local stdio uses Seatbelt on macOS
+ARM64. An agent with a grant for local stdio on another platform receives
+`MCP_STDIO_UNAVAILABLE`.
 
 The process runs with the captured workspace (`scope.root`) as its working
 directory. An AgSDL project selects its program by a relative path or bare
@@ -223,25 +223,30 @@ paths. Remaining arguments pass through as written. Plain JSON sources can
 still use absolute programs, workspace-relative program paths and bare
 programs from `/usr/bin:/bin`.
 
-Set the provider on the context passed to `StartSession::attach_committed_start`.
+Set the callbacks on the context passed to `StartSession::attach_committed_start`.
 
 ```rust
-use argentic_runtime::host::{HostContext, McpSecretProvider};
+use argentic_runtime::host::{HostContext, McpHttpAuthorizer, McpSecretProvider};
 use std::sync::Arc;
 
-fn configure_mcp(context: HostContext, vault: Arc<McpSecretProvider>) -> HostContext {
-    context.with_mcp_secrets(vault)
+fn configure_mcp(
+    context: HostContext,
+    vault: Arc<McpSecretProvider>,
+    consent: Arc<McpHttpAuthorizer>,
+) -> HostContext {
+    context.with_mcp_secrets(vault).with_mcp_http(consent)
 }
 ```
 
 `McpSecretProvider` is a `Send + Sync` callback with arguments
 `(&EngineSourceRevision, &str, &[String])` and return type
 `Option<BTreeMap<String, String>>`. Macro looks up the values by source,
-server ID and requested names. Return exactly those names, or `None` to
-refuse spawn. The synchronous callback runs under the native launch gate.
-Keep it short and use a host-owned vault handle. It runs afresh on each
-physical spawn for a server that declares secrets. The subprocess gets a
-cleared environment with the fixed runtime PATH and that server's values.
+server ID and requested names. Return exactly those names, or `None` to refuse
+the connection or spawn. The synchronous callback runs only after admission
+and after remote endpoint authorization. Keep it short and use a host-owned
+vault handle. Argentic calls it afresh for each upstream MCP session over HTTP
+or each stdio spawn that declares secrets. A local subprocess gets a cleared
+environment with the fixed runtime PATH and that server's values.
 The launcher refuses secret names that match a variable it sets, including
 `PATH`, or that control shell startup or dynamic loading. Reserved names
 also include `ENV`, `BASH_ENV`, `BASHOPTS`, `SHELLOPTS`, `PS4` and names
@@ -252,9 +257,10 @@ their effects depend on the server and its interpreters. Macro must review
 how the approved server and its dependencies interpret the requested names
 and supplied values.
 
-Argentic keeps values in memory and in the child environment. It discards
-stderr and rejects literal secret echoes in tool results and MCP requests
-for human input before retaining them. Macro's approval must cover the server
+Argentic keeps values in memory, in authorized HTTP headers, and in the
+local server's environment. It discards local stderr and rejects literal
+secret echoes in tool results, discovery and MCP requests for human input
+before retaining or forwarding them. Macro's approval for stdio must cover the server
 code, its shebang interpreter and any program the interpreter dispatches,
 such as a relative program that `/usr/bin/env` resolves in the workspace,
 and every workspace file the server reads or executes. This includes files
@@ -268,6 +274,58 @@ ceiling that excludes the retained project. Keep the entire private data
 directory outside all agent write grants. Macro must protect it from changes
 by other processes and from replacement between validation and launch,
 including when Macro provides its own sandbox or workspace mounts.
+
+### Remote endpoints and Codex equipment
+
+Present the exact source revision and retained snapshot, server ID, endpoint
+including port, path and query, and the declared secret names and their
+delivery rules. Show whether a direct step calls the server or an agent
+receives it as equipment. For an agent, show the effective allow, ask and deny
+rules, including tool patterns. A server can act with its own privileges and
+receive data from the flow or agent. Review its effects independently of the
+agent's shell and network policy. For local equipment, consent also covers the
+executable and declared assets described above.
+
+`McpHttpAuthorizer` receives the source, server ID, parsed URL, resolved socket
+addresses and requested secret names. Return `None` unless the current grant
+covers that URL and every address, including any private destination. The
+host can also reject an unexpected DNS resolution. With consent, return a map
+from each declared name to `McpHttpSecret::Bearer` or
+`McpHttpSecret::Header("X-Example-Key".into())`. Return an empty map to authorize
+a server with no secrets. Use one value per header. Argentic pins those
+addresses and disables redirects, proxies and request replay. Credentials
+belong in the vault and must be absent from authored URLs. HTTPS is required
+except for localhost or a loopback IP address with all connections pinned to
+loopback. The transport accepts JSON and SSE replies over Streamable HTTP.
+Endpoint syntax outside this profile reports `MCP_ENDPOINT_UNSUPPORTED`.
+Absent or refused consent reports `MCP_ENDPOINT_REFUSED`. An invalid or
+reserved header mapping reports `MCP_SECRET_HEADER`. Missing or mismatched
+vault values report `MCP_SECRETS_UNAVAILABLE`. Direct flow step connection
+failures use the ordinary AgSDL `CALL_FAILED` outcome.
+
+For Codex equipment, Argentic reads the selected server's tool list and
+submits only the allowed and ask tools to the private app-server. A loopback
+connection authenticates the app-server to Argentic with a per-work token
+read from its environment. Argentic keeps the upstream credentials and
+process ownership. Only `webSearch: "disabled"` is accepted as an explicit
+Codex harness setting in this profile. The official AgSDL `review-project`
+declares `issues` but gives it no usable tools under `read-only`, so Argentic
+starts the reviewer without an issues connection.
+
+Implement `ActionPolicySource::lock_current` for requests with
+`nativeRequest.method == "mcp/tool/requestApproval"`. Present the
+`nativeRequest.params.server`, `.tool` and `.arguments` on the existing
+`ask` interface. Recheck the exact captured scope and the current tool grant
+before returning the policy lease. A person answers through the existing
+decision submission API. Agent equipment supports per-tool permission
+approval. Server-initiated forms are supported for direct call steps.
+
+Closing an HTTP connection cannot confirm remote tool termination. If a
+tool request loses its terminal reply, Argentic fences the result as uncertain
+and never resends the invocation. A stopped run with unconfirmed remote
+activity stays in the stopping state. Interrupt Work and Pause of an active
+agent are unavailable for runs declaring Codex MCP equipment. Whole-run Stop
+remains available.
 
 When present, the ZIP's Git bundle is verified by size and SHA-256. The
 current snapshot opens without Git. Importing and browsing historical
@@ -587,9 +645,9 @@ checks, correlation, idempotency barrier and post-commit readback.
 
 Codex supports 0.167.x on macOS ARM64 and Linux ARM64. The exact 0.171.0
 release also supports the read-only Linux ARM64 profile with the private
-login. Documents combining Codex and approval steps require macOS ARM64. Local host
-calls, other harnesses, network content fetches and remote MCP are unavailable
-in this host.
+login. Documents combining Codex and approval steps require macOS ARM64. The standalone JSON-lines operator keeps direct host calls, other harnesses
+and network content fetches unavailable. The Rust `Host` builder accepts
+`with_mcp_http` and `with_mcp_secrets` for Codex agent equipment.
 Local relative content URIs resolve from the source file's directory. The
 content reader supports Linux, Windows and macOS ARM64 14.4 or later. Files
 must be readable under the approved workspace and agent policies. On Windows,

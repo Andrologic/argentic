@@ -5,6 +5,12 @@
 - Native local stdio MCP call steps can launch verified project assets from
   a retained snapshot. `HostContext::with_mcp_secrets` supplies each server's
   declared environment variables at spawn.
+- Native embeddings can authorize Streamable HTTP MCP endpoints and deliver
+  per-server secrets through bearer authentication or named headers. Remote
+  calls use pinned destinations and the existing call clock and response limits.
+- Codex agents can use MCP tools granted by their effective permissions.
+  Argentic owns the upstream connections and routes tool approval requests
+  through the existing human approval path.
 - Native hosts can select a replacement model and effort per agent at Start.
   Inspection and replay read the frozen selection with the original source
   identity.
