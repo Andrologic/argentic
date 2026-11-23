@@ -59,6 +59,8 @@ impl HostExecutor030 for CallExecutor030 {
             let authority = NativeCallAuthority030::capture(&host, &owner).await?;
             let broker = host.start_lease().await?.call_data030()?;
             let attempt = calls::reserve_call030(&pool, &authority, &effect).await?;
+            #[cfg(test)]
+            host.flow030().operator_test_yield("call.reserved").await;
             match calls::prepare_call030(&pool, &authority, &broker, &attempt, &cancel).await? {
                 calls::CallPreparation030::Ready => (),
                 calls::CallPreparation030::Failed { .. } => return Ok(None),
@@ -71,14 +73,15 @@ impl HostExecutor030 for CallExecutor030 {
                 }
             }
             drop(authority);
-            let Some(claim) =
+            #[cfg(test)]
+            host.flow030().operator_test_yield("call.claim").await;
+            let claim =
                 flow::claim_expected(host.flow030(), &host, &pool, &effect.identity, &effect.id)
                     .await?
-            else {
-                let authority = NativeCallAuthority030::capture(&host, &owner).await?;
-                calls::stop_before_launch030(&pool, &authority, &attempt).await?;
-                return Ok(None);
-            };
+                    .ok_or_else(|| failure("STALE_REFERENCE", "call", "Call Start changed"))?;
+            if claim.effect() != &effect {
+                return Err(failure("CORRELATION", "call", "Claimed Call Start differs"));
+            }
             let request_id = claim.request_id();
             let (send, result) = tokio::sync::oneshot::channel();
             let timeout = CancellationToken::new();

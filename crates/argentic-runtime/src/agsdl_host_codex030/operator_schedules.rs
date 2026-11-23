@@ -248,31 +248,118 @@ async fn operator_schedule_join_after_pause_ack_loss() {
 }
 
 #[tokio::test]
-async fn operator_schedule_stop_between_approval_selection_and_claim() {
-    for stop_path in STOP_PATHS {
-        for boundary in ["supervisor.host.selected", "approval.claim"] {
-            let f = Fixture::with_document(document(
-                json!({
-                    "seed":{"type":"agent","agent":"worker","next":["work","approval"]},
-                    "work":{"type":"agent","agent":"worker"},
-                    "approval":{"type":"approval","next":{"yes":[],"no":[]}}
-                }),
-                "seed",
-            ))
-            .await;
-            let tasks = StreamTasks::default();
-            let claim = arm(&f, boundary);
-            start(&f, &tasks, Arc::new(ScheduledAgent::default())).await;
-            reached(&claim, boundary).await;
-            assert!(inspect(&f)
-                .await
-                .state
-                .activations
+async fn operator_schedule_stop_between_start_selection_and_claim() {
+    let cases = [
+        (
+            "agent",
+            json!({"type":"agent","agent":"worker"}),
+            &["supervisor.agent.selected"][..],
+        ),
+        (
+            "approval",
+            json!({"type":"approval","next":{"yes":[],"no":[]}}),
+            &["supervisor.host.selected", "approval.claim"],
+        ),
+        (
+            "call.command",
+            json!({"type":"call","command":"true"}),
+            &["supervisor.host.selected", "call.reserved", "call.claim"],
+        ),
+        (
+            "call.mcp",
+            json!({"type":"call","mcp":{"server":"local","tool":"check"}}),
+            &["supervisor.host.selected", "call.reserved", "call.claim"],
+        ),
+    ];
+    // Compose and join run inside the reducer and never emit a Start. Check
+    // both editions so new step types and call variants require a schedule.
+    for schema in [
+        include_str!("../../../argentic-core/assets/schema/agsdl-030.schema.json"),
+        include_str!("../../../argentic-core/assets/schema/agsdl.schema.json"),
+    ] {
+        let schema: Value = serde_json::from_str(schema).unwrap();
+        let defs = &schema["$defs"];
+        let mut kinds = std::collections::BTreeSet::new();
+        for kind in defs["step"]["properties"]["type"]["enum"]
+            .as_array()
+            .unwrap()
+        {
+            match kind.as_str().unwrap() {
+                "compose" | "join" => (),
+                "call" => {
+                    kinds.extend(defs["callStep"]["oneOf"].as_array().unwrap().iter().map(
+                        |variant| format!("call.{}", variant["required"][0].as_str().unwrap()),
+                    ))
+                }
+                kind => {
+                    kinds.insert(kind.to_owned());
+                }
+            }
+        }
+        assert_eq!(
+            kinds,
+            cases
                 .iter()
-                .any(|a| a.agent.is_some() && a.physical));
-            stop(&f, &tasks, stop_path).await;
-            claim.release();
-            stopped(&f).await;
+                .map(|(kind, _, _)| (*kind).to_owned())
+                .collect()
+        );
+    }
+
+    for stop_path in STOP_PATHS {
+        for (kind, step, boundaries) in &cases {
+            for &boundary in *boundaries {
+                let mut doc = if *kind == "agent" {
+                    document(json!({"check":step}), "check")
+                } else {
+                    document(
+                        json!({
+                            "seed":{"type":"agent","agent":"worker","next":["work","check"]},
+                            "work":{"type":"agent","agent":"worker"},
+                            "check":step
+                        }),
+                        "seed",
+                    )
+                };
+                let capabilities = match *kind {
+                    "call.command" => &["call.command"][..],
+                    "call.mcp" => {
+                        doc["mcpServers"] = json!({"local":{"command":["true"]}});
+                        &["call.mcp"]
+                    }
+                    _ => &[],
+                };
+                let f = Fixture::with_capabilities(doc, "system", capabilities).await;
+                let tasks = StreamTasks::default();
+                let claim = arm(&f, boundary);
+                start(&f, &tasks, Arc::new(ScheduledAgent::default())).await;
+                reached(&claim, boundary).await;
+                if *kind != "agent" {
+                    assert!(inspect(&f)
+                        .await
+                        .state
+                        .activations
+                        .iter()
+                        .any(|a| a.step.as_deref() == Some(&["work".into()]) && a.physical));
+                }
+                stop(&f, &tasks, stop_path).await;
+                claim.release();
+                stopped(&f).await;
+                let reservation: Option<String> =
+                    sqlx::query_scalar("SELECT status FROM engine_flow030_calls")
+                        .fetch_optional(&f.pool)
+                        .await
+                        .unwrap();
+                let expected = match boundary {
+                    "call.reserved" => Some("reserved"),
+                    "call.claim" => Some("prepared"),
+                    _ => None,
+                };
+                assert_eq!(
+                    reservation.as_deref(),
+                    expected,
+                    "{kind} at {boundary} via {stop_path:?}"
+                );
+            }
         }
     }
 }

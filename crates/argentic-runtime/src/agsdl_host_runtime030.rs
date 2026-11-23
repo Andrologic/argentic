@@ -513,41 +513,26 @@ pub(crate) async fn drain_effects030(
             return Ok(Some(inspection.flow));
         };
         match &effect.kind {
-            FlowEffectKind030::Start { agent: Some(_), .. } => {
-                if let Err(error) = driver.start_agent(effect.clone()).await {
-                    // Stop can invalidate a pending Start between selection,
-                    // local preparation and claim. It did not start a provider.
-                    let fresh = flow::inspect_run(host.flow030(), host, pool, owner).await?;
-                    let unclaimed =
-                        fresh.flow.effects.iter().any(|row| {
-                            row["status"] == "pending" && row["effect"]["id"] == effect.id
-                        });
-                    if !(fresh.flow.state.stopping && unclaimed
-                        || error.code == "STALE_REFERENCE"
-                            && fresh.start_settled_without_admission(&effect))
-                    {
-                        return Err(error);
-                    }
-                }
-            }
-            FlowEffectKind030::Start { agent: None, .. } => {
+            FlowEffectKind030::Start { agent, .. } => {
                 #[cfg(test)]
                 host.flow030()
-                    .operator_test_yield("supervisor.host.selected")
+                    .operator_test_yield(if agent.is_some() {
+                        "supervisor.agent.selected"
+                    } else {
+                        "supervisor.host.selected"
+                    })
                     .await;
-                if let Err(error) = driver.start_host(inspection, effect.clone()).await {
+                let result = if agent.is_some() {
+                    driver.start_agent(effect.clone()).await
+                } else {
+                    driver.start_host(inspection, effect.clone()).await
+                };
+                if let Err(error) = result {
                     if error.code != "STALE_REFERENCE" {
                         return Err(error);
                     }
                     let fresh = flow::inspect_run(host.flow030(), host, pool, owner).await?;
-                    // A steer receipt can close a join while its approval
-                    // Start is selected but still unclaimed.
-                    let withdrawn =
-                        !crate::persistence::flow_store030::eligible(&fresh.flow.state, &effect)
-                            && fresh.flow.effects.iter().any(|row| {
-                                row["status"] == "pending" && row["effect"]["id"] == effect.id
-                            });
-                    if !withdrawn && !fresh.start_settled_without_admission(&effect) {
+                    if !fresh.start_withdrawn(&effect)? {
                         return Err(error);
                     }
                 }

@@ -546,7 +546,7 @@ pub(crate) async fn record_cause_tx<A: CallAuthority030>(
     authority: &A,
     attempt: &CallAttempt030,
 ) -> Result<CallCauseReceipt030> {
-    verify_attempt_tx(db, authority, attempt, true).await?;
+    verify_attempt_tx(db, authority, attempt, AttemptCheck::Active).await?;
     let row = row_tx(db, attempt).await?;
     require(
         matches!(row.get::<&str, _>("status"), "launched" | "received"),
@@ -639,7 +639,7 @@ pub(crate) async fn verify_commit_marker_tx<A: CallAuthority030>(
     authority: &A,
     marker: &CallCommitMarker030,
 ) -> Result<()> {
-    verify_attempt_tx(db, authority, &marker.attempt, false).await?;
+    verify_attempt_tx(db, authority, &marker.attempt, AttemptCheck::Attribution).await?;
     require(
         commit_marker_tx(db, &marker.attempt).await? == *marker,
         "Unknown call commit does not match exact readback",
@@ -752,11 +752,17 @@ fn declaration<'a>(
     )?;
     Ok(step.declaration_json.clone())
 }
+enum AttemptCheck {
+    Attribution,
+    PendingStart,
+    Active,
+}
+
 async fn verify_attempt_tx<A: CallAuthority030>(
     db: &mut SqliteConnection,
     authority: &A,
     attempt: &CallAttempt030,
-    active: bool,
+    check: AttemptCheck,
 ) -> Result<FlowState030> {
     require(
         attempt.identity == attempt.effect.identity
@@ -782,7 +788,10 @@ async fn verify_attempt_tx<A: CallAuthority030>(
             && row.get::<&str, _>("owner_epoch") == attempt.owner_epoch,
         "Call Start differs",
     )?;
-    if active {
+    if matches!(check, AttemptCheck::PendingStart) {
+        require_pending_call_start_tx(db, authority, &state, attempt.effect()).await?;
+    }
+    if !matches!(check, AttemptCheck::Attribution) {
         require_admission_tx(db, &attempt.identity).await?;
         require(
             flow_store030::eligible(&state, &attempt.effect),
@@ -800,6 +809,26 @@ async fn verify_attempt_tx<A: CallAuthority030>(
     Ok(state)
 }
 
+async fn require_pending_call_start_tx<A: CallAuthority030>(
+    db: &mut SqliteConnection,
+    authority: &A,
+    state: &FlowState030,
+    effect: &FlowEffect030,
+) -> Result<()> {
+    let pending = flow_store030::pending_effect_tx(db, state, &effect.id, authority.owner_epoch())
+        .await
+        .map_err(|error| match error {
+            StoreError030::Missing | StoreError030::NotClaimable => failure(
+                "STALE_REFERENCE",
+                "call",
+                "Call Start is no longer pending and eligible",
+            ),
+            other => store_error(other),
+        })?;
+    require(pending == *effect, "Stored Call Start differs")?;
+    Ok(())
+}
+
 pub(crate) async fn reserve_tx<A: CallAuthority030>(
     db: &mut SqliteConnection,
     authority: &A,
@@ -807,25 +836,14 @@ pub(crate) async fn reserve_tx<A: CallAuthority030>(
 ) -> Result<CallAttempt030> {
     let capture = capture_tx(db, authority, &effect.identity).await?;
     let state = state_tx(db, &effect.identity).await?;
+    require_pending_call_start_tx(db, authority, &state, effect).await?;
     require_admission_tx(db, &effect.identity).await?;
     let declaration_json = declaration(&capture, effect, &state)?;
-    require(
-        flow_store030::eligible(&state, effect),
-        "Cannot reserve a stopped call",
-    )?;
     authority.effect(db, effect).await.map_err(store_error)?;
     authority
         .qualify_tx(db, &capture, effect, &declaration_json)
         .await
         .map_err(store_error)?;
-    let row = sqlx::query("SELECT status,effect_json,owner_epoch FROM engine_flow030_outbox WHERE system_id=? AND invocation_id=? AND effect_id=?")
-        .bind(&effect.identity.system_start_id).bind(&effect.identity.flow_invocation_id).bind(&effect.id).fetch_one(&mut *db).await?;
-    require(
-        row.get::<&str, _>("status") == "pending"
-            && row.get::<&str, _>("owner_epoch") == authority.owner_epoch()
-            && serde_json::from_str::<FlowEffect030>(row.get("effect_json"))? == *effect,
-        "Call Start already claimed or changed",
-    )?;
     let attempt = CallAttempt030 {
         identity: effect.identity.clone(),
         owner_epoch: authority.owner_epoch().into(),
@@ -874,7 +892,7 @@ pub(crate) async fn read_attempt_tx<A: CallAuthority030>(
         attempt.identity == *id && attempt.work() == work,
         "Call readback targets a different visit",
     )?;
-    verify_attempt_tx(db, authority, &attempt, false).await?;
+    verify_attempt_tx(db, authority, &attempt, AttemptCheck::Attribution).await?;
     row_tx(db, &attempt).await?;
     Ok(Some(attempt))
 }
@@ -1011,7 +1029,7 @@ pub(crate) async fn fail_preparation_tx<A: CallAuthority030>(
     {
         return Ok(CallSettlement030::Diagnostic { diagnostic });
     }
-    let state = verify_attempt_tx(db, authority, attempt, false).await?;
+    let state = verify_attempt_tx(db, authority, attempt, AttemptCheck::PendingStart).await?;
     let row = row_tx(db, attempt).await?;
     require(
         row.get::<&str, _>("status") == "reserved",
@@ -1025,15 +1043,10 @@ pub(crate) async fn fail_preparation_tx<A: CallAuthority030>(
             receipt_id: uuid::Uuid::new_v4().to_string(),
         },
     };
-    let stopped = call_stopped(&state, attempt)?;
     let receipt = CallReceipt030 {
         attempt: attempt.clone(),
         received,
-        result: if stopped {
-            CallResult030::Stopped
-        } else {
-            CallResult030::failure("OPERAND")
-        },
+        result: CallResult030::failure("OPERAND"),
         event_id: format!("call:{}:terminal", attempt.call_id),
     };
     if let Some(diagnostic) = apply_terminal_tx(db, authority, &state, &receipt).await? {
@@ -1055,7 +1068,7 @@ pub(crate) async fn prepare_tx<A: CallAuthority030>(
     attempt: &CallAttempt030,
     prepared: &PreparedCall030,
 ) -> Result<()> {
-    verify_attempt_tx(db, authority, attempt, true).await?;
+    verify_attempt_tx(db, authority, attempt, AttemptCheck::PendingStart).await?;
     let row = row_tx(db, attempt).await?;
     validate_prepared(attempt, prepared)?;
     require(
@@ -1075,7 +1088,7 @@ pub(crate) async fn launch_tx<A: CallAuthority030>(
     attempt: &CallAttempt030,
     control: &crate::agsdl_host_calls::Control,
 ) -> Result<()> {
-    verify_attempt_tx(db, authority, attempt, true).await?;
+    verify_attempt_tx(db, authority, attempt, AttemptCheck::Active).await?;
     control
         .check()
         .map_err(|e| failure(&e.code, "call", &e.detail))?;
@@ -1308,7 +1321,7 @@ pub(crate) async fn receive_tx<A: CallAuthority030>(
     let attempt = joined.attempt();
     let received = received_from_join(joined)?;
     // A late native receipt can be retained after Stop, but cannot route success.
-    let state = verify_attempt_tx(db, authority, attempt, false).await?;
+    let state = verify_attempt_tx(db, authority, attempt, AttemptCheck::Attribution).await?;
     let row = row_tx(db, attempt).await?;
     let prepared: PreparedCall030 = serde_json::from_str(
         row.get::<Option<&str>, _>("prepared_json")
@@ -1440,7 +1453,8 @@ pub(crate) async fn finish_controlled_tx<A: CallAuthority030>(
         )?;
         return Ok(Some(CallSettlement030::Diagnostic { diagnostic }));
     }
-    let state = verify_attempt_tx(db, authority, joined.attempt(), false).await?;
+    let state =
+        verify_attempt_tx(db, authority, joined.attempt(), AttemptCheck::Attribution).await?;
     let result = if call_stopped(&state, joined.attempt())? {
         CallResult030::Stopped
     } else if settlement_cause_tx(db, authority, joined.attempt())
@@ -1476,7 +1490,7 @@ pub(crate) async fn finish_tx<A: CallAuthority030>(
     }
     let attempt = joined.attempt();
     let received = received_from_join(joined)?;
-    let state = verify_attempt_tx(db, authority, attempt, false).await?;
+    let state = verify_attempt_tx(db, authority, attempt, AttemptCheck::Attribution).await?;
     let row = row_tx(db, attempt).await?;
     if call_stopped(&state, attempt)? {
         result = CallResult030::Stopped;
@@ -1543,7 +1557,7 @@ pub(crate) async fn stop_before_launch_tx<A: CallAuthority030>(
     {
         return Ok(CallSettlement030::Diagnostic { diagnostic });
     }
-    let state = verify_attempt_tx(db, authority, attempt, false).await?;
+    let state = verify_attempt_tx(db, authority, attempt, AttemptCheck::Attribution).await?;
     let row = row_tx(db, attempt).await?;
     if row.get::<&str, _>("status") == "terminal" {
         let receipt = read_receipt_tx(db, authority, attempt.identity(), attempt.work())
@@ -1882,7 +1896,7 @@ pub(crate) async fn require_live_mcp_tx<A: CallAuthority030>(
     attempt: &CallAttempt030,
     server: &str,
 ) -> Result<()> {
-    verify_attempt_tx(db, authority, attempt, true).await?;
+    verify_attempt_tx(db, authority, attempt, AttemptCheck::Active).await?;
     let row = row_tx(db, attempt).await?;
     require(
         row.get::<&str, _>("status") == "launched",

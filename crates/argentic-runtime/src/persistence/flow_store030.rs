@@ -249,6 +249,27 @@ pub fn eligible(state: &FlowState030, effect: &FlowEffect030) -> bool {
     }
 }
 
+pub(crate) async fn pending_effect_tx(
+    db: &mut SqliteConnection,
+    state: &FlowState030,
+    effect_id: &str,
+    owner_epoch: &str,
+) -> StoreResult<FlowEffect030> {
+    let id = &state.identity;
+    let row = sqlx::query("SELECT effect_json,status,owner_epoch FROM engine_flow030_outbox WHERE system_id=? AND invocation_id=? AND effect_id=?")
+        .bind(&id.system_start_id).bind(&id.flow_invocation_id).bind(effect_id).fetch_optional(&mut *db).await?.ok_or(StoreError030::Missing)?;
+    if row.get::<String, _>("status") != "pending"
+        || row.get::<String, _>("owner_epoch") != owner_epoch
+    {
+        return Err(StoreError030::NotClaimable);
+    }
+    let effect: FlowEffect030 = serde_json::from_str(row.get::<&str, _>("effect_json"))?;
+    if effect.id != effect_id || !eligible(state, &effect) {
+        return Err(StoreError030::NotClaimable);
+    }
+    Ok(effect)
+}
+
 /// Native host calls the verifier while holding the same immediate transaction.
 /// After this returns, the claim is durable only once the caller commits. It is
 /// deliberately recorded as uncertain before any external IO and never retried.
@@ -264,17 +285,7 @@ pub async fn claim_tx<A: Authority030>(
 ) -> StoreResult<FlowEffect030> {
     authority.owner(db, id).await?;
     let (_, state) = load(db, id).await?;
-    let row = sqlx::query("SELECT effect_json,status,owner_epoch FROM engine_flow030_outbox WHERE system_id=? AND invocation_id=? AND effect_id=?")
-        .bind(&id.system_start_id).bind(&id.flow_invocation_id).bind(effect_id).fetch_optional(&mut *db).await?.ok_or(StoreError030::Missing)?;
-    if row.get::<String, _>("status") != "pending"
-        || row.get::<String, _>("owner_epoch") != authority.owner_epoch()
-    {
-        return Err(StoreError030::NotClaimable);
-    }
-    let effect: FlowEffect030 = serde_json::from_str(row.get::<&str, _>("effect_json"))?;
-    if effect.id != effect_id || !eligible(&state, &effect) {
-        return Err(StoreError030::NotClaimable);
-    }
+    let effect = pending_effect_tx(db, &state, effect_id, authority.owner_epoch()).await?;
     let blocked: i64 = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM engine_flow030_events WHERE system_id=? AND invocation_id=? AND diagnostic_json IS NOT NULL)")
         .bind(&id.system_start_id).bind(&id.flow_invocation_id).fetch_one(&mut *db).await?;
     if blocked != 0

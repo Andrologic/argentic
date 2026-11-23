@@ -1119,27 +1119,39 @@ pub(crate) struct NativeFlowInspection030 {
 }
 
 impl NativeFlowInspection030 {
-    // Stop settles the outbox row and records this event in one transaction.
-    pub(crate) fn start_settled_without_admission(&self, effect: &FlowEffect030) -> bool {
+    pub(crate) fn start_withdrawn(&self, effect: &FlowEffect030) -> Result<bool> {
         let FlowEffectKind030::Start { work, .. } = &effect.kind else {
-            return false;
+            return Ok(false);
         };
-        self.flow
-            .state
-            .events
-            .contains_key(&format!("no-admission:{}", effect.id))
-            && self.flow.effects.iter().any(|row| {
-                if row["status"] != "settled" || row["effect"]["id"] != effect.id {
-                    return false;
-                }
-                serde_json::from_value::<NoAdmissionReceipt030>(row["settlement"].clone())
-                    .is_ok_and(|proof| {
-                        proof.identity == effect.identity
-                            && proof.work == *work
-                            && proof.owner_epoch == self.owner.owner_epoch
-                            && proof.generation == self.generation
-                    })
-            })
+        let expected = serde_json::to_value(effect)?;
+        let Some(row) = self
+            .flow
+            .effects
+            .iter()
+            .find(|row| row["effect"] == expected)
+        else {
+            return Ok(false);
+        };
+        if row["status"] == "pending" {
+            // Stop or a steer receipt can withdraw an unclaimed Start.
+            return Ok(!flow_store030::eligible(&self.flow.state, effect));
+        }
+        // Stop settles the outbox row and records this event in one transaction.
+        Ok(row["status"] == "settled"
+            && self
+                .flow
+                .state
+                .events
+                .contains_key(&format!("no-admission:{}", effect.id))
+            && serde_json::from_value::<NoAdmissionReceipt030>(row["settlement"].clone())
+                .is_ok_and(|proof| {
+                    proof.identity == effect.identity
+                        && proof.work == *work
+                        && proof.owner_epoch == self.owner.owner_epoch
+                        && proof.generation == self.generation
+                        && !proof.native_receipt_id.is_empty()
+                        && matches!(proof.reason.as_str(), "unclaimed" | "unreleasedNativeClaim")
+                }))
     }
 }
 

@@ -764,14 +764,6 @@ impl PolicyLeases030 {
     ) -> Result<PreparedAgentWork030> {
         let capture = &inspection.capture;
         let state = &inspection.flow.state;
-        if capture.identity != effect.identity
-            || state.identity != capture.identity
-            || inspection.owner.system_start_id != capture.identity.system_start_id
-            || state.stopping
-            || state.verdict.is_some()
-        {
-            return Err(failure("CORRELATION", "work", "Flow snapshot differs"));
-        }
         let FlowEffectKind030::Start {
             work,
             step,
@@ -811,23 +803,6 @@ impl PolicyLeases030 {
             || activation.agent.as_deref() != Some(agent.as_str())
         {
             return Err(failure("CORRELATION", "work", "Agent activation differs"));
-        }
-        let encoded = serde_json::to_value(effect)?;
-        let matching = inspection
-            .flow
-            .effects
-            .iter()
-            .filter(|entry| {
-                entry.get("status").and_then(serde_json::Value::as_str) == Some("pending")
-                    && entry.get("effect") == Some(&encoded)
-            })
-            .count();
-        if matching != 1 {
-            return Err(failure(
-                "CORRELATION",
-                "work",
-                "Pending agent start is not unique",
-            ));
         }
         let engine_work = EngineWork {
             system_start_id: capture.identity.system_start_id.clone(),
@@ -915,6 +890,27 @@ pub(crate) async fn prepare_effective_agent_work030(
     effect: &FlowEffect030,
 ) -> Result<PreparedEffectiveAgentWork030> {
     let capture = &inspection.capture;
+    let state = &inspection.flow.state;
+    if capture.identity != effect.identity
+        || state.identity != capture.identity
+        || inspection.owner.system_start_id != capture.identity.system_start_id
+    {
+        return Err(failure("CORRELATION", "work", "Flow snapshot differs"));
+    }
+    let encoded = serde_json::to_value(effect)?;
+    if !crate::persistence::flow_store030::eligible(state, effect)
+        || !inspection
+            .flow
+            .effects
+            .iter()
+            .any(|row| row["status"] == "pending" && row["effect"] == encoded)
+    {
+        return Err(failure(
+            "STALE_REFERENCE",
+            "work",
+            "Agent Start is no longer pending and eligible",
+        ));
+    }
     let FlowEffectKind030::Start {
         work,
         step,
