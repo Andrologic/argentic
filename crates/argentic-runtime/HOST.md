@@ -363,10 +363,17 @@ Use the official login procedure in [Native Codex](https://github.com/Andrologic
 substituting this data root. The embedding API never imports credentials from
 Macro or a default Codex home. `CODEX_LOGIN_REQUIRED` is an unmet prerequisite,
 not a passing recipe. A model catalogue comes only from the native observation.
-Install the complete official same-release package, including the executable
-`codex-code-mode-host` and `codex-exec-server` siblings. Their presence and
-digests are checked and capture-bound; `CODEX_PACKAGE_INCOMPLETE` refuses an
-incomplete package before a model thread. This does not qualify a real tool run.
+Install the complete official same-release package. In 0.167.x it contains
+the executable `codex-code-mode-host` and `codex-exec-server` siblings.
+The Linux ARM64 package for 0.171.0 bundles `exec-server` in the main
+executable and supplies `codex-code-mode-host` as a sibling. Argentic checks
+the expected helpers and binds their digests to the capture. An incomplete
+package reports `CODEX_PACKAGE_INCOMPLETE` before a model thread.
+
+For Codex 0.171.0 on Linux ARM64, provision the private login outside
+`/tmp` and use the read-only host profile. The app-server gets a private
+temporary runtime directory for its Unix sockets. The profile keeps
+temporary roots and network denied for model tools.
 
 Alternatively, explicitly supply `--codex-auth-file /absolute/ordinary-home/auth.json`
 to the operator, or call `Host::with_codex_auth_file` before preflight/Start.
@@ -559,8 +566,9 @@ payload fields encoded as strings where specified; do not round them through
 JavaScript numbers. Start uses the existing immediate transaction, generation
 checks, correlation, idempotency barrier and post-commit readback.
 
-Codex remains limited to qualified 0.167.x on macOS ARM64 or Linux ARM64.
-Documents combining Codex and approval steps require macOS ARM64. Local host
+Codex supports 0.167.x on macOS ARM64 and Linux ARM64. The exact 0.171.0
+release also supports the read-only Linux ARM64 profile with the private
+login. Documents combining Codex and approval steps require macOS ARM64. Local host
 calls, other harnesses, network content fetches and remote MCP are unavailable
 in this host.
 Local relative content URIs resolve from the source file's directory. The

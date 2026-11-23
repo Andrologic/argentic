@@ -24,7 +24,14 @@ pub(crate) async fn profile_status(manager: &HostContext) -> CodexStatus {
         return status;
     }
     let result: Result<()> = async {
-        let profile = profile::prepare(manager)?;
+        let version = status.version.as_deref().ok_or_else(|| {
+            failure(
+                "CODEX_VERSION_UNQUALIFIED",
+                "engine",
+                "Codex version is absent",
+            )
+        })?;
+        let profile = profile::prepare(manager, version)?;
         let root = manager.root().join("native-discovery").join("codex");
         std::fs::create_dir_all(&root)
             .map_err(|_| failure("STORAGE", "scope", "Cannot create native diagnostic scope"))?;
@@ -124,7 +131,7 @@ pub(crate) async fn observe_catalogue030(
             "Codex version is absent",
         )
     })?;
-    let profile = profile::prepare(manager)?;
+    let profile = profile::prepare(manager, &version)?;
     let root = std::path::PathBuf::from(
         scope
             .get("root")
@@ -207,6 +214,7 @@ mod tests {
     #[test]
     fn frozen_write_denials_make_native_tools_read_only() {
         let profile = Profile {
+            runtime: None,
             executable: "/synthetic/bin/codex".into(),
             directory: "/synthetic/private".into(),
             home: "/synthetic/home".into(),
@@ -379,7 +387,7 @@ time.sleep(30)
         assert_eq!(status.version.as_deref(), Some(VERSION));
         assert_eq!(status.code, "CODEX_LOGIN_REQUIRED");
         assert!(!status.available);
-        let profile = profile::prepare(&manager.clone()).unwrap();
+        let profile = profile::prepare(&manager, VERSION).unwrap();
         let mut command = profile.app_server_command(&workspace, false).unwrap();
         command.stderr(std::process::Stdio::inherit());
         let mut process = ContainedBackgroundProcess::spawn(command).unwrap();

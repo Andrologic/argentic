@@ -357,6 +357,7 @@ mod tests {
                 "sourceOwner":source["owner"]});
             let observed = crate::agsdl_host_codex::CodexObservation030 {
                 profile: crate::agsdl_host_codex::profile::Profile {
+                    runtime: None,
                     executable: root.join("bin/codex"),
                     directory: root.join("profile"),
                     home: root.join("profile/home"),

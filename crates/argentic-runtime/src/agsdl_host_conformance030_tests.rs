@@ -254,6 +254,7 @@ impl Fixture {
             }
             let observed = crate::agsdl_host_codex::CodexObservation030 {
                 profile: crate::agsdl_host_codex::profile::Profile {
+                    runtime: None,
                     executable: workspace.join("bin/codex"),
                     directory: workspace.join("profile"),
                     home: workspace.join("profile/home"),

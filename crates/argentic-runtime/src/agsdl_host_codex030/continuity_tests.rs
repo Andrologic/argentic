@@ -219,6 +219,7 @@ fn executor_access(
 ) -> CodexExecutor030 {
     let root = f._temp.path().canonicalize().unwrap();
     let profile = crate::agsdl_host_codex::profile::Profile {
+        runtime: None,
         executable: root.join("fake-codex"),
         directory: root.join("profile"),
         home: root.join("profile/home"),

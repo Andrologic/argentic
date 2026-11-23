@@ -152,6 +152,7 @@ impl Fixture {
         let scope = json!({"projectId":"project","root":workspace,"rootIdentity":crate::content_io::admitted::workspace_root_identity(&workspace).unwrap().observation_key().unwrap(),"sourceOwner":source["owner"]});
         let observed = crate::agsdl_host_codex::CodexObservation030 {
             profile: crate::agsdl_host_codex::Profile {
+                runtime: None,
                 executable: root.join("synthetic-codex"),
                 directory: root.join("profile"),
                 home: root.join("profile/home"),

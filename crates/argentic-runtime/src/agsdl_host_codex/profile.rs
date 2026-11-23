@@ -11,18 +11,29 @@ use std::path::{Path, PathBuf};
 
 pub(crate) const ADAPTER: &str = "codex-app-server-v1";
 pub(crate) const VERSION: &str = "0.167.0";
+const LINUX_READ_ONLY: &str = "0.171.0";
 const HELPERS: &[&str] = &["codex-code-mode-host", "codex-exec-server"];
 
 /// Presence/executability and capture binding, not release qualification. The
 /// installer must supply the complete official package from the same release.
-fn package_helpers(executable: &Path) -> Result<Vec<(&'static str, String)>> {
+fn package_helpers(executable: &Path, version: &str) -> Result<Vec<(&'static str, String)>> {
     use std::io::Read;
     let unavailable = || {
-        failure("CODEX_PACKAGE_INCOMPLETE", "engine", "Install the complete official Codex package, including its same-release code-mode-host and exec-server siblings")
+        failure(
+            "CODEX_PACKAGE_INCOMPLETE",
+            "engine",
+            "Install the complete official Codex package with its same-release helpers",
+        )
     };
     let directory = executable.parent().ok_or_else(unavailable)?;
     let mut digests = Vec::new();
-    for &name in HELPERS {
+    // 0.171.0 Linux dispatches the exec-server through the main binary.
+    let required = if version == LINUX_READ_ONLY {
+        &HELPERS[..1]
+    } else {
+        HELPERS
+    };
+    for &name in required {
         let path = directory.join(name);
         let meta = path.symlink_metadata().map_err(|_| unavailable())?;
         if !meta.is_file() {
@@ -65,6 +76,7 @@ pub(crate) struct Profile {
     pub home: PathBuf,
     pub bootstrap: PathBuf,
     pub digest: String,
+    pub runtime: Option<std::sync::Arc<tempfile::TempDir>>,
 }
 fn unavailable(code: &str) -> CodexStatus {
     CodexStatus {
@@ -281,15 +293,14 @@ fn private_directory(path: &Path) -> Result<()> {
         ))
     }
 }
-pub(crate) fn prepare(manager: &HostContext) -> Result<Profile> {
+fn environment(manager: &HostContext) -> Result<Profile> {
     let executable = executable().ok_or_else(|| {
         failure(
             "CODEX_NOT_INSTALLED",
             "engine",
-            "Codex CLI 0.167.x is required",
+            "An official qualified Codex CLI package is required",
         )
     })?;
-    let helpers = package_helpers(&executable)?;
     let directory = manager.root().join("native-engines").join("codex-v1");
     let home = directory.join("home");
     for path in [
@@ -304,7 +315,27 @@ pub(crate) fn prepare(manager: &HostContext) -> Result<Profile> {
     }
     context_roots_are_empty(&directory, &home)?;
     let bootstrap = bootstrap(&directory, &manager.root().join("native-contexts/codex-v1"))?;
-    let bytes = std::fs::read(&executable).map_err(|_| {
+    Ok(Profile {
+        executable,
+        directory,
+        home,
+        bootstrap,
+        digest: String::new(),
+        runtime: None,
+    })
+}
+
+pub(crate) fn prepare(manager: &HostContext, version: &str) -> Result<Profile> {
+    if !qualified_version(version) {
+        return Err(failure(
+            "CODEX_VERSION_UNQUALIFIED",
+            "engine",
+            "Codex version is outside the qualified profile",
+        ));
+    }
+    let mut profile = environment(manager)?;
+    let helpers = package_helpers(&profile.executable, version)?;
+    let bytes = std::fs::read(&profile.executable).map_err(|_| {
         failure(
             "CODEX_NOT_INSTALLED",
             "engine",
@@ -314,12 +345,16 @@ pub(crate) fn prepare(manager: &HostContext) -> Result<Profile> {
     let mut digest = format!(
         "sha256:{:x}",
         Sha256::digest(serde_json::to_vec(&(
-            VERSION,
+            if version == LINUX_READ_ONLY {
+                LINUX_READ_ONLY
+            } else {
+                VERSION
+            },
             std::env::consts::OS,
             std::env::consts::ARCH,
             format!("{:x}", Sha256::digest(bytes)),
-            directory.to_string_lossy().as_ref(),
-            bootstrap.to_string_lossy().as_ref(),
+            profile.directory.to_string_lossy().as_ref(),
+            profile.bootstrap.to_string_lossy().as_ref(),
             "native-bootstrap-v1",
             helpers
         ))?)
@@ -334,13 +369,21 @@ pub(crate) fn prepare(manager: &HostContext) -> Result<Profile> {
             ))?)
         );
     }
-    Ok(Profile {
-        executable,
-        directory,
-        home,
-        bootstrap,
-        digest,
-    })
+    profile.digest = digest;
+    #[cfg(target_os = "linux")]
+    if version == LINUX_READ_ONLY {
+        use std::os::unix::fs::PermissionsExt;
+        // The app-server's Unix sockets need a short, owned runtime directory.
+        // Give each invocation one outside the profile's denied subtree.
+        let runtime = tempfile::Builder::new()
+            .prefix("argentic-codex-")
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir_in("/tmp")
+            .map_err(context_io)?;
+        private_directory(runtime.path())?;
+        profile.runtime = Some(std::sync::Arc::new(runtime));
+    }
+    Ok(profile)
 }
 impl Profile {
     pub fn command(&self) -> tokio::process::Command {
@@ -354,9 +397,19 @@ impl Profile {
             .env("PATH", "/usr/local/bin:/usr/bin:/bin")
             .env("LANG", "C.UTF-8")
             .current_dir(&self.directory);
+        if let Some(runtime) = &self.runtime {
+            command.env("XDG_RUNTIME_DIR", runtime.path());
+        }
         command
     }
     pub fn settings(&self, root: &Path, read_only: bool) -> Result<Value> {
+        if self.runtime.is_some() && (!read_only || self.directory.starts_with("/tmp")) {
+            return Err(failure(
+                "CODEX_PROFILE_UNQUALIFIED",
+                "scope",
+                "Codex 0.171.0 requires read-only execution and private host data outside /tmp",
+            ));
+        }
         if self.directory.starts_with(root)
             || root.starts_with(&self.directory)
             || self.bootstrap.starts_with(root)
@@ -447,7 +500,12 @@ impl Profile {
         Ok(command)
     }
     pub fn identity(&self) -> String {
-        json!({"format":"macro-codex-native-profile/1","version":VERSION,"platform":format!("{}-{}",std::env::consts::OS,std::env::consts::ARCH),
+        let version = if self.runtime.is_some() {
+            LINUX_READ_ONLY
+        } else {
+            VERSION
+        };
+        json!({"format":"macro-codex-native-profile/1","version":version,"platform":format!("{}-{}",std::env::consts::OS,std::env::consts::ARCH),
             "digest":self.digest,"toolPolicy":"codex-native","approvalPolicy":"never"}).to_string()
     }
     #[cfg(test)]
@@ -462,6 +520,7 @@ pub(super) fn qualified_version(version: &str) -> bool {
     version
         .strip_prefix("0.167.")
         .is_some_and(|patch| !patch.is_empty() && patch.bytes().all(|byte| byte.is_ascii_digit()))
+        || cfg!(all(target_os = "linux", target_arch = "aarch64")) && version == LINUX_READ_ONLY
 }
 fn qualified_platform() -> bool {
     cfg!(any(
@@ -470,7 +529,7 @@ fn qualified_platform() -> bool {
     ))
 }
 pub(crate) async fn status(manager: &HostContext) -> CodexStatus {
-    let profile = match prepare(manager) {
+    let profile = match environment(manager) {
         Ok(profile) => profile,
         Err(error) => return unavailable(&error.code),
     };
@@ -483,12 +542,18 @@ pub(crate) async fn status(manager: &HostContext) -> CodexStatus {
     let Ok(Ok(output)) = output else {
         return result;
     };
+    if !output.status.success() {
+        return result;
+    }
     let observed = String::from_utf8_lossy(&output.stdout);
     let Some(version) = observed.trim().strip_prefix("codex-cli ") else {
         return result;
     };
     if !qualified_version(version) {
         return result;
+    }
+    if let Err(error) = package_helpers(&profile.executable, version) {
+        return unavailable(&error.code);
     }
     result.version = Some(version.into());
     if manager.codex_auth_file().is_some() && version != VERSION {
@@ -637,7 +702,7 @@ mod tests {
         let cli = temp.path().join("codex");
         std::fs::write(&cli, "synthetic CLI").unwrap();
         assert_eq!(
-            package_helpers(&cli).unwrap_err().code,
+            package_helpers(&cli, VERSION).unwrap_err().code,
             "CODEX_PACKAGE_INCOMPLETE"
         );
         for &name in HELPERS {
@@ -645,22 +710,24 @@ mod tests {
             std::fs::write(&path, "synthetic helper, never executed").unwrap();
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
         }
-        let first = package_helpers(&cli).unwrap();
+        let first = package_helpers(&cli, VERSION).unwrap();
+        assert_eq!(package_helpers(&cli, LINUX_READ_ONLY).unwrap(), first[..1]);
         std::fs::write(temp.path().join(HELPERS[0]), "changed synthetic helper").unwrap();
-        assert_ne!(first, package_helpers(&cli).unwrap());
+        assert_ne!(first, package_helpers(&cli, VERSION).unwrap());
         std::fs::set_permissions(
             temp.path().join(HELPERS[1]),
             std::fs::Permissions::from_mode(0o600),
         )
         .unwrap();
         assert_eq!(
-            package_helpers(&cli).unwrap_err().code,
+            package_helpers(&cli, VERSION).unwrap_err().code,
             "CODEX_PACKAGE_INCOMPLETE"
         );
         std::fs::remove_file(temp.path().join(HELPERS[1])).unwrap();
+        assert!(package_helpers(&cli, LINUX_READ_ONLY).is_ok());
         std::os::unix::fs::symlink(&cli, temp.path().join(HELPERS[1])).unwrap();
         assert_eq!(
-            package_helpers(&cli).unwrap_err().code,
+            package_helpers(&cli, VERSION).unwrap_err().code,
             "CODEX_PACKAGE_INCOMPLETE"
         );
     }
@@ -669,7 +736,20 @@ mod tests {
         for version in ["0.167.0", "0.167.12"] {
             assert!(qualified_version(version));
         }
-        for version in ["0.163.0", "0.168.0", "0.167.", "0.167.0-beta", "0.167.0.1"] {
+        assert_eq!(
+            qualified_version(LINUX_READ_ONLY),
+            cfg!(all(target_os = "linux", target_arch = "aarch64"))
+        );
+        for version in [
+            "0.163.0",
+            "0.168.0",
+            "0.170.0",
+            "0.171.1",
+            "0.171.0-beta",
+            "0.167.",
+            "0.167.0-beta",
+            "0.167.0.1",
+        ] {
             assert!(!qualified_version(version));
         }
     }
@@ -678,6 +758,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         let profile = Profile {
+            runtime: None,
             executable: root.join("bin/codex"),
             directory: root.join("profile"),
             home: root.join("profile/home"),
