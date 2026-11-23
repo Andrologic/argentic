@@ -616,101 +616,118 @@ async fn idle(
     deferred: &DeferredSteers,
     hold_steers: bool,
 ) -> crate::persistence::flow_store030::FlowView030 {
-    tokio::time::timeout(std::time::Duration::from_secs(15), async {
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(12);
-        loop {
-            let host = &f.host;
-            let view = flow::inspect_run(host.flow030(), &host, &f.pool, &f.owner)
+    let stall_limit = std::time::Duration::from_secs(12);
+    let mut deadline = tokio::time::Instant::now() + stall_limit;
+    let mut previous_progress = None;
+    loop {
+        let host = &f.host;
+        let view = flow::inspect_run(host.flow030(), &host, &f.pool, &f.owner)
+            .await
+            .unwrap()
+            .flow;
+        let clock_works: Vec<String> =
+            sqlx::query_scalar("SELECT activation_id FROM engine_flow030_clock_works")
+                .fetch_all(&f.pool)
                 .await
-                .unwrap()
-                .flow;
-            let clock_works: Vec<String> =
-                sqlx::query_scalar("SELECT activation_id FROM engine_flow030_clock_works")
-                    .fetch_all(&f.pool)
-                    .await
-                    .unwrap();
-            let pending_clock: i64 = sqlx::query_scalar(
-                "SELECT count(*) FROM engine_flow030_clock_events WHERE output_json IS NULL",
-            )
-            .fetch_one(&f.pool)
-            .await
-            .unwrap();
-            let pending_controls: i64 = sqlx::query_scalar(
-                "SELECT count(*) FROM engine_flow030_clock_controls WHERE joined=0",
-            )
-            .fetch_one(&f.pool)
-            .await
-            .unwrap();
-            let agents = running.lock().unwrap();
-            let ready = pending_clock == 0
-                && pending_controls == 0
-                && view
-                    .state
+                .unwrap();
+        let pending_clock: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM engine_flow030_clock_events WHERE output_json IS NULL",
+        )
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+        let pending_controls: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM engine_flow030_clock_controls WHERE joined=0")
+                .fetch_one(&f.pool)
+                .await
+                .unwrap();
+        let agents = running.lock().unwrap();
+        let ready = pending_clock == 0
+            && pending_controls == 0
+            && view
+                .state
+                .activations
+                .iter()
+                .filter(|a| a.physical)
+                .all(|a| clock_works.contains(&a.id))
+            && !view.effects.iter().any(|r| {
+                if r["status"] != "pending" && r["status"] != "uncertain" {
+                    return false;
+                }
+                let kind = &r["effect"]["kind"];
+                if view.state.stopping && kind["kind"] == "stopWork" && r["status"] == "uncertain" {
+                    return false;
+                }
+                if hold_steers
+                    && kind["kind"] == "steer"
+                    && kind["deliveryActivationId"]
+                        .as_str()
+                        .is_some_and(|id| deferred.lock().unwrap().contains_key(id))
+                {
+                    return false;
+                }
+                !view.state.stopping
+                    || crate::persistence::flow_store030::eligible(
+                        &view.state,
+                        &serde_json::from_value(r["effect"].clone()).unwrap(),
+                    )
+            })
+            && view
+                .state
+                .preparations
+                .iter()
+                .all(|p| p.status != "pending")
+            && view
+                .state
+                .activations
+                .iter()
+                .filter(|a| a.physical)
+                .all(|a| {
+                    agents.iter().any(|w| w.activation == a.id)
+                        || calls.lock().unwrap().iter().any(|w| w.activation == a.id)
+                        || a.agent.is_none()
+                            && a.step.as_ref().is_some_and(|step| {
+                                f.plan
+                                    .steps
+                                    .iter()
+                                    .any(|s| &s.address == step && s.r#type == "approval")
+                            })
+                })
+            && ended.is_none_or(|id| {
+                view.state
                     .activations
                     .iter()
-                    .filter(|a| a.physical)
-                    .all(|a| clock_works.contains(&a.id))
-                && !view
-                    .effects
-                    .iter()
-                    .any(|r| {
-                        if r["status"] != "pending" && r["status"] != "uncertain" {
-                            return false;
-                        }
-                        let kind = &r["effect"]["kind"];
-                        if view.state.stopping && kind["kind"] == "stopWork" && r["status"] == "uncertain" {
-                            return false;
-                        }
-                        if hold_steers && kind["kind"] == "steer"
-                            && kind["deliveryActivationId"].as_str()
-                                .is_some_and(|id| deferred.lock().unwrap().contains_key(id))
-                        {
-                            return false;
-                        }
-                        !view.state.stopping || crate::persistence::flow_store030::eligible(
-                            &view.state, &serde_json::from_value(r["effect"].clone()).unwrap())
-                    })
-                && view
-                    .state
-                    .preparations
-                    .iter()
-                    .all(|p| p.status != "pending")
-                && view
-                    .state
-                    .activations
-                    .iter()
-                    .filter(|a| a.physical)
-                    .all(|a| {
-                        agents.iter().any(|w| w.activation == a.id)
-                            || calls.lock().unwrap().iter().any(|w| w.activation == a.id)
-                            || a.agent.is_none()
-                                && a.step.as_ref().is_some_and(|step| {
-                                    f.plan
-                                        .steps
-                                        .iter()
-                                        .any(|s| &s.address == step && s.r#type == "approval")
-                                })
-                    })
-                && ended.is_none_or(|id| {
-                    view.state
-                        .activations
-                        .iter()
-                        .any(|a| a.id == id && !a.physical)
-                });
-            drop(agents);
-            if ready {
-                return view;
-            }
-            assert!(tokio::time::Instant::now() < deadline,
-                "Timeline did not quiesce: stopping={}, verdict={:?}, ended={ended:?}, activations={:?}, effects={:?}, clock={pending_clock}/{pending_controls}",
+                    .any(|a| a.id == id && !a.physical)
+            });
+        drop(agents);
+        if ready {
+            return view;
+        }
+        // The scenario's overall watchdog already bounds its duration.
+        // Here the elapsed time measures a stall in durable progress.
+        let progress = (
+            view.state.revision.clone(),
+            view.effects
+                .iter()
+                .filter(|row| row["status"] == "settled")
+                .count(),
+            clock_works.len(),
+            pending_clock,
+            pending_controls,
+        );
+        if previous_progress.as_ref() != Some(&progress) {
+            deadline = tokio::time::Instant::now() + stall_limit;
+            previous_progress = Some(progress);
+        }
+        assert!(tokio::time::Instant::now() < deadline,
+                "Timeline stalled: stopping={}, verdict={:?}, ended={ended:?}, activations={:?}, effects={:?}, clock={pending_clock}/{pending_controls}, route jobs={}",
                 view.state.stopping, view.state.verdict,
                 view.state.activations.iter().map(|a| (&a.id, &a.step, &a.phase, a.physical)).collect::<Vec<_>>(),
-                view.effects.iter().filter(|row| row["status"] != "settled").collect::<Vec<_>>());
-            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-        }
-    })
-    .await
-    .expect("Supervisor did not reach the next timeline boundary")
+                view.effects.iter().filter(|row| row["status"] != "settled").collect::<Vec<_>>(),
+                f.route_captures.lock().unwrap().len());
+        // Each snapshot takes the same admission gate as the supervisor.
+        tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+    }
 }
 
 async fn wait_for_steer(f: &Fixture, id: &str, stopping: bool, outcome: &SteerOutcome040) {
