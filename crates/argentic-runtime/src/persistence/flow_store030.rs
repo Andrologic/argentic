@@ -203,6 +203,17 @@ pub async fn apply_tx<A: Authority030>(
     Ok(Apply030::Applied(transition.receipt))
 }
 
+// Files written before the checkpoint was stored can still derive it from
+// their journal until the next flow transition populates the run row.
+pub(crate) const RUN_HEAD030: &str = "SELECT coalesce(state_json ->> '$.lastEventId', (
+        SELECT event_id FROM engine_flow030_events e
+        WHERE e.rowid=(
+            SELECT max(head.rowid) FROM engine_flow030_events head
+            WHERE head.system_id=r.system_id AND head.invocation_id=r.invocation_id
+              AND head.receipt_json IS NOT NULL
+        )
+    )) FROM engine_flow030_runs r WHERE system_id=? AND invocation_id=?";
+
 pub fn eligible(state: &FlowState030, effect: &FlowEffect030) -> bool {
     if effect.identity != state.identity
         || (state.paused && !matches!(effect.kind, FlowEffectKind030::StopWork { .. }))

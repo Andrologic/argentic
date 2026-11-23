@@ -2329,8 +2329,11 @@ impl DispatchLease030<'_> {
             tx.commit().await.map_err(|_| uncertain())?;
             return Ok(false);
         }
-        let head: String = sqlx::query_scalar("SELECT event_id FROM engine_flow030_events WHERE system_id=? AND invocation_id=? AND diagnostic_json IS NULL ORDER BY rowid DESC LIMIT 1")
-            .bind(&self.effect.identity.system_start_id).bind(&self.effect.identity.flow_invocation_id).fetch_one(&mut *tx).await?;
+        let head: String = sqlx::query_scalar(flow_store030::RUN_HEAD030)
+            .bind(&self.effect.identity.system_start_id)
+            .bind(&self.effect.identity.flow_invocation_id)
+            .fetch_one(&mut *tx)
+            .await?;
         let revision: String = sqlx::query_scalar("SELECT state_json ->> '$.revision' FROM engine_flow030_runs WHERE system_id=? AND invocation_id=?")
             .bind(&self.effect.identity.system_start_id).bind(&self.effect.identity.flow_invocation_id).fetch_one(&mut *tx).await?;
         let wire_checkpoint = gate.as_ref().and_then(|gate| gate.wire_checkpoint());

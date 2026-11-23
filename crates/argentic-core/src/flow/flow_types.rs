@@ -371,6 +371,7 @@ pub enum Continuation030 {
 }
 record!(SteerRecord030 {effect_id:String,work:WorkRef030,delivery_activation_id:String,status:String,resolved_event_id:Option<String>,reason:Option<String>});
 record!(FlowState030 {identity:FlowIdentity030,revision:String,plan_json:Option<String>,entered:bool,stopping:bool,verdict:Option<String>,unhandled_failure:bool,activations:Vec<Activation030>,instances:Vec<InstanceState030>,preparations:Vec<Preparation030>,preparation_receipts:BTreeMap<String,String>,paths:Vec<Path030>,batches:Vec<Batch030>,groups:Vec<Group030>,route_barriers:Vec<RouteBarrier030>,visits:BTreeMap<String,String>,events:BTreeMap<String,EventRecord030>,#[serde(default, skip_serializing_if = "Vec::is_empty")] steer_deliveries:Vec<SteerRecord030>,
+    #[serde(default, skip_serializing_if = "Option::is_none")] last_event_id:Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")] paused:bool,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")] operator_holds:BTreeMap<String,OperatorHold030>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")] operator_deferred:Vec<DeferredOperator030>
@@ -380,6 +381,7 @@ impl FlowState030 {
         Self {
             identity,
             revision: "0".into(),
+            last_event_id: None,
             plan_json: None,
             entered: false,
             stopping: false,

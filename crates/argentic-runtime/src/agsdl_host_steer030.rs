@@ -258,13 +258,11 @@ impl SteerDelivery030 {
             ));
         }
         let gate = self.gate.as_ref().unwrap();
-        let checkpoint: String = sqlx::query_scalar(
-            "SELECT event_id FROM engine_flow030_events WHERE system_id=? AND invocation_id=? AND receipt_json IS NOT NULL ORDER BY rowid DESC LIMIT 1",
-        )
-        .bind(&self.effect.identity.system_start_id)
-        .bind(&self.effect.identity.flow_invocation_id)
-        .fetch_one(&gate.pool)
-        .await?;
+        let checkpoint: String = sqlx::query_scalar(crate::persistence::flow_store030::RUN_HEAD030)
+            .bind(&self.effect.identity.system_start_id)
+            .bind(&self.effect.identity.flow_invocation_id)
+            .fetch_one(&gate.pool)
+            .await?;
         gate.wire_checkpoint
             .set(checkpoint)
             .map_err(|_| refused())?;

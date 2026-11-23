@@ -170,6 +170,7 @@ pub fn reduce(
     };
     engine.state.plan_json = Some(plan_json);
     engine.state.revision = number::increment(&state.revision);
+    engine.state.last_event_id = Some(event.event_id.clone());
     engine.apply(&event.kind)?;
     engine.settle()?;
     let receipt = FlowReceipt030 {

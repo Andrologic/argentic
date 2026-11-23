@@ -639,6 +639,10 @@ async fn verify(db: &mut SqliteConnection, system: &str, invocation: &str) -> Re
         return Err(mismatch("start.enter", "accepted Enter event", Value::Null));
     }
     equal("outbox.count", &produced.len(), &outbox.len())?;
+    // Older run rows did not store the journal head.
+    if stored.last_event_id.is_none() {
+        state.last_event_id = None;
+    }
     equal("run.state", &state, &stored)?;
     for (effect, row) in produced.iter().zip(&outbox) {
         let event_id: String = row.try_get("event_id").map_err(storage)?;
