@@ -658,6 +658,33 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn archive_open_refuses_a_gap_between_local_records() {
+        let (mut entries, inventory) = baseline();
+        entries.insert(INDEX_NAME.into(), serde_json::to_vec(&inventory).unwrap());
+        let mut zip = stored_zip(&entries);
+        assert!(OpenedSource::open_archive_bytes(&zip).is_ok());
+
+        let footer = zip.len() - 22;
+        let mut directory = u32_at(&zip, footer + 16) as usize;
+        let second_local = directory + 46 + usize::from(u16_at(&zip, directory + 28));
+        let gap = u32_at(&zip, second_local + 42) as usize;
+        let new_directory = (directory as u32 + 1).to_le_bytes();
+        zip[footer + 16..footer + 20].copy_from_slice(&new_directory);
+        for _ in 0..entries.len() {
+            let local_offset = u32_at(&zip, directory + 42);
+            if local_offset as usize >= gap {
+                zip[directory + 42..directory + 46]
+                    .copy_from_slice(&(local_offset + 1).to_le_bytes());
+            }
+            directory += 46 + usize::from(u16_at(&zip, directory + 28));
+        }
+        zip.insert(gap, 0);
+
+        let error = OpenedSource::open_archive_bytes(&zip).err().unwrap();
+        assert_eq!(error.code, "ARCHIVE_LAYOUT");
+    }
+
+    #[test]
     fn export_limits_count_the_inventory() {
         let files = MAX_FILES - 1;
         let total = MAX_TOTAL - INDEX_LIMIT;

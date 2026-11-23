@@ -591,13 +591,20 @@ fn folder_sidecar_round_trip_preserves_archive_modes() {
         metadata.push('\n');
     }
     assert!(modes.values().any(|&executable| executable));
-    metadata.push_str("removed.sh");
-    write(temp.path(), ".agsdl-executables.1", metadata);
+    metadata.push_str("removed.sh\n../outside");
+    write(temp.path(), ".AGSDL-EXECUTABLES.3", &metadata);
 
     let open = |native_modes| {
         let dir = open_project_root(temp.path())?;
         OpenedSource::assembled(project::assemble_folder(dir, None, native_modes)?)
     };
+    assert!(open(false)
+        .unwrap()
+        .selected_files()
+        .unwrap()
+        .all(|file| !file.executable));
+    write(temp.path(), ".agsdl-executables.1", &metadata);
+    write(temp.path(), ".agsdl-executables.2", metadata);
     let folder = open(false).unwrap();
     let mut exported = Vec::new();
     folder.write_archive(&mut exported).unwrap();
@@ -616,15 +623,6 @@ fn folder_sidecar_round_trip_preserves_archive_modes() {
         .selected_files()
         .unwrap()
         .all(|file| !file.executable));
-
-    write(
-        temp.path(),
-        ".agsdl-executables.1",
-        "AgSDL executable paths v1\n../outside",
-    );
-    let error = open(false).err().unwrap();
-    assert_eq!(error.source.unwrap().path, ".agsdl-executables.1");
-    assert!(error.message.contains("Invalid executable path"));
 }
 
 #[test]
