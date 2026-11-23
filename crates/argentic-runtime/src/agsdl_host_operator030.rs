@@ -95,7 +95,7 @@ pub(crate) async fn control(
         "operator:{:x}",
         Sha256::digest(request.request_id.as_bytes())
     );
-    let previous = sqlx::query("SELECT event_json,receipt_json FROM engine_flow030_events WHERE system_id=? AND invocation_id=? AND event_id=?")
+    let previous = sqlx::query("SELECT event_json,receipt_json,diagnostic_json FROM engine_flow030_events WHERE system_id=? AND invocation_id=? AND event_id=?")
         .bind(system).bind(&id.flow_invocation_id).bind(&event_id).fetch_optional(&mut *tx).await?;
     let view = flow_store030::read_tx(&mut tx, &authority, id)
         .await
@@ -121,7 +121,20 @@ pub(crate) async fn control(
                 "Operator request ID has another action",
             ));
         }
-        return Ok(serde_json::from_str(previous.get("receipt_json"))?);
+        if let Some(marker) = runtime.pending_event_commit(id, &event_id)? {
+            return operator_receipt(
+                resolve_native_event_commit_tx(runtime, &lease, tx, &marker)
+                    .await?
+                    .ok_or_else(uncertain)?,
+            );
+        }
+        let receipt = previous.get::<Option<&str>, _>("receipt_json");
+        return match receipt {
+            Some(receipt) => Ok(serde_json::from_str(receipt)?),
+            None => operator_receipt(Apply030::Diagnostic(serde_json::from_str(
+                previous.get("diagnostic_json"),
+            )?)),
+        };
     }
     if state.stopping || state.verdict.is_some() {
         return Err(conflict("The run is stopping or terminal"));
@@ -221,6 +234,10 @@ pub(crate) async fn control(
         apply_native_event_transaction030(runtime, &lease, tx, &event, Some((&broker, state)))
             .await?;
     runtime.supervisors.wake(system);
+    operator_receipt(applied)
+}
+
+fn operator_receipt(applied: Apply030) -> Result<FlowReceipt030> {
     match applied {
         Apply030::Applied(receipt) | Apply030::Replayed(receipt) => Ok(receipt),
         Apply030::Diagnostic(_) => Err(conflict("The run has a retained execution diagnostic")),

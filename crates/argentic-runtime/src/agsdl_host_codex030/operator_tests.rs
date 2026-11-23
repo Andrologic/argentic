@@ -63,6 +63,99 @@ async fn operator_wait<T>(mut check: impl AsyncFnMut() -> Option<T>) -> T {
     .expect("operator state did not arrive")
 }
 
+#[tokio::test]
+async fn operator_and_message_retries_clear_only_their_exact_committed_event() {
+    use crate::api::OperatorAction as Action;
+    use crate::persistence::flow030::{
+        FlowEvent030, FlowEventKind030, Instance030, OperatorEvent030,
+    };
+    let f = Fixture::with_document(json!({
+        "contract":"agsdl-0.4.0","id":"operator-commit-retry",
+        "agents":{"worker":{"harness":"codex","permissions":"read-only"}}
+    }))
+    .await;
+    let scope = operator_scope(&f).await;
+    let runtime = f.host.flow030();
+    runtime
+        .supervisor_registry()
+        .reserve(&scope.system_start_id)
+        .unwrap();
+    let revision = async || {
+        crate::agsdl_host_flow030::inspect_run(runtime, &f.host, &f.pool, &f.owner)
+            .await
+            .unwrap()
+            .flow
+            .state
+            .revision
+    };
+
+    let expected_revision = revision().await;
+    let paused = operator_control(&f, &scope, "pause", Action::PauseRun)
+        .await
+        .unwrap();
+    let marker = FlowEvent030 {
+        identity: f.identity.clone(),
+        event_id: paused.event_id.clone(),
+        expected_revision,
+        kind: FlowEventKind030::Operator(OperatorEvent030::Pause {
+            activation_ids: vec![],
+        }),
+    };
+    // Recreate the exact state left by cancellation between COMMIT and ack.
+    runtime.begin_event_commit(&marker).unwrap();
+    assert!(runtime.available(&f.identity).is_err());
+    assert_eq!(
+        operator_control(&f, &scope, "pause", Action::ResumeRun)
+            .await
+            .unwrap_err()
+            .code,
+        "CONFLICT"
+    );
+    assert!(runtime.available(&f.identity).is_err());
+    assert_eq!(
+        operator_control(&f, &scope, "pause", Action::PauseRun)
+            .await
+            .unwrap(),
+        paused
+    );
+    runtime.available(&f.identity).unwrap();
+
+    let expected_revision = revision().await;
+    let delivered = deliver_operator(&f, &scope, "queued", "queue")
+        .await
+        .unwrap();
+    runtime
+        .begin_event_commit(&FlowEvent030 {
+            identity: f.identity.clone(),
+            event_id: delivered.event_id.clone(),
+            expected_revision,
+            kind: FlowEventKind030::Deliver {
+                agent: "worker".into(),
+                instance: Instance030::Shared,
+                delivery: "queue".into(),
+                message_json: json!({"prompt":"queued"}).to_string(),
+                sender: "host".into(),
+            },
+        })
+        .unwrap();
+    assert!(deliver_operator(&f, &scope, "queued", "steer")
+        .await
+        .is_err());
+    assert!(runtime.available(&f.identity).is_err());
+    assert_eq!(
+        deliver_operator(&f, &scope, "queued", "queue")
+            .await
+            .unwrap()
+            .event_id,
+        delivered.event_id
+    );
+    runtime.available(&f.identity).unwrap();
+    operator_control(&f, &scope, "resume", Action::ResumeRun)
+        .await
+        .unwrap();
+    assert!(!operator_view(&f, &scope).await.paused);
+}
+
 fn start_operator_supervisor(f: &Fixture, agents: Arc<dyn AgentExecutor030>, tasks: &StreamTasks) {
     let (pool, app, identity) = (f.pool.clone(), f.host.as_ref().clone(), f.identity.clone());
     let executors = Executors030 {

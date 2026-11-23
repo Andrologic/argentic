@@ -546,7 +546,18 @@ impl FlowHost030 {
             }
         }
     }
-    fn begin_event_commit(&self, event: &FlowEvent030) -> Result<()> {
+    fn pending_event_commit(
+        &self,
+        identity: &FlowIdentity030,
+        event_id: &str,
+    ) -> Result<Option<FlowEvent030>> {
+        let pending = self.event_committing.lock().map_err(|_| unavailable())?;
+        match pending.get(&(identity.system_start_id.clone(), event_id.into())) {
+            Some(event) if event.identity != *identity => Err(refused()),
+            event => Ok(event.cloned()),
+        }
+    }
+    pub(crate) fn begin_event_commit(&self, event: &FlowEvent030) -> Result<()> {
         let mut pending = self.event_committing.lock().map_err(|_| unavailable())?;
         let key = (
             event.identity.system_start_id.clone(),
@@ -1247,12 +1258,24 @@ pub(crate) async fn apply_native_event_transaction030(
     event: &FlowEvent030,
     clock: Option<(&crate::agsdl_host_human030::HumanBroker030, &FlowState030)>,
 ) -> Result<Apply030> {
-    runtime.available(&event.identity)?;
     let authority = Authority {
         runtime,
         owner: lease.owner(&event.identity.system_start_id)?,
-        lease: &lease,
+        lease,
     };
+    if let Some(marker) = runtime.pending_event_commit(&event.identity, &event.event_id)? {
+        if serde_json::to_string(&marker)? != serde_json::to_string(event)? {
+            return Err(refused());
+        }
+        authority
+            .owner(&mut tx, &event.identity)
+            .await
+            .map_err(store_error)?;
+        return resolve_native_event_commit_tx(runtime, lease, tx, &marker)
+            .await?
+            .ok_or_else(uncertain);
+    }
+    runtime.available(&event.identity)?;
     let result = flow_store030::apply_tx(&mut tx, &authority, event)
         .await
         .map_err(store_error)?;
@@ -1288,6 +1311,15 @@ pub(crate) async fn inspect_native_event_commit(
         .owner(&mut tx, &event.identity)
         .await
         .map_err(store_error)?;
+    resolve_native_event_commit_tx(runtime, &lease, tx, event).await
+}
+
+async fn resolve_native_event_commit_tx(
+    runtime: &FlowHost030,
+    lease: &HostStartLease,
+    mut tx: sqlx::Transaction<'_, sqlx::Sqlite>,
+    event: &FlowEvent030,
+) -> Result<Option<Apply030>> {
     let row = sqlx::query("SELECT event_json,receipt_json,diagnostic_json FROM engine_flow030_events WHERE system_id=? AND invocation_id=? AND event_id=?")
         .bind(&event.identity.system_start_id).bind(&event.identity.flow_invocation_id).bind(&event.event_id).fetch_optional(&mut *tx).await?;
     let result = match row {
