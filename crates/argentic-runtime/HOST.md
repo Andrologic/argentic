@@ -185,7 +185,9 @@ a `SourceDiagnostic` with `path`, `pointer` and `kind`. For an unreadable
 declared file the code is `PROJECT` and `source` gives the unreadable file's
 path, an empty pointer and kind `io`. For a URI resource, the error's top-level
 `pointer` and `message` still identify the URI declaration. Invalid project
-JSON uses the same code with kind `invalidContent`.
+JSON uses the same code with kind `invalidContent`. A reserved MCP secret
+name fails with `MCP_SECRET_RESERVED` and a `source` of kind
+`invalidContent` that locates the entry in the secrets requirements file.
 The path is relative to the project root and the pointer is relative to that
 file. An empty pointer refers to the entire file. A UI can show a read
 failure separately from an invalid declaration by matching `source.kind`.
@@ -254,6 +256,7 @@ Argentic keeps values in memory and in the child environment. It discards
 stderr and rejects literal secret echoes in tool results and MCP requests
 for human input before retaining them. Macro's approval must cover the server
 code, its shebang interpreter and any program the interpreter dispatches,
+such as a relative program that `/usr/bin/env` resolves in the workspace,
 and every workspace file the server reads or executes. This includes files
 loaded by imports or sourced by shell scripts. The server must keep
 credentials out of files, derived output and child command lines. Restart
