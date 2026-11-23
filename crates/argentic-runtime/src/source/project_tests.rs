@@ -396,11 +396,13 @@ fn a_linked_root_is_refused_with_a_trailing_separator() {
     std::os::unix::fs::symlink(&real, temp.path().join("link")).unwrap();
     let mut spelled = temp.path().join("link").into_os_string();
     spelled.push("/");
-    let message = refused(OpenedSource::open_path(Path::new(&spelled)));
-    assert!(
-        message.contains("root cannot be a symbolic link"),
-        "{message}"
-    );
+    for path in [PathBuf::from(spelled), temp.path().join("link/agsdl.json")] {
+        let message = refused(OpenedSource::open_path(&path));
+        assert!(
+            message.contains("root cannot be a symbolic link"),
+            "{message}"
+        );
+    }
 }
 
 /// A plain JSON source is read without listing its directory, as before.
@@ -477,4 +479,18 @@ fn component_errors_report_the_file_and_distinguish_io_from_content() {
         );
         std::fs::write(&component, "{").unwrap();
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn folder_reads_from_the_opened_directory_after_a_rename() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("first");
+    project(&root, "../notes.md", None);
+    let dir = open_project_root(&root).unwrap();
+    std::fs::rename(&root, temp.path().join("moved")).unwrap();
+    project(&root, "../notes.md", None);
+    write(&root, "notes.md", "Replacement.");
+    let source = OpenedSource::folder(dir, None).unwrap();
+    assert_eq!(files(&source)["notes.md"], b"Notes.\n");
 }

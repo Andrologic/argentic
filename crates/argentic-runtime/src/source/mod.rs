@@ -69,17 +69,14 @@ impl OpenedSource {
             .map_err(|e| io(path, e))?
             .components()
             .collect();
-        if path.is_dir() {
-            return Self::folder(&path, None);
+        let meta = std::fs::symlink_metadata(&path).map_err(|_| source_unavailable())?;
+        if meta.is_dir() || (meta.is_symlink() && path.is_dir()) {
+            return Self::folder(open_project_root(&path)?, None);
         }
         let name = path
             .file_name()
             .ok_or_else(|| invalid("", "", "Expected a source file"))?;
-        // Open a single file directly, as the host did before projects: its
-        // parent needs search permission only. An input that cannot be
-        // opened keeps the host's codes, SOURCE_UNAVAILABLE or INPUT_LIMIT.
         // A symlinked source, including a symlinked manifest, is refused.
-        let meta = std::fs::symlink_metadata(&path).map_err(|_| source_unavailable())?;
         if path
             .extension()
             .is_some_and(|ext| ext.eq_ignore_ascii_case("agsdl"))
@@ -91,7 +88,7 @@ impl OpenedSource {
                 open_local(&path).map_err(|_| source_unavailable())?,
             )?);
         }
-        // Preserve the exact UTF-8 bytes and 8 MiB limit of the existing JSON input.
+        // Preserve the exact UTF-8 bytes and 8 MiB limit of standalone JSON.
         if !meta.is_file() || meta.len() > MAX_JSON_TOTAL {
             return Err(failure(
                 "SOURCE_UNAVAILABLE",
@@ -99,7 +96,16 @@ impl OpenedSource {
                 "Expected a regular input file of at most 8 MiB",
             ));
         }
-        let file = read_local(&path, MAX_JSON_TOTAL).map_err(|e| {
+        let dir = if name == MANIFEST {
+            Some(open_project_root(path.parent().unwrap())?)
+        } else {
+            None
+        };
+        let file = match &dir {
+            Some(dir) => read_regular(dir, Path::new(MANIFEST), MAX_JSON_TOTAL),
+            None => read_local(&path, MAX_JSON_TOTAL),
+        }
+        .map_err(|e| {
             if e.kind() == std::io::ErrorKind::FileTooLarge {
                 failure("INPUT_LIMIT", "host", "Input grew beyond 8 MiB")
             } else {
@@ -108,11 +114,12 @@ impl OpenedSource {
         })?;
         let authored = std::str::from_utf8(&file.bytes)
             .map_err(|_| failure("PARSE", "source", "Source must be UTF-8"))?;
-        if name == MANIFEST
-            && serde_json::from_str::<Value>(authored)
+        if let Some(dir) = dir {
+            if serde_json::from_str::<Value>(authored)
                 .is_ok_and(|doc| doc.get("projectFormat").is_some())
-        {
-            return Self::folder(path.parent().unwrap(), Some(file));
+            {
+                return Self::folder(dir, Some(file));
+            }
         }
         crate::persistence::validate_json(authored)?;
         let authored = authored.to_owned();
@@ -129,17 +136,8 @@ impl OpenedSource {
         Self::archived(archive::read(Cursor::new(bytes))?)
     }
 
-    fn folder(root: &Path, manifest: Option<ProjectFile>) -> Result<Self> {
-        // The official tool refuses a project root that is a symbolic link.
-        if std::fs::symlink_metadata(root).is_ok_and(|meta| meta.is_symlink()) {
-            return Err(invalid(
-                MANIFEST,
-                "",
-                "The project root cannot be a symbolic link",
-            ));
-        }
-        let project = project::assemble_folder(root, manifest)?;
-        Self::assembled(project)
+    fn folder(dir: Dir, manifest: Option<ProjectFile>) -> Result<Self> {
+        Self::assembled(project::assemble_folder(dir, manifest)?)
     }
 
     fn archived(files: Files) -> Result<Self> {
@@ -354,6 +352,61 @@ fn parse_json(bytes: &[u8], file: &str, project_limits: bool) -> Result<Value> {
     Ok(value)
 }
 
+fn open_project_root(path: &Path) -> Result<Dir> {
+    let no_link = || {
+        invalid(
+            MANIFEST,
+            "",
+            "The project root cannot be a symbolic link or reparse point",
+        )
+    };
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let flags = libc::O_DIRECTORY | libc::O_NOFOLLOW;
+        #[cfg(target_os = "linux")]
+        let flags = flags | libc::O_PATH;
+        options.custom_flags(flags);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+            FILE_SHARE_WRITE,
+        };
+        // cap-std uses paths for some Windows directory operations. Hold the
+        // root without delete sharing so its name cannot be replaced.
+        options
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
+    }
+    let file = options.open(path).map_err(|error| {
+        if std::fs::symlink_metadata(path).is_ok_and(|meta| meta.is_symlink()) {
+            no_link()
+        } else {
+            io(Path::new(MANIFEST), error)
+        }
+    })?;
+    let meta = file
+        .metadata()
+        .map_err(|error| io(Path::new(MANIFEST), error))?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+        if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(no_link());
+        }
+    }
+    if !meta.is_dir() {
+        return Err(invalid(MANIFEST, "", "Expected a project directory"));
+    }
+    Ok(Dir::from_std_file(file))
+}
+
 fn open_regular(dir: &Dir, path: &Path) -> std::io::Result<cap_std::fs::File> {
     if !dir.symlink_metadata(path)?.is_file() {
         return Err(std::io::Error::new(
@@ -368,8 +421,26 @@ fn open_regular(dir: &Dir, path: &Path) -> std::io::Result<cap_std::fs::File> {
         use cap_std::fs::OpenOptionsExt;
         options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
     }
+    #[cfg(windows)]
+    {
+        use cap_std::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
     let file = dir.open_with(path, &options)?;
-    if !file.metadata()?.is_file() {
+    let meta = file.metadata()?;
+    #[cfg(windows)]
+    {
+        use cap_std::fs::MetadataExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+        if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Expected a regular file",
+            ));
+        }
+    }
+    if !meta.is_file() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "Expected a regular file",

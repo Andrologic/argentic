@@ -3,7 +3,7 @@ use super::{
     MAX_JSON_TOTAL, MAX_TOTAL,
 };
 use crate::persistence::Result;
-use cap_std::{ambient_authority, fs::Dir};
+use cap_std::fs::Dir;
 use percent_encoding::{percent_decode_str, utf8_percent_encode, NON_ALPHANUMERIC};
 use serde_json::{Map, Value};
 use std::{
@@ -51,7 +51,7 @@ fn scheme(uri: &str) -> Option<&str> {
 }
 
 struct Reader {
-    dir: Option<(Dir, PathBuf)>,
+    dir: Option<Dir>,
     files: Files,
     selected: BTreeSet<String>,
     skills: BTreeSet<String>,
@@ -60,13 +60,8 @@ struct Reader {
     total: u64,
 }
 
-pub(super) fn assemble_folder(
-    path: &Path,
-    manifest: Option<super::ProjectFile>,
-) -> Result<Project> {
-    let dir = Dir::open_ambient_dir(path, ambient_authority()).map_err(|e| io(path, e))?;
-    let root = path.canonicalize().map_err(|e| io(path, e))?;
-    let mut reader = Reader::new(Some((dir, root)), Files::new());
+pub(super) fn assemble_folder(dir: Dir, manifest: Option<super::ProjectFile>) -> Result<Project> {
+    let mut reader = Reader::new(Some(dir), Files::new());
     if let Some(file) = manifest {
         let canonical = reader.resolve(MANIFEST, MANIFEST, "")?;
         reader.total = file.bytes.len() as u64;
@@ -80,7 +75,7 @@ pub(super) fn assemble_archive(files: Files) -> Result<Project> {
 }
 
 impl Reader {
-    fn new(dir: Option<(Dir, PathBuf)>, files: Files) -> Self {
+    fn new(dir: Option<Dir>, files: Files) -> Self {
         Self {
             dir,
             files,
@@ -106,7 +101,7 @@ impl Reader {
             return Err(invalid(path, "", "Too many selected project files"));
         }
         if !self.files.contains_key(path) {
-            let (dir, _) = self
+            let dir = self
                 .dir
                 .as_ref()
                 .ok_or_else(|| invalid(path, "", "File absent from archive inventory"))?;
@@ -187,7 +182,7 @@ impl Reader {
                     archive::portable(&walked).map_err(|_| error("Invalid portable path"))?;
                     self.spell(&walked, &walked)
                         .map_err(|_| error("Case collision or too many project paths"))?;
-                    if let Some((dir, _)) = &self.dir {
+                    if let Some(dir) = &self.dir {
                         if dir
                             .symlink_metadata(parts.join("/"))
                             .is_ok_and(|meta| meta.is_symlink())
@@ -210,7 +205,7 @@ impl Reader {
 
     fn is_file(&self, path: &str) -> bool {
         match &self.dir {
-            Some((dir, _)) => dir.symlink_metadata(path).is_ok_and(|meta| meta.is_file()),
+            Some(dir) => dir.symlink_metadata(path).is_ok_and(|meta| meta.is_file()),
             None => self.files.contains_key(path),
         }
     }
@@ -588,7 +583,7 @@ impl Reader {
         }
         let mut pending = vec![PathBuf::from(directory)];
         let mut entries = 0;
-        if let Some((dir, _)) = &self.dir {
+        if let Some(dir) = &self.dir {
             let mut names = Vec::new();
             let mut directories = Vec::new();
             while let Some(path) = pending.pop() {
