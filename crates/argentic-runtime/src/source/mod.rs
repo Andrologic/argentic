@@ -207,23 +207,32 @@ impl OpenedSource {
     /// Exports the opened project files without Git history.
     /// Returns a `PROJECT` error for a plain JSON document or an archive limit
     /// violation before writing any bytes. On an I/O error the output may be
-    /// incomplete. The caller owns flushing and publishing the output.
-    pub fn write_archive(&self, output: impl Write) -> Result<()> {
+    /// incomplete. The output is flushed before success is reported; the
+    /// caller still owns syncing and publishing it.
+    pub fn write_archive<W: Write + ?Sized>(&self, output: &mut W) -> Result<()> {
         let project = self
             .project
             .as_ref()
             .ok_or_else(|| invalid(MANIFEST, "", "Source is not an AgSDL project"))?;
-        archive::write(&project.files, output)
+        archive::write(&project.files, &mut *output)?;
+        output.flush().map_err(|error| {
+            invalid(
+                MANIFEST,
+                "",
+                &format!("Could not flush archive output: {error}"),
+            )
+        })
     }
 
     /// Map an assembled JSON pointer to a project-relative file and a pointer
     /// within that file. Inline fields map to the manifest. This uses the
     /// closest declaring component and does not check whether the value exists.
-    /// Returns `None` for a plain JSON document or a non-pointer category.
+    /// Returns `None` for a plain JSON document, a non-pointer category or a
+    /// malformed JSON pointer.
     pub fn component_origin<'a>(&'a self, pointer: &'a str) -> Option<(&'a str, &'a str)> {
         self.project
             .as_ref()
-            .filter(|_| pointer.is_empty() || pointer.starts_with('/'))
+            .filter(|_| valid_json_pointer(pointer))
             .map(|project| project.origin(pointer))
     }
 
@@ -251,6 +260,15 @@ impl OpenedSource {
             }),
         }
     }
+}
+
+/// RFC 6901: empty or `/`-prefixed, and every `~` escapes `0` or `1`.
+fn valid_json_pointer(pointer: &str) -> bool {
+    (pointer.is_empty() || pointer.starts_with('/'))
+        && pointer
+            .split('~')
+            .skip(1)
+            .all(|rest| rest.starts_with(['0', '1']))
 }
 
 fn invalid(file: &str, pointer: &str, message: &str) -> EngineFailure {

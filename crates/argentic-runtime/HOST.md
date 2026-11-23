@@ -80,9 +80,19 @@ before writing. The host owns the output. When saving to disk, write to a
 private temporary file, flush it and publish the completed file at a new
 `.agsdl` path. Discard the temporary file on failure.
 
+The writer flushes the output before reporting success. A flush or write
+error returns an error, and the partial output must be discarded.
+
+Path checks use the Unicode tables of this crate's dependencies. The AgSDL
+v0.5.0 reference tool uses the tables of its Python runtime, so on Python 3.9
+it rejects file names containing characters assigned after Unicode 13. Keep
+such names out of projects meant for that tool until AgSDL fixes a Unicode
+baseline.
+
 The optional interoperability test uses Python 3.9 or newer and the
 AgSDL v0.5.0 reference tool. Set `AGSDL_REFERENCE_CHECKOUT` to the root
-of that checkout and run the test with Cargo.
+of that checkout and run the test with Cargo. An explicit path that is not
+an AgSDL checkout fails the test instead of skipping it.
 
 ```sh
 cargo test --locked --manifest-path crates/argentic-runtime/Cargo.toml \

@@ -109,7 +109,31 @@ fn selected_files_and_archive_keep_the_opened_snapshot() {
             assert_eq!(source.component_origin(pointer), Some(origin));
         }
         assert_eq!(source.component_origin("projectSnapshot"), None);
+        assert_eq!(source.component_origin("/agents/review/~2"), None);
+        assert_eq!(source.component_origin("/agents/review~"), None);
+        assert_eq!(
+            source.component_origin("/agents/review/a~1b~0c"),
+            Some(("agents/review.json", "/a~1b~0c"))
+        );
     }
+}
+
+#[test]
+fn a_failed_flush_is_reported() {
+    struct Rejects;
+    impl std::io::Write for Rejects {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("rejected"))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::other("rejected"))
+        }
+    }
+    let temp = tempfile::tempdir().unwrap();
+    project(temp.path());
+    let source = OpenedSource::open_path(temp.path()).unwrap();
+    let mut output = std::io::BufWriter::with_capacity(1 << 20, Rejects);
+    assert!(source.write_archive(&mut output).is_err());
 }
 
 #[cfg(unix)]
@@ -144,12 +168,18 @@ fn a_json_document_has_no_project_files_or_archive() {
 
 #[test]
 fn archive_interchanges_with_reference_tool() {
-    let reference = std::env::var_os("AGSDL_REFERENCE_CHECKOUT")
-        .map(std::path::PathBuf::from)
-        .or_else(|| {
-            let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })?;
-            Some(Path::new(&home).join("github/AgSDL"))
-        });
+    let explicit = std::env::var_os("AGSDL_REFERENCE_CHECKOUT").map(std::path::PathBuf::from);
+    if let Some(root) = &explicit {
+        assert!(
+            root.join("tooling/agsdl/archive.py").is_file(),
+            "AGSDL_REFERENCE_CHECKOUT does not point to an AgSDL checkout: {}",
+            root.display()
+        );
+    }
+    let reference = explicit.or_else(|| {
+        let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })?;
+        Some(Path::new(&home).join("github/AgSDL"))
+    });
     let Some(tooling) = reference
         .map(|root| root.join("tooling"))
         .filter(|path| path.join("agsdl/archive.py").is_file())
