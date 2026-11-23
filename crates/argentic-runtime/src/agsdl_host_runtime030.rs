@@ -522,7 +522,10 @@ pub(crate) async fn drain_effects030(
                         fresh.flow.effects.iter().any(|row| {
                             row["status"] == "pending" && row["effect"]["id"] == effect.id
                         });
-                    if !fresh.flow.state.stopping || !unclaimed {
+                    if !(fresh.flow.state.stopping && unclaimed
+                        || error.code == "STALE_REFERENCE"
+                            && fresh.start_settled_without_admission(&effect))
+                    {
                         return Err(error);
                     }
                 }
@@ -544,7 +547,7 @@ pub(crate) async fn drain_effects030(
                             && fresh.flow.effects.iter().any(|row| {
                                 row["status"] == "pending" && row["effect"]["id"] == effect.id
                             });
-                    if !withdrawn {
+                    if !withdrawn && !fresh.start_settled_without_admission(&effect) {
                         return Err(error);
                     }
                 }

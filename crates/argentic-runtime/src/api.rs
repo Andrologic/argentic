@@ -226,12 +226,7 @@ impl StartSession<'_> {
 }
 /// Startup fencing retains Macro's existing interruption semantics.
 pub async fn interrupt_previous_runs(pool: &SqlitePool) -> Result<()> {
-    flow::interrupt_previous_runs030(
-        pool,
-        #[cfg(test)]
-        None,
-    )
-    .await
+    flow::interrupt_previous_runs030(pool).await
 }
 
 pub const CODEX_ADAPTER: &str = crate::agsdl_host_codex::ADAPTER;
@@ -362,7 +357,7 @@ impl StartSession<'_> {
                 },
             ));
         let agents: Arc<dyn crate::agsdl_host_runtime030::AgentExecutor030> = Arc::new(agents);
-        #[cfg(feature = "dev-support")]
+        #[cfg(any(test, feature = "dev-support"))]
         let agents = self
             .engine
             .flow030()

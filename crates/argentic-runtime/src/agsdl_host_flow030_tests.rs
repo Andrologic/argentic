@@ -100,6 +100,7 @@ async fn example_policy_for_refusal(
         .unwrap()
         .clone();
     let inspection = flow::NativeFlowInspection030 {
+        generation: "generation".into(),
         owner: EngineOwner {
             system_start_id: identity.system_start_id.clone(),
             owner_epoch: "owner".into(),

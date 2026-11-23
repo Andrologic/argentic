@@ -1113,8 +1113,34 @@ impl FlowHost030 {
 /// read in one SQLite snapshot and never adapted into a historical State020.
 pub(crate) struct NativeFlowInspection030 {
     pub owner: EngineOwner,
+    pub generation: String,
     pub capture: StartCapture030,
     pub flow: FlowView030,
+}
+
+impl NativeFlowInspection030 {
+    // Stop settles the outbox row and records this event in one transaction.
+    pub(crate) fn start_settled_without_admission(&self, effect: &FlowEffect030) -> bool {
+        let FlowEffectKind030::Start { work, .. } = &effect.kind else {
+            return false;
+        };
+        self.flow
+            .state
+            .events
+            .contains_key(&format!("no-admission:{}", effect.id))
+            && self.flow.effects.iter().any(|row| {
+                if row["status"] != "settled" || row["effect"]["id"] != effect.id {
+                    return false;
+                }
+                serde_json::from_value::<NoAdmissionReceipt030>(row["settlement"].clone())
+                    .is_ok_and(|proof| {
+                        proof.identity == effect.identity
+                            && proof.work == *work
+                            && proof.owner_epoch == self.owner.owner_epoch
+                            && proof.generation == self.generation
+                    })
+            })
+    }
 }
 
 pub(crate) async fn inspect_run(
@@ -1162,6 +1188,7 @@ pub(crate) async fn inspect_run(
     lease.ensure_live()?;
     Ok(NativeFlowInspection030 {
         owner: owner.clone(),
+        generation: lease.generation().into(),
         capture,
         flow,
     })
@@ -2877,11 +2904,15 @@ pub(crate) async fn interrupt_run030(pool: &SqlitePool, system: &str) -> Result<
     Ok(())
 }
 
+#[cfg(test)]
+tokio::task_local! {
+    pub(crate) static RECOVERY_TEST_HOST030: HostState;
+}
+
 /// Fence unfinished runs left by an earlier application process.
-pub(crate) async fn interrupt_previous_runs030(
-    pool: &SqlitePool,
-    #[cfg(test)] runtime: Option<&FlowHost030>,
-) -> Result<()> {
+pub(crate) async fn interrupt_previous_runs030(pool: &SqlitePool) -> Result<()> {
+    #[cfg(test)]
+    let host = RECOVERY_TEST_HOST030.try_with(HostState::clone).ok();
     let mut db = pool.acquire().await?;
     let mut tx = db.begin_with("BEGIN IMMEDIATE").await?;
     mark_interrupted_tx(&mut tx, None, None).await?;
@@ -2889,13 +2920,13 @@ pub(crate) async fn interrupt_previous_runs030(
         .execute(&mut *tx)
         .await?;
     #[cfg(test)]
-    if let Some(runtime) = runtime {
-        runtime.operator_test_yield("recovery.commit").await;
+    if let Some(host) = &host {
+        host.flow030().operator_test_yield("recovery.commit").await;
     }
     tx.commit().await?;
     #[cfg(test)]
-    if let Some(runtime) = runtime {
-        runtime.operator_test_yield("recovery.ack").await;
+    if let Some(host) = &host {
+        host.flow030().operator_test_yield("recovery.ack").await;
     }
     Ok(())
 }

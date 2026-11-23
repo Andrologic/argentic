@@ -85,7 +85,7 @@ async fn timed_work(
         .await
         .unwrap();
     let agent = Arc::new(PausableAgent::default());
-    start(&f, tasks, agent.clone());
+    start(&f, tasks, agent.clone()).await;
     let id = operator_wait(async || {
         sqlx::query_scalar::<_, String>(
             "SELECT activation_id FROM engine_flow030_clock_works WHERE retired=0",
@@ -210,14 +210,16 @@ async fn operator_schedule_lost_control_ack_before_supervisor_pass_and_retry() {
 
 #[tokio::test]
 async fn operator_schedule_stop_after_lost_control_ack_without_retry() {
-    for command in COMMANDS {
-        let tasks = StreamTasks::default();
-        let (f, scope, _, id) = timed_work(command, &tasks).await;
-        let pass = freeze_pass(&f).await;
-        cancel_command(&f, &scope, "scheduled", command.action(&id), "operator.ack").await;
-        stop(&f).await;
-        pass.release();
-        stopped(&f).await;
+    for stop_path in STOP_PATHS {
+        for command in COMMANDS {
+            let tasks = StreamTasks::default();
+            let (f, scope, _, id) = timed_work(command, &tasks).await;
+            let pass = freeze_pass(&f).await;
+            cancel_command(&f, &scope, "scheduled", command.action(&id), "operator.ack").await;
+            stop(&f, &tasks, stop_path).await;
+            pass.release();
+            stopped(&f).await;
+        }
     }
 }
 
@@ -271,66 +273,75 @@ async fn operator_schedule_restart_with_timed_work_at_control_boundaries() {
 
 #[tokio::test]
 async fn operator_schedule_stop_during_timed_agent_tick() {
-    let boundaries: &[_] = if exhaustive() {
-        &["clock.reserved", "clock.evaluated", "clock.commit"]
-    } else {
-        &["clock.evaluated"]
-    };
-    for &boundary in boundaries {
-        let f = Arc::new(
-            Fixture::with_document(document(
-                json!({"work":{"type":"agent","agent":"worker","timeoutMs":10000}}),
-                "work",
-            ))
-            .await,
-        );
-        let runtime = f.host.flow030();
-        let clock = runtime.human_runtime().virtual_clock().await.unwrap();
-        let tasks = StreamTasks::default();
-        let agent = Arc::new(ScheduledAgent::default());
-        start(&f, &tasks, agent.clone());
-        tokio::time::timeout(WAIT, agent.running.notified())
-            .await
-            .unwrap();
-        let pass = freeze_pass(&f).await;
-        let tick = arm(&f, boundary);
-        clock.advance_to(10001).unwrap();
-        pass.release();
-        reached(&tick, boundary).await;
-        stop_at(&f, tick, boundary == "clock.commit").await;
-        stopped(&f).await;
+    for stop_path in STOP_PATHS {
+        let boundaries: &[_] = if exhaustive() {
+            &["clock.reserved", "clock.evaluated", "clock.commit"]
+        } else {
+            &["clock.evaluated"]
+        };
+        for &boundary in boundaries {
+            let f = Arc::new(
+                Fixture::with_document(document(
+                    json!({"work":{"type":"agent","agent":"worker","timeoutMs":10000}}),
+                    "work",
+                ))
+                .await,
+            );
+            let runtime = f.host.flow030();
+            let clock = runtime.human_runtime().virtual_clock().await.unwrap();
+            let tasks = StreamTasks::default();
+            let agent = Arc::new(ScheduledAgent::default());
+            start(&f, &tasks, agent.clone()).await;
+            tokio::time::timeout(WAIT, agent.running.notified())
+                .await
+                .unwrap();
+            let pass = freeze_pass(&f).await;
+            let tick = arm(&f, boundary);
+            clock.advance_to(10001).unwrap();
+            pass.release();
+            reached(&tick, boundary).await;
+            stop_at(&f, &tasks, stop_path, tick, boundary == "clock.commit").await;
+            stopped(&f).await;
+        }
     }
 }
 
-async fn stop_at(f: &Arc<Fixture>, gap: Arc<CommitTestHook030>, holds_admission: bool) {
+async fn stop_at(
+    f: &Fixture,
+    tasks: &StreamTasks,
+    path: StopPath,
+    gap: Arc<CommitTestHook030>,
+    holds_admission: bool,
+) {
     if holds_admission {
         // Poll Stop while the other actor owns admission, then release it.
-        let stopping = stop(f);
+        let stopping = stop(f, tasks, path);
         tokio::pin!(stopping);
         assert!(futures::poll!(&mut stopping).is_pending());
         gap.release();
         stopping.await;
     } else {
-        stop(f).await;
+        stop(f, tasks, path).await;
         gap.release();
     }
 }
 
 #[tokio::test]
 async fn operator_schedule_stop_during_joined_finalization() {
-    let boundaries: &[_] = if exhaustive() {
-        &[
-            "supervisor.joined",
-            "work.join.reserved",
-            "work.join.evaluated",
-            "work.reserve.commit",
-            "work.ack",
-        ]
-    } else {
-        &["supervisor.joined", "work.ack"]
-    };
-    for &boundary in boundaries {
-        let f = Arc::new(
+    for stop_path in STOP_PATHS {
+        let boundaries: &[_] = if exhaustive() {
+            &[
+                "supervisor.joined",
+                "work.join.reserved",
+                "work.join.evaluated",
+                "work.reserve.commit",
+                "work.ack",
+            ]
+        } else {
+            &["supervisor.joined", "work.ack"]
+        };
+        for &boundary in boundaries {
+            let f = Arc::new(
             Fixture::with_document(document(
                 json!({
                     "work":{"type":"agent","agent":"worker","timeoutMs":10000,"onError":"handler"},
@@ -340,70 +351,78 @@ async fn operator_schedule_stop_during_joined_finalization() {
             ))
             .await,
         );
-        let tasks = StreamTasks::default();
-        let agent = Arc::new(ScheduledAgent::default());
-        start(&f, &tasks, agent.clone());
-        tokio::time::timeout(WAIT, agent.running.notified())
-            .await
-            .unwrap();
-        let joined = arm(&f, "supervisor.joined");
-        agent.fail.notify_one();
-        reached(&joined, "supervisor.joined").await;
-        let gap = if boundary == "supervisor.joined" {
-            joined
-        } else {
-            let gap = arm(&f, boundary);
-            joined.release();
-            reached(&gap, boundary).await;
-            gap
-        };
-        stop_at(
-            &f,
-            gap,
-            matches!(boundary, "work.reserve.commit" | "work.ack"),
-        )
-        .await;
-        stopped(&f).await;
+            let tasks = StreamTasks::default();
+            let agent = Arc::new(ScheduledAgent::default());
+            start(&f, &tasks, agent.clone()).await;
+            tokio::time::timeout(WAIT, agent.running.notified())
+                .await
+                .unwrap();
+            let joined = arm(&f, "supervisor.joined");
+            agent.fail.notify_one();
+            reached(&joined, "supervisor.joined").await;
+            let gap = if boundary == "supervisor.joined" {
+                joined
+            } else {
+                let gap = arm(&f, boundary);
+                joined.release();
+                reached(&gap, boundary).await;
+                gap
+            };
+            stop_at(
+                &f,
+                &tasks,
+                stop_path,
+                gap,
+                matches!(boundary, "work.reserve.commit" | "work.ack"),
+            )
+            .await;
+            stopped(&f).await;
+        }
     }
 }
 
 #[tokio::test]
 async fn operator_schedule_stop_and_restart_at_agent_start() {
-    let boundaries: &[_] = if exhaustive() {
-        &[
-            "effect.admission",
-            "effect.claim.commit",
-            "effect.claim.ack",
-            "effect.handoff.commit",
-            "effect.handoff.ack",
-        ]
-    } else {
-        &["effect.claim.ack"]
-    };
-    for &boundary in boundaries {
-        for restart in [false, true] {
-            let f = Arc::new(
-                Fixture::with_document(document(
-                    json!({"work":{"type":"agent","agent":"worker","timeoutMs":10000}}),
-                    "work",
-                ))
-                .await,
-            );
-            let scope = operator_scope(&f).await;
-            let tasks = StreamTasks::default();
-            let gap = arm(&f, boundary);
-            start(&f, &tasks, Arc::new(ScheduledAgent::default()));
-            reached(&gap, boundary).await;
-            if restart {
-                f.host
-                    .flow030()
-                    .supervisors
-                    .crash_operator_fixture(&f.identity.system_start_id)
-                    .await;
-                interrupt_reopened(&f, &scope).await;
-            } else {
-                stop_at(&f, gap, boundary != "effect.admission").await;
-                stopped(&f).await;
+    for stop_path in STOP_PATHS {
+        let boundaries: &[_] = if exhaustive() {
+            &[
+                "effect.admission",
+                "effect.claim.commit",
+                "effect.claim.ack",
+                "effect.handoff.commit",
+                "effect.handoff.ack",
+            ]
+        } else {
+            &["effect.admission", "effect.claim.ack"]
+        };
+        for &boundary in boundaries {
+            for restart in [false, true] {
+                if restart && matches!(stop_path, StopPath::Public) {
+                    continue;
+                }
+                let f = Arc::new(
+                    Fixture::with_document(document(
+                        json!({"work":{"type":"agent","agent":"worker","timeoutMs":10000}}),
+                        "work",
+                    ))
+                    .await,
+                );
+                let scope = operator_scope(&f).await;
+                let tasks = StreamTasks::default();
+                let gap = arm(&f, boundary);
+                start(&f, &tasks, Arc::new(ScheduledAgent::default())).await;
+                reached(&gap, boundary).await;
+                if restart {
+                    f.host
+                        .flow030()
+                        .supervisors
+                        .crash_operator_fixture(&f.identity.system_start_id)
+                        .await;
+                    interrupt_reopened(&f, &scope).await;
+                } else {
+                    stop_at(&f, &tasks, stop_path, gap, boundary != "effect.admission").await;
+                    stopped(&f).await;
+                }
             }
         }
     }
@@ -411,96 +430,98 @@ async fn operator_schedule_stop_and_restart_at_agent_start() {
 
 #[tokio::test]
 async fn operator_schedule_steer_receipt_with_stop_restart_or_lost_hold_ack() {
-    let endings: &[_] = if exhaustive() {
-        &["stop", "restart", "pause", "interrupt"]
-    } else {
-        &["pause", "stop"]
-    };
-    for &ending in endings {
-        let f = Arc::new(
-            Fixture::with_document(document(
-                json!({
-                    "seed":{"type":"agent","agent":"worker","next":["work","steer"]},
-                    "work":{"type":"agent","agent":"worker"},
-                    "steer":{"type":"agent","agent":"worker","delivery":"steer"}
-                }),
-                "seed",
-            ))
-            .await,
-        );
-        let scope = operator_scope(&f).await;
-        let tasks = StreamTasks::default();
-        let steer = Arc::new(DeferredSteer::default());
-        let agent = Arc::new(PausableAgent {
-            deferred_steer: Some(steer.clone()),
-            confirm_deferred_steer: true,
-            ..Default::default()
-        });
-        let gap = arm(&f, "steer.receipt");
-        start(&f, &tasks, agent.clone());
-        tokio::time::timeout(WAIT, steer.sent.notified())
-            .await
-            .unwrap();
-        let work = inspect(&f)
-            .await
-            .state
-            .activations
-            .into_iter()
-            .find(|a| a.step.as_deref() == Some(&["work".into()]))
-            .unwrap();
-        steer.report.notify_one();
-        reached(&gap, "steer.receipt").await;
-        match ending {
-            "stop" => {
-                stop(&f).await;
-                gap.release();
-                stopped(&f).await;
-                assert!(inspect(&f)
-                    .await
-                    .state
-                    .steer_deliveries
-                    .iter()
-                    .all(|d| d.status != "pending"));
-            }
-            "restart" => {
-                f.host
-                    .flow030()
-                    .supervisors
-                    .crash_operator_fixture(&scope.system_start_id)
+    for stop_path in STOP_PATHS {
+        let endings: &[_] = if exhaustive() {
+            &["stop", "restart", "pause", "interrupt"]
+        } else {
+            &["pause", "stop"]
+        };
+        for &ending in endings {
+            let f = Arc::new(
+                Fixture::with_document(document(
+                    json!({
+                        "seed":{"type":"agent","agent":"worker","next":["work","steer"]},
+                        "work":{"type":"agent","agent":"worker"},
+                        "steer":{"type":"agent","agent":"worker","delivery":"steer"}
+                    }),
+                    "seed",
+                ))
+                .await,
+            );
+            let scope = operator_scope(&f).await;
+            let tasks = StreamTasks::default();
+            let steer = Arc::new(DeferredSteer::default());
+            let agent = Arc::new(PausableAgent {
+                deferred_steer: Some(steer.clone()),
+                confirm_deferred_steer: true,
+                ..Default::default()
+            });
+            let gap = arm(&f, "steer.receipt");
+            start(&f, &tasks, agent.clone()).await;
+            tokio::time::timeout(WAIT, steer.sent.notified())
+                .await
+                .unwrap();
+            let work = inspect(&f)
+                .await
+                .state
+                .activations
+                .into_iter()
+                .find(|a| a.step.as_deref() == Some(&["work".into()]))
+                .unwrap();
+            steer.report.notify_one();
+            reached(&gap, "steer.receipt").await;
+            match ending {
+                "stop" => {
+                    stop(&f, &tasks, stop_path).await;
+                    gap.release();
+                    stopped(&f).await;
+                    assert!(inspect(&f)
+                        .await
+                        .state
+                        .steer_deliveries
+                        .iter()
+                        .all(|d| d.status != "pending"));
+                }
+                "restart" => {
+                    f.host
+                        .flow030()
+                        .supervisors
+                        .crash_operator_fixture(&scope.system_start_id)
+                        .await;
+                    tasks
+                        .cancel_owned(&format!(
+                            "flow030:{}:{}",
+                            scope.system_start_id,
+                            work.start_effect_id.unwrap()
+                        ))
+                        .await
+                        .unwrap();
+                    interrupt_reopened(&f, &scope).await;
+                    gap.release();
+                }
+                _ => {
+                    let (hold, resume) = if ending == "pause" {
+                        (Command::Pause, Command::ResumeRun)
+                    } else {
+                        (Command::Interrupt, Command::ResumeWork)
+                    };
+                    cancel_command(
+                        &f,
+                        &scope,
+                        "scheduled",
+                        hold.action(&work.id),
+                        "operator.ack",
+                    )
                     .await;
-                tasks
-                    .cancel_owned(&format!(
-                        "flow030:{}:{}",
-                        scope.system_start_id,
-                        work.start_effect_id.unwrap()
-                    ))
-                    .await
-                    .unwrap();
-                interrupt_reopened(&f, &scope).await;
-                gap.release();
-            }
-            _ => {
-                let (hold, resume) = if ending == "pause" {
-                    (Command::Pause, Command::ResumeRun)
-                } else {
-                    (Command::Interrupt, Command::ResumeWork)
-                };
-                cancel_command(
-                    &f,
-                    &scope,
-                    "scheduled",
-                    hold.action(&work.id),
-                    "operator.ack",
-                )
-                .await;
-                gap.release();
-                wait_for_consumption(&f).await;
-                wait_held(&f, &work.id).await;
-                operator_control(&f, &scope, "release", resume.action(&work.id))
-                    .await
-                    .unwrap();
-                agent.finish_work.notify_one();
-                finished(&f, "succeeded").await;
+                    gap.release();
+                    wait_for_consumption(&f).await;
+                    wait_held(&f, &work.id).await;
+                    operator_control(&f, &scope, "release", resume.action(&work.id))
+                        .await
+                        .unwrap();
+                    agent.finish_work.notify_one();
+                    finished(&f, "succeeded").await;
+                }
             }
         }
     }
@@ -630,7 +651,7 @@ async fn operator_schedule_lost_executor_held_ack() {
         lose_held_ack: Some(lose.clone()),
         ..Default::default()
     });
-    start(&f, &tasks, agent.clone());
+    start(&f, &tasks, agent.clone()).await;
     let id = operator_wait(async || {
         sqlx::query_scalar::<_, String>("SELECT activation_id FROM engine_flow030_clock_works")
             .fetch_optional(&f.pool)
@@ -702,7 +723,7 @@ async fn operator_schedule_join_and_compose_with_lost_pause_and_resume_acks() {
             let scope = operator_scope(&f).await;
             let tasks = StreamTasks::default();
             let agent = Arc::new(GatedAgent::default());
-            start(&f, &tasks, agent.clone());
+            start(&f, &tasks, agent.clone()).await;
             let id = operator_wait(async || {
                 let view = inspect(&f).await;
                 view.state
@@ -765,33 +786,34 @@ async fn operator_schedule_join_and_compose_with_lost_pause_and_resume_acks() {
 
 #[tokio::test]
 async fn operator_schedule_fanout_with_pause_interrupt_and_stop() {
-    for action in ["pause", "interrupt", "stop"] {
-        let mut doc = document(
-            json!({
-                "list":{"type":"agent","agent":"lead","next":{"step":"work","each":["results","items"],"concurrency":1}},
-                "work":{"type":"agent","agent":"worker","instance":"new"}
-            }),
-            "list",
-        );
-        doc["agents"]["lead"] = json!({"harness":"codex","permissions":"read-only","results":{"items":{"schema":{"type":"array","items":{"type":"string"}}}}});
-        let f = Fixture::with_document(doc).await;
-        let scope = operator_scope(&f).await;
-        let tasks = StreamTasks::default();
-        let agent = Arc::new(GatedAgent::default());
-        let second = f
-            .host
-            .flow030()
-            .install_nth_operator_test_hook("supervisor.pass", 2);
-        start(&f, &tasks, agent.clone());
-        reached(&second, "supervisor.pass").await;
-        assert_eq!(
-            inspect(&f).await.state.activations[0].step.as_deref(),
-            Some(["list".into()].as_slice())
-        );
-        second.release();
+    for stop_path in STOP_PATHS {
+        for action in ["pause", "interrupt", "stop"] {
+            let mut doc = document(
+                json!({
+                    "list":{"type":"agent","agent":"lead","next":{"step":"work","each":["results","items"],"concurrency":1}},
+                    "work":{"type":"agent","agent":"worker","instance":"new"}
+                }),
+                "list",
+            );
+            doc["agents"]["lead"] = json!({"harness":"codex","permissions":"read-only","results":{"items":{"schema":{"type":"array","items":{"type":"string"}}}}});
+            let f = Fixture::with_document(doc).await;
+            let scope = operator_scope(&f).await;
+            let tasks = StreamTasks::default();
+            let agent = Arc::new(GatedAgent::default());
+            let second = f
+                .host
+                .flow030()
+                .install_nth_operator_test_hook("supervisor.pass", 2);
+            start(&f, &tasks, agent.clone()).await;
+            reached(&second, "supervisor.pass").await;
+            assert_eq!(
+                inspect(&f).await.state.activations[0].step.as_deref(),
+                Some(["list".into()].as_slice())
+            );
+            second.release();
 
-        for index in ["0", "1", "2"] {
-            let id = operator_wait(async || {
+            for index in ["0", "1", "2"] {
+                let id = operator_wait(async || {
                 let view = inspect(&f).await;
                 assert!(
                     view.state.verdict.is_none(),
@@ -806,44 +828,43 @@ async fn operator_schedule_fanout_with_pause_interrupt_and_stop() {
                     .bind(id).fetch_optional(&f.pool).await.unwrap()
             })
             .await;
-            if index == "1" && action == "stop" {
-                stop(&f).await;
-                stopped(&f).await;
-                assert!(inspect(&f).await.state.activations.iter().all(|a| a
-                    .occurrence
-                    .as_ref()
-                    .is_none_or(|o| o.item_index != "2")
-                    || !a.physical));
-                break;
-            }
-            if index == "1" {
-                let (hold, resume) = if action == "pause" {
-                    (Command::Pause, Command::ResumeRun)
-                } else {
-                    (Command::Interrupt, Command::ResumeWork)
-                };
-                operator_control(&f, &scope, "hold-item", hold.action(&id))
-                    .await
-                    .unwrap();
-                wait_held(&f, &id).await;
-                assert_eq!(
-                    inspect(&f)
+                if index == "1" && action == "stop" {
+                    stop(&f, &tasks, stop_path).await;
+                    stopped(&f).await;
+                    assert!(inspect(&f).await.state.activations.iter().all(|a| {
+                        a.occurrence.as_ref().is_none_or(|o| o.item_index != "2") || !a.physical
+                    }));
+                    break;
+                }
+                if index == "1" {
+                    let (hold, resume) = if action == "pause" {
+                        (Command::Pause, Command::ResumeRun)
+                    } else {
+                        (Command::Interrupt, Command::ResumeWork)
+                    };
+                    operator_control(&f, &scope, "hold-item", hold.action(&id))
                         .await
-                        .state
-                        .activations
-                        .iter()
-                        .filter(|a| a.physical)
-                        .count(),
-                    1
-                );
-                operator_control(&f, &scope, "resume-item", resume.action(&id))
-                    .await
-                    .unwrap();
+                        .unwrap();
+                    wait_held(&f, &id).await;
+                    assert_eq!(
+                        inspect(&f)
+                            .await
+                            .state
+                            .activations
+                            .iter()
+                            .filter(|a| a.physical)
+                            .count(),
+                        1
+                    );
+                    operator_control(&f, &scope, "resume-item", resume.action(&id))
+                        .await
+                        .unwrap();
+                }
+                agent.finish.notify_one();
             }
-            agent.finish.notify_one();
-        }
-        if action != "stop" {
-            finished(&f, "succeeded").await;
+            if action != "stop" {
+                finished(&f, "succeeded").await;
+            }
         }
     }
 }
@@ -861,7 +882,7 @@ async fn operator_schedule_approval_result_at_generic_flow_commit() {
         let runtime = f.host.flow030();
         let clock = runtime.human_runtime().virtual_clock().await.unwrap();
         let tasks = StreamTasks::default();
-        start(&f, &tasks, Arc::new(ScheduledAgent::default()));
+        start(&f, &tasks, Arc::new(ScheduledAgent::default())).await;
         operator_wait(async || {
             sqlx::query_scalar::<_, String>(
                 "SELECT request_id FROM engine_flow030_human_requests WHERE kind='approval'",
@@ -899,35 +920,37 @@ async fn operator_schedule_approval_result_at_generic_flow_commit() {
 
 #[tokio::test]
 async fn operator_schedule_steer_failure_withdraws_selected_approval() {
-    let f = Fixture::with_document(document(
-        json!({
-            "seed":{"type":"agent","agent":"worker","next":["work","steer","approval"]},
-            "work":{"type":"agent","agent":"worker"},
-            "steer":{"type":"agent","agent":"worker","delivery":"steer","next":"join"},
-            "approval":{"type":"approval","next":{"approve":"join"}},
-            "join":{"type":"join","next":[],"onError":"handler"},
-            "handler":{"type":"agent","agent":"worker","instance":"new"}
-        }),
-        "seed",
-    ))
-    .await;
-    let tasks = StreamTasks::default();
-    let steer = Arc::new(DeferredSteer::default());
-    let selected = arm(&f, "approval.claim");
-    start(
-        &f,
-        &tasks,
-        Arc::new(PausableAgent {
-            deferred_steer: Some(steer.clone()),
-            ..Default::default()
-        }),
-    );
-    reached(&selected, "approval.claim").await;
-    tokio::time::timeout(WAIT, steer.sent.notified())
-        .await
-        .unwrap();
-    steer.report.notify_one();
-    operator_wait(async || {
+    for stop_path in STOP_PATHS {
+        let f = Fixture::with_document(document(
+            json!({
+                "seed":{"type":"agent","agent":"worker","next":["work","steer","approval"]},
+                "work":{"type":"agent","agent":"worker"},
+                "steer":{"type":"agent","agent":"worker","delivery":"steer","next":"join"},
+                "approval":{"type":"approval","next":{"approve":"join"}},
+                "join":{"type":"join","next":[],"onError":"handler"},
+                "handler":{"type":"agent","agent":"worker","instance":"new"}
+            }),
+            "seed",
+        ))
+        .await;
+        let tasks = StreamTasks::default();
+        let steer = Arc::new(DeferredSteer::default());
+        let selected = arm(&f, "approval.claim");
+        start(
+            &f,
+            &tasks,
+            Arc::new(PausableAgent {
+                deferred_steer: Some(steer.clone()),
+                ..Default::default()
+            }),
+        )
+        .await;
+        reached(&selected, "approval.claim").await;
+        tokio::time::timeout(WAIT, steer.sent.notified())
+            .await
+            .unwrap();
+        steer.report.notify_one();
+        operator_wait(async || {
         let view = inspect(&f).await;
         let approval = view.effects.iter().find_map(|row| {
             let effect: crate::persistence::flow030::FlowEffect030 =
@@ -937,33 +960,34 @@ async fn operator_schedule_steer_failure_withdraws_selected_approval() {
         })?;
         (!crate::persistence::flow_store030::eligible(&view.state, &approval)).then_some(())
     }).await;
-    assert!(!inspect(&f).await.state.stopping);
-    selected.release();
-    operator_wait(async || {
-        if let Some(outcome) = f
-            .host
-            .flow030()
-            .supervisors
-            .outcome(&f.identity.system_start_id)
-        {
-            panic!("Supervisor stopped after the approval changed: {outcome:?}");
-        }
-        inspect(&f)
-            .await
-            .state
-            .activations
-            .iter()
-            .any(|a| a.step.as_deref() == Some(&["handler".into()]) && a.result.is_some())
-            .then_some(())
-    })
-    .await;
-    let approvals: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM engine_flow030_human_requests WHERE kind='approval'",
-    )
-    .fetch_one(&f.pool)
-    .await
-    .unwrap();
-    assert_eq!(approvals, 0);
-    stop(&f).await;
-    stopped(&f).await;
+        assert!(!inspect(&f).await.state.stopping);
+        selected.release();
+        operator_wait(async || {
+            if let Some(outcome) = f
+                .host
+                .flow030()
+                .supervisors
+                .outcome(&f.identity.system_start_id)
+            {
+                panic!("Supervisor stopped after the approval changed: {outcome:?}");
+            }
+            inspect(&f)
+                .await
+                .state
+                .activations
+                .iter()
+                .any(|a| a.step.as_deref() == Some(&["handler".into()]) && a.result.is_some())
+                .then_some(())
+        })
+        .await;
+        let approvals: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM engine_flow030_human_requests WHERE kind='approval'",
+        )
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+        assert_eq!(approvals, 0);
+        stop(&f, &tasks, stop_path).await;
+        stopped(&f).await;
+    }
 }
