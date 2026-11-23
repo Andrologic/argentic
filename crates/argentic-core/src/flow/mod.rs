@@ -166,6 +166,7 @@ pub fn reduce(
         event_id: &event.event_id,
         ordinal: 0,
         effects: vec![],
+        reassembling_queues: BTreeSet::new(),
     };
     engine.state.plan_json = Some(plan_json);
     engine.state.revision = number::increment(&state.revision);
@@ -308,6 +309,7 @@ struct Engine<'a> {
     event_id: &'a str,
     ordinal: usize,
     effects: Vec<FlowEffect030>,
+    reassembling_queues: BTreeSet<String>,
 }
 impl Engine<'_> {
     fn id(&mut self, kind: &str) -> String {
@@ -800,7 +802,23 @@ impl Engine<'_> {
             {
                 self.state.paused = false;
                 self.state.operator_holds.clear();
-                for action in std::mem::take(&mut self.state.operator_deferred) {
+                let deferred = std::mem::take(&mut self.state.operator_deferred);
+                // A steer can fall back after newer deliveries have been deferred.
+                // Assemble those queues before settle can start their next work.
+                for action in &deferred {
+                    if let DeferredOperator030::Admit {
+                        activation_id,
+                        may_steer: false,
+                    } = action
+                    {
+                        let activation = &self.state.activations[self.ai(activation_id)?];
+                        if activation.phase == "deferred" {
+                            self.reassembling_queues
+                                .extend(activation.instance_id.clone());
+                        }
+                    }
+                }
+                for action in deferred {
                     match action {
                         DeferredOperator030::Admit {
                             activation_id,
@@ -833,6 +851,7 @@ impl Engine<'_> {
                     }
                     self.settle()?;
                 }
+                self.reassembling_queues.clear();
                 Ok(())
             }
             _ => Err(FlowInputError030::StaleReference),
@@ -981,21 +1000,6 @@ impl Engine<'_> {
                 n
             });
             self.state.activations[i].instance_id = Some(self.state.instances[instance].id.clone());
-            if self.state.instances[instance].current.is_none()
-                && !self.state.instances[instance].queue.is_empty()
-            {
-                self.state.activations[i].phase = "queued".into();
-                self.state.instances[instance]
-                    .queue
-                    .push(self.state.activations[i].id.clone());
-                if !may_steer && self.plan.versions.contract == crate::argentic_core::AGSDL_040 {
-                    let activations = &self.state.activations;
-                    self.state.instances[instance]
-                        .queue
-                        .sort_by_cached_key(|id| activations.iter().position(|a| a.id == *id));
-                }
-                return Ok(());
-            }
             if let Some(current) = self.state.instances[instance].current.clone() {
                 let c = self.ai(&current)?;
                 if may_steer
@@ -1023,11 +1027,22 @@ impl Engine<'_> {
                     });
                     return Ok(());
                 }
+            }
+            let collecting = self
+                .reassembling_queues
+                .contains(&self.state.instances[instance].id);
+            if collecting
+                || self.state.instances[instance].current.is_some()
+                || !self.state.instances[instance].queue.is_empty()
+            {
                 self.state.activations[i].phase = "queued".into();
                 self.state.instances[instance]
                     .queue
                     .push(self.state.activations[i].id.clone());
-                if !may_steer && self.plan.versions.contract == crate::argentic_core::AGSDL_040 {
+                if collecting
+                    || (!may_steer
+                        && self.plan.versions.contract == crate::argentic_core::AGSDL_040)
+                {
                     let activations = &self.state.activations;
                     self.state.instances[instance]
                         .queue
@@ -2565,6 +2580,9 @@ impl Engine<'_> {
             for instance in 0..self.state.instances.len() {
                 if self.state.instances[instance].current.is_none()
                     && !self.state.instances[instance].queue.is_empty()
+                    && !self
+                        .reassembling_queues
+                        .contains(&self.state.instances[instance].id)
                 {
                     let id = self.state.instances[instance].queue.remove(0);
                     let i = self.ai(&id)?;
@@ -2603,7 +2621,7 @@ impl Engine<'_> {
 }
 
 #[cfg(test)]
-mod decision_ordinal_tests {
+mod tests {
     use super::*;
 
     fn group(id: &str) -> Group030 {
@@ -2659,6 +2677,7 @@ mod decision_ordinal_tests {
                 event_id: "event",
                 ordinal: 0,
                 effects: vec![],
+                reassembling_queues: BTreeSet::new(),
             };
             let mut waiting = group("waiting");
             waiting.join = vec!["join".into()];
@@ -2725,6 +2744,7 @@ mod decision_ordinal_tests {
             event_id: "event",
             ordinal: 0,
             effects: vec![],
+            reassembling_queues: BTreeSet::new(),
         };
         engine.set_group_decision(1, "done").unwrap();
         engine.set_group_decision(0, "closed").unwrap();
@@ -2778,5 +2798,120 @@ mod decision_ordinal_tests {
             reduce(&plan(), &state, &event),
             Err(FlowInputError030::InvalidState(_))
         ));
+    }
+
+    #[test]
+    fn resume_starts_an_older_steer_fallback_before_newer_paused_deliveries() {
+        let mut plan = plan();
+        plan.versions.contract = crate::AGSDL_040.into();
+        plan.graphless_submission_contracts
+            .insert("worker".into(), "{}".into());
+        let identity = identity();
+        for preexisting in [false, true] {
+            let mut state = FlowState030::new(identity.clone());
+            let mut apply = |id: &str, kind| {
+                let result = reduce(
+                    &plan,
+                    &state,
+                    &FlowEvent030 {
+                        identity: identity.clone(),
+                        event_id: id.into(),
+                        expected_revision: state.revision.clone(),
+                        kind,
+                    },
+                )
+                .unwrap();
+                state = result.state.clone();
+                result
+            };
+            let deliver = |id: &str, mode: &str| FlowEventKind030::Deliver {
+                agent: "worker".into(),
+                instance: Instance030::Shared,
+                delivery: mode.into(),
+                message_json: json!({"prompt":id}).to_string(),
+                sender: "host".into(),
+            };
+            apply("initial", deliver("initial", "queue"));
+            let attempt = apply("older", deliver("older", "steer"));
+            let steer = &attempt.effects[0];
+            let FlowEffectKind030::Steer {
+                work,
+                delivery_activation_id,
+                ..
+            } = &steer.kind
+            else {
+                panic!("Expected a pending steer");
+            };
+            if preexisting {
+                apply("already-queued", deliver("already-queued", "queue"));
+            }
+            apply(
+                "pause",
+                FlowEventKind030::Operator(OperatorEvent030::Pause {
+                    activation_ids: vec![work.activation_id.clone()],
+                }),
+            );
+            apply("newer", deliver("newer", "queue"));
+            apply(
+                "recipient-ended",
+                FlowEventKind030::WorkResult {
+                    work: work.clone(),
+                    result: WorkResult030::Completed {
+                        output_json: "{}".into(),
+                        route_key: None,
+                    },
+                    physical: Some(PhysicalEvidence030 {
+                        native_receipt_id: "ended".into(),
+                        descendants_joined: true,
+                    }),
+                },
+            );
+            apply(
+                "fallback",
+                FlowEventKind030::SteerFailed {
+                    effect_id: steer.id.clone(),
+                    work: work.clone(),
+                    delivery_activation_id: delivery_activation_id.clone(),
+                    code: "not-received".into(),
+                },
+            );
+            let resume = apply(
+                "resume",
+                FlowEventKind030::Operator(OperatorEvent030::ResumeRun),
+            );
+            let starts = resume
+                .effects
+                .iter()
+                .filter_map(|effect| match &effect.kind {
+                    FlowEffectKind030::Start { work, .. } => Some(&work.activation_id),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(starts, [delivery_activation_id]);
+            let instance = &resume.state.instances[0];
+            let queued: Vec<_> = instance
+                .queue
+                .iter()
+                .map(|id| {
+                    let activation = resume
+                        .state
+                        .activations
+                        .iter()
+                        .find(|activation| &activation.id == id)
+                        .unwrap();
+                    let payload: Value =
+                        serde_json::from_str(activation.message_json.as_deref().unwrap()).unwrap();
+                    payload["prompt"].as_str().unwrap().to_owned()
+                })
+                .collect();
+            assert_eq!(
+                queued,
+                if preexisting {
+                    vec!["already-queued", "newer"]
+                } else {
+                    vec!["newer"]
+                }
+            );
+        }
     }
 }
