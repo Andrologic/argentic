@@ -1,6 +1,6 @@
 //! AgSDL archive format 1. Read or write one bounded ZIP32 member at a time.
 use super::{invalid, parse_json, sha256, Files, ProjectFile, MANIFEST, MAX_FILES, MAX_TOTAL};
-use crate::persistence::Result;
+use crate::persistence::{dto::EngineFailure, failure, Result};
 use serde::Deserialize;
 use std::{
     collections::BTreeMap,
@@ -269,6 +269,10 @@ fn plain_extras(mut extra: &[u8], name: &str) -> bool {
     true
 }
 
+fn layout(message: &str) -> EngineFailure {
+    failure("ARCHIVE_LAYOUT", "", message)
+}
+
 struct Member {
     offset: u64,
     end: u64,
@@ -308,6 +312,10 @@ impl Member {
                 "ZIP member overlaps another structure or has inconsistent sizes",
             ));
         }
+        let tail_len = self.end - data_end;
+        if !descriptor && tail_len != 0 {
+            return Err(layout("Unaccounted bytes after ZIP member data"));
+        }
         let mut fields = vec![0; name.len() + extra_len];
         input.read_exact(&mut fields).map_err(io)?;
         if &fields[..name.len()] != name.as_bytes() || !plain_extras(&fields[name.len()..], name) {
@@ -324,14 +332,18 @@ impl Member {
             return Err(malformed("Incorrect ZIP member size or CRC"));
         }
         if descriptor {
-            let len = (self.end - data_end).min(16) as usize;
+            let len = tail_len.min(16) as usize;
             let mut tail = [0; 16];
             input.seek(SeekFrom::Start(data_end)).map_err(io)?;
             input.read_exact(&mut tail[..len]).map_err(io)?;
-            let matches = |at| tail[at..at + 12] == self.header[16..28];
-            if !(len >= 12 && matches(0) || len >= 16 && &tail[..4] == b"PK\x07\x08" && matches(4))
-            {
+            let signed =
+                len >= 16 && &tail[..4] == b"PK\x07\x08" && tail[4..] == self.header[16..28];
+            let plain = len >= 12 && tail[..12] == self.header[16..28];
+            if !signed && !plain {
                 return Err(malformed("Invalid ZIP data descriptor"));
+            }
+            if !(signed && tail_len == 16 || plain && tail_len == 12) {
+                return Err(layout("Unaccounted bytes after ZIP data descriptor"));
             }
         }
         Ok(bytes)
@@ -380,8 +392,15 @@ fn members(input: &mut (impl Read + Seek)) -> Result<BTreeMap<String, Member>> {
     let count = usize::from(u16_at(&footer, 10));
     let length = u64::from(u32_at(&footer, 12));
     let directory = u64::from(u32_at(&footer, 16));
-    if &footer[..4] != b"PK\x05\x06"
-        || footer[4..8] != [0; 4]
+    if &footer[..4] != b"PK\x05\x06" {
+        return Err(layout(
+            "ZIP end of central directory must be at the end of the archive",
+        ));
+    }
+    if directory + length < size - 22 {
+        return Err(layout("Unaccounted bytes after the ZIP central directory"));
+    }
+    if footer[4..8] != [0; 4]
         || footer[8..10] != footer[10..12]
         || footer[20..22] != [0; 2]
         || !(1..=MAX_FILES).contains(&count)
@@ -450,7 +469,7 @@ fn members(input: &mut (impl Read + Seek)) -> Result<BTreeMap<String, Member>> {
         }
     }
     if cursor != size - 22 {
-        return Err(zip_error("ZIP directory size or entry count differs"));
+        return Err(layout("Unaccounted bytes in the ZIP central directory"));
     }
     let mut by_offset: Vec<_> = entries.values_mut().collect();
     by_offset.sort_unstable_by_key(|member| member.offset);
@@ -461,6 +480,9 @@ fn members(input: &mut (impl Read + Seek)) -> Result<BTreeMap<String, Member>> {
         }
         member.end = end;
         end = member.offset;
+    }
+    if end != 0 {
+        return Err(layout("Unaccounted bytes before the first ZIP member"));
     }
     Ok(entries)
 }
@@ -613,6 +635,26 @@ pub(super) mod tests {
 
     pub(in crate::source) fn row(bytes: &[u8]) -> Value {
         json!({"size":bytes.len(),"sha256":sha256(bytes),"executable":false})
+    }
+
+    #[test]
+    fn zip_structures_must_cover_the_container() {
+        let entries = BTreeMap::from([("archive.json".into(), b"{}".to_vec())]);
+        let mut zip = stored_zip(&entries);
+        let mut input = std::io::Cursor::new(&zip);
+        let mut directory = members(&mut input).unwrap();
+        let member = directory.get_mut("archive.json").unwrap();
+        assert_eq!(member.read(&mut input, "archive.json").unwrap(), b"{}");
+        member.end += 1;
+        assert_eq!(
+            member.read(&mut input, "archive.json").unwrap_err().code,
+            "ARCHIVE_LAYOUT"
+        );
+        zip.push(0);
+        assert_eq!(
+            members(&mut std::io::Cursor::new(&zip)).err().unwrap().code,
+            "ARCHIVE_LAYOUT"
+        );
     }
 
     #[test]
