@@ -210,13 +210,15 @@ permissions. Codex agent MCP equipment and remote MCP still require separate
 adapter qualification.
 
 The process runs with the captured workspace (`scope.root`) as its working
-directory. A relative program with a path separator must be listed in that
-server's `mcpFiles`. A listed bare program name also selects the retained
-file, which must have its executable flag set. An argument that matches a
-declared path, such as `mcp/server.sh` in `["sh", "mcp/server.sh"]`, becomes
-the absolute path to that retained file. Remaining arguments pass through
-as written. Bare system programs use `/usr/bin:/bin`. For a plain JSON
-source a relative program path still resolves against the workspace.
+directory. An AgSDL project selects its program by a relative path or bare
+name listed in that server's `mcpFiles`. Argentic verifies the retained bytes
+at launch and requires the executable flag. The system allowlist consists of
+`/bin/sh`, which can also be written as `sh`. Its first argument must name a
+script listed in the server's `mcpFiles`. Argentic substitutes the verified
+retained path for the script and for other arguments that match declared
+paths. Remaining arguments pass through as written. Plain JSON sources can
+still use absolute programs, workspace-relative program paths and bare
+programs from `/usr/bin:/bin`.
 
 Set the provider on the context passed to `StartSession::attach_committed_start`.
 
@@ -237,6 +239,10 @@ refuse spawn. The synchronous callback runs under the native launch gate.
 Keep it short and use a host-owned vault handle. It runs afresh on each
 physical spawn for a server that declares secrets. The subprocess gets a
 cleared environment with the fixed runtime PATH and that server's values.
+The launcher refuses secret names that match a variable it sets, including
+`PATH`, or that control shell startup or dynamic loading. Reserved names
+also include `ENV`, `BASH_ENV`, `BASHOPTS`, `SHELLOPTS`, `PS4` and names
+beginning with `LD_` or `DYLD_`.
 Argentic keeps values in memory and in the child environment. It discards
 stderr and rejects literal secret echoes in tool results and MCP requests
 for human input before retaining them. Macro must approve the server code

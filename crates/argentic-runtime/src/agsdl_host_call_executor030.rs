@@ -478,25 +478,31 @@ pub(crate) fn mcp_server(
         .first()
         .and_then(Value::as_str)
         .ok_or_else(|| transport::CallError::transport("MCP program missing"))?;
-    // Resolve bare program names only within the fixed native PATH.
-    let retained_program = project
-        .as_ref()
-        .and_then(|project| project.file(program).map(|path| (&project.snapshot, path)));
-    let program = if let Some((snapshot, path)) = retained_program {
-        if !snapshot.executable(path) {
+    let program = if let Some(project) = &project {
+        if let Some(path) = project.file(program) {
+            if !project.snapshot.executable(path) {
+                return Err(transport::CallError::transport(
+                    "Retained MCP program is not executable",
+                ));
+            }
+            path.to_owned()
+        } else if matches!(program, "sh" | "/bin/sh")
+            && command
+                .get(1)
+                .and_then(Value::as_str)
+                .and_then(|script| project.file(script))
+                .is_some()
+        {
+            // The system shell may interpret only a declared retained script.
+            PathBuf::from("/bin/sh")
+        } else {
             return Err(transport::CallError::transport(
-                "Retained MCP program is not executable",
+                "Project MCP requires a retained executable or /bin/sh with a declared script",
             ));
         }
-        path.to_owned()
     } else if Path::new(program).is_absolute() {
         PathBuf::from(program)
     } else if program.contains('/') {
-        if project.is_some() {
-            return Err(transport::CallError::transport(
-                "Declare the relative MCP program in mcpFiles",
-            ));
-        }
         grant.workspace.join(program)
     } else {
         ["/usr/bin", "/bin"]
@@ -525,6 +531,20 @@ pub(crate) fn mcp_server(
         .collect::<transport::Result<Vec<_>>>()?;
     let mut secret_values = Vec::new();
     if let Some(project) = project.filter(|project| !project.names.is_empty()) {
+        if project.names.iter().any(|name| {
+            grant.environment.contains_key(name)
+                || matches!(
+                    name.as_str(),
+                    "PATH" | "ENV" | "BASH_ENV" | "BASHOPTS" | "SHELLOPTS" | "PS4"
+                )
+                || name.starts_with("LD_")
+                || name.starts_with("DYLD_")
+        }) {
+            return Err(transport::CallError::new(
+                "MCP_SECRET_RESERVED",
+                "MCP secret name is reserved by the launcher",
+            ));
+        }
         let unavailable = || {
             transport::CallError::new(
                 "MCP_SECRETS_UNAVAILABLE",

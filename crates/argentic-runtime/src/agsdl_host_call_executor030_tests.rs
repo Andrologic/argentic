@@ -553,6 +553,75 @@ async fn nested_entry_approval_keeps_host_prompt_provenance_through_its_output()
 }
 
 #[cfg(unix)]
+#[tokio::test]
+async fn retained_stdio_refuses_unverified_programs_and_reserved_secrets_before_vault_access() {
+    use crate::{
+        agsdl_host_call_executor030::mcp_server,
+        agsdl_host_calls::CommandGrant,
+        agsdl_host_confinement::{OsCeiling, SandboxPolicy},
+    };
+    use std::{fs, os::unix::fs::PermissionsExt};
+
+    let project = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let root = workspace.path().canonicalize().unwrap();
+    let mutable = root.join("server");
+    fs::write(&mutable, "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(&mutable, fs::Permissions::from_mode(0o700)).unwrap();
+    let sandbox =
+        SandboxPolicy::from_authorized_ceilings("mcp-config-test".into(), &[OsCeiling::default()])
+            .unwrap();
+    let doc = json!({
+        "projectFormat":"agsdl-project-1","contract":"agsdl-0.4.0",
+        "id":"retained-mcp-refusal","agents":{},
+        "mcpServers":{
+            "absolute":{"command":[mutable]},
+            "shell":{"command":["/bin/sh",mutable]},
+            "inline":{"command":["sh","-c","exit 0"]},
+            "system":{"command":["/bin/echo"]},
+            "path":{"command":["sh","server.sh"]},
+            "loader":{"command":["sh","server.sh"]}
+        },
+        "mcpFiles":{"path":["server.sh"],"loader":["server.sh"]},
+        "secrets":{"file":"requirements.json"}
+    });
+    fs::write(project.path().join("agsdl.json"), doc.to_string()).unwrap();
+    fs::write(project.path().join("server.sh"), "#!/bin/sh\nexit 0\n").unwrap();
+    fs::write(
+        project.path().join("requirements.json"),
+        r#"{"absolute":["TOKEN"],"path":["PATH"],"loader":["DYLD_INSERT_LIBRARIES"]}"#,
+    )
+    .unwrap();
+    let f = Fixture::new_with_project(r#"{"entry":{},"timeline":[]}"#, false, Some(project.path()))
+        .await;
+    let capture = flow::inspect_run(f.host.flow030(), &f.host, &f.pool, &f.owner)
+        .await
+        .unwrap()
+        .capture;
+    let config = f.config.clone().with_mcp_secrets(Arc::new(|_, _, _| {
+        panic!("Refused MCP configuration must not query the vault")
+    }));
+    for (server, expected) in [
+        ("absolute", "CALL_FAILED"),
+        ("shell", "CALL_FAILED"),
+        ("inline", "CALL_FAILED"),
+        ("system", "CALL_FAILED"),
+        ("path", "MCP_SECRET_RESERVED"),
+        ("loader", "MCP_SECRET_RESERVED"),
+    ] {
+        let grant = CommandGrant {
+            workspace: root.clone(),
+            environment: BTreeMap::from([("PATH".into(), "/usr/bin:/bin".into())]),
+            sandbox: sandbox.clone(),
+        };
+        let error = mcp_server(&config, grant, &capture, server)
+            .err()
+            .unwrap_or_else(|| panic!("MCP config for {server} was accepted"));
+        assert_eq!(error.code, expected, "{server}: {error:?}");
+    }
+}
+
+#[cfg(unix)]
 struct RetainedStdio(crate::host::HostContext);
 
 #[cfg(unix)]
