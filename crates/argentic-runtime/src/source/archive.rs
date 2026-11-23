@@ -18,6 +18,10 @@ const FORMAT: &str = "agsdl-archive-1";
 const INDEX_NAME: &str = "archive.json";
 const PROJECT_PREFIX: &str = "project/";
 
+fn diagnostic_path(zip_name: &str) -> &str {
+    zip_name.strip_prefix(PROJECT_PREFIX).unwrap_or(zip_name)
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct Inventory {
@@ -344,8 +348,9 @@ impl Member {
         name: &str,
         budget: &SourceBudget,
     ) -> Result<Vec<u8>> {
-        let malformed = |detail| invalid(name, "", detail);
-        let io = |e: std::io::Error| invalid(name, "", &e.to_string());
+        let path = diagnostic_path(name);
+        let malformed = |detail| invalid(path, "", detail);
+        let io = |e: std::io::Error| invalid(path, "", &e.to_string());
         let header = read_at::<30>(input, self.offset).map_err(io)?;
         let flags = u16_at(&header, 6);
         let method = u16_at(&header, 8);
@@ -378,7 +383,7 @@ impl Member {
         budget
             .work((name.len() + extra_len).div_ceil(8) + 1, "")
             .and_then(|()| budget.bytes(name.len() + extra_len, ""))
-            .map_err(|e| source_limit(name, e))?;
+            .map_err(|e| source_limit(path, e))?;
         let mut fields = vec![0; name.len() + extra_len];
         input.read_exact(&mut fields).map_err(io)?;
         if &fields[..name.len()] != name.as_bytes() || !plain_extras(&fields[name.len()..], name) {
@@ -393,7 +398,7 @@ impl Member {
                 "",
             )
             .and_then(|()| budget.bytes(size + if method == 8 { 48 * 1024 } else { 0 }, ""))
-            .map_err(|e| source_limit(name, e))?;
+            .map_err(|e| source_limit(path, e))?;
         let bytes = if method == 0 {
             let mut bytes = vec![0; size];
             input.read_exact(&mut bytes).map_err(io)?;
@@ -531,7 +536,11 @@ fn members(
         let name = std::str::from_utf8(&fields[..name_len])
             .map_err(|_| zip_error("Non-UTF-8 ZIP name"))?;
         if (!name.is_ascii() && flags & 0x800 == 0) || !plain_extras(&fields[name_len..], name) {
-            return Err(invalid(name, "", "Invalid UTF-8 flag or ZIP extra fields"));
+            return Err(invalid(
+                diagnostic_path(name),
+                "",
+                "Invalid UTF-8 flag or ZIP extra fields",
+            ));
         }
         if let Some(path) = name.strip_prefix(PROJECT_PREFIX) {
             portable(path)?;
@@ -549,7 +558,7 @@ fn members(
             )
             .is_some()
         {
-            return Err(invalid(name, "", "Duplicate ZIP entry"));
+            return Err(invalid(diagnostic_path(name), "", "Duplicate ZIP entry"));
         }
     }
     if cursor != size - 22 {
@@ -652,22 +661,23 @@ pub(super) fn read_with_budget(
         }
     }
     let mut read = |name: &str, size: serde_json::Number, digest: &str| {
+        let path = diagnostic_path(name);
         let member = entries
             .remove(name)
-            .ok_or_else(|| invalid(name, "", "Missing ZIP member"))?;
+            .ok_or_else(|| invalid(path, "", "Missing ZIP member"))?;
         let size = size.to_string();
         budget
             .work(size.len().div_ceil(8) + 1, "")
             .and_then(|()| budget.bytes(size.len() * 8 + 256, ""))
-            .map_err(|e| source_limit(name, e))?;
+            .map_err(|e| source_limit(path, e))?;
         if !argentic_core::durable_json::equal(&member.size().to_string(), &size).unwrap_or(false)
             || !hex(digest, 64)
         {
-            return Err(invalid(name, "", "Invalid inventory size or SHA-256"));
+            return Err(invalid(path, "", "Invalid inventory size or SHA-256"));
         }
         let bytes = member.read(&mut input, name, budget)?;
         if sha256(&bytes) != digest {
-            return Err(invalid(name, "", "SHA-256 does not match the inventory"));
+            return Err(invalid(path, "", "SHA-256 does not match the inventory"));
         }
         Ok(bytes)
     };
@@ -694,7 +704,11 @@ pub(super) fn read_with_budget(
         );
     }
     if let Some(name) = entries.keys().next() {
-        return Err(invalid(name, "", "ZIP member absent from inventory"));
+        return Err(invalid(
+            diagnostic_path(name),
+            "",
+            "ZIP member absent from inventory",
+        ));
     }
     Ok(files)
 }
@@ -796,6 +810,23 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn invalid_member_payload_uses_a_project_relative_diagnostic() {
+        let (mut entries, inventory) = baseline();
+        entries.insert(INDEX_NAME.into(), serde_json::to_vec(&inventory).unwrap());
+        let mut zip = stored_zip(&entries);
+        let path = "mcp/asset.txt";
+        let name = format!("{PROJECT_PREFIX}{path}");
+        let mut input = std::io::Cursor::new(&zip);
+        let positions = members(&mut input, &SourceBudget::default()).unwrap();
+        let offset = positions[&name].offset as usize + 30 + name.len();
+        zip[offset] ^= 1;
+        let error = OpenedSource::open_archive_bytes(&zip).err().unwrap();
+        assert_eq!(error.code, "PROJECT");
+        assert!(error.message.contains("Incorrect ZIP member size or CRC"));
+        assert_eq!(error.source.unwrap().path, path);
+    }
+
+    #[test]
     fn export_limits_count_the_inventory() {
         let files = MAX_FILES - 1;
         let total = MAX_TOTAL - INDEX_LIMIT;
@@ -870,6 +901,13 @@ pub(super) mod tests {
             };
             assert_eq!(error.code, "PROJECT");
             assert!(error.message.contains(needle), "{variant}: {error:?}");
+            let location = error.source.as_ref().unwrap();
+            match variant {
+                "hash" => assert_eq!(location.path, asset),
+                "unlisted" => assert_eq!(location.path, "extra.txt"),
+                "history" => assert_eq!(location.path, "history.bundle"),
+                _ => (),
+            }
             assert!(!data.join("engine.sqlite").exists());
         }
         let (mut entries, index) = baseline();
