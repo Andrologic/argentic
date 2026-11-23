@@ -1362,9 +1362,18 @@ pub(crate) async fn reconcile_dispatch_events030(
     pool: &SqlitePool,
     owner: &EngineOwner,
 ) -> Result<bool> {
-    let runtime = host.flow030();
     let lease = host.start_lease().await?;
     let _admission = host.admission_lock().lock_owned().await;
+    reconcile_event_commits_locked030(host.flow030(), pool, &lease, owner).await
+}
+
+// The caller holds the admission gate across readback and its next mutation.
+pub(crate) async fn reconcile_event_commits_locked030(
+    runtime: &FlowHost030,
+    pool: &SqlitePool,
+    lease: &HostStartLease,
+    owner: &EngineOwner,
+) -> Result<bool> {
     let pending = runtime
         .event_committing
         .lock()
@@ -1378,7 +1387,7 @@ pub(crate) async fn reconcile_dispatch_events030(
     }
     let authority = Authority {
         runtime,
-        lease: &lease,
+        lease,
         owner: owner.clone(),
     };
     let mut db = pool.acquire().await?;
@@ -2178,6 +2187,12 @@ impl DispatchLease030<'_> {
             Some(gate) => Some(gate.admission.lock_owned().await),
             None => None,
         };
+        if !reconcile_event_commits_locked030(self.runtime, &self.pool, &self.lease, &self.owner)
+            .await?
+        {
+            return Err(uncertain());
+        }
+        self.runtime.available(&self.effect.identity)?;
         self.lease.ensure_live().map_err(|_| uncertain())?;
         let authority = Authority {
             runtime: self.runtime,
@@ -2500,8 +2515,11 @@ async fn claim_selected<'a>(
     let admission = host.admission_lock().lock_owned().await;
     // Even an empty queue is not a successful claim while a commit is unknown.
     // Retirement uses its separate opaque FlowControl, never this dispatcher.
-    runtime.available(id)?;
     let owner = lease.owner(&id.system_start_id)?;
+    if !reconcile_event_commits_locked030(runtime, pool, &lease, &owner).await? {
+        return Err(uncertain());
+    }
+    runtime.available(id)?;
     let authority = Authority {
         runtime,
         lease: &lease,

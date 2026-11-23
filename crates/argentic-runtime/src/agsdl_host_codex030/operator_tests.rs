@@ -1401,10 +1401,45 @@ async fn operator_resume_routes_join_failure_from_a_steer_settled_during_pause()
             .then_some(())
     })
     .await;
-    operator_control(&f, &scope, "pause", Action::PauseRun)
+    let (dispatch, _) = registry.dispatcher(&scope.system_start_id).unwrap();
+    let gate = dispatch.lock().await;
+    let pause = operator_control(&f, &scope, "pause", Action::PauseRun);
+    tokio::pin!(pause);
+    assert!(futures::poll!(&mut pause).is_pending());
+    let block = dispatch.lock();
+    tokio::pin!(block);
+    assert!(futures::poll!(&mut block).is_pending());
+    drop(gate);
+    let paused = pause.await.unwrap();
+    let block = block.await;
+    let runtime = f.host.flow030();
+    let view = flow::inspect_run(runtime, &f.host, &f.pool, &f.owner)
         .await
         .unwrap();
+    let pause_event: Value =
+        serde_json::from_str(&view.flow.state.events[&paused.event_id].event_json).unwrap();
+    runtime
+        .begin_event_commit(&crate::persistence::flow030::FlowEvent030 {
+            identity: f.identity.clone(),
+            event_id: paused.event_id.clone(),
+            expected_revision: pause_event["expectedRevision"].as_str().unwrap().into(),
+            kind: crate::persistence::flow030::FlowEventKind030::Operator(
+                serde_json::from_value(pause_event["kind"]["Operator"].clone()).unwrap(),
+            ),
+        })
+        .unwrap();
     steer.report.notify_one();
+    // The native steer settles independently of the dispatcher. It must
+    // reconcile the durable Pause before committing its own evidence.
+    operator_wait(async || {
+        let view = flow::inspect_run(runtime, &f.host, &f.pool, &f.owner)
+            .await
+            .unwrap();
+        (view.flow.state.steer_deliveries[0].status == "failed").then_some(())
+    })
+    .await;
+    runtime.available(&f.identity).unwrap();
+    drop(block);
     let (activation_id, origin_event_id) = operator_wait(async || {
         let view = flow::inspect_run(f.host.flow030(), &f.host, &f.pool, &f.owner)
             .await

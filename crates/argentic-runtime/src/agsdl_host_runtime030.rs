@@ -1546,6 +1546,7 @@ pub(crate) async fn emit_work_event030(
     let policies = PolicyLeases030::acquire(config, project_id).await?;
     let lease = host.start_lease().await?;
     let gate = host.admission_lock().lock_owned().await;
+    flow::reconcile_event_commits_locked030(host.flow030(), pool, &lease, attempt.owner()).await?;
     host.flow030().available(attempt.identity())?;
     let parent = format!(
         "flow030:{}:{}",
