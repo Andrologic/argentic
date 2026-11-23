@@ -307,8 +307,10 @@ request: OperatorRequest) -> Result<FlowReceipt030>`. The standalone
 `Host::control_run(&self, request: OperatorRequest)` returns the same
 receipt. Supply the exact scope from `inspect` and a request ID. Each
 distinct action gets a new ID. Retrying the same action and ID returns
-its original receipt. Changing the action under that ID returns
-`CONFLICT`. An `OPERATOR_TRANSITION` response means the action cannot
+its original receipt. Before dispatch resumes after a lost commit
+acknowledgement, the supervisor checks the exact durable control or delivery
+event. Changing the action under that ID returns `CONFLICT`. An
+`OPERATOR_TRANSITION` response means the action cannot
 run in the current state.
 
 The JSON-lines command is `controlRun`. Its input is an `OperatorRequest`
@@ -325,10 +327,11 @@ with `scope`, `requestId` and `action`. The action takes one of these forms.
   The receipt records the request. Display `operatorWorks[activationId].kind`
   as `holding` until Codex confirms the end of the turn, then `held`. The
   activation stays open and retains its machine-time budget, conversation
-  and remaining corrections. An observed automatic plan carries over to the
-  continued work. An action approval for the interrupted turn closes. When
-  a person already answered and delivery had yet to begin, the journal
-  retains the answer and records that the turn closed without receiving it.
+  and remaining corrections. An automatic plan reported before Codex
+  confirms the turn ended carries over to the continued work. An action
+  approval for the interrupted turn closes. The journal retains a recorded
+  answer or a timeout reached at the hold and records when the turn closed
+  before delivery.
   Any effects already committed remain in place.
 - **Resume an agent.** Once held, use `resumeWork` to continue on the same
   Codex thread. A person can also use the existing `deliver` operation on a
@@ -347,10 +350,14 @@ with `scope`, `requestId` and `action`. The action takes one of these forms.
   this API, so Pause returns `HOST_CAPABILITY` while one is active.
 - **Resume a run.** Call `resumeRun` once its turn interruptions have been
   confirmed. This releases the held agents and the deferred dispatch work.
-  Individual resume commands are refused while the run is paused.
+  A steer known to have fallen back joins the waiting queue in its original
+  arrival order. Deferred failures retain the evidence used to evaluate
+  their routes and joins. Individual resume commands are refused while the
+  run is paused.
 - **Stop.** Use the existing whole-run Stop for a paused run or a run with a
-  held agent. It discards pending dispatch and continues native termination
-  until physical confirmation.
+  held agent. It discards pending dispatch, records any unevaluated clock
+  ticket it supersedes, and continues native termination until physical
+  confirmation.
 
 Operator transitions and clock changes are journaled. A new host cannot
 reattach to the held Codex work. On reopening an unfinished run, `inspect`
