@@ -737,42 +737,62 @@ impl<'a> Reader<'a> {
     }
 
     fn skill_tree(&mut self, directory: &str) -> Result<()> {
-        if !self.skills.insert(directory.to_owned()) {
+        if self.skills.contains(directory) {
             return Ok(());
         }
-        let mut pending = vec![PathBuf::from(directory)];
-        let mut entries = 0;
-        if let Some(dir) = &self.dir {
+        let reserve = |budget: &SourceBudget, bytes| {
+            budget
+                .bytes(bytes, "")
+                .map_err(|e| source_limit(directory, e))
+        };
+        reserve(&self.budget, 256 + directory.len() * 3)?;
+        self.skills.insert(directory.to_owned());
+        if let Some(dir) = self.dir {
+            let mut pending = vec![PathBuf::from(directory)];
             let mut names = Vec::new();
-            let mut directories = Vec::new();
+            let mut entries = 0;
             while let Some(path) = pending.pop() {
-                for item in
-                    member::with_directory(dir, &path, Dir::entries).map_err(|e| io(&path, e))?
-                {
-                    self.budget
-                        .work(1, "")
-                        .map_err(|e| source_limit(directory, e))?;
+                let path_len = path.as_os_str().len();
+                // The directory stream has a buffer of its own. Reopening
+                // the pinned path also allocates component names and handles.
+                reserve(
+                    &self.budget,
+                    4096 + path_len * 2 + path.components().count() * 128,
+                )?;
+                let mut children =
+                    member::with_directory(dir, &path, Dir::entries).map_err(|e| io(&path, e))?;
+                loop {
+                    // Both the iterator and file_name() allocate a name.
+                    reserve(&self.budget, 2048)?;
+                    let Some(item) = children.next() else {
+                        break;
+                    };
                     let item = item.map_err(|e| io(&path, e))?;
-                    let relative = path.join(item.file_name());
+                    let basename = item.file_name();
+                    let length = path_len + basename.len() + 1;
+                    self.budget
+                        .work(1 + length.div_ceil(8), "")
+                        .map_err(|e| source_limit(directory, e))?;
+                    // Reserve the joined path, portable spelling and growth
+                    // of the vectors retaining pending paths or files.
+                    reserve(&self.budget, 128 + length * 8)?;
+                    let relative = path.join(basename);
                     entries += 1;
                     if entries > 16_384 || relative.components().count() > 64 {
                         return Err(invalid(directory, "", "Skill tree exceeds path limits"));
                     }
                     let ty = item.file_type().map_err(|e| io(&relative, e))?;
+                    let name = relative
+                        .to_str()
+                        .ok_or_else(|| invalid(directory, "", "Expected UTF-8 skill path"))?
+                        .replace(std::path::MAIN_SEPARATOR, "/");
                     if ty.is_dir() {
-                        // The official walk checks directories too, including
-                        // empty ones that select no file.
-                        let name = relative
-                            .to_str()
-                            .ok_or_else(|| invalid(directory, "", "Expected UTF-8 skill path"))?
-                            .replace(std::path::MAIN_SEPARATOR, "/");
-                        directories.push(name);
+                        // The official walk checks empty directories too.
+                        archive::portable(&name)?;
+                        self.spell(&name, &name)?;
                         pending.push(relative);
                     } else if ty.is_file() {
-                        let name = relative
-                            .to_str()
-                            .ok_or_else(|| invalid(directory, "", "Expected UTF-8 skill path"))?;
-                        names.push(name.replace(std::path::MAIN_SEPARATOR, "/"));
+                        names.push(name);
                     } else {
                         return Err(invalid(
                             directory,
@@ -782,22 +802,19 @@ impl<'a> Reader<'a> {
                     }
                 }
             }
-            for name in directories {
-                archive::portable(&name)?;
-                self.spell(&name, &name)?;
-            }
             for name in names {
                 self.select(&name, MAX_TOTAL)?;
             }
         } else {
             let prefix = format!("{directory}/");
-            let names: Vec<_> = self
-                .files
-                .range(prefix.clone()..)
-                .map(|(name, _)| name)
-                .take_while(|name| name.starts_with(&prefix))
-                .cloned()
-                .collect();
+            let mut names = Vec::new();
+            for (name, _) in self.files.range(prefix.clone()..) {
+                if !name.starts_with(&prefix) {
+                    break;
+                }
+                reserve(&self.budget, 64 + name.len())?;
+                names.push(name.clone());
+            }
             for name in names {
                 self.select(&name, MAX_TOTAL)?;
             }

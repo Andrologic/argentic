@@ -459,6 +459,57 @@ fn generated(name: &str) -> String {
     }
 }
 
+fn measure_skill_tree() {
+    let project = tempfile::tempdir().unwrap();
+    let skill = project.path().join("skills/review");
+    std::fs::create_dir_all(&skill).unwrap();
+    std::fs::write(
+        skill.join("SKILL.md"),
+        "---\nname: review\ndescription: Review.\n---\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project.path().join("agsdl.json"),
+        r#"{"projectFormat":"agsdl-project-1","contract":"agsdl-0.4.0","id":"skill-budget","agents":{},"skills":{"review":{"uri":"skills/review/SKILL.md"}}}"#,
+    ).unwrap();
+    for index in 0..500 {
+        std::fs::create_dir_all(skill.join(format!("branch-{index:03}")).join("empty")).unwrap();
+    }
+    let (opened, _) = measure(
+        "skill tree with 1,000 empty or intermediate directories",
+        |budget| OpenedSource::open_path_with_budget(project.path(), budget.clone()).unwrap(),
+    );
+    assert_eq!(opened.selected_files().unwrap().len(), 2);
+
+    // Exhaust almost all the budget before opening. The walk must stop
+    // before enumerating the whole tree or allocating its path collection.
+    const REMAINING: usize = 256 * 1024;
+    let budget = SourceBudget::default();
+    budget.bytes(MAX_SOURCE_BYTES - REMAINING, "").unwrap();
+    TOTAL.store(0, Relaxed);
+    let base = LIVE.load(Relaxed);
+    PEAK.store(base, Relaxed);
+    ACTIVE.store(true, Relaxed);
+    let result = OpenedSource::open_path_with_budget(project.path(), budget);
+    ACTIVE.store(false, Relaxed);
+    let total = TOTAL.load(Relaxed);
+    let peak = PEAK.load(Relaxed).saturating_sub(base);
+    let error = result.err().expect("the walk exceeds the remaining budget");
+    assert_eq!(error.code, GRAPH_LIMIT_CODE);
+    assert_eq!(error.source.as_ref().unwrap().path, "skills/review");
+    eprintln!(
+        "nearly exhausted skill budget: {total} allocated, {peak} peak, {REMAINING} available"
+    );
+    assert!(
+        total <= 2 * REMAINING,
+        "{total} allocated with {REMAINING} available"
+    );
+    assert!(
+        peak <= REMAINING,
+        "{peak} peak bytes with {REMAINING} available"
+    );
+}
+
 fn has_limit(report: &str) -> bool {
     let json: Value = serde_json::from_str(report).unwrap();
     json["diagnostics"].as_array().unwrap().last().unwrap()["code"] == GRAPH_LIMIT_CODE
@@ -472,6 +523,8 @@ fn source_operations_keep_allocation_and_work_proportional() {
         br#"{"contract":"agsdl-0.4.0","id":"warm","agents":{"a":{"harness":"codex","permissions":"read-only"}}}"#,
         None, &SourceBudget::default(),
     ).unwrap();
+
+    measure_skill_tree();
 
     let small = tempfile::tempdir().unwrap();
     let large = tempfile::tempdir().unwrap();
