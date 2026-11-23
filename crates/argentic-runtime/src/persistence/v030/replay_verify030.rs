@@ -187,6 +187,7 @@ enum KindRead {
         work: WorkRef030,
         delivery_activation_id: String,
     },
+    Operator(crate::persistence::flow030::OperatorEvent030),
     SteerFailed {
         effect_id: String,
         work: WorkRef030,
@@ -801,13 +802,18 @@ async fn verify_physical_end(
             )
             .bind(&id.system_start_id)
             .bind(&id.flow_invocation_id)
-            .fetch_one(&mut *db).await.map_err(storage)?;
+            .fetch_one(&mut *db)
+            .await
+            .map_err(storage)?;
             equal("reopenedApproval.revokedStopped", &true, &revoked_stopped)?;
         }
         if matches!(
             receipt["kind"].as_str(),
-            Some("nativeJoinedGroupStop030" | "nativeJoinedDiagnosticStop030"
-                | "nativeReopenedApprovalStop030")
+            Some(
+                "nativeJoinedGroupStop030"
+                    | "nativeJoinedDiagnosticStop030"
+                    | "nativeReopenedApprovalStop030"
+            )
         ) {
             equal(
                 "physicalEnded.stop.eventId",
@@ -1154,8 +1160,11 @@ async fn verify_settlement(
         }
     } else if matches!(
         receipt["kind"].as_str(),
-        Some("nativeJoinedGroupStop030" | "nativeJoinedDiagnosticStop030"
-            | "nativeReopenedApprovalStop030")
+        Some(
+            "nativeJoinedGroupStop030"
+                | "nativeJoinedDiagnosticStop030"
+                | "nativeReopenedApprovalStop030"
+        )
     ) {
         // Retained R6 group stops settled directly with the joined event and
         // the original Start handoff, without creating a second handoff row.

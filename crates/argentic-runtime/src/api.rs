@@ -13,11 +13,12 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 pub use crate::agsdl_host_codex::CodexStatus;
+pub use crate::agsdl_host_flow030::operator030::{OperatorAction, OperatorRequest};
 pub use crate::agsdl_host_flow030::{DeliveryReceipt030, DeliveryRequest030};
 pub use crate::agsdl_host_human030::HumanAnswer030;
 pub use crate::agsdl_host_projection030::{
-    RuntimeProjectionContinuation030, RuntimeProjectionItem030, RuntimeProjectionPage030,
-    RuntimeProjectionQuery030, RuntimeProjectionScope030,
+    OperatorWorkState, RuntimeProjectionContinuation030, RuntimeProjectionItem030,
+    RuntimeProjectionPage030, RuntimeProjectionQuery030, RuntimeProjectionScope030,
 };
 pub use crate::tasks::StreamTasks;
 
@@ -103,6 +104,14 @@ impl HostState {
         continuation: Option<RuntimeProjectionContinuation030>,
     ) -> Result<RuntimeProjectionPage030> {
         crate::agsdl_host_projection030::read(self, pool, query, continuation).await
+    }
+    /// Commit a live operator transition and wake the run supervisor.
+    pub async fn control_run(
+        &self,
+        pool: &SqlitePool,
+        request: OperatorRequest,
+    ) -> Result<persistence::flow030::FlowReceipt030> {
+        flow::operator030::control(self, pool, request).await
     }
     pub async fn deliver_message(
         &self,
@@ -330,13 +339,15 @@ impl StartSession<'_> {
         let plan: persistence::flow030::FlowPlan030 =
             serde_json::from_str(&capture.compiled_plan_json)?;
         let document: Value = serde_json::from_str(&plan.document_json)?;
-        let needs_clock = plan.steps.iter().any(|step| {
-            step.r#type == "approval" || step.r#type == "call" || step.timeout_ms_json.is_some()
-        }) || document["agents"].as_object().is_some_and(|agents| {
-            agents
-                .values()
-                .any(|agent| agent.get("answerTimeoutMs").is_some())
-        });
+        let needs_clock = plan.versions.contract == argentic_core::AGSDL_040
+            || plan.steps.iter().any(|step| {
+                step.r#type == "approval" || step.r#type == "call" || step.timeout_ms_json.is_some()
+            })
+            || document["agents"].as_object().is_some_and(|agents| {
+                agents
+                    .values()
+                    .any(|agent| agent.get("answerTimeoutMs").is_some())
+            });
         let agents = crate::agsdl_host_codex030::CodexExecutor030::new(context.clone())
             .with_approvals(Arc::new(
                 crate::agsdl_host_action_approval030::AgentActionHumans030 {

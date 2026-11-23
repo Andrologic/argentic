@@ -204,7 +204,9 @@ pub async fn apply_tx<A: Authority030>(
 }
 
 pub fn eligible(state: &FlowState030, effect: &FlowEffect030) -> bool {
-    if effect.identity != state.identity {
+    if effect.identity != state.identity
+        || (state.paused && !matches!(effect.kind, FlowEffectKind030::StopWork { .. }))
+    {
         return false;
     }
     match &effect.kind {

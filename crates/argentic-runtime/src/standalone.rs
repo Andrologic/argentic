@@ -613,6 +613,12 @@ impl Host {
     pub async fn submit_person(&self, answer: HumanSubmission) -> Result<String> {
         self.engine.submit_person(&self.pool, answer).await
     }
+    pub async fn control_run(
+        &self,
+        input: api::OperatorRequest,
+    ) -> Result<persistence::flow030::FlowReceipt030> {
+        self.engine.control_run(&self.pool, input).await
+    }
     pub async fn deliver(&self, input: api::DeliveryRequest030) -> Result<api::DeliveryReceipt030> {
         self.engine.deliver_message(&self.pool, input).await
     }

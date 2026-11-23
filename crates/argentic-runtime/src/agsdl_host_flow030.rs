@@ -1236,7 +1236,7 @@ pub(crate) async fn apply_native_event(
         .execute(&mut *db)
         .await?;
     let tx = db.begin_with("BEGIN IMMEDIATE").await?;
-    apply_native_event_transaction030(runtime, &lease, tx, event).await
+    apply_native_event_transaction030(runtime, &lease, tx, event, None).await
 }
 
 /// The caller retains the admission gate from revision read through COMMIT.
@@ -1245,6 +1245,7 @@ pub(crate) async fn apply_native_event_transaction030(
     lease: &HostStartLease,
     mut tx: sqlx::Transaction<'_, sqlx::Sqlite>,
     event: &FlowEvent030,
+    clock: Option<(&crate::agsdl_host_human030::HumanBroker030, &FlowState030)>,
 ) -> Result<Apply030> {
     runtime.available(&event.identity)?;
     let authority = Authority {
@@ -1255,6 +1256,9 @@ pub(crate) async fn apply_native_event_transaction030(
     let result = flow_store030::apply_tx(&mut tx, &authority, event)
         .await
         .map_err(store_error)?;
+    if let Some((broker, before)) = clock.filter(|_| matches!(result, Apply030::Applied(_))) {
+        broker.reserve_operator_clock(&mut tx, before).await?;
+    }
     lease.ensure_live()?;
     runtime.begin_event_commit(event)?;
     tx.commit().await.map_err(|_| uncertain())?;
@@ -2095,7 +2099,10 @@ impl DispatchLease030<'_> {
             .await?;
             let state: FlowState030 = serde_json::from_str(&state)?;
             if code == "unsent-at-deadline" {
-                code = if crate::persistence::flow030::accepts_steer030(&state, work) {
+                code = if !state.paused
+                    && !state.operator_holds.contains_key(&work.activation_id)
+                    && crate::persistence::flow030::accepts_steer030(&state, work)
+                {
                     "HARNESS_REFUSED"
                 } else {
                     "not-received"
@@ -2645,15 +2652,21 @@ pub(crate) async fn recover_pending_stops030(host: &HostState, pool: &SqlitePool
                     start_effect_id: start_effect_id.clone(),
                     agent_instance_id: activation.instance_id.clone(),
                 };
-                if control.settle_unadmitted(host.flow030(), pool, &work).await?.is_some() {
+                if control
+                    .settle_unadmitted(host.flow030(), pool, &work)
+                    .await?
+                    .is_some()
+                {
                     continue;
                 }
                 // The autonomous approval executor only owns an in-memory
                 // wait. It cannot outlive the previous exclusive host.
                 if let Some(stop) = activation.stop_effect_id.as_ref().filter(|_| {
-                    activation.agent.is_none() && activation.instance_id.is_none()
+                    activation.agent.is_none()
+                        && activation.instance_id.is_none()
                         && plan.steps.iter().any(|step| {
-                            step.r#type == "approval" && Some(&step.address) == activation.step.as_ref()
+                            step.r#type == "approval"
+                                && Some(&step.address) == activation.step.as_ref()
                         })
                 }) {
                     control.settle_reopened_approval(pool, work, stop).await?;
@@ -2894,10 +2907,13 @@ impl FlowControl030 {
     ) -> Result<()> {
         let _admission = self.admission.clone().lock_owned().await;
         let mut db = pool.acquire().await?;
-        sqlx::query("PRAGMA synchronous=FULL").execute(&mut *db).await?;
+        sqlx::query("PRAGMA synchronous=FULL")
+            .execute(&mut *db)
+            .await?;
         let mut tx = db.begin_with("BEGIN IMMEDIATE").await?;
         let view = flow_store030::read_tx(&mut tx, self, &self.identity)
-            .await.map_err(store_error)?;
+            .await
+            .map_err(store_error)?;
         let start: Option<String> = sqlx::query_scalar(
             "SELECT receipt_json FROM engine_flow030_handoffs
              WHERE system_id=? AND invocation_id=? AND effect_id=? AND owner_epoch=? AND generation=?",
@@ -2909,9 +2925,14 @@ impl FlowControl030 {
             return Ok(());
         };
         let start: Value = serde_json::from_str(&start)?;
-        let expected_start = format!("flow030:{}:{}", self.identity.system_start_id, work.start_effect_id);
-        if start["kind"] != "nativeOwnedHandoff030" || start["requestId"] != expected_start
-            || start.get("workAttempt").is_some() || !view.state.stopping
+        let expected_start = format!(
+            "flow030:{}:{}",
+            self.identity.system_start_id, work.start_effect_id
+        );
+        if start["kind"] != "nativeOwnedHandoff030"
+            || start["requestId"] != expected_start
+            || start.get("workAttempt").is_some()
+            || !view.state.stopping
         {
             return Err(refused());
         }
@@ -2919,10 +2940,15 @@ impl FlowControl030 {
             "SELECT status,effect_json FROM engine_flow030_outbox
              WHERE system_id=? AND invocation_id=? AND effect_id=? AND owner_epoch=?",
         )
-        .bind(&self.identity.system_start_id).bind(&self.identity.flow_invocation_id)
-        .bind(stop).bind(&self.owner.owner_epoch).fetch_one(&mut *tx).await?;
+        .bind(&self.identity.system_start_id)
+        .bind(&self.identity.flow_invocation_id)
+        .bind(stop)
+        .bind(&self.owner.owner_epoch)
+        .fetch_one(&mut *tx)
+        .await?;
         let effect: FlowEffect030 = serde_json::from_str(row.get("effect_json"))?;
-        if effect.id != stop || effect.identity != self.identity
+        if effect.id != stop
+            || effect.identity != self.identity
             || !matches!(&effect.kind, FlowEffectKind030::StopWork { work: target, include_descendants: true } if target == &work)
         {
             return Err(refused());
@@ -2940,7 +2966,9 @@ impl FlowControl030 {
                 },
             },
         };
-        let result = flow_store030::apply_tx(&mut tx, self, &event).await.map_err(store_error)?;
+        let result = flow_store030::apply_tx(&mut tx, self, &event)
+            .await
+            .map_err(store_error)?;
         if !matches!(result, Apply030::Applied(_)) {
             return Err(refused());
         }
@@ -2956,9 +2984,14 @@ impl FlowControl030 {
                  WHERE system_id=? AND invocation_id=? AND effect_id=? AND owner_epoch=?
                  AND status IN ('pending','uncertain')",
             )
-            .bind(receipt.to_string()).bind(&self.identity.system_start_id)
-            .bind(&self.identity.flow_invocation_id).bind(stop).bind(&self.owner.owner_epoch)
-            .execute(&mut *tx).await?.rows_affected();
+            .bind(receipt.to_string())
+            .bind(&self.identity.system_start_id)
+            .bind(&self.identity.flow_invocation_id)
+            .bind(stop)
+            .bind(&self.owner.owner_epoch)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
             if changed != 1 {
                 return Err(refused());
             }
@@ -3562,3 +3595,6 @@ impl Authority030 for FlowControl030 {
 mod delivery030;
 pub(crate) use delivery030::deliver030;
 pub use delivery030::{DeliveryReceipt030, DeliveryRequest030};
+
+#[path = "agsdl_host_operator030.rs"]
+pub(crate) mod operator030;

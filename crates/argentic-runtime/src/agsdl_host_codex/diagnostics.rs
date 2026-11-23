@@ -165,6 +165,7 @@ pub(crate) fn fixed_code(error: &EngineFailure) -> &'static str {
         "CODEX_TURN_CONNECTION_FAILED",
         "CODEX_TURN_STREAM_FAILED",
         "CODEX_TURN_INTERRUPTED",
+        "CODEX_INTERRUPT_UNCONFIRMED",
         "CODEX_TURN_FAILED_AFTER_SCOPE_DECLINE",
         "CODEX_APPROVAL_METHOD_UNQUALIFIED",
         "NATIVE_UNCERTAIN",

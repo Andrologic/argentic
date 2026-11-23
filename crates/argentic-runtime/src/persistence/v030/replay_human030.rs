@@ -96,11 +96,14 @@ pub(super) async fn verify(
             WHERE s.system_id=o.system_id AND s.invocation_id=o.invocation_id
               AND s.owner_epoch=o.owner_epoch AND s.generation=o.generation
               AND s.event_id IS NOT NULL
-        ) AS stopped FROM engine_flow030_owners o WHERE o.system_id=? AND o.invocation_id=?",
+        ) AS stopped, EXISTS (
+            SELECT 1 FROM engine_flow030_interruptions i WHERE i.system_id=o.system_id
+        ) AS interrupted FROM engine_flow030_owners o WHERE o.system_id=? AND o.invocation_id=?",
     )
     .bind(&id.system_start_id)
     .bind(&id.flow_invocation_id)
-    .fetch_one(&mut *db).await?;
+    .fetch_one(&mut *db)
+    .await?;
     let fenced_stop = plan.versions.contract == argentic_core::AGSDL_040
         && state.stopping
         && native_owner.get::<&str, _>("status") == "revoked"
@@ -131,15 +134,16 @@ pub(super) async fn verify(
             "Clock ticket correlation",
         )?;
         let options: Value = serde_json::from_str(&ticket.options_json)?;
-        require(options == json!({"maxSliceMs":2147483647}), "Clock options differ")?;
+        require(
+            options == json!({"maxSliceMs":2147483647}),
+            "Clock options differ",
+        )?;
         let envelope: Value = serde_json::from_str(&ticket.event_json)?;
         let event = &envelope["event"];
         let kind = event["kind"].as_str().ok_or("Clock event kind absent")?;
         let now = ms(envelope["nowMs"].as_str().ok_or("Clock time absent")?)?;
         require(
-            now >= observed
-                && envelope["owner"] == owner
-                && envelope["eventId"] == ticket.event_id,
+            now >= observed && envelope["owner"] == owner && envelope["eventId"] == ticket.event_id,
             "Clock event identity/time",
         )?;
         match kind {
@@ -159,18 +163,25 @@ pub(super) async fn verify(
                     .iter()
                     .find(|a| a.id == work_id)
                     .ok_or("Clock activation absent")?;
-                let step = plan
-                    .steps
-                    .iter()
-                    .find(|s| Some(&s.address) == activation.step.as_ref())
-                    .ok_or("Clock step absent")?;
+                let step = match &activation.step {
+                    Some(address) => Some(
+                        plan.steps
+                            .iter()
+                            .find(|s| &s.address == address)
+                            .ok_or("Clock step absent")?,
+                    ),
+                    None if activation.agent.is_some() => None,
+                    None => return Err("Clock work has no captured declaration".into()),
+                };
+                let work_kind = step.map(|s| s.r#type.as_str()).unwrap_or("agent");
+                let timeout = step.and_then(|s| s.timeout_ms_json.clone());
                 require(
                     r.get::<&str, _>("owner_epoch") == clock.get::<&str, _>("owner_epoch")
                         && r.get::<&str, _>("generation") == clock.get::<&str, _>("generation")
                         && work["identity"] == serde_json::to_value(id)?
                         && work["owner"] == owner
                         && work["generation"] == clock.get::<&str, _>("generation")
-                        && work["kind"] == step.r#type,
+                        && work["kind"] == work_kind,
                     "Clock work metadata",
                 )?;
                 let start = r.get::<&str, _>("start_effect_id");
@@ -178,7 +189,7 @@ pub(super) async fn verify(
                     activation.start_effect_id.as_deref() == Some(start)
                         && work["reference"]
                             == json!({"activationId":activation.id,"startEffectId":start,"agentInstanceId":activation.instance_id})
-                        && r.get::<Option<String>, _>("timeout_json") == step.timeout_ms_json,
+                        && r.get::<Option<String>, _>("timeout_json") == timeout,
                     "Clock work reference/duration",
                 )?;
                 let origin=sqlx::query("SELECT started_ms FROM engine_flow030_handoff_clock WHERE system_id=? AND invocation_id=? AND start_effect_id=? AND owner_epoch=? AND generation=?")
@@ -187,20 +198,28 @@ pub(super) async fn verify(
                 require(
                     origin.get::<&str, _>("started_ms") == started
                         && event["startedAtMs"] == started
-                        && event["timeoutMs"] == json!(step.timeout_ms_json),
+                        && event["timeoutMs"] == json!(timeout),
                     "Clock origin/duration",
                 )?;
-                let declaration: Value = serde_json::from_str(&step.declaration_json)?;
-                require((kind == "approval") == (step.r#type == "approval"), "Clock admission kind differs")?;
+                let declaration: Value = step
+                    .map(|s| serde_json::from_str(&s.declaration_json))
+                    .transpose()?
+                    .unwrap_or(Value::Null);
+                require(
+                    (kind == "approval") == (work_kind == "approval"),
+                    "Clock admission kind differs",
+                )?;
                 if kind == "approval" {
-                    let choices = declaration["next"].as_object().ok_or("Approval choices absent")?;
+                    let choices = declaration["next"]
+                        .as_object()
+                        .ok_or("Approval choices absent")?;
                     require(
                         !choices.is_empty()
                             && event["choices"] == json!(choices.keys().collect::<Vec<_>>()),
                         "Approval ticket choices differ",
                     )?;
                 }
-                let agent_declaration = step
+                let agent_declaration = activation
                     .agent
                     .as_ref()
                     .and_then(|name| plan.agents.iter().find(|a| a["agentName"] == *name))
@@ -221,7 +240,7 @@ pub(super) async fn verify(
                 )?;
                 works.push(Work {
                     id: work_id.into(),
-                    kind: step.r#type.clone(),
+                    kind: work_kind.into(),
                     start: ms(started)?,
                     timeout: r.get("timeout_json"),
                     answer_timeout: r.get("answer_timeout_json"),
@@ -229,7 +248,8 @@ pub(super) async fn verify(
                     retired: false,
                 });
             }
-            "open" | "associate" | "answer" | "approvalAnswer" | "ack" | "retire" | "tick" => {}
+            "open" | "associate" | "answer" | "approvalAnswer" | "ack" | "retire" | "tick"
+            | "operatorHold" => {}
             _ => return Err("Unknown clock event".into()),
         }
         if kind == "open" || kind == "approval" {
@@ -348,7 +368,13 @@ pub(super) async fn verify(
         let Some(output) = row.try_get::<Option<&str>, _>("output_json")? else {
             // Verify facts written at reservation above. A fenced Stop can
             // retain an undecided tail, but it contributes no clock output.
-            require(fenced_stop && index + 1 == events.len(), "Uncommitted clock ticket")?;
+            let fenced_operator = kind == "operatorHold"
+                && native_owner.get::<&str, _>("status") == "revoked"
+                && native_owner.get::<bool, _>("interrupted");
+            require(
+                (fenced_stop || fenced_operator) && index + 1 == events.len(),
+                "Uncommitted clock ticket",
+            )?;
             require(
                 index != 0 || now >= retained_observed,
                 "Initial clock observation is later than its reservation",
@@ -478,8 +504,8 @@ pub(super) async fn verify(
             require(
                 parsed(row, "resolution_json")? == expected
                     && row.get::<&str, _>("revision") == "1"
-                    && row.get::<&str, _>("delivery") == "acknowledged"
-                    && r.acknowledged,
+                    && (resolution["operatorCancelled"] == true
+                        || (row.get::<&str, _>("delivery") == "acknowledged" && r.acknowledged)),
                 "Resolution/readback differs",
             )?;
             let proof=sqlx::query("SELECT p.resolution_json,e.output_json FROM engine_flow030_human_resolution_proofs p JOIN engine_flow030_clock_events e USING(system_id,invocation_id,event_id) WHERE p.system_id=? AND p.invocation_id=? AND p.request_id=?")

@@ -300,6 +300,63 @@ report a pending receipt, within the steer deadline. This observation uses
 none of an accepted result's machine-time budget. The runtime still joins
 the process and its descendants before routing the recipient's result.
 
+## Operator controls for AgSDL 0.4.0
+
+The Rust embedding API is `Engine::control_run(&self, pool: &SqlitePool,
+request: OperatorRequest) -> Result<FlowReceipt030>`. The standalone
+`Host::control_run(&self, request: OperatorRequest)` returns the same
+receipt. Supply the exact scope from `inspect` and a request ID. Each
+distinct action gets a new ID. Retrying the same action and ID returns
+its original receipt. Changing the action under that ID returns
+`CONFLICT`. An `OPERATOR_TRANSITION` response means the action cannot
+run in the current state.
+
+The JSON-lines command is `controlRun`. Its input is an `OperatorRequest`
+with `scope`, `requestId` and `action`. The action takes one of these forms.
+
+```json
+{"kind":"interruptWork","activationId":"ACTIVATION"}
+{"kind":"resumeWork","activationId":"ACTIVATION"}
+{"kind":"pauseRun"}
+{"kind":"resumeRun"}
+```
+
+- **Interrupt.** Use the current activation ID from the instance projection.
+  The receipt records the request. Display `operatorWorks[activationId].kind`
+  as `holding` until Codex confirms the end of the turn, then `held`. The
+  activation stays open and retains its machine-time budget, conversation
+  and remaining corrections. An action approval for the interrupted turn
+  closes. Any effects already committed remain in place.
+- **Resume an agent.** Once held, use `resumeWork` to continue on the same
+  Codex thread. A person can also use the existing `deliver` operation on a
+  held shared or named instance. A `steer` attempts receipt by the continued
+  work through the ordinary steer evidence path. A `queue` releases the hold
+  and appends the message in arrival order for its own work. In a flow,
+  external messages require an exact held instance. For an instance created
+  with `instance: "new"`, use `resumeWork`.
+- **Pause a run.** `paused: true` means the dispatch gate is closed.
+  Admitted agent work goes through the same `holding` and `held` states.
+  Starts, new deliveries, and routes wait. Flow approvals still accept
+  answers and expire on their original deadlines. To warn about expiry,
+  read pending `flowChoice` requests in `humans` and use the available
+  clock's `openedAtMs` and `timeoutMs`. An approval outcome can appear
+  while its route is pending. An admitted host call cannot be suspended by
+  this API, so Pause returns `HOST_CAPABILITY` while one is active.
+- **Resume a run.** Call `resumeRun` once its turn interruptions have been
+  confirmed. This releases the held agents and the deferred dispatch work.
+  Individual resume commands are refused while the run is paused.
+- **Stop.** Use the existing whole-run Stop for a paused run or a run with a
+  held agent. It discards pending dispatch and continues native termination
+  until physical confirmation.
+
+Operator transitions and clock changes are journaled. A new host cannot
+reattach to the held Codex work. On reopening an unfinished run, `inspect`
+reports `verdict: "interrupted"`. Each retained hold has `kind: "interrupted"`
+and `code: "INTERRUPTED"`. `interruptedWhilePaused` records a pause at
+the restart boundary. The work-level code is a host status. The whole-run
+AgSDL recovery outcome follows no normal or error route and creates no
+step failure. A previously committed Stop keeps its existing recovery rules.
+
 ## Storage, API and limits
 
 `standalone::Host::open` owns an exclusive OS file lock for its lifetime. It

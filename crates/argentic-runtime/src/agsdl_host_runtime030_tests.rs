@@ -204,7 +204,7 @@ impl Fixture {
         let pool = crate::sqlite::create_file(&root.join("run.db"))
             .await
             .unwrap();
-        let request = serde_json::from_value(json!({"source":source,"profile":"macro-agsdl-030-v1", "associations":{}, "requestId":"request", "entry":{"deliveryId":"delivery", "messageJson":"{\"prompt\":\"Start\"}"}})).unwrap();
+        let request = serde_json::from_value(json!({"source":source,"profile":"macro-agsdl-030-v1", "associations":{}, "requestId":"request", "entry":document.get("flow").map(|_| json!({"deliveryId":"delivery", "messageJson":"{\"prompt\":\"Start\"}"}))})).unwrap();
         start030::start_linked(
             &pool,
             &request,
@@ -745,7 +745,8 @@ async fn stop_before_the_first_handoff_settles_an_unadmitted_start() {
         "contract": argentic_core::AGSDL_040, "id": "unadmitted-stop",
         "agents": {"worker": {"harness": "codex", "permissions": "workspace"}},
         "flow": {"entry": "first", "steps": {"first": {"type": "agent", "agent": "worker"}}}
-    })).await;
+    }))
+    .await;
     stop_fixture(&f, "stop-before-handoff").await;
     let tasks = StreamTasks::default();
     let starts = Arc::new(AtomicUsize::new(0));
@@ -786,20 +787,29 @@ async fn stop_before_the_first_handoff_settles_an_unadmitted_start() {
         .await
         .unwrap();
     assert_eq!(view.flow.state.verdict.as_deref(), Some("cancelled"));
-    let page = f.host.runtime_projection(
-        &f.pool,
-        crate::api::RuntimeProjectionQuery030 {
-            system_start_id: f.identity.system_start_id.clone(),
-            source: view.capture.source,
-            snapshot_id: None,
-        },
-        None,
-    ).await.unwrap();
-    let statuses = page.items.iter().find_map(|item| match item {
-        crate::agsdl_host_projection030::RuntimeProjectionItem030::Activation { value } =>
-            value.message.as_ref().map(|message| &message.statuses),
-        _ => None,
-    }).unwrap();
+    let page = f
+        .host
+        .runtime_projection(
+            &f.pool,
+            crate::api::RuntimeProjectionQuery030 {
+                system_start_id: f.identity.system_start_id.clone(),
+                source: view.capture.source,
+                snapshot_id: None,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    let statuses = page
+        .items
+        .iter()
+        .find_map(|item| match item {
+            crate::agsdl_host_projection030::RuntimeProjectionItem030::Activation { value } => {
+                value.message.as_ref().map(|message| &message.statuses)
+            }
+            _ => None,
+        })
+        .unwrap();
     assert_eq!(statuses, &["sent"]);
 }
 

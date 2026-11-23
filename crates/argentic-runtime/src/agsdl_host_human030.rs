@@ -546,6 +546,13 @@ impl HumanBroker030 {
         let mut tx = connection.begin_with("BEGIN IMMEDIATE").await?;
         self.guard(&mut tx, &lease).await?;
         self.verify_work(&mut tx, work).await?;
+        if kind == "ask" && self.operator_held(&mut tx, work.work_id()).await? {
+            return Err(failure(
+                "OPERATOR_HOLD",
+                "approval",
+                "The turn is being interrupted",
+            ));
+        }
         let timeout: Option<String> = sqlx::query_scalar("SELECT answer_timeout_json FROM engine_flow030_clock_works WHERE system_id=? AND invocation_id=? AND activation_id=?")
             .bind(&self.identity.system_start_id).bind(&self.identity.flow_invocation_id).bind(work.work_id()).fetch_one(&mut *tx).await?;
         let now = self.clock.now_ms().to_string();
@@ -694,12 +701,13 @@ impl HumanBroker030 {
             !state.stopping
                 && state.verdict.is_none()
                 && work_ids.iter().all(|id| {
-                    state.activations.iter().any(|a| {
-                        &a.id == id
-                            && a.phase == "running"
-                            && a.result.is_none()
-                            && a.stop_effect_id.is_none()
-                    })
+                    !state.operator_holds.contains_key(id)
+                        && state.activations.iter().any(|a| {
+                            &a.id == id
+                                && a.phase == "running"
+                                && a.result.is_none()
+                                && a.stop_effect_id.is_none()
+                        })
                 }),
             "Human answer targets a stale visit",
         )?;
@@ -797,6 +805,67 @@ impl HumanBroker030 {
         sqlx::query("INSERT INTO engine_flow030_clock_events(system_id,invocation_id,event_id,ticket_json) VALUES(?,?,?,?)")
             .bind(&self.identity.system_start_id).bind(&self.identity.flow_invocation_id).bind(event_id).bind(serde_json::to_string(&input)?).execute(db).await?;
         Ok(())
+    }
+    pub(crate) async fn reserve_operator_clock(
+        &self,
+        db: &mut SqliteConnection,
+        before: &FlowState030,
+    ) -> Result<()> {
+        let raw: String = sqlx::query_scalar(
+            "SELECT state_json FROM engine_flow030_runs WHERE system_id=? AND invocation_id=?",
+        )
+        .bind(&self.identity.system_start_id)
+        .bind(&self.identity.flow_invocation_id)
+        .fetch_one(&mut *db)
+        .await?;
+        let after: FlowState030 = serde_json::from_str(&raw)?;
+        let active: Vec<String> = sqlx::query_scalar("SELECT activation_id FROM engine_flow030_clock_works WHERE system_id=? AND invocation_id=? AND kind='agent' AND retired=0 ORDER BY rowid")
+            .bind(&self.identity.system_start_id).bind(&self.identity.flow_invocation_id)
+            .fetch_all(&mut *db).await?;
+        let mut held = Vec::new();
+        let mut released = Vec::new();
+        for id in active {
+            match (
+                before.operator_holds.contains_key(&id),
+                after.operator_holds.contains_key(&id),
+            ) {
+                (false, true) => held.push(id),
+                (true, false) => released.push(id),
+                _ => (),
+            }
+        }
+        if held.is_empty() && released.is_empty() {
+            return Ok(());
+        }
+        let requests = sqlx::query("SELECT request_id,work_ids_json FROM engine_flow030_human_requests WHERE system_id=? AND invocation_id=? AND kind='ask' AND resolution_json IS NULL ORDER BY rowid")
+            .bind(&self.identity.system_start_id).bind(&self.identity.flow_invocation_id)
+            .fetch_all(&mut *db).await?;
+        let mut cancel_asks = Vec::new();
+        for request in requests {
+            let works: Vec<String> = serde_json::from_str(request.get("work_ids_json"))?;
+            if works.iter().any(|id| held.contains(id)) {
+                cancel_asks.push(request.get::<String, _>("request_id"));
+            }
+        }
+        self.reserve(
+            db,
+            json!({"kind":"operatorHold","held":held,"released":released,"cancelAsks":cancel_asks}),
+            &self.clock.now_ms().to_string(),
+        )
+        .await
+    }
+
+    async fn operator_held(&self, db: &mut SqliteConnection, id: &str) -> Result<bool> {
+        Ok(sqlx::query_scalar(
+            "SELECT EXISTS (
+            SELECT 1 FROM engine_flow030_runs r, json_each(r.state_json, '$.operatorHolds') h
+            WHERE r.system_id=? AND r.invocation_id=? AND h.key=?)",
+        )
+        .bind(&self.identity.system_start_id)
+        .bind(&self.identity.flow_invocation_id)
+        .bind(id)
+        .fetch_one(db)
+        .await?)
     }
     pub(crate) async fn tick(&self, host: &HostState) -> Result<()> {
         self.event(host, json!({"kind":"tick"})).await
@@ -1237,6 +1306,13 @@ impl HumanBroker030 {
                     == Some(decision.resolution.to_string().as_str()),
             "Action decision is stale or already delivered",
         )?;
+        if self.operator_held(&mut tx, work.work_id()).await? {
+            return Err(failure(
+                "OPERATOR_HOLD",
+                "approval",
+                "The turn is being interrupted",
+            ));
+        }
         tx.commit().await?;
         lease.ensure_live()?;
         deliver(
@@ -1275,7 +1351,11 @@ impl HumanBroker030 {
         .fetch_one(&mut *db)
         .await?;
         if timed_out {
-            return Err(failure("TIMEOUT", "clock", "The work deadline already committed"));
+            return Err(failure(
+                "TIMEOUT",
+                "clock",
+                "The work deadline already committed",
+            ));
         }
         let active: bool = sqlx::query_scalar(
             "SELECT EXISTS (SELECT 1 FROM engine_flow030_clock_works

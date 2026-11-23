@@ -144,6 +144,14 @@ fn event(raw: &Value, expected_owner: &Value, decoder: &impl JsonDecoder) -> Res
             ("choice", id(b.get("choice"))?),
             ("comment", b.get("comment").clone()),
         ])
+    } else if kind.eq_str("operatorHold") {
+        keys(b, &["kind", "held", "released", "cancelAsks"])?;
+        o([
+            ("kind", kind.clone()),
+            ("held", ids(b.get("held"))?),
+            ("released", ids(b.get("released"))?),
+            ("cancelAsks", ids(b.get("cancelAsks"))?),
+        ])
     } else if kind.eq_str("tick") {
         keys(b, &["kind"])?;
         o([("kind", kind.clone())])

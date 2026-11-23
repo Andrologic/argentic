@@ -217,6 +217,18 @@ impl Projection {
                     ]),
                 );
             }
+        } else if kind.eq_str("operatorHold") {
+            for (key, held) in [("held", true), ("released", false)] {
+                for id in event.get(key).array().unwrap() {
+                    let Some(i) = find(&self.clocks, id) else {
+                        return plain("Unknown held work.");
+                    };
+                    self.clocks[i].1.borrow_mut().set_held(held, now_raw)?;
+                }
+            }
+            for id in event.get("cancelAsks").array().unwrap() {
+                self.registry.cancel_ask(id, now_raw)?;
+            }
         } else if kind.eq_str("ack") {
             if let Some(i) = find(&self.approvals, event.get("requestId")) {
                 if self.approvals[i].1.resolution.is_none() {
@@ -357,13 +369,17 @@ impl Projection {
             }
             answer
         };
-        Ok(resolution(
+        let mut projected = resolution(
             id,
             raw.get("expired").truthy(),
             raw.get("resolvedAtMs").clone(),
             raw.get("workActions").clone(),
             answer,
-        ))
+        );
+        if raw.get("operatorCancelled").truthy() {
+            projected.set("operatorCancelled", Value::Bool(true));
+        }
+        Ok(projected)
     }
 }
 fn resolution(id: &Value, expired: bool, at: Value, actions: Value, answer: Value) -> Value {

@@ -61,7 +61,8 @@ pub(crate) async fn deliver030(
         ));
     }
     let plan: FlowPlan030 = serde_json::from_str(&inspection.capture.compiled_plan_json)?;
-    if plan.entry.is_some()
+    let current = plan.versions.contract == argentic_core::AGSDL_040;
+    if (plan.entry.is_some() && !current)
         || !plan
             .graphless_submission_contracts
             .contains_key(&request.agent_name)
@@ -95,6 +96,39 @@ pub(crate) async fn deliver030(
             "Message does not satisfy this agent's input contract",
         ));
     }
+    let dispatcher = current
+        .then(|| {
+            host.flow030()
+                .supervisors
+                .dispatcher(&request.scope.system_start_id)
+        })
+        .flatten();
+    let _dispatch = match &dispatcher {
+        Some((gate, _)) => Some(gate.lock().await),
+        None => None,
+    };
+    let broker = if dispatcher.is_some() {
+        Some(
+            host.flow030()
+                .humans
+                .broker(host, pool, &inspection.capture.identity)
+                .await?,
+        )
+    } else {
+        None
+    };
+    let _clock = match &broker {
+        Some(broker) => {
+            let guard = broker.operation.lock().await;
+            if !inspection.flow.state.stopping && inspection.flow.state.verdict.is_none() {
+                broker
+                    .pump(host, &tokio_util::sync::CancellationToken::new())
+                    .await?;
+            }
+            Some(guard)
+        }
+        None => None,
+    };
     let _admission = host.admission_lock().lock_owned().await;
     let authority = Authority {
         runtime: host.flow030(),
@@ -132,7 +166,32 @@ pub(crate) async fn deliver030(
             .as_str()
             .ok_or_else(refused)?
             .to_owned(),
-        None => view.state.revision,
+        None => {
+            if let FlowEventKind030::Deliver {
+                agent, instance, ..
+            } = &kind
+            {
+                let hold = view
+                    .state
+                    .instances
+                    .iter()
+                    .find(|i| &i.agent == agent && &i.selector == instance && !i.discarded)
+                    .and_then(|i| view.state.operator_holds.get(i.current.as_ref()?));
+                if plan.entry.is_some() && hold.is_none() {
+                    return Err(failure(
+                        "INPUT_CONSTRAINT",
+                        "agent",
+                        "Messages in a flow require a held agent instance",
+                    ));
+                }
+                if !view.state.paused && hold.is_some_and(|hold| !hold.ready) {
+                    return Err(operator030::conflict(
+                        "The turn interruption is still pending",
+                    ));
+                }
+            }
+            view.state.revision.clone()
+        }
     };
     let event = FlowEvent030 {
         identity: inspection.capture.identity,
@@ -140,7 +199,17 @@ pub(crate) async fn deliver030(
         expected_revision,
         kind,
     };
-    let applied = apply_native_event_transaction030(host.flow030(), &lease, tx, &event).await?;
+    let applied = apply_native_event_transaction030(
+        host.flow030(),
+        &lease,
+        tx,
+        &event,
+        broker.as_deref().map(|broker| (broker, &view.state)),
+    )
+    .await?;
+    host.flow030()
+        .supervisors
+        .wake(&request.scope.system_start_id);
     let revision = match applied {
         Apply030::Applied(r) | Apply030::Replayed(r) => r.revision,
         Apply030::Diagnostic(_) => {

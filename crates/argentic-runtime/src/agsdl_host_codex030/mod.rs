@@ -178,6 +178,9 @@ impl CodexExecutor030 {
 }
 
 impl AgentExecutor030 for CodexExecutor030 {
+    fn supports_operator_hold(&self) -> bool {
+        true
+    }
     fn prepare(&self, work: PreparedEffectiveAgentWork030) -> HostResult<AttestedWorkPolicy030> {
         if approvals::enabled(work.policy()) && self.approvals.is_none() {
             return Err(failure(
@@ -266,6 +269,7 @@ fn append_resources(
 }
 
 struct SteerContext030 {
+    operator: Option<crate::agsdl_host_flow030::operator030::AgentOperator030>,
     inbox: crate::agsdl_host_steer030::SteerInbox030,
     tasks: crate::tasks::StreamTasks,
     attempt: crate::agsdl_host_flow030::FlowWorkAttempt030,
@@ -351,7 +355,11 @@ impl PendingSteer030 {
                     && event["id"].as_u64() == request_id
                     && steer_invalid_params(&event)
                 {
-                    return Err(failure("CORRELATION", "steer", "Codex refused steer parameters"));
+                    return Err(failure(
+                        "CORRELATION",
+                        "steer",
+                        "Codex refused steer parameters",
+                    ));
                 }
                 if is_steer_message(&event, &id) {
                     client.check_auth_current().await?;
@@ -510,6 +518,77 @@ fn defer_native030(
 /// A turn may end before the host has accepted its result. While the
 /// controller is working, reject only messages that have not reached Codex;
 /// this releases admission so the pending terminal can trigger queue fallback.
+async fn operator_request(
+    operator: &mut Option<crate::agsdl_host_flow030::operator030::AgentOperator030>,
+) -> String {
+    match operator.as_mut() {
+        Some(operator) => operator.requested().await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn interrupt_turn030(
+    client: &mut Client,
+    thread: &str,
+    turn: &str,
+    pending: &mut PendingSteer030,
+    steer: &mut Option<&mut SteerContext030>,
+    mut deferred: std::collections::VecDeque<Value>,
+) -> HostResult<()> {
+    let observe = async {
+        client
+            .begin_request("turn/interrupt", json!({"threadId":thread,"turnId":turn}))
+            .await?;
+        loop {
+            let event = match deferred.pop_front() {
+                Some(event) => event,
+                None => client.notification().await?,
+            };
+            if client.handle_auth_request(&event).await?
+                || pending.receive(client, &event, thread, turn, steer).await?
+            {
+                continue;
+            }
+            let params = &event["params"];
+            if event["method"] == "turn/completed"
+                && params["threadId"] == thread
+                && params["turn"]["id"] == turn
+                && matches!(
+                    params["turn"]["status"].as_str(),
+                    Some("completed" | "interrupted" | "failed")
+                )
+            {
+                client.check_auth_current().await?;
+                if let Some(delivery) = &pending.delivery {
+                    pending.turn_ended_while_counted =
+                        delivery.observe_turn_end_while_counted().await?;
+                }
+                return Ok(());
+            }
+            if event.get("id").is_some() && event.get("method").is_some() {
+                let reply = match event["method"].as_str() {
+                    Some(
+                        "item/commandExecution/requestApproval" | "item/fileChange/requestApproval",
+                    ) => json!({"decision":"decline"}),
+                    Some("item/permissions/requestApproval") => json!({"permissions":{}}),
+                    _ => return Err(missing("approvalMethod")),
+                };
+                client.answer_request030(event["id"].clone(), reply).await?;
+            }
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(5), observe)
+        .await
+        .map_err(|_| {
+            failure(
+                "CODEX_INTERRUPT_UNCONFIRMED",
+                "turn",
+                "Codex did not confirm that its turn ended",
+            )
+        })??;
+    pending.drain(client, thread, turn, steer).await
+}
+
 async fn between_turn_event030(
     events: &AdapterSink030,
     body: Value,
@@ -744,6 +823,7 @@ impl CodexExecutor030 {
             &sink,
             &cancel,
             Some(SteerContext030 {
+                operator: Some(work.operator),
                 inbox: work.steer,
                 tasks: work.tasks,
                 attempt: work.attempt,
@@ -921,6 +1001,7 @@ impl CodexExecutor030 {
             .await
             .insert(key.clone(), thread.clone());
         *current_thread = Some(thread.clone());
+        let mut operator = steer.as_mut().and_then(|context| context.operator.take());
         let mut prompt = mission.to_owned();
         let auto_plan = steer.as_ref().is_some_and(|s| s.auto_plan);
         let mut plan_presented = false;
@@ -930,7 +1011,37 @@ impl CodexExecutor030 {
             if !frozen["modelEffort"].is_null() {
                 params["effort"] = frozen["modelEffort"].clone();
             }
-            let response = client.request("turn/start", params).await?;
+            let response = if let Some(operator) = operator.as_mut().filter(|_| current_steer) {
+                let Some(admission) = operator.admit_turn().await? else {
+                    let hold = operator.requested().await;
+                    operator.park(hold).await?;
+                    continue;
+                };
+                let request = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    client.begin_request("turn/start", params),
+                )
+                .await
+                .map_err(|_| {
+                    failure(
+                        "NATIVE_UNCERTAIN",
+                        "turn",
+                        "The turn request may have been sent",
+                    )
+                })??;
+                drop(admission);
+                tokio::time::timeout(std::time::Duration::from_secs(30), client.response(request))
+                    .await
+                    .map_err(|_| {
+                        failure(
+                            "NATIVE_UNCERTAIN",
+                            "turn",
+                            "Codex did not confirm that the turn started",
+                        )
+                    })??
+            } else {
+                client.request("turn/start", params).await?
+            };
             let turn = required(&response["turn"], "id")?;
             *current_turn = Some(turn.clone());
             let mut final_item = None;
@@ -939,9 +1050,14 @@ impl CodexExecutor030 {
             let mut deferred_native = std::collections::VecDeque::new();
             let mut deferred_bytes = 0usize;
             let mut deferred_text = Vec::new();
-            loop {
+            let mut hold_id = None;
+            'turn_events: loop {
                 let event = tokio::select! {
                     biased;
+                    id = operator_request(&mut operator) => {
+                        hold_id = Some(id);
+                        break 'turn_events;
+                    }
                     // Reading is cancellation-safe, including partial stdio frames.
                     event = async {
                         if current_steer || pending_steer.request_id.is_none() {
@@ -1124,7 +1240,18 @@ impl CodexExecutor030 {
                             loop {
                                 tokio::select! {
                                     biased;
-                                    result = &mut answer => { diagnostics::at(&attempt, Stage::Ask, result)?; break; }
+                                    result = &mut answer => {
+                                        if result.as_ref().is_err_and(|err| err.code == "OPERATOR_HOLD") {
+                                            hold_id = Some(operator_request(&mut operator).await);
+                                            break 'turn_events;
+                                        }
+                                        diagnostics::at(&attempt, Stage::Ask, result)?;
+                                        break;
+                                    }
+                                    id = operator_request(&mut operator) => {
+                                        hold_id = Some(id);
+                                        break 'turn_events;
+                                    }
                                     event = client.notification() => {
                                         let event = event?;
                                         if client.handle_auth_request(&event).await? { continue; }
@@ -1267,6 +1394,21 @@ impl CodexExecutor030 {
                     }
                     break;
                 }
+            }
+            if let Some(id) = hold_id {
+                interrupt_turn030(
+                    client,
+                    &thread,
+                    &turn,
+                    pending_steer,
+                    &mut steer,
+                    deferred_native,
+                )
+                .await?;
+                *current_turn = None;
+                operator.as_mut().unwrap().park(id).await?;
+                prompt = "Continue the current work from where the operator interrupted the previous turn. Use the existing conversation and return the required structured result.".into();
+                continue;
             }
             if !current_steer {
                 *current_turn = None;
@@ -1599,12 +1741,21 @@ for line in sys.stdin:
   result={}
  elif method=='turn/interrupt':
   open(sys.argv[4]+'.interrupted','w').write('yes')
+  if mode=='continuity':
+   print(json.dumps({'method':'turn/completed','params':{'threadId':thread,'turn':{'id':p['turnId'],'status':'interrupted'}}}),flush=True)
   if mode=='steer-stop-040':
    print(json.dumps({'id':pending_steer_id,'result':{'turnId':'turn1'}}),flush=True)
    print(json.dumps({'method':'item/completed','params':{'threadId':thread,'turnId':'turn1','item':{'type':'userMessage','clientId':'steer-test'}}}),flush=True)
   result={}
  elif method=='turn/steer':
   turn_id='turn'+str(count)
+  if mode=='continuity':
+   assert p['expectedTurnId']==turn_id and p['threadId']==thread
+   print(json.dumps({'id':i,'result':{'turnId':turn_id}}),flush=True)
+   print(json.dumps({'method':'item/completed','params':{'threadId':thread,'turnId':turn_id,'item':{'type':'userMessage','clientId':p['clientUserMessageId']}}}),flush=True)
+   print(json.dumps({'method':'item/completed','params':{'threadId':thread,'turnId':turn_id,'item':{'id':'final','type':'agentMessage','phase':'final_answer','text':json.dumps(pending_envelope)}}}),flush=True)
+   print(json.dumps({'method':'turn/completed','params':{'threadId':thread,'turn':{'id':turn_id,'status':'completed'}}}),flush=True)
+   continue
   expected_message='steer-followup' if mode=='steer-correction-040' and count==2 else 'steer-test'
   assert p['expectedTurnId']==turn_id and p['clientUserMessageId']==expected_message
   assert 'host' in p['input'][0]['text'] and 'Update the changelog' in p['input'][0]['text']
@@ -1666,6 +1817,9 @@ for line in sys.stdin:
    result={'turn':{'id':'turn'+str(count)}}
    print(json.dumps({'id':i,'result':result}),flush=True)
    if envelope is None: continue
+   if envelope.pop('_waitForSteer', False):
+    pending_envelope=envelope
+    continue
    if '_approval' in envelope:
     native=envelope.pop('_approval')
     pending_envelope=envelope; pending_turn='turn'+str(count)
@@ -1869,6 +2023,7 @@ for line in sys.stdin:
                 }));
             }
             approval_context = Some(SteerContext030 {
+                operator: None,
                 inbox,
                 tasks,
                 attempt,
@@ -2548,6 +2703,7 @@ for line in sys.stdin:
                             &sink,
                             &task_cancel,
                             Some(SteerContext030 {
+                                operator: None,
                                 inbox,
                                 tasks: registry,
                                 attempt: target,
@@ -2634,7 +2790,9 @@ for line in sys.stdin:
             tasks.join_agent030(&attempt, false).await.unwrap();
             if matches!(
                 mode,
-                "steer-malformed-040" | "steer-content-040" | "steer-oversized-040"
+                "steer-malformed-040"
+                    | "steer-content-040"
+                    | "steer-oversized-040"
                     | "steer-invalid-params-040"
             ) {
                 let code = match mode {

@@ -82,6 +82,13 @@ impl crate::agsdl_host_codex030::approvals::CommandApprovals030 for AgentActionH
                 Stage::BrokerResolution,
                 broker.take_resolution(host, &ticket).await,
             )?;
+            if decision.resolution()["operatorCancelled"] == true {
+                return Err(failure(
+                    "OPERATOR_HOLD",
+                    "approval",
+                    "The turn is being interrupted",
+                ));
+            }
             let view = diagnostics::at(
                 attempt,
                 Stage::BrokerInspect,

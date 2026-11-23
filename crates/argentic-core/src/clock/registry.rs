@@ -165,6 +165,20 @@ impl HumanWaitRegistry {
         }
         self.close(i, answer.clone(), false, now)
     }
+    pub(crate) fn cancel_ask(&mut self, id: &Value, now: &Value) -> Result<()> {
+        let i = self.get(id)?;
+        if !self.requests[i].1.input.get("kind").eq_str("ask") {
+            return plain("operator hold requires an action request.");
+        }
+        if self.requests[i].1.resolution.is_none() {
+            let answer = o([("kind", s("decision")), ("decision", s("no"))]);
+            let mut resolution = self.close(i, answer, false, now)?;
+            resolution.set("operatorCancelled", Value::Bool(true));
+            self.requests[i].1.resolution = Some(resolution.clone());
+            put(&mut self.pending, id, resolution);
+        }
+        Ok(())
+    }
     pub(crate) fn tick(&mut self, now: &Value) -> Result<Value> {
         let at = monotone(now)?;
         if self.last.as_ref().is_some_and(|last| at < *last) {

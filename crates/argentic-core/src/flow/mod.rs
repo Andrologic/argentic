@@ -90,6 +90,8 @@ pub fn steer_effect_eligible030(state: &FlowState030, effect: &FlowEffect030) ->
         return false;
     };
     effect.identity == state.identity
+        && !state.paused
+        && !state.operator_holds.contains_key(&work.activation_id)
         && !state.stopping
         && state.verdict.is_none()
         && state.steer_deliveries.iter().any(|delivery| {
@@ -440,7 +442,14 @@ impl Engine<'_> {
                 message_json,
                 sender,
             } => {
-                if self.plan.entry.is_some()
+                let target = self
+                    .state
+                    .instances
+                    .iter()
+                    .find(|i| i.agent == *agent && i.selector == *instance && !i.discarded)
+                    .and_then(|i| i.current.clone())
+                    .filter(|id| self.state.operator_holds.contains_key(id));
+                if (self.plan.entry.is_some() && target.is_none())
                     || *instance == Instance030::New
                     || !["queue", "steer"].contains(&delivery.as_str())
                     || !self.plan.graphless_submission_contracts.contains_key(agent)
@@ -450,6 +459,9 @@ impl Engine<'_> {
                     return Err(invalid("Invalid graphless delivery"));
                 }
                 exact(message_json)?;
+                if let Some(id) = target.filter(|_| !self.state.paused) {
+                    self.resume_work(&id)?;
+                }
                 self.state.entered = true;
                 let i = self.allocate(
                     None,
@@ -511,28 +523,22 @@ impl Engine<'_> {
                             output_json: output_json.clone(),
                             route_key: route_key.clone(),
                         });
-                        if let Some(step) = self.state.activations[i].step.clone() {
-                            let r = self.select(&step, "normal", route_key.as_deref())?;
-                            let p = self.producer(i, output_json.clone());
-                            self.follow(i, r, p)?;
-                        } else {
-                            self.effect(FlowEffectKind030::Return {
-                                activation_id: self.state.activations[i].id.clone(),
-                                sender: self.state.activations[i]
-                                    .sender
-                                    .clone()
-                                    .unwrap_or_default(),
-                                output_json: output_json.clone(),
-                            });
-                            self.end(i, None)?;
-                        }
                     }
                     WorkResult030::Failed { error } => {
                         self.state.activations[i].result = Some(WorkResultRecord030::Failed {
                             error: error.clone(),
                         });
-                        self.fail(i, error.clone())?;
                     }
+                }
+                if self.state.paused {
+                    self.defer(
+                        i,
+                        DeferredOperator030::Result {
+                            activation_id: work.activation_id.clone(),
+                        },
+                    );
+                } else {
+                    self.finish_result(i)?;
                 }
             }
             FlowEventKind030::Prepared {
@@ -684,15 +690,6 @@ impl Engine<'_> {
                 } else if fallback {
                     self.state.activations[i].phase = "ready".into();
                     self.admit_delivery(i, false)?;
-                    // Activations are allocated in message arrival order.
-                    if let Some(instance) = self.state.instances.iter_mut().find(|instance| {
-                        instance.queue.iter().any(|id| id == delivery_activation_id)
-                    }) {
-                        let activations = &self.state.activations;
-                        instance
-                            .queue
-                            .sort_by_cached_key(|id| activations.iter().position(|a| a.id == *id));
-                    }
                 } else {
                     let reason = match code.as_str() {
                         "STEER_UNCERTAIN" | "CONTENT_UNAVAILABLE" => code.as_str(),
@@ -721,11 +718,15 @@ impl Engine<'_> {
                     self.end(i, None)?;
                 }
             }
+            FlowEventKind030::Operator(event) => self.operator(event)?,
             FlowEventKind030::Stop => {
                 if self.state.verdict.is_some() || self.state.stopping {
                     return Err(FlowInputError030::StaleReference);
                 }
                 self.state.stopping = true;
+                self.state.paused = false;
+                self.state.operator_holds.clear();
+                self.state.operator_deferred.clear();
                 self.state.route_barriers.clear();
                 for p in &mut self.state.paths {
                     if p.phase == "pending" {
@@ -756,6 +757,135 @@ impl Engine<'_> {
             }
         }
         Ok(())
+    }
+    fn operator(&mut self, event: &OperatorEvent030) -> Result<()> {
+        if self.plan.versions.contract != crate::argentic_core::AGSDL_040
+            || self.state.stopping
+            || self.state.verdict.is_some()
+        {
+            return Err(FlowInputError030::StaleReference);
+        }
+        match event {
+            OperatorEvent030::Hold { activation_id } if !self.state.paused => {
+                self.hold(activation_id)
+            }
+            OperatorEvent030::Held {
+                activation_id,
+                hold_id,
+            } => {
+                let hold = self
+                    .state
+                    .operator_holds
+                    .get_mut(activation_id)
+                    .filter(|hold| hold.id == *hold_id)
+                    .ok_or(FlowInputError030::StaleReference)?;
+                hold.ready = true;
+                Ok(())
+            }
+            OperatorEvent030::ResumeWork { activation_id } if !self.state.paused => {
+                self.resume_work(activation_id)
+            }
+            OperatorEvent030::Pause { activation_ids } => {
+                for id in activation_ids {
+                    self.hold(id)?;
+                }
+                self.state.paused = true;
+                Ok(())
+            }
+            OperatorEvent030::ResumeRun
+                if self.state.operator_holds.values().all(|hold| hold.ready) =>
+            {
+                self.state.paused = false;
+                self.state.operator_holds.clear();
+                for action in std::mem::take(&mut self.state.operator_deferred) {
+                    match action {
+                        DeferredOperator030::Admit {
+                            activation_id,
+                            may_steer,
+                        } => {
+                            let i = self.ai(&activation_id)?;
+                            if self.state.activations[i].phase == "deferred" {
+                                self.admit_delivery(i, may_steer)?;
+                            }
+                        }
+                        DeferredOperator030::Result { activation_id } => {
+                            let i = self.ai(&activation_id)?;
+                            if self.state.activations[i].phase == "deferred" {
+                                self.finish_result(i)?;
+                            }
+                        }
+                        DeferredOperator030::Failure {
+                            activation_id,
+                            error,
+                        } => {
+                            let i = self.ai(&activation_id)?;
+                            if self.state.activations[i].phase == "deferred" {
+                                self.fail(i, error)?;
+                            }
+                        }
+                    }
+                    self.settle()?;
+                }
+                Ok(())
+            }
+            _ => Err(FlowInputError030::StaleReference),
+        }
+    }
+    fn hold(&mut self, id: &str) -> Result<()> {
+        let a = &self.state.activations[self.ai(id)?];
+        if a.phase != "running" || a.agent.is_none() || !a.physical || a.stop_effect_id.is_some() {
+            return Err(FlowInputError030::StaleReference);
+        }
+        self.state
+            .operator_holds
+            .entry(id.into())
+            .or_insert_with(|| OperatorHold030 {
+                id: self.event_id.into(),
+                ready: false,
+            });
+        Ok(())
+    }
+    fn resume_work(&mut self, id: &str) -> Result<()> {
+        if self
+            .state
+            .operator_holds
+            .get(id)
+            .is_some_and(|hold| !hold.ready)
+        {
+            return Err(FlowInputError030::StaleReference);
+        }
+        self.state.operator_holds.remove(id);
+        Ok(())
+    }
+    fn defer(&mut self, i: usize, action: DeferredOperator030) {
+        self.state.activations[i].phase = "deferred".into();
+        self.state.operator_deferred.push(action);
+    }
+    fn finish_result(&mut self, i: usize) -> Result<()> {
+        match self.state.activations[i]
+            .result
+            .clone()
+            .ok_or(FlowInputError030::StaleReference)?
+        {
+            WorkResultRecord030::Completed {
+                output_json,
+                route_key,
+            } => {
+                if let Some(step) = self.state.activations[i].step.clone() {
+                    let route = self.select(&step, "normal", route_key.as_deref())?;
+                    let producer = self.producer(i, output_json);
+                    self.follow(i, route, producer)
+                } else {
+                    self.effect(FlowEffectKind030::Return {
+                        activation_id: self.state.activations[i].id.clone(),
+                        sender: self.state.activations[i].sender.clone().unwrap_or_default(),
+                        output_json,
+                    });
+                    self.end(i, None)
+                }
+            }
+            WorkResultRecord030::Failed { error } => self.fail(i, error),
+        }
     }
     fn allocate(
         &mut self,
@@ -807,6 +937,16 @@ impl Engine<'_> {
         self.admit_delivery(i, true)
     }
     fn admit_delivery(&mut self, i: usize, may_steer: bool) -> Result<()> {
+        if self.state.paused {
+            self.defer(
+                i,
+                DeferredOperator030::Admit {
+                    activation_id: self.state.activations[i].id.clone(),
+                    may_steer,
+                },
+            );
+            return Ok(());
+        }
         if let Some(agent) = self.state.activations[i].agent.clone() {
             let selector = self.state.activations[i]
                 .selector
@@ -841,6 +981,12 @@ impl Engine<'_> {
                 self.state.instances[instance]
                     .queue
                     .push(self.state.activations[i].id.clone());
+                if !may_steer && self.plan.versions.contract == crate::argentic_core::AGSDL_040 {
+                    let activations = &self.state.activations;
+                    self.state.instances[instance]
+                        .queue
+                        .sort_by_cached_key(|id| activations.iter().position(|a| a.id == *id));
+                }
                 return Ok(());
             }
             if let Some(current) = self.state.instances[instance].current.clone() {
@@ -874,6 +1020,12 @@ impl Engine<'_> {
                 self.state.instances[instance]
                     .queue
                     .push(self.state.activations[i].id.clone());
+                if !may_steer && self.plan.versions.contract == crate::argentic_core::AGSDL_040 {
+                    let activations = &self.state.activations;
+                    self.state.instances[instance]
+                        .queue
+                        .sort_by_cached_key(|id| activations.iter().position(|a| a.id == *id));
+                }
                 return Ok(());
             }
         }
@@ -945,6 +1097,9 @@ impl Engine<'_> {
         Ok(())
     }
     fn physical_end(&mut self, i: usize) {
+        self.state
+            .operator_holds
+            .remove(&self.state.activations[i].id);
         self.state.activations[i].physical = false;
         self.state.activations[i].physical_wait_groups.clear();
         if let Some(id) = &self.state.activations[i].instance_id {
@@ -1052,6 +1207,16 @@ impl Engine<'_> {
         Ok(())
     }
     fn fail(&mut self, i: usize, error: Failure030) -> Result<()> {
+        if self.state.paused {
+            self.defer(
+                i,
+                DeferredOperator030::Failure {
+                    activation_id: self.state.activations[i].id.clone(),
+                    error,
+                },
+            );
+            return Ok(());
+        }
         let a = self.state.activations[i].clone();
         let counted = self.counted(&a.context);
         self.effect(FlowEffectKind030::Failure {
@@ -2215,6 +2380,9 @@ impl Engine<'_> {
         Ok(())
     }
     fn settle(&mut self) -> Result<()> {
+        if self.state.paused {
+            return Ok(());
+        }
         loop {
             let mut changed = false;
             if self.plan.versions.runtime == SHARED_STOP_RUNTIME

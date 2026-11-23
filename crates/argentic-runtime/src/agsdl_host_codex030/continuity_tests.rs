@@ -902,3 +902,6 @@ async fn codex_authorized_missions_keep_permanent_instructions_permissions_and_d
         .as_deref()
         .is_some_and(|message| message.contains("UNAUTHORIZED_MISSION"))));
 }
+
+#[path = "operator_tests.rs"]
+mod operator;

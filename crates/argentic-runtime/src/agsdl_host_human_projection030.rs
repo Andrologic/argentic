@@ -77,7 +77,9 @@ pub(crate) async fn read(
                 "person"
             };
             let resolved = json!({"receiptId":receipt,"resolvedAtMs":resolution["resolvedAtMs"],"accepted":true,"reason":reason,"answer":answer});
-            status = if expired {
+            status = if resolution["operatorCancelled"] == true {
+                json!({"kind":"cancelled","resolution":{"receiptId":format!("human:{id}:closed"),"resolvedAtMs":resolution["resolvedAtMs"],"accepted":false,"reason":"workEnded","answer":null}})
+            } else if expired {
                 json!({"kind":"expired","resolution":resolved})
             } else if row.get::<&str, _>("delivery") == "acknowledged" {
                 json!({"kind":"consumed","receiptId":receipt,"resolutionReceiptId":id,"resolution":resolved})
@@ -112,7 +114,7 @@ pub(crate) async fn read(
                 })
                 .transpose()?
                 .flatten();
-            works.push(json!({"workId":work,"machineElapsedMs":elapsed,"machineRemainingMs":remaining,"machinePaused":snapshot["openHumanRequests"].as_array().is_some_and(|a|!a.is_empty())}));
+            works.push(json!({"workId":work,"machineElapsedMs":elapsed,"machineRemainingMs":remaining,"machinePaused":snapshot["operatorHeld"] == true || snapshot["openHumanRequests"].as_array().is_some_and(|a|!a.is_empty())}));
         }
         let clock_fact = observed.as_ref().map(|at|json!({"kind":"available","value":{"openedAtMs":deadline["openedAtMs"],"observedAtMs":at,"timeoutMs":deadline["timeoutMs"],"works":works}})).unwrap_or(json!({"kind":"unavailable","gap":"human-clock-observation"}));
         let occurrences: Vec<Value> = work_ids.iter().map(|work|json!({"workId":work,"activation":{"kind":"available","scope":{"systemStartId":scope.system_start_id,"source":scope.source,"snapshotId":capture.identity.snapshot_id},"activationId":work}})).collect();

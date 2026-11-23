@@ -272,7 +272,14 @@ pub(crate) fn compile(
         &Value::Undefined
     };
     let delivery_check = if let (Some(document), Some(graph)) = (&document, &graph) {
-        let valid = matches!(graph.entry, Value::Null)
+        // The live host authenticates a held target before accepting a message
+        // into a flow. The compiler checks the message against its document.
+        let valid = (matches!(graph.entry, Value::Null)
+            || document
+                .as_object()
+                .and_then(|value| value.get("contract"))
+                .and_then(|value| value.as_str())
+                == Some(crate::argentic_core::AGSDL_040))
             && delivery
                 .get("agentName")
                 .text()
