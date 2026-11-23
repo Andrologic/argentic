@@ -47,3 +47,5 @@
   results and approval decisions. The agent result and its clock retirement
   reservation commit together. Recovery retains the exact unevaluated clock
   ticket when it fences an interrupted run.
+- Run state now stores `lastEventId`. Builds predating `9c49a0e` cannot read
+  run state written with this field.
