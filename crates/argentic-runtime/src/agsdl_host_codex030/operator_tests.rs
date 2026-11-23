@@ -551,6 +551,7 @@ async fn operator_pause_defers_a_pending_start_and_stop_withdraws_it() {
 struct PausableAgent {
     starts: std::sync::Mutex<Vec<String>>,
     finish_work: Arc<Notify>,
+    disconnect_on_hold: bool,
 }
 impl AgentExecutor030 for PausableAgent {
     fn supports_operator_hold(&self) -> bool {
@@ -580,15 +581,28 @@ impl AgentExecutor030 for PausableAgent {
             .unwrap_or_else(|| "message".into());
         self.starts.lock().unwrap().push(step.clone());
         let finish = self.finish_work.clone();
+        let disconnect = self.disconnect_on_hold;
         Box::pin(async move {
-            if step == "work" {
+            let sibling = disconnect && step == "sibling";
+            if step == "work" || sibling {
                 let hold = tokio::select! {
                     id = work.operator.requested() => id,
                     _ = cancel.cancelled() => return Ok(()),
                 };
+                if disconnect && !sibling {
+                    return Err(crate::persistence::failure(
+                        "CODEX_RUNNER_EXITED",
+                        "turn",
+                        "Scripted disconnect before interruption confirmation",
+                    ));
+                }
                 tokio::select! {
                     result = work.operator.park(hold) => result?,
                     _ = cancel.cancelled() => return Ok(()),
+                }
+                if sibling {
+                    cancel.cancelled().await;
+                    return Ok(());
                 }
                 tokio::select! {
                     _ = finish.notified() => (),
@@ -764,5 +778,137 @@ async fn operator_pause_defers_delivery_and_routing_while_approval_expires() {
                 &["seed", "work", "expired", "queued", "message"][..]
             }
         );
+    }
+}
+
+#[tokio::test]
+async fn operator_resume_routes_a_join_failure_with_the_original_result_evidence() {
+    use crate::api::OperatorAction as Action;
+    use crate::persistence::flow030::FlowEffectKind030;
+    for approval in [false, true] {
+        let work = if approval {
+            json!({"type":"approval","timeoutMs":800,"next":{"yes":"join","no":"join"}})
+        } else {
+            json!({"type":"agent","agent":"worker","instance":"new","next":"join"})
+        };
+        let f = Fixture::with_document(json!({
+            "contract":"agsdl-0.4.0","id":"deferred-branch-failure",
+            "agents":{"worker":{"harness":"codex","permissions":"read-only"}},
+            "flow":{"entry":"seed","steps":{
+                "seed":{"type":"agent","agent":"worker","next":["work","sibling"]},
+                "work":work,
+                "sibling":{"type":"agent","agent":"worker","instance":"new","next":"join"},
+                "join":{"type":"join","next":[],"onError":"handler"},
+                "handler":{"type":"agent","agent":"worker"}
+            }}
+        }))
+        .await;
+        let scope = operator_scope(&f).await;
+        let tasks = StreamTasks::default();
+        let registry = f.host.flow030().supervisor_registry();
+        registry.reserve(&scope.system_start_id).unwrap();
+        let agent = Arc::new(PausableAgent {
+            disconnect_on_hold: true,
+            ..Default::default()
+        });
+        let clock = f
+            .host
+            .flow030()
+            .human_runtime()
+            .virtual_clock()
+            .await
+            .unwrap();
+        start_operator_supervisor(&f, agent.clone(), &tasks);
+        let inspect = async || {
+            crate::agsdl_host_flow030::inspect_run(f.host.flow030(), &f.host, &f.pool, &f.owner)
+                .await
+                .unwrap()
+                .flow
+        };
+        let activation_id = if approval {
+            operator_wait(async || sqlx::query_scalar::<_, String>(
+                "SELECT work_ids_json ->> '$[0]' FROM engine_flow030_human_requests WHERE kind='approval'",
+            ).fetch_optional(&f.pool).await.unwrap()).await
+        } else {
+            operator_wait(async || {
+                inspect()
+                    .await
+                    .state
+                    .activations
+                    .into_iter()
+                    .find(|a| {
+                        a.step.as_deref() == Some(&["work".into()])
+                            && a.phase == "running"
+                            && a.physical
+                    })
+                    .map(|a| a.id)
+            })
+            .await
+        };
+        operator_wait(async || {
+            agent
+                .starts
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|step| step == "sibling")
+                .then_some(())
+        })
+        .await;
+        operator_control(&f, &scope, "pause", Action::PauseRun)
+            .await
+            .unwrap();
+        if approval {
+            clock.advance_to(801).unwrap();
+            registry.wake(&scope.system_start_id);
+        }
+        let origin = operator_wait(async || {
+            let state = inspect().await.state;
+            let deferred = state
+                .activations
+                .iter()
+                .any(|a| a.id == activation_id && a.phase == "deferred");
+            (deferred && state.operator_holds.values().all(|hold| hold.ready)).then(|| {
+                state
+                    .events
+                    .into_iter()
+                    .find_map(|(id, record)| {
+                        let event: Value = serde_json::from_str(&record.event_json).unwrap();
+                        (event.pointer("/kind/WorkResult/work/activationId")
+                            == Some(&json!(activation_id))
+                            && event.pointer("/kind/WorkResult/result/Failed").is_some())
+                        .then_some(id)
+                    })
+                    .expect("original result event")
+            })
+        })
+        .await;
+        assert!(!agent.starts.lock().unwrap().contains(&"handler".into()));
+        let resumed = operator_control(&f, &scope, "resume", Action::ResumeRun)
+            .await
+            .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            registry.wait(&scope.system_start_id),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let done = inspect().await;
+        assert_eq!(done.state.verdict.as_deref(), Some("succeeded"));
+        assert!(agent.starts.lock().unwrap().contains(&"handler".into()));
+        assert!(done.effects.iter().any(|row| {
+            let effect: crate::persistence::flow030::FlowEffect030 = serde_json::from_value(row["effect"].clone()).unwrap();
+            resumed.effect_ids.contains(&effect.id) && matches!(effect.kind,
+                FlowEffectKind030::Failure {activation_id: id, origin_event_id: Some(event), counted: true, ..}
+                    if id == activation_id && event == origin)
+        }));
+        let replay = crate::persistence::replay_verify030::verify_path030(
+            &f._temp.path().join("run.db"),
+            &scope.system_start_id,
+            &f.identity.flow_invocation_id,
+        )
+        .await;
+        assert!(replay.ok, "{:?}", replay.divergence);
     }
 }

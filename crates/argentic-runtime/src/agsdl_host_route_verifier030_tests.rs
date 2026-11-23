@@ -106,6 +106,7 @@ async fn failed_group_requires_one_exact_accepted_join_failure() {
                 step: Some(vec!["merge".into()]),
                 error: actual,
                 counted: true,
+                origin_event_id: None,
             },
         };
         let mut ids = vec!["failure".to_owned()];

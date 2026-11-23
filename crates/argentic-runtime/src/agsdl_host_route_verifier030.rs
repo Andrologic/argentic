@@ -756,6 +756,7 @@ async fn verify_failure_effect_tx(
             step,
             error: effect_error,
             counted,
+            ..
         } = &effect.kind
         {
             if activation_id == &producer.activation_id && step == &producer.step {
@@ -1010,6 +1011,7 @@ fn verify_failed_group_tx<'a>(
                     step,
                     error,
                     counted: true,
+                    origin_event_id,
                 } = &effect.kind
                 else {
                     continue;
@@ -1063,7 +1065,27 @@ fn verify_failed_group_tx<'a>(
                         _ => None,
                     }) == Some(&path.id),
                 )?;
-                let origin = PathFailureOrigin030::derive(&event, acts[0], state, error)?;
+                let original = match origin_event_id {
+                    Some(origin_id) => {
+                        require(
+                            event.pointer("/kind/Operator") == Some(&json!("ResumeRun"))
+                                && origin_id != event_id,
+                        )?;
+                        let original = state
+                            .events
+                            .get(origin_id)
+                            .ok_or(StoreError030::Authority)?;
+                        let value: Value = serde_json::from_str(&original.event_json)?;
+                        require(
+                            value["eventId"] == *origin_id
+                                && value["identity"] == event["identity"],
+                        )?;
+                        Some(value)
+                    }
+                    None => None,
+                };
+                let origin_event = original.as_ref().unwrap_or(&event);
+                let origin = PathFailureOrigin030::derive(origin_event, acts[0], state, error)?;
                 let address = step.as_ref().ok_or(StoreError030::Authority)?;
                 let declarations = plan
                     .steps
@@ -1088,27 +1110,44 @@ fn verify_failed_group_tx<'a>(
                         };
                         let call = verify_call_source_tx(db, capture, &producer, owner, generation)
                             .await?;
-                        require(call.event_id() == event_id)?;
+                        require(call.event_id() == origin_event_id.as_deref().unwrap_or(event_id))?;
                     }
-                    PathFailureOrigin030::Compose => {
+                    PathFailureOrigin030::Approval | PathFailureOrigin030::Compose => {
+                        let is_approval = matches!(origin, PathFailureOrigin030::Approval);
                         let source = Producer030 {
                             activation_id: activation_id.clone(),
                             step: step.clone(),
-                            kind: "compose".into(),
+                            kind: if is_approval { "approval" } else { "compose" }.into(),
                             input_json: acts[0].input_json.clone(),
                             message_json: acts[0].message_json.clone(),
                             item_json: acts[0].item_json.clone(),
                             output_json: json!({"error":error}).to_string(),
                         };
-                        verify_native_failure_source_tx(db, capture, &source, owner).await?;
+                        if is_approval {
+                            require(
+                                origin_event.pointer("/kind/WorkResult/result/Failed/error")
+                                    == Some(path_error),
+                            )?;
+                            verify_human_compose_source_tx(db, capture, &source, owner, generation)
+                                .await?;
+                        } else {
+                            verify_native_failure_source_tx(db, capture, &source, owner).await?;
+                        }
                     }
                     PathFailureOrigin030::AgentWork => {
                         require(
-                            event.pointer("/kind/WorkResult/result/Failed/error")
+                            origin_event.pointer("/kind/WorkResult/result/Failed/error")
                                 == Some(path_error),
                         )?;
-                        verify_preparation_origin_tx(db, capture, owner, generation, &event, state)
-                            .await?;
+                        verify_preparation_origin_tx(
+                            db,
+                            capture,
+                            owner,
+                            generation,
+                            origin_event,
+                            state,
+                        )
+                        .await?;
                     }
                     PathFailureOrigin030::FailedJoin => {
                         let nested = Producer030 {
@@ -1133,10 +1172,22 @@ fn verify_failed_group_tx<'a>(
                         .await?;
                         require(nested_rowid == row.get::<i64, _>("rowid"))?;
                     }
+                    // If resume itself admits queued work, the exact reducer replay
+                    // below proves that admission reached its visit limit.
+                    PathFailureOrigin030::AdmissionLimit
+                        if origin_event_id.is_none()
+                            && event.pointer("/kind/Operator") == Some(&json!("ResumeRun")) => {}
                     PathFailureOrigin030::PreparedFailure
                     | PathFailureOrigin030::AdmissionLimit => {
-                        verify_preparation_origin_tx(db, capture, owner, generation, &event, state)
-                            .await?;
+                        verify_preparation_origin_tx(
+                            db,
+                            capture,
+                            owner,
+                            generation,
+                            origin_event,
+                            state,
+                        )
+                        .await?;
                     }
                 }
                 verify_reduced_failure_tx(db, capture, state, &effect).await?;

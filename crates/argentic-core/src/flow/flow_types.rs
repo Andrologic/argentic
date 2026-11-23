@@ -229,10 +229,14 @@ pub enum DeferredOperator030 {
     },
     Result {
         activation_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin_event_id: Option<String>,
     },
     Failure {
         activation_id: String,
         error: Failure030,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin_event_id: Option<String>,
     },
 }
 
@@ -293,6 +297,8 @@ pub enum FlowEffectKind030 {
         step: Option<Address030>,
         error: Failure030,
         counted: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin_event_id: Option<String>,
     },
     Return {
         activation_id: String,

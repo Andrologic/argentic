@@ -535,10 +535,12 @@ impl Engine<'_> {
                         i,
                         DeferredOperator030::Result {
                             activation_id: work.activation_id.clone(),
+                            origin_event_id: matches!(result, WorkResult030::Failed { .. })
+                                .then(|| self.event_id.into()),
                         },
                     );
                 } else {
-                    self.finish_result(i)?;
+                    self.finish_result(i, None)?;
                 }
             }
             FlowEventKind030::Prepared {
@@ -684,6 +686,7 @@ impl Engine<'_> {
                             step: a.step.clone(),
                             error: Failure030::new(code),
                             counted: false,
+                            origin_event_id: None,
                         });
                     }
                     self.end(i, None)?;
@@ -808,19 +811,23 @@ impl Engine<'_> {
                                 self.admit_delivery(i, may_steer)?;
                             }
                         }
-                        DeferredOperator030::Result { activation_id } => {
+                        DeferredOperator030::Result {
+                            activation_id,
+                            origin_event_id,
+                        } => {
                             let i = self.ai(&activation_id)?;
                             if self.state.activations[i].phase == "deferred" {
-                                self.finish_result(i)?;
+                                self.finish_result(i, origin_event_id)?;
                             }
                         }
                         DeferredOperator030::Failure {
                             activation_id,
                             error,
+                            origin_event_id,
                         } => {
                             let i = self.ai(&activation_id)?;
                             if self.state.activations[i].phase == "deferred" {
-                                self.fail(i, error)?;
+                                self.fail_from(i, error, origin_event_id)?;
                             }
                         }
                     }
@@ -861,7 +868,7 @@ impl Engine<'_> {
         self.state.activations[i].phase = "deferred".into();
         self.state.operator_deferred.push(action);
     }
-    fn finish_result(&mut self, i: usize) -> Result<()> {
+    fn finish_result(&mut self, i: usize, origin_event_id: Option<String>) -> Result<()> {
         match self.state.activations[i]
             .result
             .clone()
@@ -884,7 +891,7 @@ impl Engine<'_> {
                     self.end(i, None)
                 }
             }
-            WorkResultRecord030::Failed { error } => self.fail(i, error),
+            WorkResultRecord030::Failed { error } => self.fail_from(i, error, origin_event_id),
         }
     }
     fn allocate(
@@ -1207,12 +1214,21 @@ impl Engine<'_> {
         Ok(())
     }
     fn fail(&mut self, i: usize, error: Failure030) -> Result<()> {
+        self.fail_from(i, error, None)
+    }
+    fn fail_from(
+        &mut self,
+        i: usize,
+        error: Failure030,
+        origin_event_id: Option<String>,
+    ) -> Result<()> {
         if self.state.paused {
             self.defer(
                 i,
                 DeferredOperator030::Failure {
                     activation_id: self.state.activations[i].id.clone(),
                     error,
+                    origin_event_id: Some(origin_event_id.unwrap_or_else(|| self.event_id.into())),
                 },
             );
             return Ok(());
@@ -1224,6 +1240,7 @@ impl Engine<'_> {
             step: a.step.clone(),
             error: error.clone(),
             counted,
+            origin_event_id,
         });
         if !counted {
             return self.end(i, None);

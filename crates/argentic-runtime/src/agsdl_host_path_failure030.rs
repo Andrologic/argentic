@@ -4,6 +4,7 @@ use crate::persistence::flow030::{reduce, Activation030, Failure030, FlowIdentit
 
 pub(super) enum PathFailureOrigin030 {
     AgentWork,
+    Approval,
     Call,
     Compose,
     FailedJoin,
@@ -34,11 +35,11 @@ impl PathFailureOrigin030 {
         }
         let plan: crate::persistence::flow030::FlowPlan030 =
             serde_json::from_str(state.plan_json.as_deref().ok_or(StoreError030::Authority)?)?;
-        if plan
+        let step = plan
             .steps
             .iter()
-            .any(|s| Some(&s.address) == activation.step.as_ref() && s.r#type == "compose")
-        {
+            .find(|s| Some(&s.address) == activation.step.as_ref());
+        if step.is_some_and(|s| s.r#type == "compose") {
             return Ok(Self::Compose);
         }
         require(
@@ -48,11 +49,12 @@ impl PathFailureOrigin030 {
                 == Some(activation.id.as_str())
                 && activation.start_effect_id.is_some(),
         )?;
-        Ok(if activation.agent.is_none() {
-            Self::Call
-        } else {
-            Self::AgentWork
-        })
+        match step.map(|s| s.r#type.as_str()) {
+            Some("call") => Ok(Self::Call),
+            Some("approval") => Ok(Self::Approval),
+            _ if activation.agent.is_some() => Ok(Self::AgentWork),
+            _ => Err(StoreError030::Authority),
+        }
     }
 }
 
