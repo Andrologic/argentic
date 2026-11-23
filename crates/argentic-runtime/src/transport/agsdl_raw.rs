@@ -3,6 +3,7 @@
 //! Raw JSON tokens never pass through a floating-point representation.
 pub(crate) const MAX_MCP_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 const TOOL_HANDOFF_TIMEOUT: Duration = Duration::from_secs(5);
+const HTTP_SESSION_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -291,7 +292,7 @@ struct HttpWire {
     url: url::Url,
     headers: reqwest::header::HeaderMap,
     session: Option<String>,
-    version: &'static str,
+    version: Option<&'static str>,
     responses: VecDeque<Body>,
     tool_schema: Option<(String, String)>,
     parameter_headers: reqwest::header::HeaderMap,
@@ -437,11 +438,10 @@ fn start_with_stdio(
                     ));
                 }
             }
-            let pinned: Vec<_> = config
-                .addresses
-                .iter()
-                .map(|address| SocketAddr::new(address.ip(), 0))
-                .collect();
+            let mut pinned = config.addresses;
+            for address in &mut pinned {
+                address.set_port(0);
+            }
             let client = reqwest::Client::builder()
                 .no_proxy()
                 .redirect(reqwest::redirect::Policy::none())
@@ -465,8 +465,8 @@ fn start_with_stdio(
                 headers,
                 session: None,
                 version: match server.protocol {
-                    Protocol::Legacy => "2025-11-25",
-                    Protocol::Modern => "2026-07-28",
+                    Protocol::Legacy => None,
+                    Protocol::Modern => Some("2026-07-28"),
                 },
                 responses: VecDeque::new(),
                 tool_schema: config.tool_schema,
@@ -589,14 +589,14 @@ impl Session {
             _ => {}
         }
         if let Wire::Http(http) = &mut self.wire {
-            http.version = match version.as_str() {
+            http.version = Some(match version.as_str() {
                 "2024-10-07" => "2024-10-07",
                 "2024-11-05" => "2024-11-05",
                 "2025-03-26" => "2025-03-26",
                 "2025-06-18" => "2025-06-18",
                 "2025-11-25" => "2025-11-25",
                 _ => "2026-07-28",
-            };
+            });
         }
         if matches!(self.protocol, Protocol::Legacy) {
             self.send(
@@ -974,6 +974,15 @@ impl Session {
                         failure = Some(CallError::new("UNCERTAIN", "MCP listener did not close"));
                     }
                 }
+                // Session cleanup is independent of whether a tool stopped.
+                http.responses.clear();
+                if http.session.is_some() {
+                    let _ = tokio::time::timeout(
+                        HTTP_SESSION_CLOSE_TIMEOUT,
+                        http.request(reqwest::Method::DELETE).send(),
+                    )
+                    .await;
+                }
                 (
                     PhysicalEvidence::Remote {
                         response_received: received,
@@ -1073,18 +1082,26 @@ impl Drop for HttpWire {
     }
 }
 impl HttpWire {
-    fn post(&self, message: &str) -> Result<reqwest::RequestBuilder> {
+    fn request(&self, method: reqwest::Method) -> reqwest::RequestBuilder {
         let mut request = self
             .client
-            .post(self.url.clone())
-            .headers(self.headers.clone())
-            .header("accept", "application/json, text/event-stream")
-            .header("content-type", "application/json")
-            .header("mcp-protocol-version", self.version);
+            .request(method, self.url.clone())
+            .headers(self.headers.clone());
+        if let Some(version) = self.version {
+            request = request.header("mcp-protocol-version", version);
+        }
         if let Some(session) = &self.session {
             request = request.header("mcp-session-id", session);
         }
-        if self.version == "2026-07-28" {
+        request
+    }
+
+    fn post(&self, message: &str) -> Result<reqwest::RequestBuilder> {
+        let mut request = self
+            .request(reqwest::Method::POST)
+            .header("accept", "application/json, text/event-stream")
+            .header("content-type", "application/json");
+        if self.version == Some("2026-07-28") {
             let message_fields = object(message)?;
             if let Some(method) = message_fields.get("method") {
                 let method = string(method)?;
@@ -1133,7 +1150,7 @@ impl HttpWire {
         if let Some(session) = response
             .headers()
             .get("mcp-session-id")
-            .filter(|_| self.version != "2026-07-28")
+            .filter(|_| self.version != Some("2026-07-28"))
         {
             let session = session
                 .to_str()
@@ -1195,7 +1212,9 @@ impl HttpWire {
         let url = self.url.clone();
         let headers = self.headers.clone();
         let session = self.session.clone();
-        let version = self.version;
+        let version = self
+            .version
+            .expect("initialized legacy session negotiated a version");
         let stop = control.stop.child_token();
         self.listener_stop = Some(stop.clone());
         let control = Control {
@@ -1476,21 +1495,14 @@ impl Wire {
                     return Ok(value);
                 }
                 let body = http.responses.pop_front().expect("response exists");
-                if body.sse && http.version != "2026-07-28" {
+                if body.sse && http.version != Some("2026-07-28") {
                     if let Some(id) = body.last_event_id {
                         // Resume only the response stream. The original POST is never replayed.
                         tokio::time::sleep(Duration::from_millis(body.retry_ms)).await;
-                        let mut request = http
-                            .client
-                            .get(http.url.clone())
-                            .headers(http.headers.clone())
+                        let response = http
+                            .request(reqwest::Method::GET)
                             .header("accept", "text/event-stream")
-                            .header("mcp-protocol-version", http.version)
-                            .header("last-event-id", id.clone());
-                        if let Some(session) = &http.session {
-                            request = request.header("mcp-session-id", session);
-                        }
-                        let response = request
+                            .header("last-event-id", id.clone())
                             .send()
                             .await
                             .map_err(|e| CallError::transport(e.to_string()))?;

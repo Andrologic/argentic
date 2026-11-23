@@ -50,6 +50,21 @@ async fn http_handler(
     state.requests.lock().await.push(body.clone());
     let id = value.get("id").cloned().unwrap_or(serde_json::Value::Null);
     let method = value.get("method").and_then(|v| v.as_str()).unwrap_or("");
+    if state.mode == "legacy-2025-06-18" {
+        let version = headers
+            .get("mcp-protocol-version")
+            .and_then(|h| h.to_str().ok());
+        if method == "initialize" {
+            assert_eq!(value["params"]["protocolVersion"], "2025-11-25");
+            if version.is_some() {
+                return axum::http::StatusCode::BAD_REQUEST.into_response();
+            }
+        } else if version != Some("2025-06-18")
+            || headers.get("mcp-session-id").and_then(|h| h.to_str().ok()) != Some("captured")
+        {
+            return axum::http::StatusCode::BAD_REQUEST.into_response();
+        }
+    }
     if method.is_empty() || method == "notifications/initialized" {
         if method.is_empty() {
             state.answer_seen.notify_one();
@@ -57,6 +72,9 @@ async fn http_handler(
         return axum::http::StatusCode::ACCEPTED.into_response();
     }
     let result: String = match method {
+        "initialize" if state.mode == "legacy-2025-06-18" => {
+            r#"{"protocolVersion":"2025-06-18","capabilities":{},"serverInfo":{"name":"synthetic","version":"1"}}"#.into()
+        }
         "initialize" => r#"{"protocolVersion":"2025-11-25","capabilities":{},"serverInfo":{"name":"synthetic","version":"1"}}"#.into(),
         "server/discover" => {
             assert!(value["params"]["_meta"].is_object());
@@ -123,6 +141,19 @@ async fn resume_handler(
     ([("content-type", "text/event-stream")], "id: cursor-2\ndata: {\"jsonrpc\":\"2.0\",\"id\":\"2\",\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"resumed\"}]}}\n\n").into_response()
 }
 
+async fn delete_session(
+    axum::extract::State(state): axum::extract::State<Arc<HttpFixture>>,
+    headers: axum::http::HeaderMap,
+) -> axum::http::StatusCode {
+    assert_eq!(headers["mcp-session-id"], "captured");
+    if state.mode == "legacy-2025-06-18" {
+        assert_eq!(headers["mcp-protocol-version"], "2025-06-18");
+    }
+    state.requests.lock().await.push("DELETE captured".into());
+    // Servers may refuse session deletion.
+    axum::http::StatusCode::METHOD_NOT_ALLOWED
+}
+
 async fn http_fixture(
     mode: &'static str,
 ) -> (
@@ -141,7 +172,9 @@ async fn http_fixture(
     let app = axum::Router::new()
         .route(
             "/mcp",
-            axum::routing::post(http_handler).get(resume_handler),
+            axum::routing::post(http_handler)
+                .get(resume_handler)
+                .delete(delete_session),
         )
         .with_state(state.clone());
     let task = tokio::spawn(async move {
@@ -220,6 +253,7 @@ async fn isolated(
 async fn http_exact_receipts_human_waits_modern_continuation_and_no_replay() {
     for mode in [
         "json",
+        "legacy-2025-06-18",
         "sse",
         "resume",
         "modern",
@@ -264,6 +298,17 @@ async fn http_exact_receipts_human_waits_modern_continuation_and_no_replay() {
                 .iter()
                 .any(|r| r == "GET resume"));
         }
+        assert_eq!(
+            fixture
+                .requests
+                .lock()
+                .await
+                .iter()
+                .filter(|value| *value == "DELETE captured")
+                .count(),
+            usize::from(!mode.starts_with("modern")),
+            "{mode}",
+        );
         assert!(matches!(
             evidence,
             PhysicalEvidence::Remote {
