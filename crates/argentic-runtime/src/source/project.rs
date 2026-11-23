@@ -107,6 +107,11 @@ fn sidecar_name(name: &str) -> bool {
 
 fn restore_executable_modes(dir: &Dir, files: &mut Files) -> Result<()> {
     let root = Path::new(MANIFEST);
+    let selected = files
+        .keys()
+        .filter(|name| sidecar_name(name))
+        .map(|name| name.to_ascii_lowercase())
+        .collect::<BTreeSet<_>>();
     let mut found = false;
     for entry in dir.entries().map_err(|e| io(root, e))? {
         let entry = entry.map_err(|e| io(root, e))?;
@@ -114,10 +119,11 @@ fn restore_executable_modes(dir: &Dir, files: &mut Files) -> Result<()> {
         let Some(name) = name.to_str().filter(|name| sidecar_name(name)) else {
             continue;
         };
-        if !entry
-            .file_type()
-            .map_err(|e| io(Path::new(name), e))?
-            .is_file()
+        if selected.contains(&name.to_ascii_lowercase())
+            || !entry
+                .file_type()
+                .map_err(|e| io(Path::new(name), e))?
+                .is_file()
         {
             continue;
         }
