@@ -529,6 +529,32 @@ fn component_errors_report_the_file_and_distinguish_io_from_content() {
     }
 }
 
+#[test]
+fn missing_uri_reports_the_resource_and_keeps_the_declaring_pointer() {
+    let temp = tempfile::tempdir().unwrap();
+    project(temp.path(), "../notes.md", None);
+    write(
+        temp.path(),
+        "agents/a.json",
+        br#"{"harness":"codex","permissions":"read-only",
+             "instructions":[{"uri":"../instructions.md"}]}"#,
+    );
+    let error = OpenedSource::open_path(temp.path()).err().unwrap();
+    assert_eq!(error.code, "PROJECT");
+    assert_eq!(error.pointer, "/instructions/0/uri");
+    assert!(error
+        .message
+        .starts_with("agents/a.json#/instructions/0/uri: instructions.md: "));
+    assert_eq!(
+        error.source.as_deref(),
+        Some(&SourceDiagnostic {
+            path: "instructions.md".into(),
+            pointer: String::new(),
+            kind: SourceErrorKind::Io,
+        })
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn folder_reads_from_the_opened_directory_after_a_rename() {

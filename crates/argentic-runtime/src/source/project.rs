@@ -629,14 +629,19 @@ impl<'a> Reader<'a> {
             self.resolve(owner, &path, &pointer)?
         };
         self.select(&task, MAX_TOTAL).map_err(|cause| {
-            // `select` already names the selected file; keep one location.
+            // Keep the authored URI in the error and locate an I/O failure
+            // at the resource itself.
             let detail = cause
                 .message
                 .strip_prefix(&format!("{task}#: "))
                 .unwrap_or(&cause.message);
             let mut error = invalid(owner, &pointer, &format!("{task}: {detail}"));
-            if let (Some(location), Some(cause)) = (&mut error.source, cause.source) {
-                location.kind = cause.kind;
+            if cause
+                .source
+                .as_ref()
+                .is_some_and(|location| location.kind == SourceErrorKind::Io)
+            {
+                error.source = cause.source;
             }
             error
         })?;

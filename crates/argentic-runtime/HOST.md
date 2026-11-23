@@ -164,8 +164,10 @@ Project open maps that pointer to the declaring file.
 Plain JSON read failures retain their host codes, `SOURCE_UNAVAILABLE`
 and `INPUT_LIMIT`. For project diagnostics, `EngineFailure.source` can carry
 a `SourceDiagnostic` with `path`, `pointer` and `kind`. For an unreadable
-declared file the code is `PROJECT`, the kind is `io` and the pointer is
-empty. Invalid component JSON uses the same code with kind `invalidContent`.
+declared file the code is `PROJECT` and `source` gives the unreadable file's
+path, an empty pointer and kind `io`. For a URI resource, the error's top-level
+`pointer` and `message` still identify the URI declaration. Invalid project
+JSON uses the same code with kind `invalidContent`.
 The path is relative to the project root and the pointer is relative to that
 file. An empty pointer refers to the entire file. A UI can show a read
 failure separately from an invalid declaration by matching `source.kind`.
