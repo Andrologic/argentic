@@ -27,6 +27,7 @@ pub fn failure(code: &str, pointer: &str, message: &str) -> EngineFailure {
         pointer: pointer.into(),
         message: message.into(),
         work: None,
+        source: None,
     }
 }
 #[doc(hidden)]

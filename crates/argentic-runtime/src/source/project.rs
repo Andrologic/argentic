@@ -113,10 +113,14 @@ impl Reader {
             let remaining = MAX_TOTAL - self.total;
             let file = read_regular(dir, Path::new(path), limit.min(remaining)).map_err(|e| {
                 let own_size = dir.symlink_metadata(path).map_or(0, |meta| meta.len());
-                if e.kind() == std::io::ErrorKind::FileTooLarge && own_size <= limit {
-                    invalid(path, "", "Project selection exceeds the 256 MiB total")
-                } else {
-                    invalid(path, "", &e.to_string())
+                match e.kind() {
+                    std::io::ErrorKind::FileTooLarge if own_size <= limit => {
+                        invalid(path, "", "Project selection exceeds the 256 MiB total")
+                    }
+                    std::io::ErrorKind::FileTooLarge | std::io::ErrorKind::InvalidData => {
+                        invalid(path, "", &e.to_string())
+                    }
+                    _ => io(Path::new(path), e),
                 }
             })?;
             self.total += file.bytes.len() as u64;
@@ -548,7 +552,11 @@ impl Reader {
                 .message
                 .strip_prefix(&format!("{task}#: "))
                 .unwrap_or(&cause.message);
-            invalid(owner, &pointer, &format!("{task}: {detail}"))
+            let mut error = invalid(owner, &pointer, &format!("{task}: {detail}"));
+            if let (Some(location), Some(cause)) = (&mut error.source, cause.source) {
+                location.kind = cause.kind;
+            }
+            error
         })?;
         const ENCODE: percent_encoding::AsciiSet = NON_ALPHANUMERIC
             .remove(b'/')

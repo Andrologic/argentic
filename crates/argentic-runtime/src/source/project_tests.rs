@@ -442,3 +442,39 @@ fn a_retained_copy_does_not_depend_on_file_modes() {
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o600)).unwrap();
     snapshot::retain(temp.path(), &sha256(b"{}"), &files).unwrap();
 }
+
+#[test]
+fn component_errors_report_the_file_and_distinguish_io_from_content() {
+    let temp = tempfile::tempdir().unwrap();
+    project(temp.path(), "../notes.md", None);
+    let component = temp.path().join("agents/a.json");
+    std::fs::remove_file(&component).unwrap();
+    for kind in [SourceErrorKind::Io, SourceErrorKind::InvalidContent] {
+        let error = OpenedSource::open_path(temp.path()).err().unwrap();
+        assert_eq!(error.code, "PROJECT");
+        assert_eq!(error.pointer, "");
+        assert_eq!(
+            error.source.as_deref(),
+            Some(&SourceDiagnostic {
+                path: "agents/a.json".into(),
+                pointer: String::new(),
+                kind,
+            })
+        );
+        let encoded = serde_json::to_value(&error).unwrap();
+        assert_eq!(encoded["source"]["path"], "agents/a.json");
+        assert_eq!(
+            encoded["source"]["kind"],
+            if kind == SourceErrorKind::Io {
+                "io"
+            } else {
+                "invalidContent"
+            }
+        );
+        assert_eq!(
+            serde_json::from_value::<EngineFailure>(encoded).unwrap(),
+            error
+        );
+        std::fs::write(&component, "{").unwrap();
+    }
+}

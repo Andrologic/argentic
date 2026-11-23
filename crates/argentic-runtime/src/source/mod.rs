@@ -13,7 +13,10 @@ mod snapshot;
 pub use snapshot::RetainedSource;
 pub(crate) use snapshot::Snapshot;
 
-use crate::persistence::{dto::EngineFailure, failure, Result};
+use crate::persistence::{
+    dto::{EngineFailure, SourceDiagnostic, SourceErrorKind},
+    failure, Result,
+};
 use cap_std::fs::Dir;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -240,11 +243,19 @@ impl OpenedSource {
     /// Errors whose pointer is a host category, such as `projectSnapshot`,
     /// name no component and are returned unchanged.
     pub fn locate_error(&self, mut error: EngineFailure) -> EngineFailure {
+        if error.source.is_some() {
+            return error;
+        }
         if let Some((file, local)) = self
             .component_origin(&error.pointer)
             .filter(|_| error.pointer.starts_with('/'))
         {
             error.message = format!("{file}#{local}: {}", error.message);
+            error.source = Some(Box::new(SourceDiagnostic {
+                path: file.into(),
+                pointer: local.into(),
+                kind: SourceErrorKind::InvalidContent,
+            }));
         }
         error
     }
@@ -272,7 +283,29 @@ fn valid_json_pointer(pointer: &str) -> bool {
 }
 
 fn invalid(file: &str, pointer: &str, message: &str) -> EngineFailure {
-    failure("PROJECT", pointer, &format!("{file}#{pointer}: {message}"))
+    project_failure(
+        "PROJECT",
+        file,
+        pointer,
+        SourceErrorKind::InvalidContent,
+        message,
+    )
+}
+
+fn project_failure(
+    code: &str,
+    file: &str,
+    pointer: &str,
+    kind: SourceErrorKind,
+    message: &str,
+) -> EngineFailure {
+    let mut error = failure(code, pointer, &format!("{file}#{pointer}: {message}"));
+    error.source = Some(Box::new(SourceDiagnostic {
+        path: file.into(),
+        pointer: pointer.into(),
+        kind,
+    }));
+    error
 }
 
 fn source_unavailable() -> EngineFailure {
@@ -284,7 +317,13 @@ fn source_unavailable() -> EngineFailure {
 }
 
 fn io(path: &Path, error: std::io::Error) -> EngineFailure {
-    invalid(&path.display().to_string(), "", &error.to_string())
+    project_failure(
+        "PROJECT",
+        &path.to_string_lossy(),
+        "",
+        SourceErrorKind::Io,
+        &error.to_string(),
+    )
 }
 
 pub(crate) fn sha256(bytes: &[u8]) -> String {
@@ -317,7 +356,10 @@ fn parse_json(bytes: &[u8], file: &str, project_limits: bool) -> Result<Value> {
 
 fn open_regular(dir: &Dir, path: &Path) -> std::io::Result<cap_std::fs::File> {
     if !dir.symlink_metadata(path)?.is_file() {
-        return Err(std::io::Error::other("Expected a regular file"));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Expected a regular file",
+        ));
     }
     let mut options = cap_std::fs::OpenOptions::new();
     options.read(true);
@@ -328,7 +370,10 @@ fn open_regular(dir: &Dir, path: &Path) -> std::io::Result<cap_std::fs::File> {
     }
     let file = dir.open_with(path, &options)?;
     if !file.metadata()?.is_file() {
-        return Err(std::io::Error::other("Expected a regular file"));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Expected a regular file",
+        ));
     }
     Ok(file)
 }
@@ -344,7 +389,10 @@ fn open_local(path: &Path) -> std::io::Result<std::fs::File> {
     }
     let file = options.open(path)?;
     if !file.metadata()?.is_file() {
-        return Err(std::io::Error::other("Expected a regular file"));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Expected a regular file",
+        ));
     }
     Ok(file)
 }
