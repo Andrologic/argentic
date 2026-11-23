@@ -56,11 +56,12 @@ async fn compile_project(
 }
 ```
 
-`locate_error` relocates a failure whose pointer is a JSON pointer. Compiler
-diagnostics arrive inside `result_json` (`/static/diagnostics` and
-`/runtime/diagnostics`), not as an `Err`. Pass each error diagnostic's code,
-pointer and message to `locate_error` to name its component file. The
-standalone host locates the first error and appends the full compile report.
+`locate_error` adds a component location when a failure has an assembled
+JSON pointer. Compiler diagnostics arrive in `result_json` under
+`/static/diagnostics` or `/runtime/diagnostics`. Pass each diagnostic's code,
+pointer and message to `persistence::failure`, then pass that failure to
+`locate_error`. The standalone host locates the first error and appends the
+full compile report.
 
 For a project folder or an opened archive, `selected_files()` returns a
 borrowed iterator in ascending path order over the original selected files.
@@ -118,21 +119,58 @@ document. A relative URI in a message resolves against the document location,
 which for a project is the retained copy, so it reaches only inventory
 members. Attach workspace files to a project run with absolute `file:` URIs.
 
-A folder and its archive select the same files. Both apply the archive name
-rules, including the refusal of `.git`, `.env` and `.env.*` in skill trees,
-and refuse symbolic links in a selected path or as the project root. A
-component traversed only on the way to `..` needs a portable name without a
-case collision, even when it does not exist. A folder is also limited to an
-inventory of at most 2 MiB, the archive limit, which bounds the retained
-index. As in the official v0.5.0 tool, a folder may select 8192 files and 256
-MiB, while an archive's 8192 entries and 256 MiB also count `archive.json` and
-any `history.bundle`. On Windows, a folder records no executable file. The
-official tool restores executables there from a `.agsdl-executables` sidecar,
-which Argentic does not read; open the archive instead to keep them. A
-reference may pass through `..` lexically, as in the official reader. A plain
-JSON source that cannot be read keeps the host codes `SOURCE_UNAVAILABLE` and
-`INPUT_LIMIT`. Project and archive diagnostics use `PROJECT` with the file and
-JSON pointer concerned.
+A folder and its archive select the same project files. Both apply the
+archive name rules, including the refusal of `.git`, `.env` and `.env.*`
+in skill trees. Opening a folder or its `agsdl.json` pins the root directory
+before reading the manifest. Members are opened relative to that handle.
+Unix opens the root with no-follow flags. Windows opens the root without
+following reparse points and keeps the handle open without delete sharing.
+A reference can pass through `..` lexically. Any component traversed on
+the way to `..` needs a portable name without a case collision, even when
+it does not exist.
+
+Unix uses the source file's POSIX executable bits. On Windows, Argentic
+restores flags from a regular root file named `.agsdl-executables` or
+`.agsdl-executables.<number>` with the UTF-8 header
+`AgSDL executable paths v1\n`. The body is limited to 2 MiB and lists
+portable project-relative paths separated by LF. An optional final LF is
+accepted. Portable paths outside the current selection are ignored.
+Recognized metadata cannot be a selected file. Argentic refuses more than
+one recognized sidecar outside the selection. A candidate without the
+header can be ordinary project content. ZIP exports record the restored
+flags in `archive.json`.
+
+A folder can select at most 8192 files and 256 MiB, and its inventory must
+fit in 2 MiB. An archive's 8192 entries and 256 MiB also count
+`archive.json` and any `history.bundle`. ZIP local records and their
+descriptors must cover every byte up to the central directory. The central
+directory and final end record must account for the rest of the container.
+`ARCHIVE_LAYOUT` identifies a layout refusal, including unaccounted bytes
+before or between structures or after the end record.
+
+Core validation budgets expansion of the flow and composition roots
+together. The budget allows 8192 expanded nodes, including compose calls
+and synthetic exits, 32768 route targets, including intermediate outputs,
+and 32 nested composition bodies. Compilation applies the limits to its own
+expansion passes and can materialize up to 32 MiB of step, route and message
+JSON. The public `argentic_core` constants are `MAX_EXPANDED_GRAPH_NODES`,
+`MAX_EXPANDED_GRAPH_EDGES`, `MAX_COMPOSITION_DEPTH` and
+`MAX_COMPILED_GRAPH_JSON_BYTES`. The stable code `GRAPH_LIMIT` points to the
+authored composition, or `/flow` when the flow itself exceeds a limit.
+Project open maps that pointer to the declaring file.
+
+Plain JSON read failures retain their host codes, `SOURCE_UNAVAILABLE`
+and `INPUT_LIMIT`. For project diagnostics, `EngineFailure.source` can carry
+a `SourceDiagnostic` with `path`, `pointer` and `kind`. For an unreadable
+declared file the code is `PROJECT`, the kind is `io` and the pointer is
+empty. Invalid component JSON uses the same code with kind `invalidContent`.
+The path is relative to the project root and the pointer is relative to that
+file. An empty pointer refers to the entire file. A UI can show a read
+failure separately from an invalid declaration by matching `source.kind`.
+Use `code` to identify refusals that apply to the whole input, including
+`ARCHIVE_LAYOUT`. Existing `code`, `pointer`, `message` and `work` fields
+remain available. If there is no source location, the serialized failure
+omits `source`.
 
 `secrets()` returns the names required by each declared MCP server.
 `mcp_files()` returns paths relative to `retained.resource_root()`. Opening

@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Project validation and compilation bound expanded graph nodes, route
+  targets and composition depth. `GRAPH_LIMIT` locates the authored
+  composition or flow that exceeded the limit.
+- Project folders pin their root before reading the manifest and members,
+  and restore executable flags from the AgSDL sidecar on Windows.
+- Archive import reports `ARCHIVE_LAYOUT` for unaccounted ZIP bytes.
+- Project errors expose a file, local JSON pointer and diagnostic kind.
+  Component I/O failures and invalid JSON retain the `PROJECT` code.
+
 - Argentic runtime exposes the selected project files with their original bytes
   and executable flags, and maps assembled JSON pointers to component files.
 - Hosts can write a deterministic AgSDL v0.5.0 snapshot archive without Git
