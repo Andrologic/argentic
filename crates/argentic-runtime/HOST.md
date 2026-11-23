@@ -297,6 +297,24 @@ addresses and disables redirects, proxies and request replay. Credentials
 belong in the vault and must be absent from authored URLs. HTTPS is required
 except for localhost or a loopback IP address with all connections pinned to
 loopback. The transport accepts JSON and SSE replies over Streamable HTTP.
+Legacy MCP initialization proposes a protocol version in the JSON body.
+Subsequent HTTP requests carry the negotiated version. On shutdown Argentic
+gives a stateful server up to two seconds to accept a session DELETE at the
+same pinned endpoint. Argentic relies on the tool's terminal response to
+confirm that a dispatched remote call ended.
+
+Remote DNS resolution and HTTP connection establishment each have a
+five-second limit. Remote initialization and tool discovery each have a
+ten-second limit, including the initialized notification and all tool list
+pages respectively. A tool handoff has a separate five-second limit for both
+HTTP and stdio.
+
+A direct remote call without an authored `timeoutMs` gets 60 seconds on the
+durable work clock. Time awaiting a person's form answer pauses that clock.
+For Codex MCP tools, an authored work deadline governs the invocation. With
+no authored work deadline, each tool invocation gets 60 seconds starting at
+dispatch, after any tool approval.
+
 Endpoint syntax outside this profile reports `MCP_ENDPOINT_UNSUPPORTED`.
 Absent or refused consent reports `MCP_ENDPOINT_REFUSED`. An invalid or
 reserved header mapping reports `MCP_SECRET_HEADER`. Missing or mismatched
@@ -310,15 +328,19 @@ read from its environment. Argentic keeps the upstream credentials and
 process ownership. Only `webSearch: "disabled"` is accepted as an explicit
 Codex harness setting in this profile. The official AgSDL `review-project`
 declares `issues` but gives it no usable tools under `read-only`, so Argentic
-starts the reviewer without an issues connection.
+starts the reviewer without an issues connection. A deny that covers every tool
+on a server, such as `issues/*`, skips consent and discovery for that server.
 
 Implement `ActionPolicySource::lock_current` for requests with
 `nativeRequest.method == "mcp/tool/requestApproval"`. Present the
 `nativeRequest.params.server`, `.tool` and `.arguments` on the existing
 `ask` interface. Recheck the exact captured scope and the current tool grant
 before returning the policy lease. A person answers through the existing
-decision submission API. Agent equipment supports per-tool permission
-approval. Server-initiated forms are supported for direct call steps.
+decision submission API. Argentic holds the current policy lease and the
+same admission gate used by whole-run Stop through the tool handoff. It
+releases both before waiting for the tool result. Agent equipment supports
+per-tool permission approval. Server-initiated forms are supported for direct
+call steps.
 
 Closing an HTTP connection cannot confirm remote tool termination. If a
 tool request loses its terminal reply, Argentic fences the result as uncertain

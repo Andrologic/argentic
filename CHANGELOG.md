@@ -11,6 +11,14 @@
 - Codex agents can use MCP tools granted by their effective permissions.
   Argentic owns the upstream connections and routes tool approval requests
   through the existing human approval path.
+- Approved Codex MCP calls keep the current policy lease and Stop admission
+  gate until the request reaches the transport. Server-wide tool denials skip
+  endpoint consent and discovery.
+- Streamable HTTP preserves IPv6 interface scopes, sends the negotiated
+  protocol version after initialization, and attempts to close stateful
+  sessions on shutdown. Remote connection and discovery have deadlines.
+  MCP tool calls without an authored deadline use a 60-second machine budget
+  after approval or excluding waits for a form answer.
 - Native hosts can select a replacement model and effort per agent at Start.
   Inspection and replay read the frozen selection with the original source
   identity.
