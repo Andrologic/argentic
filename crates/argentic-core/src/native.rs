@@ -71,26 +71,15 @@ impl Text {
     pub(crate) fn push(&mut self, s: &Self) {
         self.0.extend_from_slice(&s.0)
     }
-    pub(crate) fn quoted(&self) -> String {
-        let mut out = String::from("\"");
+    fn quote_to(&self, out: &mut impl std::fmt::Write) -> std::fmt::Result {
+        out.write_char('"')?;
         for c in char::decode_utf16(self.0.iter().copied()) {
             match c {
-                Err(e) => out.push_str(&format!("\\u{:04x}", e.unpaired_surrogate())),
-                Ok(c) => match c {
-                    '"' => out.push_str("\\\""),
-                    '\\' => out.push_str("\\\\"),
-                    '\u{8}' => out.push_str("\\b"),
-                    '\u{c}' => out.push_str("\\f"),
-                    '\n' => out.push_str("\\n"),
-                    '\r' => out.push_str("\\r"),
-                    '\t' => out.push_str("\\t"),
-                    c if (c as u32) < 32 => out.push_str(&format!("\\u{:04x}", c as u32)),
-                    c => out.push(c),
-                },
+                Err(e) => write!(out, "\\u{:04x}", e.unpaired_surrogate())?,
+                Ok(c) => exact::quote_char(out, c)?,
             }
         }
-        out.push('"');
-        out
+        out.write_char('"')
     }
 }
 impl From<&str> for Text {
@@ -266,50 +255,57 @@ impl Value {
         }
     }
     pub(crate) fn stringify(&self) -> String {
+        let mut out = String::new();
+        self.stringify_to(&mut out).expect("writing to a String");
+        out
+    }
+
+    pub(crate) fn stringify_to(&self, out: &mut impl std::fmt::Write) -> std::fmt::Result {
         enum Task<'a> {
             Value(&'a Value),
-            Text(String),
+            Text(&'static str),
+            Key(&'a Text),
         }
-        let mut out = String::new();
         let mut tasks = vec![Task::Value(self)];
         while let Some(task) = tasks.pop() {
             match task {
-                Task::Text(s) => out.push_str(&s),
+                Task::Text(s) => out.write_str(s)?,
+                Task::Key(k) => k.quote_to(out)?,
                 Task::Value(v) => match v {
-                    Self::Undefined | Self::Null => out.push_str("null"),
-                    Self::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
-                    Self::String(t) => out.push_str(&t.quoted()),
-                    Self::Number(n) => out.push_str(n.json()),
+                    Self::Undefined | Self::Null => out.write_str("null")?,
+                    Self::Bool(b) => out.write_str(if *b { "true" } else { "false" })?,
+                    Self::String(t) => t.quote_to(out)?,
+                    Self::Number(n) => out.write_str(n.json())?,
                     Self::Array(v) => {
-                        out.push('[');
-                        tasks.push(Task::Text("]".into()));
+                        out.write_char('[')?;
+                        tasks.push(Task::Text("]"));
                         for (i, v) in v.iter().enumerate().rev() {
                             tasks.push(Task::Value(v));
                             if i > 0 {
-                                tasks.push(Task::Text(",".into()));
+                                tasks.push(Task::Text(","));
                             }
                         }
                     }
                     Self::Object(v) => {
-                        out.push('{');
-                        tasks.push(Task::Text("}".into()));
+                        out.write_char('{')?;
+                        tasks.push(Task::Text("}"));
                         let fields: Vec<_> = v
                             .iter()
                             .filter(|(_, v)| !matches!(v, Self::Undefined))
                             .collect();
                         for (i, (k, v)) in fields.into_iter().enumerate().rev() {
                             tasks.push(Task::Value(v));
-                            tasks.push(Task::Text(":".into()));
-                            tasks.push(Task::Text(k.quoted()));
+                            tasks.push(Task::Text(":"));
+                            tasks.push(Task::Key(k));
                             if i > 0 {
-                                tasks.push(Task::Text(",".into()));
+                                tasks.push(Task::Text(","));
                             }
                         }
                     }
                 },
             }
         }
-        out
+        Ok(())
     }
 }
 fn index(key: &Text) -> Option<u32> {

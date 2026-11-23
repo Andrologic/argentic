@@ -165,22 +165,36 @@ impl Value {
 /// hold the unpaired surrogates that JS would escape.
 pub(crate) fn quote(text: &str) -> String {
     let mut out = String::with_capacity(text.len() + 2);
-    out.push('"');
-    for c in text.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\u{8}' => out.push_str("\\b"),
-            '\u{c}' => out.push_str("\\f"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
+    quote_to(&mut out, text).expect("writing to a String");
+    out
+}
+
+pub(super) fn quote_to(out: &mut impl std::fmt::Write, text: &str) -> std::fmt::Result {
+    out.write_char('"')?;
+    let mut start = 0;
+    for (index, byte) in text.bytes().enumerate() {
+        if matches!(byte, b'"' | b'\\' | 0..=31) {
+            out.write_str(&text[start..index])?;
+            quote_char(out, char::from(byte))?;
+            start = index + 1;
         }
     }
-    out.push('"');
-    out
+    out.write_str(&text[start..])?;
+    out.write_char('"')
+}
+
+pub(super) fn quote_char(out: &mut impl std::fmt::Write, c: char) -> std::fmt::Result {
+    match c {
+        '"' => out.write_str("\\\""),
+        '\\' => out.write_str("\\\\"),
+        '\u{8}' => out.write_str("\\b"),
+        '\u{c}' => out.write_str("\\f"),
+        '\n' => out.write_str("\\n"),
+        '\r' => out.write_str("\\r"),
+        '\t' => out.write_str("\\t"),
+        c if (c as u32) < 0x20 => write!(out, "\\u{:04x}", c as u32),
+        c => out.write_char(c),
+    }
 }
 
 const PARSE_MESSAGE: &str = "Invalid or unsupported exact JSON.";

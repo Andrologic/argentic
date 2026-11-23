@@ -338,18 +338,85 @@ fn path(value: &Value) -> Result<()> {
     }
     Ok(())
 }
+pub(crate) enum NormalizedTarget<'a, T> {
+    Output {
+        name: &'a str,
+    },
+    Step {
+        address: Vec<String>,
+        raw: &'a Value,
+        definition: T,
+        receives: bool,
+        message: Option<&'a Value>,
+        each: Option<&'a Value>,
+        concurrency: Option<&'a Value>,
+        max: Option<&'a Value>,
+    },
+}
+
+pub(crate) fn receives_messages(kind: &str) -> bool {
+    ["agent", "approval", "compose"].contains(&kind)
+}
+
 pub(crate) fn normalize_route(route_json: &str, scope: &Scope) -> Result<Vec<RouteTarget>> {
     let route = exact::decode(route_json)?;
+    let targets = normalize_targets(&route, &scope.prefix, scope.outputs.as_deref(), |address| {
+        let Some(definition) = scope.steps.iter().find(|s| s.address == address) else {
+            return fail("REFERENCE", "", "Unknown step in route scope.");
+        };
+        let step_value = exact::decode(&definition.declaration_json)?;
+        let step = exact::record(Some(&step_value), "")?;
+        Ok((
+            definition,
+            receives_messages(exact::text(step.get("type"), "")?),
+        ))
+    })?;
+    Ok(targets
+        .into_iter()
+        .map(|target| match target {
+            NormalizedTarget::Output { name } => RouteTarget::Output {
+                name: name.to_owned(),
+            },
+            NormalizedTarget::Step {
+                address,
+                raw,
+                definition,
+                message,
+                each,
+                concurrency,
+                max,
+                ..
+            } => RouteTarget::Step {
+                address,
+                step_json: definition.declaration_json.clone(),
+                declaration_json: exact::encode(raw),
+                message_json: message.map(exact::encode),
+                each_path_json: each.map(exact::encode),
+                concurrency_json: concurrency.map(exact::encode),
+                max_json: max.map(exact::encode),
+            },
+        })
+        .collect())
+}
+
+pub(crate) fn normalize_targets<'a, T>(
+    route: &'a Value,
+    prefix: &[String],
+    outputs: Option<&[String]>,
+    definition: impl Fn(&[String]) -> Result<(T, bool)>,
+) -> Result<Vec<NormalizedTarget<'a, T>>> {
     let mut seen = HashSet::new();
-    let raws: Vec<&Value> = match &route {
+    let raws: Vec<&Value> = match route {
         Value::Array(v) => v.iter().collect(),
-        _ => vec![&route],
+        _ => vec![route],
     };
     let mut targets = Vec::new();
     for raw in raws {
-        let shorthand = raw.as_str().map(|name| object([("step", string(name))]));
-        let target = exact::record(shorthand.as_ref().or(Some(raw)), "")?;
-        if target.contains_key("output") {
+        let target = match raw {
+            Value::String(_) => None,
+            raw => Some(exact::record(Some(raw), "")?),
+        };
+        if let Some(target) = target.filter(|target| target.contains_key("output")) {
             if target.iter().any(|(k, _)| k != "output") {
                 return fail(
                     "ROUTES",
@@ -358,67 +425,65 @@ pub(crate) fn normalize_route(route_json: &str, scope: &Scope) -> Result<Vec<Rou
                 );
             }
             let name = exact::text(target.get("output"), "")?;
-            if !scope
-                .outputs
-                .as_ref()
-                .is_some_and(|outputs| outputs.iter().any(|s| s == name))
-            {
+            if !outputs.is_some_and(|outputs| outputs.iter().any(|s| s == name)) {
                 return fail("ROUTES", "", "Output is outside this composition body.");
             }
-            if !seen.insert(format!("output:{name}")) {
+            if !seen.insert(("output", name)) {
                 return fail("DUPLICATE", "", "Repeated route target.");
             }
-            targets.push(RouteTarget::Output {
-                name: name.to_owned(),
-            });
+            targets.push(NormalizedTarget::Output { name });
             continue;
         }
-        if target
-            .iter()
-            .any(|(k, _)| !["step", "message", "each", "concurrency", "max"].contains(&k))
-        {
+        if target.is_some_and(|target| {
+            target
+                .iter()
+                .any(|(k, _)| !["step", "message", "each", "concurrency", "max"].contains(&k))
+        }) {
             return fail("ROUTES", "", "Invalid route target fields.");
         }
-        let name = exact::text(target.get("step"), "")?;
-        let mut address = scope.prefix.clone();
+        let field = |key| target.and_then(|target| target.get(key));
+        let name = exact::text(
+            if target.is_some() {
+                field("step")
+            } else {
+                Some(raw)
+            },
+            "",
+        )?;
+        let mut address = prefix.to_vec();
         address.push(name.to_owned());
-        let Some(definition) = scope.steps.iter().find(|s| s.address == address) else {
-            return fail("REFERENCE", "", "Unknown step in route scope.");
-        };
-        if !seen.insert(exact::encode(&array(&address))) {
+        if !seen.insert(("step", name)) {
             return fail("DUPLICATE", "", "Repeated route target.");
         }
-        let step_value = exact::decode(&definition.declaration_json)?;
-        let step = exact::record(Some(&step_value), "")?;
-        let receives =
-            ["agent", "approval", "compose"].contains(&exact::text(step.get("type"), "")?);
-        if (target.contains_key("message") || target.contains_key("each")) && !receives {
+        let (definition, receives) = definition(&address)?;
+        let message = field("message");
+        let each = field("each");
+        let concurrency = field("concurrency");
+        let max = field("max");
+        if (message.is_some() || each.is_some()) && !receives {
             return fail("ROUTES", "", "This step receives no message or item.");
         }
-        if (target.contains_key("concurrency") || target.contains_key("max"))
-            && !target.contains_key("each")
-        {
+        if (concurrency.is_some() || max.is_some()) && each.is_none() {
             return fail("ROUTES", "", "Fan-out limits require each.");
         }
-        if let Some(each) = target.get("each") {
+        if let Some(each) = each {
             path(each)?;
             if exact::list(Some(each), "")?.first().and_then(Value::as_str) == Some("item") {
                 return fail("MESSAGE_PATH", "", "each reads the source, not an item.");
             }
         }
-        for name in ["concurrency", "max"] {
-            if let Some(value) = target.get(name) {
-                positive_integer(value)?;
-            }
+        for value in [concurrency, max].into_iter().flatten() {
+            positive_integer(value)?;
         }
-        targets.push(RouteTarget::Step {
+        targets.push(NormalizedTarget::Step {
             address,
-            step_json: definition.declaration_json.clone(),
-            declaration_json: exact::encode(raw),
-            message_json: target.get("message").map(exact::encode),
-            each_path_json: target.get("each").map(exact::encode),
-            concurrency_json: target.get("concurrency").map(exact::encode),
-            max_json: target.get("max").map(exact::encode),
+            raw,
+            definition,
+            receives,
+            message,
+            each,
+            concurrency,
+            max,
         });
     }
     Ok(targets)
@@ -595,7 +660,7 @@ pub(crate) fn instructions_expectation(
                 _,
             ) => {
                 let step = exact::decode(&step_json)?;
-                if ["agent", "approval", "compose"].contains(&exact::text(
+                if receives_messages(exact::text(
                     exact::record(Some(&step), "")?.get("type"),
                     "",
                 )?) {
@@ -610,27 +675,38 @@ pub(crate) fn instructions_expectation(
             }
         }
     }
+    instruction_kind(
+        instructs,
+        targets.iter().map(|target| {
+            let target = target.as_object().expect("normalized target object");
+            (target.get("message"), target.get("each"))
+        }),
+    )
+}
+
+pub(crate) fn instruction_kind<'a>(
+    instructs: bool,
+    targets: impl IntoIterator<Item = (Option<&'a Value>, Option<&'a Value>)>,
+) -> Result<&'static str> {
     if !instructs {
         return Ok("none");
     }
     let mut expects = false;
     let mut fanout = false;
     let mut single = false;
-    for target in &targets {
-        let target = exact::record(Some(target), "")?;
-        let each_instructions = target
-            .get("each")
-            .is_some_and(|v| exact::equal(v, &object_path(&["instructions"])));
+    for (message, each) in targets {
+        let each_instructions =
+            each.is_some_and(|v| exact::equal(v, &object_path(&["instructions"])));
         fanout |= each_instructions;
         if each_instructions {
             expects = true;
         }
-        if !target.contains_key("message") {
+        let Some(message) = message else {
             expects = true;
             single |= !each_instructions;
             continue;
-        }
-        let message = exact::record(target.get("message"), "")?;
+        };
+        let message = exact::record(Some(message), "")?;
         // NumberToken also satisfies the TS object test, then record rejects it.
         if let Some(prompt @ (Value::Object(_) | Value::Number(_))) = message.get("prompt") {
             let selected = exact::record(Some(prompt), "")?;

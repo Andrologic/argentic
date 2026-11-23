@@ -9,7 +9,7 @@
 //! strings and `BigInteger` exponents: no machine number and no expansion of an
 //! exponent into zeros. The shared and 0.3 helpers stay separate functions
 //! because they normalize zero differently.
-use super::{quote, scan::js_object_order, BigInteger, NumberToken, Object, Value};
+use super::{quote_to, scan::js_object_order, BigInteger, NumberToken, Object, Value};
 use std::cmp::Ordering;
 
 struct Lexeme<'a> {
@@ -231,28 +231,33 @@ fn same_keys<'a>(a: &'a Object, b: &'a Object, pending: &mut Vec<(&'a Value, &'a
 /// for every `Value`: the 0.3 refusals (non-JSON lexeme, unpaired surrogate,
 /// holes, cycles, non-JSON JS values) cannot occur in this type. Iterative.
 pub(crate) fn stringify(value: &Value) -> String {
+    let mut out = String::new();
+    stringify_to(&mut out, value).expect("writing to a String");
+    out
+}
+
+pub(crate) fn stringify_to(out: &mut impl std::fmt::Write, value: &Value) -> std::fmt::Result {
     enum Task<'a> {
         Value(&'a Value),
         Text(&'static str),
         Key(&'a str),
     }
-    let mut out = String::new();
     let mut pending = vec![Task::Value(value)];
     while let Some(task) = pending.pop() {
         match task {
-            Task::Text(text) => out.push_str(text),
+            Task::Text(text) => out.write_str(text)?,
             Task::Key(key) => {
-                out.push_str(&quote(key));
-                out.push(':');
+                quote_to(out, key)?;
+                out.write_char(':')?;
             }
             Task::Value(value) => match value {
-                Value::Null => out.push_str("null"),
-                Value::Bool(true) => out.push_str("true"),
-                Value::Bool(false) => out.push_str("false"),
-                Value::Number(token) => out.push_str(token.raw()),
-                Value::String(text) => out.push_str(&quote(text)),
+                Value::Null => out.write_str("null")?,
+                Value::Bool(true) => out.write_str("true")?,
+                Value::Bool(false) => out.write_str("false")?,
+                Value::Number(token) => out.write_str(token.raw())?,
+                Value::String(text) => quote_to(out, text)?,
                 Value::Array(items) => {
-                    out.push('[');
+                    out.write_char('[')?;
                     pending.push(Task::Text("]"));
                     for (index, item) in items.iter().enumerate().rev() {
                         pending.push(Task::Value(item));
@@ -262,7 +267,7 @@ pub(crate) fn stringify(value: &Value) -> String {
                     }
                 }
                 Value::Object(object) => {
-                    out.push('{');
+                    out.write_char('{')?;
                     pending.push(Task::Text("}"));
                     for (index, (key, item)) in object.iter().enumerate().rev() {
                         pending.push(Task::Value(item));
@@ -275,7 +280,7 @@ pub(crate) fn stringify(value: &Value) -> String {
             },
         }
     }
-    out
+    Ok(())
 }
 
 /// A number operand of the 0.3 helpers: an authored token, or an internal JS
