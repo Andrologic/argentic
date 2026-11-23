@@ -151,8 +151,10 @@ before or between structures or after the end record.
 Core validation budgets expansion of the flow and composition roots
 together. The budget allows 8192 expanded nodes, including compose calls
 and synthetic exits, 32768 route targets, including intermediate outputs,
-and 32 nested composition bodies. Compilation applies the limits to its own
-expansion passes and can materialize up to 32 MiB of step, route and message
+and 32 nested composition bodies. Join analysis also limits the aggregate
+branch records, memberships and diagnostics to 131,072 items per pass.
+Compilation applies the limits to its own expansion passes and can
+materialize up to 32 MiB of step, route, message and submission contract
 JSON. The public `argentic_core` constants are `MAX_EXPANDED_GRAPH_NODES`,
 `MAX_EXPANDED_GRAPH_EDGES`, `MAX_COMPOSITION_DEPTH` and
 `MAX_COMPILED_GRAPH_JSON_BYTES`. The stable code `GRAPH_LIMIT` points to the

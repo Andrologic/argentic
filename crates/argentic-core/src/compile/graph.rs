@@ -225,7 +225,7 @@ pub(crate) fn compile(document: &Object) -> Result<CompiledGraph> {
     let mut covered = OrderedSet::new();
     if document.contains_key("flow") {
         let graph = Graph::for_scope(document, None, None, &mut ExpansionBudget::default())?;
-        let (initial, _) = analyse_joins(&graph)?;
+        let (initial, _) = analyse_joins(&graph, &mut ExpansionBudget::default())?;
         let members = initial
             .values()
             .flat_map(|i| i.branches.values().flat_map(|b| b.iter().cloned()))
@@ -308,7 +308,7 @@ pub(crate) fn compile(document: &Object) -> Result<CompiledGraph> {
                         composition.is_none().then(|| covered.clone()),
                         &mut local_budget,
                     )?;
-                    let (infos, problems) = analyse_joins(&graph)?;
+                    let (infos, problems) = analyse_joins(&graph, &mut local_budget)?;
                     if !problems.is_empty() {
                         return fail("JOIN", "", "Validated graph disagrees with join analysis.");
                     }

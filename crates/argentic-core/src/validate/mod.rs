@@ -1420,12 +1420,9 @@ impl<'a, 'r> Checker<'a, 'r> {
             let flow = object(flow, "flow")?;
             let steps = object(required(flow, "steps")?, "steps")?;
             if steps.contains_key(text(required(flow, "entry")?, "entry")?) {
-                let (infos, _) = analyse_joins(&Graph::for_scope(
-                    doc,
-                    None,
-                    None,
-                    &mut ExpansionBudget::default(),
-                )?)?;
+                let mut initial_budget = ExpansionBudget::default();
+                let initial = Graph::for_scope(doc, None, None, &mut initial_budget)?;
+                let (infos, _) = analyse_joins(&initial, &mut initial_budget)?;
                 let mut members = OrderedSet::new();
                 for info in infos.values() {
                     for found in info.branches.values() {
@@ -1454,7 +1451,7 @@ impl<'a, 'r> Checker<'a, 'r> {
         let mut joins: OrderedMap<Option<String>, OrderedMap<String, LocalJoin>> =
             OrderedMap::new();
         for (scope_key, graph) in &scopes {
-            let (infos, problems) = analyse_joins(graph)?;
+            let (infos, problems) = analyse_joins(graph, &mut local_budget)?;
             for problem in problems {
                 self.report.error("JOIN", &problem.pointer, problem.message);
             }
@@ -1554,6 +1551,7 @@ impl<'a, 'r> Checker<'a, 'r> {
                     let target = text(required(compose.decl, "composition")?, "composition")?;
                     if let Some(found) = joins.get(&Some(target.to_owned())) {
                         for (name, info) in found.iter() {
+                            budget.join_analysis(info.branches.len(), Some(target))?;
                             self.report.joins.set(
                                 format!("{use_addr}/{name}"),
                                 ReportJoin {
@@ -1575,6 +1573,13 @@ impl<'a, 'r> Checker<'a, 'r> {
                     .get(&scope.composition)
                     .and_then(|local| local.get(&node.name))
                 {
+                    budget.join_analysis(
+                        info.branches
+                            .values()
+                            .map(|members| members.len() + 1)
+                            .sum(),
+                        scope.composition.as_deref(),
+                    )?;
                     let mut info = info.clone();
                     info.prefix = scope.prefix.clone();
                     infos.set(addr.clone(), info);
@@ -1586,7 +1591,7 @@ impl<'a, 'r> Checker<'a, 'r> {
             self.record_choices(graph);
             self.check_selections(graph, &infos)?;
             self.check_missions(graph)?;
-            self.check_shared_instances(graph, &infos)?;
+            self.check_shared_instances(graph, &infos, &mut budget)?;
         }
         Ok(())
     }
@@ -2224,113 +2229,70 @@ impl<'a, 'r> Checker<'a, 'r> {
         addr: &str,
         infos: &OrderedMap<String, LocalJoin>,
     ) -> Result<Option<OrderedSet<String>>, Internal> {
-        struct Frame {
-            addr: String,
-            edges: Vec<usize>,
-            next: usize,
-            names: OrderedSet<String>,
-        }
-        let frame = |addr: &str| Frame {
-            addr: addr.to_owned(),
-            edges: graph
-                .edges
-                .iter()
-                .enumerate()
-                .filter(|(_, edge)| edge.dst == addr)
-                .map(|(index, _)| index)
-                .collect(),
-            next: 0,
-            names: OrderedSet::new(),
-        };
         if graph.root.as_deref() == Some(addr) {
             return Ok(None);
         }
-        let mut stack = vec![frame(addr)];
-        enum Step {
-            Add(Vec<String>),
-            Push(String),
-            Null,
-        }
-        loop {
-            let depth = stack.len();
-            let next = {
-                let top = stack.last_mut().expect("frame");
-                if top.next == top.edges.len() {
-                    None
-                } else {
-                    top.next += 1;
-                    Some(top.edges[top.next - 1])
-                }
-            };
-            let Some(index) = next else {
-                let done = stack.pop().expect("frame");
-                match stack.last_mut() {
-                    None => return Ok(Some(done.names)),
-                    Some(parent) => {
-                        for name in &done.names {
-                            parent.names.insert(name.clone());
-                        }
-                    }
-                }
+        let mut active = HashSet::from([addr]);
+        let mut visited = HashSet::new();
+        let mut stack = vec![(addr, graph.incoming(addr)?.iter())];
+        let mut names = OrderedSet::new();
+        while let Some((addr, incoming)) = stack.last_mut() {
+            let Some(&index) = incoming.next() else {
+                active.remove(*addr);
+                visited.insert(*addr);
+                stack.pop();
                 continue;
             };
             let edge = &graph.edges[index];
-            let step = if let Some(message) = edge.message {
+            if let Some(message) = edge.message {
                 let resources = object_or_empty(member(Some(message), "resources"), "resources")?;
-                Step::Add(resources.iter().map(|(name, _)| name.to_owned()).collect())
-            } else if edge.kind == RouteKind::Error {
-                Step::Add(vec!["error".to_owned()])
-            } else {
-                let node = graph.node_at(&edge.src)?;
-                match node.kind {
-                    "agent" => match self.agent_of(node) {
-                        None => Step::Null,
-                        Some(agent) => {
-                            let mut names = vec!["text".to_owned()];
-                            for (name, _) in
-                                object_or_empty(member(Some(agent), "results"), "results")?.iter()
-                            {
-                                names.push(name.to_owned());
-                            }
-                            Step::Add(names)
-                        }
-                    },
-                    "call" => Step::Add(vec!["result".to_owned()]),
-                    "join" if infos.contains_key(&node.addr) => Step::Add(
-                        infos
-                            .get(&node.addr)
-                            .expect("join")
-                            .branches
-                            .keys()
-                            .cloned()
-                            .collect(),
-                    ),
-                    "approval"
-                        if !stack[..depth - 1]
-                            .iter()
-                            .any(|frame| frame.addr == node.addr) =>
+                for (name, _) in resources.iter() {
+                    names.insert(name.to_owned());
+                }
+                continue;
+            }
+            if edge.kind == RouteKind::Error {
+                names.insert("error".to_owned());
+                continue;
+            }
+            let node = graph.node_at(&edge.src)?;
+            match node.kind {
+                "agent" => {
+                    let Some(agent) = self.agent_of(node) else {
+                        return Ok(None);
+                    };
+                    names.insert("text".to_owned());
+                    for (name, _) in
+                        object_or_empty(member(Some(agent), "results"), "results")?.iter()
                     {
-                        Step::Push(node.addr.clone())
-                    }
-                    _ => Step::Null,
-                }
-            };
-            match step {
-                Step::Null => return Ok(None),
-                Step::Add(names) => {
-                    let top = stack.last_mut().expect("frame");
-                    for name in names {
-                        top.names.insert(name);
+                        names.insert(name.to_owned());
                     }
                 }
-                Step::Push(child) => {
-                    if graph.root.as_deref() == Some(child.as_str()) {
+                "call" => {
+                    names.insert("result".to_owned());
+                }
+                "join" => {
+                    let Some(info) = infos.get(&node.addr) else {
+                        return Ok(None);
+                    };
+                    for name in info.branches.keys() {
+                        names.insert(name.clone());
+                    }
+                }
+                "approval" => {
+                    let source = node.addr.as_str();
+                    if graph.root.as_deref() == Some(source) || active.contains(source) {
                         return Ok(None);
                     }
-                    stack.push(frame(&child));
+                    if !visited.contains(source) {
+                        active.insert(source);
+                        stack.push((source, graph.incoming(source)?.iter()));
+                    }
                 }
+                _ => return Ok(None),
             }
         }
+        Ok(Some(names))
     }
 
     fn branch_producers<'b>(
@@ -2581,6 +2543,7 @@ impl<'a, 'r> Checker<'a, 'r> {
         &mut self,
         graph: &Graph<'a>,
         infos: &OrderedMap<String, LocalJoin>,
+        budget: &mut ExpansionBudget,
     ) -> Result<(), Internal> {
         let sorted = sorted_addresses(graph.nodes.keys());
         for (addr, info) in infos.iter() {
@@ -2633,7 +2596,7 @@ impl<'a, 'r> Checker<'a, 'r> {
             }
             let join = graph.node_at(addr)?;
             if is_text(join.decl.and_then(|decl| decl.get("remaining")), "finish") {
-                self.check_after_finish(graph, addr, &finishing)?;
+                self.check_after_finish(graph, addr, &finishing, budget)?;
             }
         }
         self.check_fanout_instances(graph, infos)?;
@@ -2810,6 +2773,7 @@ impl<'a, 'r> Checker<'a, 'r> {
         graph: &Graph<'a>,
         join: &str,
         finishing: &HashMap<(String, Option<&'a str>), String>,
+        budget: &mut ExpansionBudget,
     ) -> Result<(), Internal> {
         let join_node = graph.node_at(join)?;
         for later in sorted_addresses(&graph.reachable(join, &OrderedSet::new())?) {
@@ -2829,6 +2793,7 @@ impl<'a, 'r> Checker<'a, 'r> {
             let Some(branch) = finishing.get(&(agent.clone(), instance)) else {
                 continue;
             };
+            budget.join_analysis(1, graph.scopes[join_node.scope].composition.as_deref())?;
             self.report.warning_step(
                 "SHARED_INSTANCE_PARALLEL",
                 &node.pointer,
@@ -3190,6 +3155,42 @@ mod tests {
             ]
         );
         assert!(!report.valid());
+    }
+
+    #[test]
+    fn approval_resource_analysis_unions_paths_and_leaves_cycles_unknown() {
+        for cyclic in [false, true] {
+            let steps = serde_json::json!({
+                "prepare":{"type":"agent","agent":"a","next":[
+                    "left",{"step":"right","message":{"resources":{"extra":{"from":["text"]}}}}
+                ]},
+                "left":{"type":"approval","next":{"yes":"check","no":[]}},
+                "right":{"type":"approval","next":{"yes":"check","no":[]}},
+                "check":{"type":"approval","next":{"yes":if cyclic {serde_json::json!("left")} else {serde_json::json!([])},"no":[]}}
+            });
+            let source = serde_json::json!({
+                "agents":{"a":{"results":{"notes":{}}}},
+                "flow":{"entry":"prepare","steps":steps}
+            });
+            let parsed = parse_v030(source.to_string().as_bytes()).unwrap();
+            let doc = parsed.tree.as_object().unwrap();
+            let graph = Graph::for_scope(doc, None, None, &mut ExpansionBudget::default()).unwrap();
+            let modules = ModuleMap::new();
+            let mut report = Report::new();
+            let checker = Checker::new(doc, &modules, &mut report).unwrap();
+            let names = checker
+                .received_resources(&graph, "check", &OrderedMap::new())
+                .unwrap();
+            if cyclic {
+                assert!(names.is_none());
+            } else {
+                let names = names.unwrap();
+                assert_eq!(
+                    names.iter().map(String::as_str).collect::<Vec<_>>(),
+                    ["text", "notes", "extra"]
+                );
+            }
+        }
     }
 
     #[test]

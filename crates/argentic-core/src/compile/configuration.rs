@@ -467,7 +467,7 @@ fn optional_object<'a>(v: Option<&'a E>, p: &str) -> Result<&'a Object> {
 }
 fn covered(document: &Object) -> Result<OrderedSet<String>> {
     let graph = Graph::for_scope(document, None, None, &mut ExpansionBudget::default())?;
-    let (initial, _) = analyse_joins(&graph)?;
+    let (initial, _) = analyse_joins(&graph, &mut ExpansionBudget::default())?;
     let members = initial
         .values()
         .flat_map(|info| info.branches.values().flat_map(|v| v.iter().cloned()))
@@ -490,7 +490,7 @@ fn receivers(document: &Object) -> Result<OrderedSet<String>> {
             composition.is_none().then(|| covered.clone()),
             &mut local_budget,
         )?;
-        let (infos, _) = analyse_joins(&g)?;
+        let (infos, _) = analyse_joins(&g, &mut local_budget)?;
         in_branch.set(
             composition.map(str::to_owned),
             infos
