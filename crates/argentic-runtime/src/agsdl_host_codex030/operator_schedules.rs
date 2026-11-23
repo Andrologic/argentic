@@ -5,6 +5,10 @@ use crate::api::OperatorAction as Action;
 #[path = "operator_boundary_schedules.rs"]
 mod boundaries;
 
+#[cfg(unix)]
+#[path = "mcp_dispatch_schedules.rs"]
+mod mcp_dispatch;
+
 const WAIT: std::time::Duration = std::time::Duration::from_secs(15);
 
 fn exhaustive() -> bool {

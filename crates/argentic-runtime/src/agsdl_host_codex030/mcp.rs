@@ -69,16 +69,8 @@ impl Equipment {
         approvals: Option<Arc<dyn CommandApprovals030>>,
         cancel: &CancellationToken,
     ) -> Result<Self> {
-        let stop = cancel.child_token();
         let token = uuid::Uuid::new_v4().to_string();
-        let mut state = Bridge {
-            stop,
-            auth: format!("Bearer {token}"),
-            work: work.attempt.clone(),
-            approvals,
-            admission: work.operator.clone(),
-            upstreams: BTreeMap::new(),
-        };
+        let mut state = Bridge::new(work, approvals, cancel, format!("Bearer {token}"));
         let result = async {
             for name in agent["mcpServers"].as_array().into_iter().flatten() {
                 let name = name.as_str().ok_or_else(|| {
@@ -91,7 +83,7 @@ impl Equipment {
                 }
                 let server = &document["mcpServers"][name];
                 let control = state.control();
-                state.admit(&control).await?;
+                drop(state.admit(&control).await?);
                 let session = if let Some(url) = server["url"].as_str() {
                     remote_mcp(context, &work.capture, name, url)
                         .map_err(transport_error)?
@@ -110,21 +102,7 @@ impl Equipment {
                         mcp_server(context, grant, &work.capture, name).map_err(transport_error)?;
                     raw_mcp::start(server).map_err(transport_error)?
                 };
-                let identity = CallIdentity {
-                    system_id: work.attempt.identity().system_start_id.clone(),
-                    run_id: work.attempt.identity().flow_invocation_id.clone(),
-                    group_id: String::new(),
-                    work_id: work.attempt.work().activation_id.clone(),
-                    epoch: work.attempt.owner().owner_epoch.clone(),
-                    effect_id: work.attempt.start_effect_id().to_owned(),
-                    provider_attempt_id: None,
-                    native_call_id: uuid::Uuid::new_v4().to_string(),
-                };
-                let upstream = Upstream {
-                    session: Mutex::new(Some(session)),
-                    tools: BTreeMap::new(),
-                    identity,
-                };
+                let upstream = Upstream::new(session, &work.attempt);
                 let upstream = state.upstreams.entry(name.to_owned()).or_insert(upstream);
                 let mut session = upstream.session.lock().await;
                 let session = session.as_mut().expect("owned discovery session");
@@ -295,7 +273,43 @@ impl Drop for Equipment {
     }
 }
 
+impl Upstream {
+    fn new(session: raw_mcp::Session, attempt: &FlowWorkAttempt030) -> Self {
+        let identity = CallIdentity {
+            system_id: attempt.identity().system_start_id.clone(),
+            run_id: attempt.identity().flow_invocation_id.clone(),
+            group_id: String::new(),
+            work_id: attempt.work().activation_id.clone(),
+            epoch: attempt.owner().owner_epoch.clone(),
+            effect_id: attempt.start_effect_id().to_owned(),
+            provider_attempt_id: None,
+            native_call_id: uuid::Uuid::new_v4().to_string(),
+        };
+        Self {
+            session: Mutex::new(Some(session)),
+            tools: BTreeMap::new(),
+            identity,
+        }
+    }
+}
+
 impl Bridge {
+    fn new(
+        work: &AgentWork030,
+        approvals: Option<Arc<dyn CommandApprovals030>>,
+        cancel: &CancellationToken,
+        auth: String,
+    ) -> Self {
+        Self {
+            stop: cancel.child_token(),
+            auth,
+            work: work.attempt.clone(),
+            approvals,
+            admission: work.operator.clone(),
+            upstreams: BTreeMap::new(),
+        }
+    }
+
     fn control(&self) -> Control {
         Control {
             stop: self.stop.clone(),
@@ -303,12 +317,31 @@ impl Bridge {
         }
     }
 
-    async fn admit(&self, control: &Control) -> Result<()> {
-        let _admission =
+    async fn admit(&self, control: &Control) -> Result<tokio::sync::OwnedMutexGuard<()>> {
+        let admission =
             self.admission.admit_turn().await?.ok_or_else(|| {
                 mcp_error("STOP_PENDING", "Agent work cannot admit an MCP request")
             })?;
-        control.check().map_err(transport_error)
+        control.check().map_err(transport_error)?;
+        Ok(admission)
+    }
+
+    async fn dispatch(
+        &self,
+        session: &mut raw_mcp::Session,
+        tool: &str,
+        args: &str,
+        control: &Control,
+    ) -> Result<raw_mcp::PendingToolCall> {
+        #[cfg(test)]
+        self.admission.test_yield("mcp.dispatch.before").await;
+        let pending = session
+            .dispatch_tool(tool, args, control)
+            .await
+            .map_err(|error| mcp_error(&error.code, "Cannot deliver the admitted MCP tool call"))?;
+        #[cfg(test)]
+        self.admission.test_yield("mcp.dispatch.handed_off").await;
+        Ok(pending)
     }
 
     async fn call(&self, upstream: &Upstream, server: &str, params: &Value) -> Option<Value> {
@@ -333,9 +366,13 @@ impl Bridge {
         if session.tool_in_flight() || session.guard_secrets(&arguments_json).is_err() {
             return None;
         }
-        if *effect == Effect::Ask {
+        let pending = if *effect == Effect::Ask {
             let approvals = self.approvals.as_ref()?;
-            let (send, receive) = tokio::sync::oneshot::channel();
+            let mut pending = None;
+            let dispatched = &mut pending;
+            let wire = &mut *session;
+            let args = arguments_json.as_str();
+            let control = &control;
             let payload = json!({"nativeRequest":{
                 "id": uuid::Uuid::new_v4().to_string(),
                 "method":"mcp/tool/requestApproval",
@@ -348,26 +385,28 @@ impl Bridge {
                     &self.stop,
                     Box::new(move |yes| {
                         Box::pin(async move {
-                            let _ = send.send(yes);
+                            // The broker already holds the policy lease and
+                            // Stop's admission gate while delivering this answer.
+                            if yes {
+                                *dispatched = Some(self.dispatch(wire, tool, args, control).await?);
+                            }
                             Ok(())
                         })
                     }),
                 )
                 .await
                 .ok()?;
-            if receive.await.ok() != Some(true) {
-                return None;
-            }
-        }
-        self.admit(&control).await.ok()?;
+            pending?
+        } else {
+            let _admission = self.admit(&control).await.ok()?;
+            self.dispatch(session, tool, &arguments_json, &control)
+                .await
+                .ok()?
+        };
+        #[cfg(test)]
+        self.admission.test_yield("mcp.dispatch.wait").await;
         let receipt = session
-            .call_tool(
-                tool,
-                &arguments_json,
-                &NoHuman,
-                &upstream.identity,
-                &control,
-            )
+            .finish_tool_call(pending, &NoHuman, &upstream.identity, &control)
             .await
             .ok()?;
         serde_json::from_str(&receipt.raw_result_json).ok()
@@ -454,4 +493,44 @@ fn transport_error(
 
 fn mcp_error(code: &str, message: &str) -> crate::persistence::dto::EngineFailure {
     failure(code, "/mcpServers", message)
+}
+
+#[cfg(all(test, unix))]
+pub(crate) async fn call_test_session(
+    work: &AgentWork030,
+    approvals: Arc<dyn CommandApprovals030>,
+    cancel: &CancellationToken,
+    session: raw_mcp::Session,
+) -> Result<Option<Value>> {
+    let mut state = Bridge::new(work, Some(approvals), cancel, String::new());
+    let mut upstream = Upstream::new(session, &work.attempt);
+    upstream
+        .tools
+        .insert("check".into(), (Effect::Ask, Value::Null));
+    state.upstreams.insert("issues".into(), upstream);
+    let equipment = Equipment {
+        state: Arc::new(state),
+        server: None,
+        config: None,
+    };
+    let upstream = &equipment.state.upstreams["issues"];
+    upstream
+        .session
+        .lock()
+        .await
+        .as_mut()
+        .unwrap()
+        .initialize(
+            Arc::new(NoHuman),
+            &upstream.identity,
+            &equipment.state.control(),
+        )
+        .await
+        .map_err(transport_error)?;
+    let result = equipment
+        .state
+        .call(upstream, "issues", &json!({"name":"check"}))
+        .await;
+    equipment.close().await?;
+    Ok(result)
 }

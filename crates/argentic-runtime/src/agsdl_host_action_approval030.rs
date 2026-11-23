@@ -88,6 +88,12 @@ impl crate::agsdl_host_codex030::approvals::CommandApprovals030 for AgentActionH
                     "The turn is being interrupted",
                 ));
             }
+            #[cfg(test)]
+            if payload["nativeRequest"]["method"] == "mcp/tool/requestApproval" {
+                host.flow030()
+                    .operator_test_yield("mcp.approval.resolved")
+                    .await;
+            }
             let view = diagnostics::at(
                 attempt,
                 Stage::BrokerInspect,
@@ -100,6 +106,12 @@ impl crate::agsdl_host_codex030::approvals::CommandApprovals030 for AgentActionH
                 Stage::BrokerPolicy,
                 self.policy.lock_current(&view.capture, &payload).await,
             )?;
+            #[cfg(test)]
+            if payload["nativeRequest"]["method"] == "mcp/tool/requestApproval" {
+                host.flow030()
+                    .operator_test_yield("mcp.approval.policy")
+                    .await;
+            }
             let allowed = policy.allows();
             let _operation = broker.operation.lock().await;
             diagnostics::at(

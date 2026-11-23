@@ -311,6 +311,11 @@ impl AgentOperator030 {
         Ok(Some(guard))
     }
 
+    #[cfg(test)]
+    pub(crate) async fn test_yield(&self, point: &'static str) {
+        self.host.flow030().operator_test_yield(point).await;
+    }
+
     pub(crate) async fn requested(&mut self) -> String {
         loop {
             if let Some(id) = self.commands.borrow_and_update().clone() {
