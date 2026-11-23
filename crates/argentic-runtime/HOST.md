@@ -130,15 +130,12 @@ the way to `..` needs a portable name without a case collision, even when
 it does not exist.
 
 Unix uses the source file's POSIX executable bits. On Windows, Argentic
-restores flags from a regular root file named `.agsdl-executables` or
-`.agsdl-executables.<number>` with the UTF-8 header
-`AgSDL executable paths v1\n`. The body is limited to 2 MiB and lists
-portable project-relative paths separated by LF. An optional final LF is
-accepted. Portable paths outside the current selection are ignored.
-Only files outside the project selection are considered for metadata.
-A selected file with the same name and header is ordinary project content.
-Argentic refuses more than one recognized sidecar outside the selection.
-ZIP exports record the restored flags in `archive.json`.
+restores flags from the first unselected regular root file whose name is
+`.agsdl-executables` or `.agsdl-executables.<number>` in lowercase and whose
+header is `AgSDL executable paths v1\n`. The UTF-8 body is limited to 2 MiB.
+Each LF-separated line that exactly matches a selected project path sets
+its executable flag. A selected file with the same sidecar name and header
+is ordinary project content. ZIP exports record the flags in `archive.json`.
 
 A folder can select at most 8192 files and 256 MiB, and its inventory must
 fit in 2 MiB. An archive's 8192 entries and 256 MiB also count
@@ -148,18 +145,28 @@ directory and final end record must account for the rest of the container.
 `ARCHIVE_LAYOUT` identifies a layout refusal, including unaccounted bytes
 before or between structures or after the end record.
 
-Core validation budgets expansion of the flow and composition roots
-together. The budget allows 8192 expanded nodes, including compose calls
-and synthetic exits, 32768 route targets, including intermediate outputs,
-and 32 nested composition bodies. Join analysis also limits the aggregate
-branch records, memberships and diagnostics to 131,072 items per pass.
-Compilation applies the limits to its own expansion passes and can
-materialize up to 32 MiB of step, route, message and submission contract
-JSON. The public `argentic_core` constants are `MAX_EXPANDED_GRAPH_NODES`,
-`MAX_EXPANDED_GRAPH_EDGES`, `MAX_COMPOSITION_DEPTH` and
-`MAX_COMPILED_GRAPH_JSON_BYTES`. The stable code `GRAPH_LIMIT` points to the
-authored composition, or `/flow` when the flow itself exceeds a limit.
-Project open maps that pointer to the declaring file.
+Source opening and compilation each use a shared `argentic_core::SourceBudget`.
+An open charges JSON parsing, project assembly, validation and diagnostic
+production to the same budget. Compilation shares its budget across parsing,
+static validation, graph expansion, adapter qualification and host checks.
+Each operation permits 8,000,000 work units and 256 MiB of estimated cumulative
+allocation. Work units count input scans, visits and comparisons. The byte
+allowance includes temporary allocations and retained output. JSON parsing
+allows 128 levels of nesting and property names up to 4,096 source bytes.
+The archive file and project component limits above also apply.
+
+Expansion allows 8,192 graph nodes, 32,768 route targets and 32 nested
+composition bodies. Join analysis allows 131,072 branch records, memberships
+and diagnostics per pass. Validation allows 1,024 diagnostics and 512 KiB of
+diagnostic data before adding a limit diagnostic. Messages retain up to 2 KiB,
+with short excerpts of long authored values. The compiler charges retained
+graph JSON and the encoded plan together against the 32 MiB graph JSON cap.
+
+`GRAPH_LIMIT` covers source work, bytes, nesting, expansion and diagnostic
+limits. Its pointer identifies the relevant field, composition or `/flow`.
+Project open maps that location to the declaring file and returns a structured
+`SourceDiagnostic` with kind `invalidContent`. The existing native result size
+limit still uses `INPUT_LIMIT`.
 
 Plain JSON read failures retain their host codes, `SOURCE_UNAVAILABLE`
 and `INPUT_LIMIT`. For project diagnostics, `EngineFailure.source` can carry

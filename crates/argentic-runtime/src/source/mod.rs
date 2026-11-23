@@ -29,6 +29,8 @@ use std::{
 };
 use url::Url;
 
+use argentic_core::{SourceBudget, GRAPH_LIMIT_CODE};
+
 const MANIFEST: &str = "agsdl.json";
 const MAX_FILES: usize = 8192;
 const MAX_TOTAL: u64 = 256 * 1024 * 1024;
@@ -71,9 +73,15 @@ impl OpenedSource {
             .map_err(|e| io(path, e))?
             .components()
             .collect();
+        let budget = SourceBudget::default();
         let meta = std::fs::symlink_metadata(&path).map_err(|_| source_unavailable())?;
         if meta.is_dir() || (meta.is_symlink() && path.is_dir()) {
-            return Self::folder(open_project_root(&path)?, None);
+            return Self::assembled(project::assemble_folder_with_budget(
+                open_project_root(&path)?,
+                None,
+                cfg!(unix),
+                budget,
+            )?);
         }
         let name = path
             .file_name()
@@ -86,9 +94,10 @@ impl OpenedSource {
             if !meta.is_file() {
                 return Err(source_unavailable());
             }
-            return Self::archived(archive::read(
+            return Self::open_archive(
                 open_local(&path).map_err(|_| source_unavailable())?,
-            )?);
+                budget,
+            );
         }
         // Preserve the exact UTF-8 bytes and 8 MiB limit of standalone JSON.
         if !meta.is_file() || meta.len() > MAX_JSON_TOTAL {
@@ -115,13 +124,21 @@ impl OpenedSource {
             }
         })?;
         if let Some(dir) = dir {
-            let manifest = parse_json(&file.bytes, MANIFEST, false)?;
+            let manifest = parse_json(&file.bytes, MANIFEST, false, &budget)?;
             if manifest.get("projectFormat").is_some() {
-                return Self::folder(dir, Some(file));
+                return Self::assembled(project::assemble_folder_with_budget(
+                    dir,
+                    Some(file),
+                    cfg!(unix),
+                    budget,
+                )?);
             }
         }
         let authored = std::str::from_utf8(&file.bytes)
             .map_err(|_| failure("PARSE", "source", "Source must be UTF-8"))?;
+        budget
+            .json_input(authored.as_bytes(), "")
+            .map_err(|e| source_limit(name.to_str().unwrap_or(""), e))?;
         crate::persistence::validate_json(authored)?;
         let authored = authored.to_owned();
         Ok(Self {
@@ -134,15 +151,17 @@ impl OpenedSource {
     /// Open untrusted uploaded bytes. References are resolved inside the
     /// archive only. This API never uses a client-supplied local path.
     pub fn open_archive_bytes(bytes: &[u8]) -> Result<Self> {
-        Self::archived(archive::read(Cursor::new(bytes))?)
+        Self::open_archive(Cursor::new(bytes), SourceBudget::default())
     }
 
+    #[cfg(test)]
     fn folder(dir: Dir, manifest: Option<ProjectFile>) -> Result<Self> {
         Self::assembled(project::assemble_folder(dir, manifest, cfg!(unix))?)
     }
 
-    fn archived(files: Files) -> Result<Self> {
-        Self::assembled(project::assemble_archive(files)?)
+    fn open_archive(input: impl Read + std::io::Seek, budget: SourceBudget) -> Result<Self> {
+        let files = archive::read_with_budget(input, &budget)?;
+        Self::assembled(project::assemble_archive(files, budget)?)
     }
 
     fn assembled(project: project::Project) -> Result<Self> {
@@ -155,7 +174,7 @@ impl OpenedSource {
                 "Project inventory exceeds the 2 MiB archive limit; select fewer or shorter paths",
             ));
         }
-        let authored = serde_json::to_string(&project.document)?;
+        let authored = encode_document(&project.document, &project.budget)?;
         Ok(Self {
             authored,
             origin: None,
@@ -329,10 +348,66 @@ pub(crate) fn sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-fn parse_json(bytes: &[u8], file: &str, project_limits: bool) -> Result<Value> {
+fn source_limit(file: &str, error: argentic_core::calculation::Failure) -> EngineFailure {
+    project_failure(
+        GRAPH_LIMIT_CODE,
+        file,
+        &error.pointer,
+        SourceErrorKind::InvalidContent,
+        &error.message,
+    )
+}
+
+fn encode_document(value: &Value, budget: &SourceBudget) -> Result<String> {
+    struct Writer<'a> {
+        budget: &'a SourceBudget,
+        bytes: Vec<u8>,
+        limit: Option<argentic_core::calculation::Failure>,
+    }
+    impl Write for Writer<'_> {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if let Err(error) = self
+                .budget
+                .bytes(bytes.len(), "")
+                .and_then(|()| self.budget.work(bytes.len().div_ceil(8), ""))
+            {
+                self.limit = Some(error);
+                return Err(std::io::ErrorKind::FileTooLarge.into());
+            }
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut writer = Writer {
+        budget,
+        bytes: Vec::new(),
+        limit: None,
+    };
+    let result = serde_json::to_writer(&mut writer, value);
+    if let Some(limit) = writer.limit {
+        return Err(source_limit(MANIFEST, limit));
+    }
+    result?;
+    Ok(String::from_utf8(writer.bytes).expect("JSON is UTF-8"))
+}
+
+fn parse_json(
+    bytes: &[u8],
+    file: &str,
+    project_limits: bool,
+    budget: &SourceBudget,
+) -> Result<Value> {
     let error = |message: &str| invalid(file, "", message);
-    let text = std::str::from_utf8(bytes).map_err(|e| error(&e.to_string()))?;
-    let value = argentic_core::durable_json::value(text).map_err(|e| error(&e.to_string()))?;
+    let value = argentic_core::parse_source_json(bytes, budget).map_err(|failure| {
+        if failure.code == GRAPH_LIMIT_CODE {
+            source_limit(file, failure)
+        } else {
+            error(&failure.message)
+        }
+    })?;
     if project_limits {
         let mut pending = vec![(&value, 0)];
         while let Some((value, depth)) = pending.pop() {

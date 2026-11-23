@@ -1,6 +1,7 @@
 use super::{
-    archive, invalid, io, member, open_regular, parse_json, project_failure, read_regular, Files,
-    MANIFEST, MAX_FILES, MAX_JSON, MAX_JSON_TOTAL, MAX_TOTAL,
+    archive, encode_document, invalid, io, member, open_regular, parse_json, project_failure,
+    read_regular, source_limit, Files, SourceBudget, GRAPH_LIMIT_CODE, MANIFEST, MAX_FILES,
+    MAX_JSON, MAX_JSON_TOTAL, MAX_TOTAL,
 };
 use crate::persistence::{dto::SourceErrorKind, Result};
 use cap_std::fs::Dir;
@@ -20,6 +21,7 @@ const SECTIONS: &[&str] = &["agents", "compositions", "content", "skills", "mcpS
 
 pub(super) struct Project {
     pub document: Value,
+    pub(super) budget: SourceBudget,
     pub secrets: BTreeMap<String, Vec<String>>,
     pub mcp_files: BTreeMap<String, Vec<String>>,
     pub files: Files,
@@ -56,6 +58,7 @@ fn scheme(uri: &str) -> Option<&str> {
 
 struct Reader<'a> {
     dir: Option<&'a Dir>,
+    budget: SourceBudget,
     files: Files,
     selected: BTreeSet<String>,
     skills: BTreeSet<String>,
@@ -64,12 +67,23 @@ struct Reader<'a> {
     total: u64,
 }
 
+#[cfg(test)]
 pub(super) fn assemble_folder(
     dir: Dir,
     manifest: Option<super::ProjectFile>,
     native_modes: bool,
 ) -> Result<Project> {
-    let mut reader = Reader::new(Some(&dir), Files::new());
+    assemble_folder_with_budget(dir, manifest, native_modes, SourceBudget::default())
+}
+
+pub(super) fn assemble_folder_with_budget(
+    dir: Dir,
+    manifest: Option<super::ProjectFile>,
+    native_modes: bool,
+    budget: SourceBudget,
+) -> Result<Project> {
+    let mut reader = Reader::new(Some(&dir), Files::new(), budget);
+
     if let Some(file) = manifest {
         let canonical = reader.resolve(MANIFEST, MANIFEST, "")?;
         reader.total = file.bytes.len() as u64;
@@ -80,7 +94,7 @@ pub(super) fn assemble_folder(
         for file in project.files.values_mut() {
             file.executable = false;
         }
-        restore_executable_modes(&dir, &mut project.files)?;
+        restore_executable_modes(&dir, &mut project.files, &project.budget)?;
     }
     Ok(project)
 }
@@ -96,7 +110,7 @@ fn sidecar_name(name: &str) -> bool {
             }))
 }
 
-fn restore_executable_modes(dir: &Dir, files: &mut Files) -> Result<()> {
+fn restore_executable_modes(dir: &Dir, files: &mut Files, budget: &SourceBudget) -> Result<()> {
     let root = Path::new(MANIFEST);
     // Both folder and archive assembly preserve the project's selection.
     // Only a root file outside it can carry unpacker metadata.
@@ -105,6 +119,7 @@ fn restore_executable_modes(dir: &Dir, files: &mut Files) -> Result<()> {
         .map(|name| archive::path_key(name))
         .collect::<BTreeSet<_>>();
     for entry in dir.entries().map_err(|e| io(root, e))? {
+        budget.work(16, "").map_err(|e| source_limit(MANIFEST, e))?;
         let entry = entry.map_err(|e| io(root, e))?;
         let name = entry.file_name();
         let Some(name) = name.to_str().filter(|name| sidecar_name(name)) else {
@@ -151,14 +166,15 @@ fn restore_executable_modes(dir: &Dir, files: &mut Files) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn assemble_archive(files: Files) -> Result<Project> {
-    Reader::new(None, files).assemble()
+pub(super) fn assemble_archive(files: Files, budget: SourceBudget) -> Result<Project> {
+    Reader::new(None, files, budget).assemble()
 }
 
 impl<'a> Reader<'a> {
-    fn new(dir: Option<&'a Dir>, files: Files) -> Self {
+    fn new(dir: Option<&'a Dir>, files: Files, budget: SourceBudget) -> Self {
         Self {
             dir,
+            budget,
             files,
             selected: BTreeSet::new(),
             skills: BTreeSet::new(),
@@ -170,6 +186,9 @@ impl<'a> Reader<'a> {
 
     fn select(&mut self, path: &str, limit: u64) -> Result<()> {
         // Folder and archive inputs select the same portable names.
+        self.budget
+            .work(1 + path.len().div_ceil(8), "")
+            .map_err(|e| source_limit(path, e))?;
         archive::portable(path)?;
         for (end, _) in path
             .match_indices('/')
@@ -208,6 +227,10 @@ impl<'a> Reader<'a> {
     /// Record one path's spelling. Names that differ only by case folding
     /// or Unicode normalization collide, including directory names.
     fn spell(&mut self, part: &str, path: &str) -> Result<()> {
+        self.budget
+            .work(1 + part.len().div_ceil(8), "")
+            .and_then(|()| self.budget.bytes(part.len() * 3 + 64, ""))
+            .map_err(|e| source_limit(path, e))?;
         if self
             .spellings
             .insert(archive::path_key(part), part.into())
@@ -224,7 +247,13 @@ impl<'a> Reader<'a> {
     }
 
     fn resolve(&mut self, owner: &str, name: &str, pointer: &str) -> Result<String> {
-        let error = |detail| invalid(owner, pointer, &format!("{detail}: {name:?}"));
+        self.budget
+            .work(1 + name.len().div_ceil(8), pointer)
+            .map_err(|e| source_limit(owner, e))?;
+        let error = |detail| {
+            let shown = &name[..name.floor_char_boundary(name.len().min(160))];
+            invalid(owner, pointer, &format!("{detail}: {shown:?}"))
+        };
         if name.is_empty()
             || name.starts_with('/')
             || name.contains('\\')
@@ -259,10 +288,22 @@ impl<'a> Reader<'a> {
                     parts.push(part);
                     // As the official reader does, a component used only on
                     // the way to `..` still needs a portable, consistent name.
+                    let bytes = parts.iter().map(|part| part.len() + 1).sum::<usize>();
+                    self.budget
+                        .work(1 + bytes.div_ceil(8), pointer)
+                        .map_err(|e| source_limit(owner, e))?;
+                    self.budget
+                        .bytes(128 + bytes * 5, pointer)
+                        .map_err(|e| source_limit(owner, e))?;
                     let walked = parts.join("/");
                     archive::portable(&walked).map_err(|_| error("Invalid portable path"))?;
-                    self.spell(&walked, &walked)
-                        .map_err(|_| error("Case collision or too many project paths"))?;
+                    self.spell(&walked, &walked).map_err(|cause| {
+                        if cause.code == GRAPH_LIMIT_CODE {
+                            cause
+                        } else {
+                            error("Case collision or too many project paths")
+                        }
+                    })?;
                     if let Some(dir) = &self.dir {
                         if member::metadata(dir, Path::new(&walked))
                             .is_ok_and(|meta| member::is_link(&meta))
@@ -303,7 +344,7 @@ impl<'a> Reader<'a> {
                 "Project JSON exceeds per-file or aggregate limit",
             ));
         }
-        parse_json(bytes, file, true)
+        parse_json(bytes, file, true, &self.budget)
     }
 
     fn component(
@@ -312,6 +353,12 @@ impl<'a> Reader<'a> {
         value: Value,
         pointer: &str,
     ) -> Result<Value> {
+        self.budget
+            .work(1, pointer)
+            .map_err(|e| source_limit(MANIFEST, e))?;
+        self.budget
+            .bytes(pointer.len() + 96, pointer)
+            .map_err(|e| source_limit(MANIFEST, e))?;
         if value
             .as_object()
             .is_some_and(|object| object.len() == 1 && object.contains_key("file"))
@@ -354,6 +401,7 @@ impl<'a> Reader<'a> {
         let secrets = manifest.remove("secrets");
         let mut project = Project {
             document: Value::Null,
+            budget: self.budget.clone(),
             secrets: BTreeMap::new(),
             mcp_files: BTreeMap::new(),
             files: Files::new(),
@@ -597,6 +645,9 @@ impl<'a> Reader<'a> {
             return Ok(());
         };
         let pointer = child(pointer, "uri");
+        self.budget
+            .work(1 + uri.len().div_ceil(8), &pointer)
+            .map_err(|e| source_limit(owner, e))?;
         if let Some(scheme) = scheme(uri) {
             return if scheme.eq_ignore_ascii_case("file") {
                 Err(invalid(
@@ -622,6 +673,9 @@ impl<'a> Reader<'a> {
             self.resolve(owner, &path, &pointer)?
         };
         self.select(&task, MAX_TOTAL).map_err(|cause| {
+            if cause.code == GRAPH_LIMIT_CODE {
+                return cause;
+            }
             // Keep the authored URI in the error and locate an I/O failure
             // at the resource itself.
             let detail = cause
@@ -644,6 +698,9 @@ impl<'a> Reader<'a> {
             .remove(b'.')
             .remove(b'_')
             .remove(b'~');
+        self.budget
+            .bytes(task.len() * 3 + uri.len() - split, &pointer)
+            .map_err(|e| source_limit(owner, e))?;
         source["uri"] = Value::from(format!(
             "{}{}",
             utf8_percent_encode(&task, &ENCODE),
@@ -675,6 +732,9 @@ impl<'a> Reader<'a> {
                 for item in
                     member::with_directory(dir, &path, Dir::entries).map_err(|e| io(&path, e))?
                 {
+                    self.budget
+                        .work(1, "")
+                        .map_err(|e| source_limit(directory, e))?;
                     let item = item.map_err(|e| io(&path, e))?;
                     let relative = path.join(item.file_name());
                     entries += 1;
@@ -730,36 +790,22 @@ impl<'a> Reader<'a> {
 }
 
 fn validate(project: &Project) -> Result<()> {
-    let authored = serde_json::to_vec(&project.document)?;
-    let report = argentic_core::validate_document_json(&authored, None)
-        .map_err(|e| invalid(MANIFEST, &e.pointer, &e.message))?;
-    let report: Value = serde_json::from_str(&report)?;
-    if !report["valid"].as_bool().unwrap_or(false) {
-        let diagnostic = report["diagnostics"].as_array().and_then(|items| {
-            items
-                .iter()
-                .find(|d| d["code"] == argentic_core::GRAPH_LIMIT_CODE)
-                .or_else(|| items.iter().find(|d| d["severity"] == "error"))
-        });
-        if let Some(diagnostic) = diagnostic {
-            let location = diagnostic["path"].as_str().unwrap_or("");
-            let (file, pointer) = project.origin(location);
-            let code = if diagnostic["code"] == argentic_core::GRAPH_LIMIT_CODE {
-                argentic_core::GRAPH_LIMIT_CODE
-            } else {
-                "PROJECT"
-            };
-            return Err(project_failure(
-                code,
-                file,
-                pointer,
-                SourceErrorKind::InvalidContent,
-                diagnostic["message"].as_str().unwrap_or("Invalid document"),
-            ));
-        }
-        return Err(invalid(MANIFEST, "", "Invalid assembled document"));
-    }
-    Ok(())
+    let authored = encode_document(&project.document, &project.budget)?;
+    argentic_core::validate_source(authored.as_bytes(), &project.budget).map_err(|error| {
+        let (file, pointer) = project.origin(&error.pointer);
+        let code = if error.code == GRAPH_LIMIT_CODE {
+            GRAPH_LIMIT_CODE
+        } else {
+            "PROJECT"
+        };
+        project_failure(
+            code,
+            file,
+            pointer,
+            SourceErrorKind::InvalidContent,
+            &error.message,
+        )
+    })
 }
 
 fn object(value: Value, file: &str, pointer: &str) -> Result<Map<String, Value>> {

@@ -2,11 +2,13 @@
 
 ## Unreleased
 
-- Project validation and compilation bound expanded graph nodes, route
-  targets and composition depth. `GRAPH_LIMIT` locates the authored
-  composition or flow that exceeded the limit.
+- Project opening and compilation share work and allocation budgets across
+  parsing, expansion, validation and output. `GRAPH_LIMIT` locates refusals,
+  including when diagnostics or the retained compiled plan exceed their limits.
+  Approval prompt checks reuse results across converging routes.
 - Project folders pin their root before reading the manifest and members,
-  and restore executable flags from the AgSDL sidecar on Windows.
+  and restore executable flags from the first matching lowercase AgSDL
+  sidecar on Windows. Direct local file opens reject reparse points.
 - Archive import reports `ARCHIVE_LAYOUT` for unaccounted ZIP bytes.
 - Project errors expose a file, local JSON pointer and diagnostic kind.
   Component I/O failures and invalid JSON retain the `PROJECT` code.

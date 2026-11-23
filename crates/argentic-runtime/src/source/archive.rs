@@ -381,7 +381,10 @@ fn inflate(input: impl Read, compressed: u64, size: u64) -> std::io::Result<Vec<
     }
 }
 
-fn members(input: &mut (impl Read + Seek)) -> Result<BTreeMap<String, Member>> {
+fn members(
+    input: &mut (impl Read + Seek),
+    budget: &super::SourceBudget,
+) -> Result<BTreeMap<String, Member>> {
     let zip_error = |detail| invalid("ZIP", "", detail);
     let io = |e: std::io::Error| invalid("ZIP", "", &e.to_string());
     let size = input.seek(SeekFrom::End(0)).map_err(io)?;
@@ -412,6 +415,10 @@ fn members(input: &mut (impl Read + Seek)) -> Result<BTreeMap<String, Member>> {
             "Expected single-volume ZIP32 with a bounded central directory",
         ));
     }
+    budget
+        .work(count + (length as usize).div_ceil(8), "")
+        .and_then(|()| budget.bytes(count * 256 + length as usize, ""))
+        .map_err(|e| super::source_limit("archive.json", e))?;
     let mut cursor = directory;
     let mut total = 0;
     let mut entries = BTreeMap::new();
@@ -487,14 +494,22 @@ fn members(input: &mut (impl Read + Seek)) -> Result<BTreeMap<String, Member>> {
     Ok(entries)
 }
 
-pub(super) fn read(mut input: impl Read + Seek) -> Result<Files> {
-    let mut entries = members(&mut input)?;
+#[cfg(test)]
+pub(super) fn read(input: impl Read + Seek) -> Result<Files> {
+    read_with_budget(input, &super::SourceBudget::default())
+}
+
+pub(super) fn read_with_budget(
+    mut input: impl Read + Seek,
+    budget: &super::SourceBudget,
+) -> Result<Files> {
+    let mut entries = members(&mut input, budget)?;
     let manifest = entries
         .remove(INDEX_NAME)
         .filter(|entry| entry.size() <= INDEX_LIMIT)
         .ok_or_else(|| invalid("archive.json", "", "Missing or oversized inventory"))?;
     let raw = manifest.read(&mut input, "archive.json")?;
-    let value = parse_json(&raw, "archive.json", false)?;
+    let value = parse_json(&raw, "archive.json", false, budget)?;
     if value.get("history").is_some_and(serde_json::Value::is_null) {
         return Err(invalid(
             "archive.json",
@@ -540,6 +555,10 @@ pub(super) fn read(mut input: impl Read + Seek) -> Result<Files> {
             .chain(std::iter::once((name.len(), "")))
         {
             let path = &name[..end];
+            budget
+                .work(1 + path.len().div_ceil(8), "")
+                .and_then(|()| budget.bytes(path.len() * 3 + 64, ""))
+                .map_err(|e| super::source_limit(name, e))?;
             let key = path_key(path);
             if spellings
                 .insert(key, path)
@@ -565,6 +584,9 @@ pub(super) fn read(mut input: impl Read + Seek) -> Result<Files> {
         {
             return Err(invalid(name, "", "Invalid inventory size or SHA-256"));
         }
+        budget
+            .work((member.size() as usize).div_ceil(256) * 2, "")
+            .map_err(|e| super::source_limit(name, e))?;
         let bytes = member.read(&mut input, name)?;
         if sha256(&bytes) != digest {
             return Err(invalid(name, "", "SHA-256 does not match the inventory"));
@@ -642,7 +664,8 @@ pub(super) mod tests {
         let entries = BTreeMap::from([("archive.json".into(), b"{}".to_vec())]);
         let mut zip = stored_zip(&entries);
         let mut input = std::io::Cursor::new(&zip);
-        let mut directory = members(&mut input).unwrap();
+        let budget = super::super::SourceBudget::default();
+        let mut directory = members(&mut input, &budget).unwrap();
         let member = directory.get_mut("archive.json").unwrap();
         assert_eq!(member.read(&mut input, "archive.json").unwrap(), b"{}");
         member.end += 1;
@@ -652,7 +675,10 @@ pub(super) mod tests {
         );
         zip.push(0);
         assert_eq!(
-            members(&mut std::io::Cursor::new(&zip)).err().unwrap().code,
+            members(&mut std::io::Cursor::new(&zip), &budget)
+                .err()
+                .unwrap()
+                .code,
             "ARCHIVE_LAYOUT"
         );
     }
