@@ -81,9 +81,7 @@ pub(crate) fn copy_module(module: &Value) -> Result<Value, ModuleError> {
 fn module_name(module: &Value) -> Result<&str, Internal> {
     match module.as_object().and_then(|object| object.get("name")) {
         Some(Value::String(name)) => Ok(name),
-        _ => Err(Internal {
-            message: "a checked module has no name".to_owned(),
-        }),
+        _ => Err(Internal::new("a checked module has no name")),
     }
 }
 
@@ -95,11 +93,11 @@ fn defaults() -> Result<&'static [Value], ReadError> {
             .iter()
             .map(|(name, text)| {
                 // The JSON import is `JSON.parse`: ordinary JS member order.
-                let tree = parse_shared(text.as_bytes()).map_err(|error| Internal {
-                    message: format!(
+                let tree = parse_shared(text.as_bytes()).map_err(|error| {
+                    Internal::new(format!(
                         "pinned module {name} is not exact JSON: {}",
                         error.message()
-                    ),
+                    ))
                 })?;
                 copy_module(&tree.tree).map_err(ReadError::Module)
             })

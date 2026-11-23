@@ -573,3 +573,50 @@ fn reserved_sidecar_contents_cannot_become_a_project_member() {
     assert!(refused(OpenedSource::open_path(temp.path()))
         .contains("Executable metadata cannot be a selected"));
 }
+
+#[test]
+fn graph_limit_identifies_the_declaring_component_on_open() {
+    let temp = tempfile::tempdir().unwrap();
+    let compose = |target: String, route: Value| {
+        json!({
+            "type":"compose", "composition":target,"next":{"done":route},
+        })
+    };
+    let depth = argentic_core::MAX_COMPOSITION_DEPTH + 1;
+    let bodies = (1..=depth)
+        .map(|index| {
+            let output = json!({"output":"done"});
+            let step = if index == depth {
+                json!({"type":"agent","agent":"a","next":output})
+            } else {
+                compose(format!("body{}", index + 1), output)
+            };
+            let body = json!({"entry":"step","outputs":["done"],"steps":{"step":step}});
+            let name = format!("body{index}");
+            if index == depth {
+                write(temp.path(), "body.json", body.to_string());
+                (name, json!({"file":"body.json"}))
+            } else {
+                (name, body)
+            }
+        })
+        .collect::<serde_json::Map<_, _>>();
+    write(
+        temp.path(),
+        MANIFEST,
+        json!({
+            "projectFormat":"agsdl-project-1","contract":"agsdl-0.4.0","id":"depth",
+            "agents":{"a":{"harness":"codex","permissions":"read-only"}},
+            "flow":{"entry":"step","steps":{"step":compose("body1".into(), json!([]))}},
+            "compositions":bodies,
+        })
+        .to_string(),
+    );
+    for path in [temp.path().to_owned(), temp.path().join(MANIFEST)] {
+        let error = OpenedSource::open_path(&path).err().unwrap();
+        assert_eq!(error.code, argentic_core::GRAPH_LIMIT_CODE);
+        let location = error.source.unwrap();
+        assert_eq!(location.path, "body.json");
+        assert_eq!(location.pointer, "");
+    }
+}

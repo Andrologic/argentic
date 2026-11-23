@@ -43,6 +43,10 @@ mod native_json;
 pub mod durable_json;
 pub mod flow;
 
+pub use graph::{
+    GRAPH_LIMIT_CODE, MAX_COMPILED_GRAPH_JSON_BYTES, MAX_COMPOSITION_DEPTH,
+    MAX_EXPANDED_GRAPH_EDGES, MAX_EXPANDED_GRAPH_NODES,
+};
 pub use reader::validate_document_json;
 
 /// Exact bundled harness-module bytes. Descriptive support never grants an effect.

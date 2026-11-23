@@ -6,7 +6,7 @@ use crate::argentic_core::{
     graph::{
         analyse_joins,
         ordered::{OrderedMap, OrderedSet},
-        Graph, InBranch,
+        ExpansionBudget, Graph, InBranch,
     },
     native::{self, a, fail, o, s, Error, Text, Value},
     reader::{self, Modules},
@@ -466,8 +466,8 @@ fn optional_object<'a>(v: Option<&'a E>, p: &str) -> Result<&'a Object> {
     }
 }
 fn covered(document: &Object) -> Result<OrderedSet<String>> {
-    let graph = Graph::for_scope(document, None, None).map_err(internal)?;
-    let (initial, _) = analyse_joins(&graph).map_err(internal)?;
+    let graph = Graph::for_scope(document, None, None, &mut ExpansionBudget::default())?;
+    let (initial, _) = analyse_joins(&graph)?;
     let members = initial
         .values()
         .flat_map(|info| info.branches.values().flat_map(|v| v.iter().cloned()))
@@ -481,15 +481,16 @@ fn receivers(document: &Object) -> Result<OrderedSet<String>> {
     let covered = covered(document)?;
     let compositions = optional_object(document.get("compositions"), "")?;
     let mut in_branch = InBranch::new();
+    let mut local_budget = ExpansionBudget::default();
     for composition in std::iter::once(None).chain(compositions.iter().map(|(name, _)| Some(name)))
     {
         let g = Graph::for_scope(
             document,
             composition,
             composition.is_none().then(|| covered.clone()),
-        )
-        .map_err(internal)?;
-        let (infos, _) = analyse_joins(&g).map_err(internal)?;
+            &mut local_budget,
+        )?;
+        let (infos, _) = analyse_joins(&g)?;
         in_branch.set(
             composition.map(str::to_owned),
             infos
@@ -498,7 +499,12 @@ fn receivers(document: &Object) -> Result<OrderedSet<String>> {
                 .collect(),
         );
     }
-    let graph = Graph::for_flow(document, Some(in_branch), Some(covered)).map_err(internal)?;
+    let graph = Graph::for_flow(
+        document,
+        Some(std::rc::Rc::new(in_branch)),
+        Some(covered),
+        &mut ExpansionBudget::default(),
+    )?;
     let mut receivers = OrderedSet::new();
     if let Some(root) = &graph.root {
         receivers.insert(root.clone());
@@ -593,12 +599,13 @@ pub(crate) fn used_properties(
     }
     let receivers = receivers(document)?;
     let mut graphs = vec![];
+    let mut budget = ExpansionBudget::default();
     let has_flow = document.contains_key("flow");
     if has_flow {
-        graphs.push(Graph::for_flow(document, None, None).map_err(internal)?);
+        graphs.push(Graph::for_flow(document, None, None, &mut budget)?);
     }
     for (name, _) in optional_object(document.get("compositions"), "")?.iter() {
-        graphs.push(Graph::for_composition(document, name, None).map_err(internal)?);
+        graphs.push(Graph::for_composition(document, name, None, &mut budget)?);
     }
     for (i, graph) in graphs.iter().enumerate() {
         for node in graph.nodes.values() {

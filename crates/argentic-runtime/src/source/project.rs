@@ -1,8 +1,8 @@
 use super::{
-    archive, invalid, io, open_regular, parse_json, read_regular, Files, MANIFEST, MAX_FILES,
-    MAX_JSON, MAX_JSON_TOTAL, MAX_TOTAL,
+    archive, invalid, io, open_regular, parse_json, project_failure, read_regular, Files, MANIFEST,
+    MAX_FILES, MAX_JSON, MAX_JSON_TOTAL, MAX_TOTAL,
 };
-use crate::persistence::Result;
+use crate::persistence::{dto::SourceErrorKind, Result};
 use cap_std::fs::Dir;
 use percent_encoding::{percent_decode_str, utf8_percent_encode, NON_ALPHANUMERIC};
 use serde_json::{Map, Value};
@@ -743,15 +743,25 @@ fn validate(project: &Project) -> Result<()> {
         .map_err(|e| invalid(MANIFEST, &e.pointer, &e.message))?;
     let report: Value = serde_json::from_str(&report)?;
     if !report["valid"].as_bool().unwrap_or(false) {
-        let diagnostic = report["diagnostics"]
-            .as_array()
-            .and_then(|items| items.iter().find(|d| d["severity"] == "error"));
+        let diagnostic = report["diagnostics"].as_array().and_then(|items| {
+            items
+                .iter()
+                .find(|d| d["code"] == argentic_core::GRAPH_LIMIT_CODE)
+                .or_else(|| items.iter().find(|d| d["severity"] == "error"))
+        });
         if let Some(diagnostic) = diagnostic {
             let location = diagnostic["path"].as_str().unwrap_or("");
             let (file, pointer) = project.origin(location);
-            return Err(invalid(
+            let code = if diagnostic["code"] == argentic_core::GRAPH_LIMIT_CODE {
+                argentic_core::GRAPH_LIMIT_CODE
+            } else {
+                "PROJECT"
+            };
+            return Err(project_failure(
+                code,
                 file,
                 pointer,
+                SourceErrorKind::InvalidContent,
                 diagnostic["message"].as_str().unwrap_or("Invalid document"),
             ));
         }

@@ -24,8 +24,8 @@ use super::{
     graph::{
         address_parts, analyse_joins, empty_object, is_route_map, key, open_body_forks,
         ordered::{OrderedMap, OrderedSet},
-        route_items, route_targets, sort_utf16, sorted_addresses, step_routes, Edge, Graph,
-        InBranch, Node, RouteKind, TargetKind, Unshaped,
+        route_items, route_targets, sort_utf16, sorted_addresses, step_routes, Edge,
+        ExpansionBudget, Graph, InBranch, Node, RouteKind, TargetKind, Unshaped, GRAPH_LIMIT_CODE,
     },
     schema::{self, truthy, SchemaError},
     valueschema::{self, path_pointer, Descent, OutsideShape, PointerPart},
@@ -33,6 +33,7 @@ use super::{
 use std::{
     cmp::Ordering,
     collections::{HashMap, HashSet},
+    rc::Rc,
 };
 
 pub(crate) const CONTRACT: &str = "agsdl-0.3.0";
@@ -47,13 +48,21 @@ pub(crate) struct ModuleError {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Internal {
     pub(crate) message: String,
+    limit_pointer: Option<String>,
+}
+
+impl Internal {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            limit_pointer: None,
+        }
+    }
 }
 
 impl From<SchemaError> for Internal {
     fn from(error: SchemaError) -> Self {
-        Self {
-            message: error.message,
-        }
+        Self::new(error.message)
     }
 }
 
@@ -61,18 +70,17 @@ impl From<Unshaped> for Internal {
     fn from(error: Unshaped) -> Self {
         Self {
             message: error.message,
+            limit_pointer: error.limit_pointer,
         }
     }
 }
 
 impl From<OutsideShape> for Internal {
     fn from(error: OutsideShape) -> Self {
-        Self {
-            message: format!(
-                "value schema outside the published shape at {}",
-                error.pointer
-            ),
-        }
+        Self::new(format!(
+            "value schema outside the published shape at {}",
+            error.pointer
+        ))
     }
 }
 
@@ -102,9 +110,7 @@ impl From<ModuleError> for ReadError {
 }
 
 fn internal<T>(message: impl Into<String>) -> Result<T, Internal> {
-    Err(Internal {
-        message: message.into(),
-    })
+    Err(Internal::new(message))
 }
 
 /// Harness modules by name with the semantics of a JS `Map`: `set` on a known
@@ -631,7 +637,14 @@ impl<'a, 'r> Checker<'a, 'r> {
         }
         self.check_agents()?;
         if !self.cycle {
-            self.check_graphs()?;
+            if let Err(error) = self.check_graphs() {
+                if let Some(pointer) = error.limit_pointer {
+                    self.report
+                        .error_at(GRAPH_LIMIT_CODE, &pointer, error.message);
+                    return Ok(());
+                }
+                return Err(error);
+            }
         }
         self.check_completion_choices()?;
         self.check_harnesses()
@@ -1401,12 +1414,18 @@ impl<'a, 'r> Checker<'a, 'r> {
         let doc: &'a Object = self.doc;
         let compositions: &'a Object = self.compositions;
         let mut scopes: Vec<(Option<String>, Graph<'a>)> = Vec::new();
+        let mut local_budget = ExpansionBudget::default();
         let mut covered: OrderedSet<String> = OrderedSet::new();
         if let Some(flow) = doc.get("flow") {
             let flow = object(flow, "flow")?;
             let steps = object(required(flow, "steps")?, "steps")?;
             if steps.contains_key(text(required(flow, "entry")?, "entry")?) {
-                let (infos, _) = analyse_joins(&Graph::for_scope(doc, None, None)?)?;
+                let (infos, _) = analyse_joins(&Graph::for_scope(
+                    doc,
+                    None,
+                    None,
+                    &mut ExpansionBudget::default(),
+                )?)?;
                 let mut members = OrderedSet::new();
                 for info in infos.values() {
                     for found in info.branches.values() {
@@ -1416,7 +1435,10 @@ impl<'a, 'r> Checker<'a, 'r> {
                     }
                 }
                 covered = Graph::flow_error_covered(doc, &members)?;
-                scopes.push((None, Graph::for_scope(doc, None, Some(covered.clone()))?));
+                scopes.push((
+                    None,
+                    Graph::for_scope(doc, None, Some(covered.clone()), &mut local_budget)?,
+                ));
             }
         }
         for (name, composition) in compositions.iter() {
@@ -1425,7 +1447,7 @@ impl<'a, 'r> Checker<'a, 'r> {
             if steps.contains_key(text(required(composition, "entry")?, "entry")?) {
                 scopes.push((
                     Some(name.to_owned()),
-                    Graph::for_scope(doc, Some(name), None)?,
+                    Graph::for_scope(doc, Some(name), None, &mut local_budget)?,
                 ));
             }
         }
@@ -1497,13 +1519,16 @@ impl<'a, 'r> Checker<'a, 'r> {
             }
             in_branch.set(scope_key.clone(), members);
         }
+        let in_branch = Rc::new(in_branch);
         let has_flow = scopes.iter().any(|(scope_key, _)| scope_key.is_none());
         let mut graphs: Vec<Graph<'a>> = Vec::new();
+        let mut budget = ExpansionBudget::default();
         if has_flow {
             graphs.push(Graph::for_flow(
                 doc,
                 Some(in_branch.clone()),
                 Some(covered.clone()),
+                &mut budget,
             )?);
         }
         for (name, _) in compositions.iter() {
@@ -1511,7 +1536,12 @@ impl<'a, 'r> Checker<'a, 'r> {
                 .iter()
                 .any(|(scope_key, _)| scope_key.as_deref() == Some(name))
             {
-                graphs.push(Graph::for_composition(doc, name, Some(in_branch.clone()))?);
+                graphs.push(Graph::for_composition(
+                    doc,
+                    name,
+                    Some(in_branch.clone()),
+                    &mut budget,
+                )?);
             }
         }
         for (index, graph) in graphs.iter().enumerate() {

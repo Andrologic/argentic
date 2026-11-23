@@ -24,6 +24,7 @@ use std::{
     cell::OnceCell,
     cmp::Ordering,
     collections::{HashMap, HashSet},
+    rc::Rc,
     sync::OnceLock,
 };
 
@@ -31,6 +32,7 @@ use std::{
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Unshaped {
     pub(crate) message: String,
+    pub(crate) limit_pointer: Option<String>,
 }
 
 pub(crate) type GraphResult<T> = Result<T, Unshaped>;
@@ -38,7 +40,108 @@ pub(crate) type GraphResult<T> = Result<T, Unshaped>;
 fn unshaped<T>(message: impl Into<String>) -> GraphResult<T> {
     Err(Unshaped {
         message: message.into(),
+        limit_pointer: None,
     })
+}
+
+/// Step instances (including compose calls and synthetic exits) in expanded graphs.
+pub const MAX_EXPANDED_GRAPH_NODES: usize = 8192;
+/// Route targets processed during expansion, including intermediate outputs.
+pub const MAX_EXPANDED_GRAPH_EDGES: usize = 32_768;
+/// Composition bodies on one expansion path. The enclosing flow has depth zero.
+pub const MAX_COMPOSITION_DEPTH: usize = 32;
+/// Serialized step, route and message data materialized during compilation.
+pub const MAX_COMPILED_GRAPH_JSON_BYTES: usize = 32 * 1024 * 1024;
+/// Stable diagnostic code for an expansion budget refusal.
+pub const GRAPH_LIMIT_CODE: &str = "GRAPH_LIMIT";
+
+#[derive(Default)]
+pub(crate) struct ExpansionBudget {
+    nodes: usize,
+    edges: usize,
+    json_bytes: usize,
+}
+
+impl ExpansionBudget {
+    pub(crate) fn scope(
+        &mut self,
+        count: usize,
+        depth: usize,
+        composition: Option<&str>,
+    ) -> GraphResult<()> {
+        if depth > MAX_COMPOSITION_DEPTH {
+            return Err(expansion_limit(
+                composition,
+                "composition depth",
+                MAX_COMPOSITION_DEPTH,
+            ));
+        }
+        self.nodes(count, composition)
+    }
+
+    fn nodes(&mut self, count: usize, composition: Option<&str>) -> GraphResult<()> {
+        spend(
+            &mut self.nodes,
+            count,
+            MAX_EXPANDED_GRAPH_NODES,
+            composition,
+            "expanded graph nodes",
+        )
+    }
+
+    pub(crate) fn edges(&mut self, count: usize, composition: Option<&str>) -> GraphResult<()> {
+        spend(
+            &mut self.edges,
+            count,
+            MAX_EXPANDED_GRAPH_EDGES,
+            composition,
+            "expanded graph route targets",
+        )
+    }
+
+    pub(crate) fn json(&mut self, bytes: usize, composition: Option<&str>) -> GraphResult<()> {
+        spend(
+            &mut self.json_bytes,
+            bytes,
+            MAX_COMPILED_GRAPH_JSON_BYTES,
+            composition,
+            "compiled graph JSON bytes",
+        )
+    }
+
+    pub(crate) fn route(&mut self, route: &Value, composition: Option<&str>) -> GraphResult<()> {
+        self.edges(
+            match route {
+                Value::Array(items) => items.len().max(1),
+                _ => 1,
+            },
+            composition,
+        )
+    }
+}
+
+fn spend(
+    used: &mut usize,
+    count: usize,
+    limit: usize,
+    composition: Option<&str>,
+    label: &str,
+) -> GraphResult<()> {
+    if count > limit - *used {
+        return Err(expansion_limit(composition, label, limit));
+    }
+    *used += count;
+    Ok(())
+}
+
+fn expansion_limit(composition: Option<&str>, label: &str, limit: usize) -> Unshaped {
+    Unshaped {
+        message: format!("Maximum {label} exceeded ({limit})."),
+        limit_pointer: Some(composition.map_or_else(
+            || "/flow".to_owned(),
+            |name| super::exact::at("/compositions", name),
+        )),
+    }
 }
 
 pub(crate) fn empty_object() -> &'static Object {
@@ -362,7 +465,7 @@ pub(crate) type Adjacency = HashMap<String, Vec<usize>>;
 
 pub(crate) struct Graph<'a> {
     pub(crate) document: &'a Object,
-    pub(crate) in_branch: InBranch,
+    in_branch: Option<Rc<InBranch>>,
     pub(crate) covered: OrderedSet<String>,
     pub(crate) compositions: &'a Object,
     pub(crate) scopes: Vec<Scope<'a>>,
@@ -384,12 +487,12 @@ fn compositions_of(document: &Object) -> GraphResult<&Object> {
 impl<'a> Graph<'a> {
     fn new(
         document: &'a Object,
-        in_branch: Option<InBranch>,
+        in_branch: Option<Rc<InBranch>>,
         covered: Option<OrderedSet<String>>,
     ) -> GraphResult<Self> {
         Ok(Self {
             document,
-            in_branch: in_branch.unwrap_or_default(),
+            in_branch,
             covered: covered.unwrap_or_default(),
             compositions: compositions_of(document)?,
             scopes: Vec::new(),
@@ -466,13 +569,16 @@ impl<'a> Graph<'a> {
     /// `Graph.for_flow(document, in_branch, covered)`.
     pub(crate) fn for_flow(
         document: &'a Object,
-        in_branch: Option<InBranch>,
+        in_branch: Option<Rc<InBranch>>,
         covered: Option<OrderedSet<String>>,
+        budget: &mut ExpansionBudget,
     ) -> GraphResult<Self> {
         let mut graph = Graph::new(document, in_branch, covered)?;
         let flow = Self::flow(document)?;
+        let steps = object_of(member(flow, "steps", "flow")?, "steps")?;
+        budget.scope(steps.len(), 0, None)?;
         let scope = graph.add_scope_record(Scope {
-            steps: object_of(member(flow, "steps", "flow")?, "steps")?,
+            steps,
             pointer: vec![key("flow"), key("steps")],
             prefix: String::new(),
             composition: None,
@@ -481,8 +587,8 @@ impl<'a> Graph<'a> {
             parent: None,
             compose_name: None,
         });
-        graph.add_scope(scope, &[])?;
-        graph.connect()?;
+        graph.add_scope(scope, &[], budget)?;
+        graph.connect(budget)?;
         let entry = string_of(member(flow, "entry", "flow")?, "entry")?;
         graph.root = graph.resolve(scope, entry)?;
         Ok(graph)
@@ -543,6 +649,7 @@ impl<'a> Graph<'a> {
         document: &'a Object,
         composition: Option<&str>,
         covered: Option<OrderedSet<String>>,
+        budget: &mut ExpansionBudget,
     ) -> GraphResult<Self> {
         let mut graph = Graph::new(
             document,
@@ -557,6 +664,7 @@ impl<'a> Graph<'a> {
             ),
         };
         let steps = object_of(member(container, "steps", "container")?, "steps")?;
+        budget.scope(steps.len(), usize::from(composition.is_some()), composition)?;
         let scope = graph.add_scope_record(Scope {
             steps,
             pointer,
@@ -578,8 +686,9 @@ impl<'a> Graph<'a> {
                 (node.decl.expect("step node"), node.pointer.clone())
             };
             for route in step_routes(decl, &pointer) {
+                budget.route(route.route, composition)?;
                 for item in route_items(route.route, &route.pointer)? {
-                    if let Some(dst) = graph.local_target(scope, item.kind, item.name)? {
+                    if let Some(dst) = graph.local_target(scope, item.kind, item.name, budget)? {
                         graph.edges.push(Edge::new(
                             addr.clone(),
                             dst,
@@ -597,8 +706,9 @@ impl<'a> Graph<'a> {
         sort_utf16(&mut covered);
         for name in covered {
             let on_error = member(container, "onError", "flow")?;
+            budget.route(on_error, composition)?;
             for item in route_items(on_error, &[key("flow"), key("onError")])? {
-                if let Some(dst) = graph.local_target(scope, item.kind, item.name)? {
+                if let Some(dst) = graph.local_target(scope, item.kind, item.name, budget)? {
                     graph.edges.push(Edge::new(
                         name.clone(),
                         dst,
@@ -616,9 +726,15 @@ impl<'a> Graph<'a> {
         Ok(graph)
     }
 
-    fn exit_node(&mut self, scope: usize, name: &str) -> GraphResult<String> {
+    fn exit_node(
+        &mut self,
+        scope: usize,
+        name: &str,
+        budget: &mut ExpansionBudget,
+    ) -> GraphResult<String> {
         let addr = format!("#exit/{name}");
         if !self.nodes.contains_key(&addr) {
+            budget.nodes(1, self.scopes[scope].composition.as_deref())?;
             let node = self.node(&addr, None, scope, name)?;
             self.nodes.set(addr.clone(), node);
         }
@@ -630,6 +746,7 @@ impl<'a> Graph<'a> {
         scope: usize,
         kind: TargetKind,
         name: &str,
+        budget: &mut ExpansionBudget,
     ) -> GraphResult<Option<String>> {
         if kind == TargetKind::Step {
             return Ok(self.nodes.contains_key(name).then(|| name.to_owned()));
@@ -637,19 +754,22 @@ impl<'a> Graph<'a> {
         if self.scopes[scope].composition.is_none() {
             return Ok(None);
         }
-        self.exit_node(scope, name).map(Some)
+        self.exit_node(scope, name, budget).map(Some)
     }
 
     /// `Graph.for_composition(document, name, in_branch)`.
     pub(crate) fn for_composition(
         document: &'a Object,
         name: &str,
-        in_branch: Option<InBranch>,
+        in_branch: Option<Rc<InBranch>>,
+        budget: &mut ExpansionBudget,
     ) -> GraphResult<Self> {
         let mut graph = Graph::new(document, in_branch, None)?;
         let composition = graph.composition(name)?;
+        let steps = object_of(member(composition, "steps", "composition")?, "steps")?;
+        budget.scope(steps.len(), 1, Some(name))?;
         let scope = graph.add_scope_record(Scope {
-            steps: object_of(member(composition, "steps", "composition")?, "steps")?,
+            steps,
             pointer: vec![key("compositions"), key(name), key("steps")],
             prefix: format!("#{name}"),
             composition: Some(name.to_owned()),
@@ -658,14 +778,19 @@ impl<'a> Graph<'a> {
             parent: None,
             compose_name: None,
         });
-        graph.add_scope(scope, &[name.to_owned()])?;
-        graph.connect()?;
+        graph.add_scope(scope, &[name.to_owned()], budget)?;
+        graph.connect(budget)?;
         let entry = string_of(member(composition, "entry", "composition")?, "entry")?;
         graph.root = graph.resolve(scope, entry)?;
         Ok(graph)
     }
 
-    fn add_scope(&mut self, scope: usize, stack: &[String]) -> GraphResult<()> {
+    fn add_scope(
+        &mut self,
+        scope: usize,
+        stack: &[String],
+        budget: &mut ExpansionBudget,
+    ) -> GraphResult<()> {
         struct Frame<'a> {
             scope: usize,
             entries: Vec<(&'a str, &'a Value)>,
@@ -714,6 +839,8 @@ impl<'a> Graph<'a> {
                 );
                 continue;
             };
+            let child_steps = object_of(member(composition, "steps", "composition")?, "steps")?;
+            budget.scope(child_steps.len(), active.len() + 1, Some(target))?;
             let mut bindings = OrderedMap::new();
             let agents = match decl.get("agents") {
                 None | Some(Value::Null) => empty_object(),
@@ -737,7 +864,7 @@ impl<'a> Graph<'a> {
             let compose_name = (!name.is_empty() || !prefix.is_empty())
                 .then(|| name.rsplit('/').next().unwrap_or(name).to_owned());
             let child = self.add_scope_record(Scope {
-                steps: object_of(member(composition, "steps", "composition")?, "steps")?,
+                steps: child_steps,
                 pointer: vec![key("compositions"), key(target), key("steps")],
                 prefix: addr.clone(),
                 composition: Some(target.to_owned()),
@@ -755,7 +882,6 @@ impl<'a> Graph<'a> {
                 },
             );
             active.insert(target.to_owned());
-            let child_steps: &'a Object = self.scopes[child].steps;
             frames.push(Frame {
                 scope: child,
                 entries: child_steps.iter().collect(),
@@ -794,6 +920,8 @@ impl<'a> Graph<'a> {
         &mut self,
         scope: usize,
         item: RouteItem<'a>,
+        budget: &mut ExpansionBudget,
+        source_composition: Option<&str>,
     ) -> GraphResult<
         Vec<(
             String,
@@ -815,7 +943,7 @@ impl<'a> Graph<'a> {
                 if self.scopes[scope].composition.is_none() {
                     continue;
                 }
-                let addr = self.exit_node(scope, item.name)?;
+                let addr = self.exit_node(scope, item.name, budget)?;
                 found.push((addr, item.message, item.pointer, item.fanout));
                 continue;
             };
@@ -836,6 +964,7 @@ impl<'a> Graph<'a> {
                 &self.scopes[parent].pointer,
                 [key(&segment), key("next"), key(item.name)],
             );
+            budget.route(route, source_composition)?;
             let items = route_items(route, &outer)?;
             for item in items.into_iter().rev() {
                 pending.push((parent, item));
@@ -856,7 +985,8 @@ impl<'a> Graph<'a> {
             let composition = self.scopes[scope].composition.clone();
             if self
                 .in_branch
-                .get(&composition)
+                .as_ref()
+                .and_then(|members| members.get(&composition))
                 .is_some_and(|members| members.contains(&name))
             {
                 return Ok(None);
@@ -884,7 +1014,7 @@ impl<'a> Graph<'a> {
         Ok(None)
     }
 
-    fn connect(&mut self) -> GraphResult<()> {
+    fn connect(&mut self, budget: &mut ExpansionBudget) -> GraphResult<()> {
         let snapshot: Vec<String> = self.nodes.keys().cloned().collect();
         for addr in snapshot {
             let (decl, pointer, scope, name) = {
@@ -909,9 +1039,13 @@ impl<'a> Graph<'a> {
                     ));
                 }
             }
+            let composition = self.scopes[scope].composition.clone();
             for (route, scope) in routes {
+                budget.route(route.route, composition.as_deref())?;
                 for item in route_items(route.route, &route.pointer)? {
-                    for (dst, carried, at, fanout) in self.targets(scope, item)? {
+                    for (dst, carried, at, fanout) in
+                        self.targets(scope, item, budget, composition.as_deref())?
+                    {
                         self.edges.push(Edge::new(
                             addr.clone(),
                             dst,
@@ -1504,6 +1638,93 @@ mod tests {
     use crate::argentic_core::exact::scan::parse_v030;
 
     #[test]
+    fn expansion_budget_checks_nodes_and_route_targets_before_allocation() {
+        let mut budget = ExpansionBudget::default();
+        budget.scope(MAX_EXPANDED_GRAPH_NODES - 1, 0, None).unwrap();
+        let source = super::super::exact::scan::parse_v030(
+            br#"{
+            "flow":{"entry":"start","steps":{"start":{"type":"compose","composition":"review"}}},
+            "compositions":{"review":{"entry":"end","steps":{"end":{"type":"agent","agent":"a","next":"end"}}}}
+        }"#,
+        )
+        .unwrap();
+        let document = source.tree.as_object().unwrap();
+        let error = Graph::for_flow(document, None, None, &mut budget)
+            .err()
+            .unwrap();
+        assert_eq!(error.limit_pointer.as_deref(), Some("/compositions/review"));
+        assert_eq!(budget.nodes, MAX_EXPANDED_GRAPH_NODES);
+        let mut budget = ExpansionBudget::default();
+        budget.edges(MAX_EXPANDED_GRAPH_EDGES, None).unwrap();
+        let error = Graph::for_flow(document, None, None, &mut budget)
+            .err()
+            .unwrap();
+        assert_eq!(error.limit_pointer.as_deref(), Some("/compositions/review"));
+        assert_eq!(budget.edges, MAX_EXPANDED_GRAPH_EDGES);
+        budget.json(MAX_COMPILED_GRAPH_JSON_BYTES, None).unwrap();
+        let error = budget.json(1, Some("review")).unwrap_err();
+        assert_eq!(error.limit_pointer.as_deref(), Some("/compositions/review"));
+    }
+
+    #[test]
+    fn validation_and_compiler_enforce_composition_depth() {
+        let compose = |target: String, route: serde_json::Value| {
+            serde_json::json!({
+                "type":"compose", "composition":target, "next":{"done":route},
+            })
+        };
+        let document = |depth: usize| {
+            use serde_json::json;
+            let bodies = (1..=depth)
+                .map(|index| {
+                    let output = json!({"output":"done"});
+                    let step = if index == depth {
+                        json!({"type":"agent","agent":"a","next":output})
+                    } else {
+                        compose(format!("body{}", index + 1), output)
+                    };
+                    (
+                        format!("body{index}"),
+                        json!({"entry":"step","outputs":["done"],"steps":{"step":step}}),
+                    )
+                })
+                .collect::<serde_json::Map<_, _>>();
+            json!({
+                "contract":"agsdl-0.4.0","id":"depth",
+                "agents":{"a":{"harness":"codex","permissions":"read-only"}},
+                "flow":{"entry":"step","steps":{"step":compose("body1".into(), json!([]))}},
+                "compositions":bodies,
+            })
+            .to_string()
+        };
+        let accepted = document(MAX_COMPOSITION_DEPTH);
+        let report: serde_json::Value = serde_json::from_str(
+            &crate::validate_document_json(accepted.as_bytes(), None).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(report["valid"], true, "{report}");
+        let refused = document(MAX_COMPOSITION_DEPTH + 1);
+        let pointer = format!("/compositions/body{}", MAX_COMPOSITION_DEPTH + 1);
+        let report: serde_json::Value =
+            serde_json::from_str(&crate::validate_document_json(refused.as_bytes(), None).unwrap())
+                .unwrap();
+        assert!(
+            report["diagnostics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| { entry["code"] == GRAPH_LIMIT_CODE && entry["path"] == pointer }),
+            "{report}"
+        );
+        let parsed = crate::exact::decode(&refused).unwrap();
+        let error = crate::compile::graph::compile(parsed.as_object().unwrap())
+            .err()
+            .unwrap();
+        assert_eq!(error.code, GRAPH_LIMIT_CODE);
+        assert_eq!(error.pointer.utf8().as_deref(), Some(pointer.as_str()));
+    }
+
+    #[test]
     fn utf16_order_differs_from_utf8_for_astral_characters() {
         let mut values = vec![
             "\u{FF61}".to_owned(),
@@ -1525,7 +1746,8 @@ mod tests {
             "j":{"type":"join"}}}}"#;
         let parsed = parse_v030(text.as_bytes()).unwrap();
         let document = parsed.tree.as_object().unwrap();
-        let graph = Graph::for_scope(document, None, None).unwrap();
+        let graph =
+            Graph::for_scope(document, None, None, &mut ExpansionBudget::default()).unwrap();
         let (infos, problems) = analyse_joins(&graph).unwrap();
         assert!(problems.is_empty());
         let info = infos.get("j").unwrap();

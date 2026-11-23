@@ -15,9 +15,7 @@ use crate::argentic_core::exact::{Object, Value};
 pub(crate) const ACTIONS: [&str; 6] = ["read", "write", "shell", "network", "mcp", "delegate"];
 
 fn internal<T>(message: impl Into<String>) -> Result<T, Internal> {
-    Err(Internal {
-        message: message.into(),
-    })
+    Err(Internal::new(message))
 }
 
 fn order(effect: &str) -> Result<u8, Internal> {
