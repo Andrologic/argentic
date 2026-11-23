@@ -3,15 +3,12 @@
 use super::metadata as m;
 use crate::argentic_core::{
     exact::{self, Object, Value as E},
-    graph::{
-        analyse_joins,
-        ordered::{OrderedMap, OrderedSet},
-        ExpansionBudget, Graph, InBranch,
-    },
+    graph::{analyse_joins, ordered::OrderedMap, ExpansionBudget, Graph, InBranch},
     native::{self, a, fail, o, s, Error, Text, Value},
-    reader::{self, Modules},
+    reader,
     validate::ModuleMap,
     valueschema::{self, PointerPart},
+    SourceBudget,
 };
 type Result<T> = std::result::Result<T, Error>;
 fn unique(names: impl IntoIterator<Item = Text>, pointer: &str) -> Result<()> {
@@ -27,11 +24,17 @@ fn unique(names: impl IntoIterator<Item = Text>, pointer: &str) -> Result<()> {
     }
     Ok(())
 }
-pub(crate) fn json(value: &Value, p: &str) -> Result<String> {
-    if value.text().is_some_and(|t| t.utf8().is_none()) {
+fn json(value: &Value, p: &str, budget: &SourceBudget) -> Result<(String, E)> {
+    let raw = m::text(value, p, "UNSUPPORTED")?;
+    let Some(raw) = raw.utf8() else {
         return fail("PARSE", p, "Invalid UTF-16 in JSON transport text.");
-    }
-    m::json(value, p)
+    };
+    budget
+        .json_input(raw.as_bytes(), p)
+        .map_err(super::limit_error)?;
+    let parsed = exact::decode(&raw)
+        .map_err(|_| Error::new("UNSUPPORTED", p, "Expected validated exact JSON metadata."))?;
+    Ok((raw, parsed))
 }
 pub(crate) fn nonempty(value: &E) -> bool {
     match value {
@@ -41,9 +44,9 @@ pub(crate) fn nonempty(value: &E) -> bool {
         _ => false,
     }
 }
-fn receipt(value: &Value, p: &str) -> Result<String> {
-    let captured = json(value, p)?;
-    if !nonempty(&exact::decode(&captured)?) {
+fn receipt(value: &Value, p: &str, budget: &SourceBudget) -> Result<String> {
+    let (captured, parsed) = json(value, p, budget)?;
+    if !nonempty(&parsed) {
         return fail(
             "CORRELATION",
             p,
@@ -79,7 +82,7 @@ fn objects<'a>(v: &'a Value, p: &str) -> Result<Vec<(&'a Value, String)>> {
         })
         .collect()
 }
-fn capabilities(v: &Value, p: &str) -> Result<Value> {
+fn capabilities(v: &Value, p: &str, budget: &SourceBudget) -> Result<Value> {
     let mut result = vec![];
     for (entry, p) in objects(v, p)? {
         let name = m::identity(entry.get("name"), &format!("{p}/name"), "UNSUPPORTED")?;
@@ -94,9 +97,18 @@ fn capabilities(v: &Value, p: &str) -> Result<Value> {
             );
         }
         let evidence = if entry.get("support").eq_str("absent") {
-            json(entry.get("evidenceJson"), &format!("{p}/evidenceJson"))?
+            json(
+                entry.get("evidenceJson"),
+                &format!("{p}/evidenceJson"),
+                budget,
+            )?
+            .0
         } else {
-            receipt(entry.get("evidenceJson"), &format!("{p}/evidenceJson"))?
+            receipt(
+                entry.get("evidenceJson"),
+                &format!("{p}/evidenceJson"),
+                budget,
+            )?
         };
         result.push(o([
             ("name", s(name)),
@@ -177,18 +189,13 @@ pub(crate) fn no_credentials(value: &E, pointer: &str) -> Result<()> {
     }
     Ok(())
 }
-fn settings(v: &Value, p: &str) -> Result<String> {
-    let captured = json(v, p)?;
-    let value = exact::decode(&captured)?;
+fn settings(v: &Value, p: &str, budget: &SourceBudget) -> Result<String> {
+    let (captured, value) = json(v, p, budget)?;
     exact::record(Some(&value), p)?;
     no_credentials(&value, p)?;
     Ok(captured)
 }
-pub(crate) fn module(json: &str, p: &str) -> Result<E> {
-    reader::load_harness_module(json.as_bytes())
-        .map_err(|_| Error::new("HARNESS_MODULE", p, "Invalid AgSDL 0.3 harness module."))
-}
-pub(crate) fn capture_registry(input: &Value) -> Result<Value> {
+pub(crate) fn capture_registry(input: &Value, budget: &SourceBudget) -> Result<(Value, ModuleMap)> {
     m::object(input, "/registry", "UNSUPPORTED")?;
     if !input.get("format").eq_str("macro-agsdl-registry/030") {
         return fail(
@@ -199,10 +206,34 @@ pub(crate) fn capture_registry(input: &Value) -> Result<Value> {
     }
     let version = m::identity(input.get("version"), "/registry/version", "UNSUPPORTED")?;
     let mut modules = vec![];
+    let mut module_map = ModuleMap::new();
     for (entry, p) in objects(input.get("modules"), "/registry/modules")? {
         let harness = m::identity(entry.get("harness"), &format!("{p}/harness"), "UNSUPPORTED")?;
-        let raw = json(entry.get("moduleJson"), &format!("{p}/moduleJson"))?;
-        let loaded = module(&raw, &format!("{p}/moduleJson"))?;
+        let at = format!("{p}/moduleJson");
+        let raw = m::text(entry.get("moduleJson"), &at, "UNSUPPORTED")?
+            .utf8()
+            .ok_or_else(|| {
+                Error::new(
+                    "PARSE",
+                    at.as_str(),
+                    "Invalid UTF-16 in JSON transport text.",
+                )
+            })?;
+        let loaded =
+            reader::load_harness_module_with_budget(raw.as_bytes(), budget).map_err(|error| {
+                match error {
+                    crate::validate::ReadError::Internal(error)
+                        if error.limit_pointer.is_some() =>
+                    {
+                        Error::new(crate::GRAPH_LIMIT_CODE, at.as_str(), error.message)
+                    }
+                    _ => Error::new(
+                        "HARNESS_MODULE",
+                        at.as_str(),
+                        "Invalid AgSDL 0.3 harness module.",
+                    ),
+                }
+            })?;
         if !harness.eq_str(exact::text(
             exact::record(Some(&loaded), "")?.get("name"),
             "",
@@ -213,6 +244,7 @@ pub(crate) fn capture_registry(input: &Value) -> Result<Value> {
                 "Module name differs from its registry identity.",
             );
         }
+        module_map.set(harness.utf8().expect("module name is exact JSON"), loaded);
         modules.push(o([("harness", s(harness)), ("moduleJson", s(raw))]));
     }
     unique(
@@ -227,6 +259,7 @@ pub(crate) fn capture_registry(input: &Value) -> Result<Value> {
         Some(capabilities(
             input.get("hostCapabilities"),
             "/registry/hostCapabilities",
+            budget,
         )?)
     };
     let mut harnesses = vec![];
@@ -248,7 +281,11 @@ pub(crate) fn capture_registry(input: &Value) -> Result<Value> {
                 "Expected a qualification observation.",
             );
         }
-        let caps = capabilities(entry.get("capabilities"), &format!("{p}/capabilities"))?;
+        let caps = capabilities(
+            entry.get("capabilities"),
+            &format!("{p}/capabilities"),
+            budget,
+        )?;
         let mut models = vec![];
         for (model, p) in objects(entry.get("models"), &format!("{p}/models"))? {
             let name = m::identity(model.get("name"), &format!("{p}/name"), "UNSUPPORTED")?;
@@ -310,11 +347,11 @@ pub(crate) fn capture_registry(input: &Value) -> Result<Value> {
     )?;
     let mut agents = vec![];
     for (entry, p) in objects(input.get("agents"), "/registry/agents")? {
-        let raw = json(
+        let (raw, value) = json(
             entry.get("agentDeclarationJson"),
             &format!("{p}/agentDeclarationJson"),
+            budget,
         )?;
-        let value = exact::decode(&raw)?;
         let declaration = exact::record(Some(&value), &format!("{p}/agentDeclarationJson"))?;
         if let Some(v) = declaration.get("harnessSettings") {
             no_credentials(v, &format!("{p}/agentDeclarationJson/harnessSettings"))?;
@@ -334,6 +371,7 @@ pub(crate) fn capture_registry(input: &Value) -> Result<Value> {
                 s(settings(
                     entry.get("settingsJson"),
                     &format!("{p}/settingsJson"),
+                    budget,
                 )?),
             ),
             (
@@ -341,17 +379,23 @@ pub(crate) fn capture_registry(input: &Value) -> Result<Value> {
                 s(receipt(
                     entry.get("permissionsJson"),
                     &format!("{p}/permissionsJson"),
+                    budget,
                 )?),
             ),
             (
                 "scopeJson",
-                s(receipt(entry.get("scopeJson"), &format!("{p}/scopeJson"))?),
+                s(receipt(
+                    entry.get("scopeJson"),
+                    &format!("{p}/scopeJson"),
+                    budget,
+                )?),
             ),
             (
                 "evidenceJson",
                 s(receipt(
                     entry.get("evidenceJson"),
                     &format!("{p}/evidenceJson"),
+                    budget,
                 )?),
             ),
             (
@@ -359,6 +403,7 @@ pub(crate) fn capture_registry(input: &Value) -> Result<Value> {
                 s(receipt(
                     entry.get("provenanceJson"),
                     &format!("{p}/provenanceJson"),
+                    budget,
                 )?),
             ),
         ]));
@@ -379,16 +424,7 @@ pub(crate) fn capture_registry(input: &Value) -> Result<Value> {
     if let Some(host) = host {
         captured.set("hostCapabilities", host);
     }
-    Ok(captured)
-}
-pub(crate) fn modules(registry: &Value) -> Result<ModuleMap> {
-    let mut map = ModuleMap::new();
-    for entry in registry.get("modules").array().unwrap() {
-        let name = entry.get("harness").text().and_then(Text::utf8).unwrap();
-        let raw = entry.get("moduleJson").text().and_then(Text::utf8).unwrap();
-        map.set(name, module(&raw, "/registry/modules")?);
-    }
-    Ok(map)
+    Ok((captured, module_map))
 }
 fn capability(observation: &Value, name: &str, p: &str, native: bool) -> Result<()> {
     let cap = observation
@@ -465,23 +501,18 @@ fn optional_object<'a>(v: Option<&'a E>, p: &str) -> Result<&'a Object> {
         v => Ok(exact::record(v, p)?),
     }
 }
-fn covered(document: &Object) -> Result<OrderedSet<String>> {
-    let graph = Graph::for_scope(document, None, None, &mut ExpansionBudget::default())?;
-    let (initial, _) = analyse_joins(&graph, &mut ExpansionBudget::default())?;
+fn receiver_graph<'a>(document: &'a Object, budget: &SourceBudget) -> Result<Graph<'a>> {
+    let mut initial_budget = ExpansionBudget::new(budget);
+    let graph = Graph::for_scope(document, None, None, &mut initial_budget)?;
+    let (initial, _) = analyse_joins(&graph, &mut initial_budget)?;
     let members = initial
         .values()
         .flat_map(|info| info.branches.values().flat_map(|v| v.iter().cloned()))
         .collect();
-    Graph::flow_error_covered(document, &members).map_err(internal)
-}
-fn receivers(document: &Object) -> Result<OrderedSet<String>> {
-    if !document.contains_key("flow") {
-        return Ok(OrderedSet::new());
-    }
-    let covered = covered(document)?;
+    let covered = Graph::flow_error_covered(document, &members, &initial_budget)?;
     let compositions = optional_object(document.get("compositions"), "")?;
     let mut in_branch = InBranch::new();
-    let mut local_budget = ExpansionBudget::default();
+    let mut local_budget = ExpansionBudget::new(budget);
     for composition in std::iter::once(None).chain(compositions.iter().map(|(name, _)| Some(name)))
     {
         let g = Graph::for_scope(
@@ -499,48 +530,57 @@ fn receivers(document: &Object) -> Result<OrderedSet<String>> {
                 .collect(),
         );
     }
-    let graph = Graph::for_flow(
+    Ok(Graph::for_flow(
         document,
         Some(std::rc::Rc::new(in_branch)),
         Some(covered),
-        &mut ExpansionBudget::default(),
-    )?;
-    let mut receivers = OrderedSet::new();
-    if let Some(root) = &graph.root {
-        receivers.insert(root.clone());
-    }
-    loop {
-        let mut changed = false;
-        for edge in &graph.edges {
-            let source = graph.nodes.get(&edge.src);
-            let has = if let Some(message) = edge.message {
-                let message = exact::record(Some(message), "")?;
-                message.contains_key("resources")
-                    && exact::record(message.get("resources"), "")?.len() > 0
-            } else {
-                edge.kind == crate::argentic_core::graph::RouteKind::Error
-                    || source.is_some_and(|s| {
-                        ["agent", "call", "join"].contains(&s.kind)
-                            || s.kind == "approval" && receivers.contains(&edge.src)
-                    })
-            };
-            if has && receivers.insert(edge.dst.clone()) {
-                changed = true;
-            }
+        &mut ExpansionBudget::new(budget),
+    )?)
+}
+
+fn receivers<'g>(graph: &'g Graph<'_>) -> Result<std::collections::HashSet<&'g str>> {
+    use crate::graph::RouteKind;
+    graph.work(graph.edges.len() * 2)?;
+    graph.bytes(graph.nodes.len() * 80)?;
+    let mut receivers = std::collections::HashSet::new();
+    let mut pending = Vec::new();
+    let mut add = |addr: &'g str, pending: &mut Vec<&'g str>| {
+        if receivers.insert(addr) {
+            pending.push(addr);
         }
-        if !changed {
-            break;
+    };
+    if let Some(root) = &graph.root {
+        add(root, &mut pending);
+    }
+    for edge in &graph.edges {
+        let has = if let Some(message) = edge.message {
+            let message = exact::record(Some(message), "")?;
+            message.contains_key("resources")
+                && exact::record(message.get("resources"), "")?.len() > 0
+        } else {
+            edge.kind == RouteKind::Error
+                || ["agent", "call", "join"].contains(&graph.node_at(&edge.src)?.kind)
+        };
+        if has {
+            add(&edge.dst, &mut pending);
+        }
+    }
+    while let Some(addr) = pending.pop() {
+        if graph.node_at(addr)?.kind != "approval" {
+            continue;
+        }
+        for &edge in graph.outgoing(addr)? {
+            let edge = &graph.edges[edge];
+            if edge.message.is_none() && edge.kind == RouteKind::Normal {
+                add(&edge.dst, &mut pending);
+            }
         }
     }
     Ok(receivers)
 }
+
 pub(crate) type Use = (String, String, Option<Vec<String>>);
-pub(crate) fn used_properties(
-    document: &Object,
-    agent_name: &str,
-    agent: &Object,
-    p: &str,
-) -> Result<Vec<Use>> {
+pub(crate) fn used_properties(agent: &Object, p: &str, step_uses: &[Use]) -> Result<Vec<Use>> {
     let mut used: OrderedMap<String, OrderedMap<String, (String, Option<Vec<String>>)>> =
         OrderedMap::new();
     let mut add = |name: &str, where_: String, step: Option<Vec<String>>| {
@@ -597,42 +637,8 @@ pub(crate) fn used_properties(
             add("directories", format!("{p}/permissions/directories"), None);
         }
     }
-    let receivers = receivers(document)?;
-    let mut graphs = vec![];
-    let mut budget = ExpansionBudget::default();
-    let has_flow = document.contains_key("flow");
-    if has_flow {
-        graphs.push(Graph::for_flow(document, None, None, &mut budget)?);
-    }
-    for (name, _) in optional_object(document.get("compositions"), "")?.iter() {
-        graphs.push(Graph::for_composition(document, name, None, &mut budget)?);
-    }
-    for (i, graph) in graphs.iter().enumerate() {
-        for node in graph.nodes.values() {
-            if node.agent.as_deref() != Some(agent_name) {
-                continue;
-            }
-            let Some(decl) = node.decl else {
-                continue;
-            };
-            let where_ = valueschema::path_pointer(&node.pointer);
-            let step = if i == 0 && has_flow {
-                Some(node.addr.split('/').map(str::to_owned).collect())
-            } else {
-                None
-            };
-            if decl.get("instance").and_then(E::as_str) == Some("new") {
-                add("instance.new", format!("{where_}/instance"), step.clone());
-            } else if decl.get("delivery").and_then(E::as_str) != Some("steer") {
-                add("delivery.queue", format!("{where_}/delivery"), step.clone());
-            }
-            if decl.get("delivery").and_then(E::as_str) == Some("steer") {
-                add("delivery.steer", format!("{where_}/delivery"), step.clone());
-            }
-            if i == 0 && has_flow && receivers.contains(&node.addr) {
-                add("resources", where_, step);
-            }
-        }
+    for (name, at, step) in step_uses {
+        add(name, at.clone(), step.clone());
     }
     Ok(used
         .iter()
@@ -643,31 +649,62 @@ pub(crate) fn used_properties(
         })
         .collect())
 }
-pub(crate) fn capture_agent(
-    document_json: &Value,
-    agent_name: &Value,
-    registry: &Value,
-) -> Result<Value> {
-    let captured = capture_registry(registry)?;
-    let document = exact::decode(&json(document_json, "/document")?)?;
-    let document = exact::record(Some(&document), "")?;
-    let modules = modules(&captured)?;
-    let validation = reader::validate_exact(
-        &E::Object(exact::Object::from_entries(
-            document
-                .iter()
-                .map(|(k, v)| (k.to_owned(), exact::values::clone(v))),
-        )),
-        Modules::Explicit(&modules),
-    )
-    .map_err(internal)?;
-    if let Some(error) = validation
-        .diagnostics
-        .iter()
-        .find(|d| d.severity == "error")
-    {
-        return fail(error.code, error.path.clone(), error.message.clone());
+pub(crate) fn step_uses(
+    document: &Object,
+    budget: &SourceBudget,
+) -> Result<std::collections::HashMap<String, Vec<Use>>> {
+    let mut all = std::collections::HashMap::new();
+    let mut record =
+        |graph: &Graph<'_>, receivers: &std::collections::HashSet<&str>, is_flow| -> Result<()> {
+            graph.work(graph.nodes.len())?;
+            graph.bytes(graph.nodes.len() * 384)?;
+            for node in graph.nodes.values() {
+                let Some(decl) = node.decl else {
+                    continue;
+                };
+                let Some(agent) = &node.agent else { continue };
+                let uses = all.entry(agent.clone()).or_insert_with(Vec::new);
+                let mut add = |name: &str, at, step| uses.push((name.to_owned(), at, step));
+                let where_ = valueschema::path_pointer(&node.pointer);
+                let step = if is_flow {
+                    Some(node.addr.split('/').map(str::to_owned).collect())
+                } else {
+                    None
+                };
+                if decl.get("instance").and_then(E::as_str) == Some("new") {
+                    add("instance.new", format!("{where_}/instance"), step.clone());
+                } else if decl.get("delivery").and_then(E::as_str) != Some("steer") {
+                    add("delivery.queue", format!("{where_}/delivery"), step.clone());
+                }
+                if decl.get("delivery").and_then(E::as_str) == Some("steer") {
+                    add("delivery.steer", format!("{where_}/delivery"), step.clone());
+                }
+                if is_flow && receivers.contains(node.addr.as_str()) {
+                    add("resources", where_, step);
+                }
+            }
+            Ok(())
+        };
+    if document.contains_key("flow") {
+        let graph = receiver_graph(document, budget)?;
+        record(&graph, &receivers(&graph)?, true)?;
     }
+    let mut expansion = ExpansionBudget::new(budget);
+    for (name, _) in optional_object(document.get("compositions"), "")?.iter() {
+        let graph = Graph::for_composition(document, name, None, &mut expansion)?;
+        record(&graph, &Default::default(), false)?;
+    }
+    Ok(all)
+}
+
+pub(crate) fn capture_agent(
+    document: &Object,
+    agent_name: &Value,
+    captured: &Value,
+    modules: &ModuleMap,
+    uses: &[Use],
+    budget: &SourceBudget,
+) -> Result<Value> {
     let name = m::identity(agent_name, "/agentName", "UNSUPPORTED")?;
     let pointer = m::at(&Text::from("/agents"), &name);
     let definitions = exact::record(document.get("agents"), "/agents")?;
@@ -684,7 +721,7 @@ pub(crate) fn capture_agent(
         .find(|v| v.get("agentName").text() == Some(&name));
     if proof.is_none()
         || !exact::equal(
-            &exact::decode(&json(proof.unwrap().get("agentDeclarationJson"), "")?)?,
+            &json(proof.unwrap().get("agentDeclarationJson"), &p, budget)?.1,
             definitions.get(&name_utf8).unwrap(),
         )
     {
@@ -757,22 +794,22 @@ pub(crate) fn capture_agent(
         )?;
     }
     let module = modules.get(harness);
-    for (key, where_, _) in used_properties(document, &name_utf8, agent, &p)? {
+    for (key, where_, _) in uses {
         capability(
             observation,
-            &key,
-            &where_,
+            key,
+            where_,
             key == "planFirst.ask" || key == "delivery.queue",
         )?;
         if let Some(support) = module
             .and_then(E::as_object)
             .and_then(|m| m.get("properties"))
             .and_then(E::as_object)
-            .and_then(|p| p.get(&key))
+            .and_then(|p| p.get(key))
             .and_then(E::as_object)
         {
             if let Some(v) = support.get("versions") {
-                range(observation, exact::text(Some(v), "")?, &where_)?;
+                range(observation, exact::text(Some(v), "")?, where_)?;
             }
         }
     }
@@ -783,7 +820,7 @@ pub(crate) fn capture_agent(
     if let Some(v) = agent.get("harnessSettings") {
         no_credentials(v, &format!("{p}/harnessSettings"))?;
     }
-    let effective = exact::decode(&json(proof.get("settingsJson"), "")?)?;
+    let (_, effective) = json(proof.get("settingsJson"), &p, budget)?;
     let effective = exact::record(Some(&effective), "")?;
     if agent.contains_key("harnessSettings") || effective.len() > 0 {
         capability(
@@ -801,7 +838,7 @@ pub(crate) fn capture_agent(
                     .iter()
                     .map(|(k, v)| (k.to_owned(), exact::values::clone(v))),
             ));
-            let problems = valueschema::validate(
+            let problems = valueschema::validate_with_budget(
                 &value,
                 schema,
                 &[
@@ -809,8 +846,14 @@ pub(crate) fn capture_agent(
                     PointerPart::Key(name_utf8.clone()),
                     PointerPart::Key("harnessSettings".into()),
                 ],
+                budget,
             )
-            .map_err(internal)?;
+            .map_err(|error| {
+                error
+                    .limit
+                    .map(super::limit_error)
+                    .unwrap_or_else(|| internal(()))
+            })?;
             if let Some((pointer, message)) = problems.first() {
                 return fail("HARNESS_SETTINGS", pointer.clone(), message.clone());
             }

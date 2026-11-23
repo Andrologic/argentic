@@ -133,11 +133,7 @@ pub(crate) fn parse(raw: &str, number: super::calculation::NativeNumber) -> Resu
             }
             Task::Object(keys) => {
                 let items = values.split_off(values.len() - keys.len());
-                let mut object = Value::Object(vec![]);
-                for (k, v) in keys.into_iter().zip(items) {
-                    object.set(k, v);
-                }
-                values.push(object);
+                values.push(Value::from_entries(keys.into_iter().zip(items)));
             }
         }
     }

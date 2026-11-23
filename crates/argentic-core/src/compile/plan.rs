@@ -1,10 +1,10 @@
 //! compiler030.ts, with an owned pre-digest capture and a separate pure finish.
-use super::{configuration as c, graph, metadata as m};
+use super::{configuration as c, encode, graph, limit_error, metadata as m};
 use crate::argentic_core::{
     exact::{self, Value as E},
     native::{self, a, o, s, Error, Text, Value},
-    reader::{self, Modules},
-    validate::{ModuleMap, Report},
+    validate::{validate_document_with_budget, ModuleMap, Report},
+    SourceBudget, GRAPH_LIMIT_CODE, MAX_COMPILED_GRAPH_JSON_BYTES,
 };
 use sha2::{Digest, Sha256};
 pub(crate) const PROFILE: &str = "macro-agsdl-030-v1";
@@ -13,7 +13,10 @@ pub(crate) const RUNTIME: &str = "macro-agsdl-runtime/030";
 pub(crate) struct Prepared {
     assessment: Value,
     runtime: Value,
-    document: Option<E>,
+    pub(crate) document: Option<E>,
+    pub(crate) host_graph: Option<graph::CompiledGraph>,
+    budget: SourceBudget,
+    modules: ModuleMap,
     registry: Option<Value>,
     source: Option<Value>,
     bytes: Vec<u8>,
@@ -68,7 +71,9 @@ impl Prepared {
             .is_empty()
             && !self.assessment.get("valid").truthy()
         {
-            d.set("code", s("PARSE"));
+            if error.code != GRAPH_LIMIT_CODE {
+                d.set("code", s("PARSE"));
+            }
             self.assessment = o([("valid", Value::Bool(false)), ("diagnostics", a([d]))]);
         } else {
             self.runtime.set("supported", Value::Bool(false));
@@ -76,10 +81,13 @@ impl Prepared {
         }
         self.ready = false;
     }
-    fn unavailable(self) -> Value {
+    fn unavailable(&mut self) -> Value {
         o([
-            ("static", self.assessment),
-            ("runtime", self.runtime),
+            (
+                "static",
+                std::mem::replace(&mut self.assessment, Value::Null),
+            ),
+            ("runtime", std::mem::replace(&mut self.runtime, Value::Null)),
             ("plan", Value::Null),
             ("compiledPlanJson", Value::Null),
             ("productRuntimeAvailable", Value::Bool(false)),
@@ -87,7 +95,12 @@ impl Prepared {
     }
 }
 /// Every caller-owned input needed after the digest is copied before returning.
-pub(crate) fn prepare(authored: &Value, source: &Value, input: &Value) -> Prepared {
+pub(crate) fn prepare(
+    authored: &Value,
+    source: &Value,
+    input: &Value,
+    budget: &SourceBudget,
+) -> Prepared {
     let mut state = Prepared {
         assessment: o([("valid", Value::Bool(false)), ("diagnostics", a([]))]),
         runtime: o([
@@ -99,6 +112,9 @@ pub(crate) fn prepare(authored: &Value, source: &Value, input: &Value) -> Prepar
             ("unassessed", a([])),
         ]),
         document: None,
+        host_graph: None,
+        budget: budget.clone(),
+        modules: ModuleMap::new(),
         registry: None,
         source: None,
         bytes: vec![],
@@ -108,41 +124,34 @@ pub(crate) fn prepare(authored: &Value, source: &Value, input: &Value) -> Prepar
         let Some(text) = authored.text() else {
             return native::fail("PARSE", "", "Authored source must be primitive text.");
         };
-        state.bytes = text.lossy().into_bytes();
-        let document = super::source::read_text(text).ok();
-        if !document.as_ref().is_some_and(|v| v.as_object().is_some()) {
+        state.bytes = text
+            .utf8()
+            .ok_or_else(|| Error::new("PARSE", "", "Invalid JSON: unpaired UTF-16 surrogate."))?
+            .into_bytes();
+        budget.json_input(&state.bytes, "").map_err(limit_error)?;
+        state.document = Some(
+            exact::scan::parse_v030(&state.bytes)
+                .map_err(|error| Error::new("PARSE", "", error.message()))?
+                .tree,
+        );
+        if state.document.as_ref().unwrap().as_object().is_none() {
             state.assessment = report(
-                reader::read(&state.bytes, Modules::Explicit(&ModuleMap::new()))
-                    .map_err(internal)?,
+                validate_document_with_budget(
+                    state.document.as_ref().unwrap(),
+                    &state.modules,
+                    budget,
+                )
+                .map_err(internal)?,
             );
-            if state.assessment.get("valid").truthy() {
-                state.assessment = o([
-                    ("valid", Value::Bool(false)),
-                    (
-                        "diagnostics",
-                        a([o([
-                            ("code", s("PARSE")),
-                            ("pointer", s("")),
-                            ("severity", s("error")),
-                            ("message", s("Invalid exact JSON source.")),
-                        ])]),
-                    ),
-                ]);
-            }
             return Ok(());
         }
-        state.document = document;
-        state.assessment = report(
-            reader::read(&state.bytes, Modules::Explicit(&ModuleMap::new())).map_err(internal)?,
-        );
         let source = m::capture_source(source)?;
         state.runtime.set("source", source.clone());
         state.source = Some(source);
-        let registry = c::capture_registry(input)?;
+        let (registry, modules) = c::capture_registry(input, budget)?;
         state
             .runtime
             .set("registryVersion", registry.get("version").clone());
-        let modules = c::modules(&registry)?;
         let mut unassessed = vec![];
         for observation in registry.get("harnesses").array().unwrap() {
             if let Some(module) = observation
@@ -174,22 +183,31 @@ pub(crate) fn prepare(authored: &Value, source: &Value, input: &Value) -> Prepar
             "Native admission of resources in later graphless messages",
         ));
         state.runtime.set("unassessed", a(unassessed));
-        state.assessment =
-            report(reader::read(&state.bytes, Modules::Explicit(&modules)).map_err(internal)?);
+        state.assessment = report(
+            validate_document_with_budget(state.document.as_ref().unwrap(), &modules, budget)
+                .map_err(internal)?,
+        );
+        state.modules = modules;
         state.ready = state.assessment.get("valid").truthy();
         state.registry = Some(registry);
         Ok(())
     })();
     if let Err(error) = result {
+        if let Some(document) = &state.document {
+            if let Ok(assessment) = validate_document_with_budget(document, &state.modules, budget)
+            {
+                state.assessment = report(assessment);
+            }
+        }
         state.catch(error);
     }
     state
 }
-pub(crate) fn finish(mut state: Prepared) -> Value {
+pub(crate) fn finish(state: &mut Prepared) -> Value {
     if !state.ready {
         return state.unavailable();
     }
-    let result = (|| -> Result<(Value, Value, bool), Error> {
+    let result = (|| -> Result<(Value, Value, bool, String), Error> {
         let source = state.source.as_ref().unwrap();
         let digest = format!("{:x}", Sha256::digest(&state.bytes));
         if !source.get("sourceSha256").eq_str(&digest) {
@@ -200,22 +218,47 @@ pub(crate) fn finish(mut state: Prepared) -> Value {
             );
         }
         let document = state.document.as_ref().unwrap();
-        let document_json = exact::encode(document);
+        let document_json = encode(&state.budget, MAX_COMPILED_GRAPH_JSON_BYTES, |out| {
+            exact::values::stringify_to(out, document)
+        })?
+        .ok_or_else(|| {
+            Error::new(
+                GRAPH_LIMIT_CODE,
+                "",
+                "Maximum compiled document JSON bytes exceeded.",
+            )
+        })?;
+        state
+            .budget
+            .bytes(document_json.len() * 2, "")
+            .map_err(limit_error)?;
         let document = exact::record(Some(document), "")?;
         let registry = state.registry.as_ref().unwrap();
+        let by_agent = c::step_uses(document, &state.budget)?;
+        let definitions = exact::record(document.get("agents"), "")?;
         let mut agents = vec![];
-        for (name, _) in exact::record(document.get("agents"), "")?.iter() {
-            agents.push(c::capture_agent(
-                &s(document_json.clone()),
+        let mut warnings = vec![];
+        for (name, definition) in definitions.iter() {
+            let definition = exact::record(Some(definition), "")?;
+            let p = exact::at("/agents", name);
+            let uses = c::used_properties(
+                definition,
+                &p,
+                by_agent.get(name).map(Vec::as_slice).unwrap_or(&[]),
+            )?;
+            let proof_count = registry.get("agents").array().unwrap().len();
+            state
+                .budget
+                .work(proof_count + uses.len(), &p)
+                .map_err(limit_error)?;
+            let agent = c::capture_agent(
+                document,
                 &s(name),
                 registry,
-            )?);
-        }
-        let mut warnings = vec![];
-        for agent in &agents {
-            let name = agent.get("agentName").text().unwrap().utf8().unwrap();
-            let definition =
-                exact::record(exact::record(document.get("agents"), "")?.get(&name), "")?;
+                &state.modules,
+                &uses,
+                &state.budget,
+            )?;
             let observation = registry
                 .get("harnesses")
                 .array()
@@ -223,14 +266,20 @@ pub(crate) fn finish(mut state: Prepared) -> Value {
                 .iter()
                 .find(|v| native::equal(v.get("harness"), agent.get("harness")))
                 .ok_or_else(|| internal(()))?;
-            let uses =
-                c::used_properties(document, &name, definition, &exact::at("/agents", &name))?;
             let concrete: std::collections::HashSet<_> = uses
                 .iter()
                 .filter(|(_, _, step)| step.is_some())
                 .map(|(name, p, _)| format!("{name}\0{p}"))
                 .collect();
             for (name, p, step) in uses {
+                state
+                    .budget
+                    .work(
+                        observation.get("capabilities").array().unwrap().len()
+                            + state.assessment.get("diagnostics").array().unwrap().len(),
+                        &p,
+                    )
+                    .map_err(limit_error)?;
                 if step.is_none() && concrete.contains(&format!("{name}\0{p}")) {
                     continue;
                 }
@@ -276,16 +325,30 @@ pub(crate) fn finish(mut state: Prepared) -> Value {
                     if let Some(step) = step {
                         d.set("step", a(step.into_iter().map(s)));
                     }
+                    state.budget.bytes(256, "/agents").map_err(limit_error)?;
+                    if warnings.len() >= 1024 {
+                        return native::fail(
+                            GRAPH_LIMIT_CODE,
+                            "/agents",
+                            "Maximum compilation diagnostic count exceeded.",
+                        );
+                    }
                     warnings.push(d);
                 }
             }
+            agents.push(agent);
         }
-        let graph = graph::compile(document)?;
+        state.host_graph = Some(graph::compile_with_budget(document, &state.budget)?);
+        let graph = state.host_graph.as_ref().unwrap();
         for step in &graph.steps {
-            let raw = step.get("declarationJson").text().unwrap().utf8().unwrap();
-            let value = exact::decode(&raw)?;
-            let declaration = exact::record(Some(&value), "")?;
             let required = if step.get("type").eq_str("call") {
+                let raw = step.get("declarationJson").text().unwrap().utf8().unwrap();
+                state
+                    .budget
+                    .json_input(raw.as_bytes(), "/flow")
+                    .map_err(limit_error)?;
+                let value = exact::decode(&raw)?;
+                let declaration = exact::record(Some(&value), "")?;
                 Some(if declaration.contains_key("command") {
                     "call.command"
                 } else {
@@ -297,6 +360,16 @@ pub(crate) fn finish(mut state: Prepared) -> Value {
                 None
             };
             if let Some(required) = required {
+                state
+                    .budget
+                    .work(
+                        registry
+                            .get("hostCapabilities")
+                            .array()
+                            .map_or(0, <[Value]>::len),
+                        "/flow",
+                    )
+                    .map_err(limit_error)?;
                 if !registry
                     .get("hostCapabilities")
                     .array()
@@ -369,31 +442,37 @@ pub(crate) fn finish(mut state: Prepared) -> Value {
             ("documentJson", s(document_json)),
             ("agents", a(agents)),
         ]);
-        let graph = graph.value();
-        for (k, v) in graph.object().unwrap() {
-            plan.set(k.clone(), v.clone());
-        }
-        Ok((plan, a(warnings), product))
+        let remaining = graph.remaining_json;
+        state.host_graph.take().unwrap().append_to(&mut plan);
+        let encoded = encode(&state.budget, remaining, |out| plan.stringify_to(out))?
+            .ok_or_else(|| Error::new(GRAPH_LIMIT_CODE, "/flow", format!("Maximum compiled graph JSON bytes exceeded ({MAX_COMPILED_GRAPH_JSON_BYTES}).")))?;
+        state
+            .budget
+            .bytes(encoded.len() * 2, "/flow")
+            .map_err(limit_error)?;
+        Ok((plan, a(warnings), product, encoded))
     })();
     match result {
         Err(error) => {
             state.catch(error);
             state.unavailable()
         }
-        Ok((plan, warnings, product)) => {
+        Ok((plan, warnings, product, encoded)) => {
             state.runtime.set("supported", Value::Bool(true));
             state.runtime.set("diagnostics", warnings);
-            let encoded = plan.stringify();
             o([
-                ("static", state.assessment),
-                ("runtime", state.runtime),
+                (
+                    "static",
+                    std::mem::replace(&mut state.assessment, Value::Null),
+                ),
+                (
+                    "runtime",
+                    std::mem::replace(&mut state.runtime, Value::Null),
+                ),
                 ("plan", plan),
                 ("compiledPlanJson", s(encoded)),
                 ("productRuntimeAvailable", Value::Bool(product)),
             ])
         }
     }
-}
-pub(crate) fn compile(authored: &Value, source: &Value, registry: &Value) -> Value {
-    finish(prepare(authored, source, registry))
 }

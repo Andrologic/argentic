@@ -1,6 +1,6 @@
 //! Complete compileHost030 facade, including entry/delivery checks and the
 //! original UTF-8 transport refusal. No broker, discovery or execution occurs.
-use super::{graph, plan};
+use super::{encode as encode_bounded, graph, limit_error, plan};
 use crate::argentic_core::{
     exact::{self, Object, Value as E},
     messages::{self, CapturedContent},
@@ -8,6 +8,7 @@ use crate::argentic_core::{
     route::{ItemContext, Provenance, RouteSource, RouteTarget, SourceKind},
     schema::{self, SchemaChecker},
 };
+use crate::{SourceBudget, GRAPH_LIMIT_CODE};
 pub(crate) const RESULT_LIMIT: usize = 8_000_000;
 fn invalid() -> Value {
     o([
@@ -19,23 +20,24 @@ fn invalid() -> Value {
 fn empty() -> &'static Object {
     crate::argentic_core::graph::empty_object()
 }
-fn host_message(raw: &Value, document: &Object) -> Value {
+fn host_message(raw: &Value, document: &Object, budget: &SourceBudget) -> Result<Value, Error> {
     let result = (|| -> Result<Value, Error> {
         let Some(raw) = raw.text().and_then(Text::utf8) else {
             return Ok(invalid());
         };
-        let message = exact::decode(&raw)?;
-        let message = exact::record(Some(&message), "")?;
+        budget
+            .json_input(raw.as_bytes(), "/message")
+            .map_err(limit_error)?;
+        let value = exact::decode(&raw)?;
+        let message = exact::record(Some(&value), "")?;
         static ROOT: std::sync::OnceLock<SchemaChecker> = std::sync::OnceLock::new();
         let root=ROOT.get_or_init(||SchemaChecker::new(schema::root_with_document_defs(r##""type":"object","additionalProperties":false,"properties":{"prompt":{"$ref":"#/$defs/instructions"},"resources":{"$ref":"#/$defs/resources"}}"##).expect("code-defined host message schema")));
-        let value = E::Object(exact::Object::from_entries(
-            message
-                .iter()
-                .map(|(k, v)| (k.to_owned(), exact::values::clone(v))),
-        ));
         if !root
-            .check(&value)
-            .map_err(|_| {
+            .check_with_budget(&value, budget)
+            .map_err(|error| {
+                if let Some(pointer) = error.limit_pointer {
+                    return Error::new(GRAPH_LIMIT_CODE, pointer, error.message);
+                }
                 Error::new(
                     "COMPILATION",
                     "",
@@ -91,31 +93,50 @@ fn host_message(raw: &Value, document: &Object) -> Value {
             ("unassessed", a(unique.into_iter().map(s))),
         ]))
     })();
-    result.unwrap_or_else(|_| invalid())
+    match result {
+        Err(error) if error.code != GRAPH_LIMIT_CODE => Ok(invalid()),
+        result => result,
+    }
 }
-pub(crate) fn encode(result: &Value, registry: &Value, validations: &Value) -> String {
-    let mut all = result.clone();
-    all.set("capturedRegistryJson", s(registry.stringify()));
-    if let Some(fields) = validations.object() {
-        for (k, v) in fields {
-            all.set(k.clone(), v.clone());
+fn encode(
+    mut result: Value,
+    registry: &Value,
+    validations: &Value,
+    budget: &SourceBudget,
+) -> Result<String, Error> {
+    let encoded_registry = encode_bounded(budget, RESULT_LIMIT, |out| registry.stringify_to(out));
+    let encoding = encoded_registry.and_then(|encoded_registry| {
+        let Some(encoded_registry) = encoded_registry else {
+            return Ok(None);
+        };
+        budget
+            .bytes(encoded_registry.len() * 2, "/registry")
+            .map_err(limit_error)?;
+        result.set("capturedRegistryJson", s(encoded_registry));
+        if let Some(fields) = validations.object() {
+            for (k, v) in fields {
+                result.set(k.clone(), v.clone());
+            }
         }
-    }
-    let encoded = all.stringify();
-    if encoded.len() <= RESULT_LIMIT {
-        return encoded;
-    }
+        encode_bounded(budget, RESULT_LIMIT, |out| result.stringify_to(out))
+    });
+    let (code, pointer, message) = match encoding {
+        Ok(Some(encoded)) => return Ok(encoded),
+        Ok(None) => (
+            "INPUT_LIMIT",
+            s(""),
+            s("Expanded compilation exceeds the native result limit."),
+        ),
+        Err(error) => (error.code, s(error.pointer), s(error.message)),
+    };
     let mut runtime = result.get("runtime").clone();
     runtime.set("supported", Value::Bool(false));
     runtime.set(
         "diagnostics",
         a([o([
-            ("code", s("INPUT_LIMIT")),
-            ("pointer", s("")),
-            (
-                "message",
-                s("Expanded compilation exceeds the native result limit."),
-            ),
+            ("code", s(code)),
+            ("pointer", pointer),
+            ("message", message),
         ])]),
     );
     runtime.set("unassessed", a([]));
@@ -155,12 +176,19 @@ pub(crate) fn encode(result: &Value, registry: &Value, validations: &Value) -> S
         };
         refusal.set(field, value);
     }
-    refusal.stringify()
+    encode_bounded(budget, RESULT_LIMIT, |out| refusal.stringify_to(out))?.ok_or_else(|| {
+        Error::new(
+            code,
+            "",
+            "Expanded compilation exceeds the native result limit.",
+        )
+    })
 }
 pub(crate) fn compile(
     authored: &Value,
     source: &Value,
     observation: &Value,
+    budget: &SourceBudget,
 ) -> Result<String, Error> {
     let mut registry = o([]);
     for field in ["format", "version", "modules", "harnesses", "agents"] {
@@ -172,32 +200,55 @@ pub(crate) fn compile(
             observation.get("hostCapabilities").clone(),
         );
     }
-    let mut result = plan::compile(authored, source, &registry);
+    let mut prepared = plan::prepare(authored, source, &registry, budget);
+    let mut result = plan::finish(&mut prepared);
     let mut runtime = result.get("runtime").clone();
     runtime.set("source", source.clone());
     runtime.set("registryVersion", observation.get("version").clone());
     result.set("runtime", runtime);
-    let mut document = None;
-    let mut graph = None;
-    if result.get("static").get("valid").truthy() {
-        if let Some(raw) = authored.text().and_then(Text::utf8) {
-            if let Ok(value) = exact::decode(&raw) {
-                if let Some(record) = value.as_object() {
-                    graph = graph::compile(record).ok();
-                    document = Some(value);
-                }
+    let document = prepared.document.as_ref().and_then(E::as_object);
+    let mut fallback = o([]);
+    let plan = result.get("plan");
+    let graph = if !plan.is_nullish() {
+        Some(plan)
+    } else if result.get("static").get("valid").truthy()
+        && (observation.has("startEntry") || observation.has("deliveryInput"))
+        && !result
+            .get("runtime")
+            .get("diagnostics")
+            .array()
+            .is_some_and(|diagnostics| {
+                diagnostics
+                    .iter()
+                    .any(|d| d.get("code").eq_str(GRAPH_LIMIT_CODE))
+            })
+    {
+        let graph = match prepared.host_graph.take() {
+            Some(graph) => Ok(Some(graph)),
+            None => document
+                .map(|doc| graph::compile_with_budget(doc, budget))
+                .transpose(),
+        };
+        match graph {
+            Ok(Some(graph)) => {
+                graph.append_to(&mut fallback);
+                Some(&fallback)
             }
+            Err(error) if error.code == GRAPH_LIMIT_CODE => return Err(error),
+            _ => None,
         }
-    }
+    } else {
+        None
+    };
     let entry = observation.get("startEntry").get("messageJson");
     let entry = if entry.is_nullish() {
         &Value::Null
     } else {
         entry
     };
-    let mut check = if let (Some(document), Some(graph)) = (&document, &graph) {
-        if !matches!(graph.entry, Value::Null) {
-            host_message(entry, document.as_object().unwrap())
+    let mut check = if let (Some(document), Some(graph)) = (document, graph) {
+        if !matches!(graph.get("entry"), Value::Null) {
+            host_message(entry, document, budget)?
         } else if matches!(observation.get("startEntry"), Value::Null) {
             o([
                 ("valid", Value::Bool(true)),
@@ -210,12 +261,10 @@ pub(crate) fn compile(
     } else {
         invalid()
     };
-    if let (Some(_document), Some(graph)) = (&document, &graph) {
-        if let Some(step) = graph
-            .steps
-            .iter()
-            .find(|step| crate::argentic_core::native::equal(step.get("address"), &graph.entry))
-        {
+    if let (Some(_document), Some(graph)) = (document, graph) {
+        if let Some(step) = graph.get("steps").array().unwrap().iter().find(|step| {
+            crate::argentic_core::native::equal(step.get("address"), graph.get("entry"))
+        }) {
             if check.get("valid").truthy()
                 && entry.text().is_some()
                 && ["agent", "approval", "compose"]
@@ -271,14 +320,11 @@ pub(crate) fn compile(
     } else {
         &Value::Undefined
     };
-    let delivery_check = if let (Some(document), Some(graph)) = (&document, &graph) {
+    let delivery_check = if let (Some(document), Some(graph)) = (document, graph) {
         // The live host authenticates a held target before accepting a message
         // into a flow. The compiler checks the message against its document.
-        let valid = (matches!(graph.entry, Value::Null)
-            || document
-                .as_object()
-                .and_then(|value| value.get("contract"))
-                .and_then(|value| value.as_str())
+        let valid = (matches!(graph.get("entry"), Value::Null)
+            || document.get("contract").and_then(|value| value.as_str())
                 == Some(crate::argentic_core::AGSDL_040))
             && delivery
                 .get("agentName")
@@ -286,14 +332,12 @@ pub(crate) fn compile(
                 .and_then(Text::utf8)
                 .is_some_and(|name| {
                     document
-                        .as_object()
-                        .unwrap()
                         .get("agents")
                         .and_then(E::as_object)
                         .is_some_and(|a| a.contains_key(&name))
                 });
         if valid {
-            host_message(delivery.get("messageJson"), document.as_object().unwrap())
+            host_message(delivery.get("messageJson"), document, budget)?
         } else {
             invalid()
         }
@@ -324,5 +368,5 @@ pub(crate) fn compile(
             ]),
         );
     }
-    Ok(encode(&result, &registry, &validations))
+    encode(result, &registry, &validations, budget)
 }

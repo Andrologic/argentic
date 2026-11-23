@@ -14,13 +14,15 @@
 use super::{
     calculation::Failure,
     exact::{
-        scan::{parse_shared, parse_v030, Span},
+        scan::{parse_shared, parse_v030},
         stringify, Value,
     },
     validate::{
-        check_module, validate_document, Internal, ModuleError, ModuleMap, ReadError, Report,
+        check_module_with_budget, validate_document_with_budget, Internal, ModuleError, ModuleMap,
+        ReadError, Report,
     },
 };
+use crate::{SourceBudget, GRAPH_LIMIT_CODE};
 use std::sync::OnceLock;
 
 /// The pinned harness modules, in the import order of `reader.mjs`.
@@ -49,20 +51,22 @@ pub(crate) enum Modules<'m> {
     Encoded(&'m [&'m [u8]]),
 }
 
-/// `readWithSpans(bytes, options)`.
-pub(crate) struct ReadOutput {
-    pub(crate) report: Report,
-    pub(crate) spans: Vec<Span>,
-}
-
 /// `loadHarnessModule(bytes)`.
 pub(crate) fn load_harness_module(bytes: &[u8]) -> Result<Value, ReadError> {
+    load_harness_module_with_budget(bytes, &SourceBudget::default())
+}
+
+pub(crate) fn load_harness_module_with_budget(
+    bytes: &[u8],
+    budget: &SourceBudget,
+) -> Result<Value, ReadError> {
+    budget.json_input(bytes, "").map_err(Internal::from)?;
     match parse_v030(bytes) {
         Err(error) => Err(ModuleError {
             message: error.message(),
         }
         .into()),
-        Ok(parsed) => check_module(parsed.tree),
+        Ok(parsed) => check_module_with_budget(parsed.tree, budget),
     }
 }
 
@@ -109,7 +113,15 @@ fn defaults() -> Result<&'static [Value], ReadError> {
 }
 
 /// `registry(options)`: a detached copy of every module, keyed as given.
+#[cfg(test)]
 pub(crate) fn registry(modules: Modules<'_>) -> Result<ModuleMap, ReadError> {
+    registry_with_budget(modules, &SourceBudget::default())
+}
+
+fn registry_with_budget(
+    modules: Modules<'_>,
+    budget: &SourceBudget,
+) -> Result<ModuleMap, ReadError> {
     let source: Vec<(&str, &Value)> = match modules {
         Modules::Pinned => {
             let mut source = Vec::new();
@@ -125,7 +137,7 @@ pub(crate) fn registry(modules: Modules<'_>) -> Result<ModuleMap, ReadError> {
         Modules::Encoded(sources) => {
             let mut modules = ModuleMap::new();
             for source in sources {
-                let module = load_harness_module(source)?;
+                let module = load_harness_module_with_budget(source, budget)?;
                 let name = module_name(&module)?.to_owned();
                 if modules.get(&name).is_some() {
                     return Err(ModuleError {
@@ -159,28 +171,105 @@ fn parse_report(message: String) -> Report {
     report
 }
 
-/// `readWithSpans(bytes, options)`. A parse failure never consults the
-/// modules and carries no spans.
-pub(crate) fn read_with_spans(bytes: &[u8], modules: Modules<'_>) -> Result<ReadOutput, ReadError> {
-    match parse_v030(bytes) {
-        Err(error) => Ok(ReadOutput {
-            report: parse_report(error.message()),
-            spans: Vec::new(),
-        }),
-        Ok(parsed) => {
-            let registry = registry(modules)?;
-            let report = validate_document(&parsed.tree, &registry)?;
-            Ok(ReadOutput {
-                report,
-                spans: parsed.spans(),
-            })
+/// `read(bytes, options)`.
+pub(crate) fn read(bytes: &[u8], modules: Modules<'_>) -> Result<Report, ReadError> {
+    read_budgeted(bytes, modules, &SourceBudget::default())
+}
+
+fn read_budgeted(
+    bytes: &[u8],
+    modules: Modules<'_>,
+    budget: &SourceBudget,
+) -> Result<Report, ReadError> {
+    if let Err(error) = budget.json_input(bytes, "") {
+        let mut report = Report::new();
+        report.error_at(GRAPH_LIMIT_CODE, &error.pointer, error.message);
+        return Ok(report);
+    }
+    let parsed = match parse_v030(bytes) {
+        Ok(parsed) => parsed,
+        Err(error) => return Ok(parse_report(error.message())),
+    };
+    let registry = registry_with_budget(modules, budget)?;
+    Ok(validate_document_with_budget(
+        &parsed.tree,
+        &registry,
+        budget,
+    )?)
+}
+
+/// Parse source-component JSON with exact numbers and unique object keys.
+pub fn parse_source_json(
+    bytes: &[u8],
+    budget: &SourceBudget,
+) -> Result<serde_json::Value, Failure> {
+    use crate::exact::Value as Exact;
+    use serde_json::Value;
+    fn convert(value: &Exact) -> Value {
+        match value {
+            Exact::Null => Value::Null,
+            Exact::Bool(value) => Value::Bool(*value),
+            Exact::String(value) => Value::String(value.clone()),
+            Exact::Number(value) => {
+                Value::Number(serde_json::from_str(value.raw()).expect("scanned JSON number"))
+            }
+            Exact::Array(values) => Value::Array(values.iter().map(convert).collect()),
+            Exact::Object(values) => Value::Object(
+                values
+                    .iter()
+                    .map(|(name, value)| (name.to_owned(), convert(value)))
+                    .collect(),
+            ),
         }
+    }
+    budget.json_input(bytes, "")?;
+    let parsed = parse_v030(bytes).map_err(|error| Failure {
+        code: "PARSE".into(),
+        pointer: "".into(),
+        message: error.message(),
+    })?;
+    // Conversion is bounded by the depth and allocation allowance reserved
+    // by json_input. Building objects directly preserves all user keys.
+    Ok(convert(&parsed.tree))
+}
+
+/// Validate an assembled source and return its first error. A resource-limit
+/// refusal takes precedence so hosts can distinguish it from content errors.
+pub fn validate_source(bytes: &[u8], budget: &SourceBudget) -> Result<(), Failure> {
+    let report = read_budgeted(bytes, Modules::Pinned, budget).map_err(read_failure)?;
+    let diagnostic = report
+        .diagnostics
+        .iter()
+        .find(|d| d.code == GRAPH_LIMIT_CODE)
+        .or_else(|| report.diagnostics.iter().find(|d| d.severity == "error"));
+    match diagnostic {
+        Some(diagnostic) => Err(Failure {
+            code: diagnostic.code.into(),
+            pointer: diagnostic.path.clone(),
+            message: diagnostic.message.clone(),
+        }),
+        None => Ok(()),
     }
 }
 
-/// `read(bytes, options)`.
-pub(crate) fn read(bytes: &[u8], modules: Modules<'_>) -> Result<Report, ReadError> {
-    read_with_spans(bytes, modules).map(|output| output.report)
+fn read_failure(error: ReadError) -> Failure {
+    match error {
+        ReadError::Module(error) => Failure {
+            code: "HARNESS_MODULE".into(),
+            pointer: "/modules".into(),
+            message: error.message,
+        },
+        ReadError::Internal(error) => Failure {
+            code: if error.limit_pointer.is_some() {
+                GRAPH_LIMIT_CODE
+            } else {
+                "VALIDATION"
+            }
+            .into(),
+            pointer: error.limit_pointer.unwrap_or_default(),
+            message: error.message,
+        },
+    }
 }
 
 /// Validate authored AgSDL 0.3.0 bytes and return the standard JSON report.
@@ -193,31 +282,7 @@ pub fn validate_document_json(bytes: &[u8], modules: Option<&[&[u8]]>) -> Result
     let modules = modules.map_or(Modules::Pinned, Modules::Encoded);
     read(bytes, modules)
         .map(|report| report.to_json())
-        .map_err(|error| match error {
-            ReadError::Module(error) => Failure {
-                code: "HARNESS_MODULE".into(),
-                pointer: "/modules".into(),
-                message: error.message,
-            },
-            ReadError::Internal(error) => Failure {
-                code: "VALIDATION".into(),
-                pointer: String::new(),
-                message: error.message,
-            },
-        })
-}
-
-/// `validateExact(document, options)`: the registry first, then the exact
-/// text of the document through the 0.3 scanner. The JS refusals of
-/// `stringify` (unpaired surrogates, cycles, non-JSON values) have no `Value`
-/// counterpart.
-pub(crate) fn validate_exact(document: &Value, modules: Modules<'_>) -> Result<Report, ReadError> {
-    let registry = registry(modules)?;
-    let source = stringify(document);
-    match parse_v030(source.as_bytes()) {
-        Err(error) => Ok(parse_report(error.message())),
-        Ok(parsed) => Ok(validate_document(&parsed.tree, &registry)?),
-    }
+        .map_err(read_failure)
 }
 
 #[cfg(test)]

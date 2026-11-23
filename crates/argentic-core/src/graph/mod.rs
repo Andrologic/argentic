@@ -17,7 +17,11 @@ use super::{
         values::{compare_numbers, Num},
         Object, Value,
     },
-    valueschema::PointerPart,
+    resource::{
+        number_excerpt, SourceBudget, MAX_DIAGNOSTICS, MAX_DIAGNOSTIC_BYTES, MAX_SOURCE_BYTES,
+        MAX_SOURCE_WORK,
+    },
+    valueschema::{path_pointer, PointerPart},
 };
 use ordered::{OrderedMap, OrderedSet};
 use std::{
@@ -59,13 +63,31 @@ const MAX_JOIN_ANALYSIS_ITEMS: usize = 131_072;
 
 #[derive(Default)]
 pub(crate) struct ExpansionBudget {
+    source: SourceBudget,
     nodes: usize,
     edges: usize,
     json_bytes: usize,
     join_items: usize,
+    diagnostic_bytes: usize,
+    diagnostics: usize,
 }
 
 impl ExpansionBudget {
+    pub(crate) fn new(source: &SourceBudget) -> Self {
+        Self {
+            source: source.clone(),
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn work(&self, count: usize, composition: Option<&str>) -> GraphResult<()> {
+        graph_work(&self.source, count, composition)
+    }
+
+    pub(crate) fn bytes(&self, count: usize, composition: Option<&str>) -> GraphResult<()> {
+        graph_bytes(&self.source, count, composition)
+    }
+
     pub(crate) fn scope(
         &mut self,
         count: usize,
@@ -83,6 +105,8 @@ impl ExpansionBudget {
     }
 
     fn nodes(&mut self, count: usize, composition: Option<&str>) -> GraphResult<()> {
+        self.work(count, composition)?;
+        self.bytes(count.saturating_mul(288), composition)?;
         spend(
             &mut self.nodes,
             count,
@@ -93,6 +117,8 @@ impl ExpansionBudget {
     }
 
     pub(crate) fn edges(&mut self, count: usize, composition: Option<&str>) -> GraphResult<()> {
+        self.work(count, composition)?;
+        self.bytes(count.saturating_mul(152), composition)?;
         spend(
             &mut self.edges,
             count,
@@ -103,12 +129,25 @@ impl ExpansionBudget {
     }
 
     pub(crate) fn json(&mut self, bytes: usize, composition: Option<&str>) -> GraphResult<()> {
+        self.bytes(bytes.saturating_mul(2), composition)?;
         spend(
             &mut self.json_bytes,
             bytes,
             MAX_COMPILED_GRAPH_JSON_BYTES,
             composition,
             "compiled graph JSON bytes",
+        )
+    }
+
+    pub(crate) fn remaining_json(&self) -> usize {
+        MAX_COMPILED_GRAPH_JSON_BYTES - self.json_bytes
+    }
+
+    pub(crate) fn json_limit(&self, composition: Option<&str>) -> Unshaped {
+        expansion_limit(
+            composition,
+            "compiled graph JSON bytes",
+            MAX_COMPILED_GRAPH_JSON_BYTES,
         )
     }
 
@@ -119,6 +158,8 @@ impl ExpansionBudget {
     ) -> GraphResult<()> {
         // Branch names, memberships and diagnostics can outnumber nodes and
         // edges, even though each individual reachability scan is linear space.
+        self.work(count, composition)?;
+        self.bytes(count.saturating_mul(128), composition)?;
         spend(
             &mut self.join_items,
             count,
@@ -128,15 +169,47 @@ impl ExpansionBudget {
         )
     }
 
-    pub(crate) fn route(&mut self, route: &Value, composition: Option<&str>) -> GraphResult<()> {
-        self.edges(
-            match route {
-                Value::Array(items) => items.len().max(1),
-                _ => 1,
-            },
-            composition,
-        )
+    fn diagnostic(&mut self, problem: &GraphProblem, composition: Option<&str>) -> GraphResult<()> {
+        let pointer = path_pointer(&problem.pointer);
+        let bytes = pointer.len() + problem.addr.len() + problem.message.len() + 128;
+        if self.diagnostics >= MAX_DIAGNOSTICS
+            || bytes > MAX_DIAGNOSTIC_BYTES - self.diagnostic_bytes
+        {
+            return Err(Unshaped {
+                message: "Maximum join diagnostic count or bytes exceeded.".into(),
+                limit_pointer: Some(pointer),
+            });
+        }
+        self.bytes(bytes, composition)?;
+        self.diagnostics += 1;
+        self.diagnostic_bytes += bytes;
+        Ok(())
     }
+
+    pub(crate) fn route(&mut self, route: &Value, composition: Option<&str>) -> GraphResult<()> {
+        self.edges(route_len(route), composition)
+    }
+}
+
+pub(crate) fn route_len(route: &Value) -> usize {
+    match route {
+        Value::Array(items) => items.len().max(1),
+        _ => 1,
+    }
+}
+
+fn graph_work(budget: &SourceBudget, count: usize, composition: Option<&str>) -> GraphResult<()> {
+    budget
+        .charge_work(count)
+        .then_some(())
+        .ok_or_else(|| expansion_limit(composition, "source work units", MAX_SOURCE_WORK))
+}
+
+fn graph_bytes(budget: &SourceBudget, count: usize, composition: Option<&str>) -> GraphResult<()> {
+    budget
+        .charge_bytes(count)
+        .then_some(())
+        .ok_or_else(|| expansion_limit(composition, "source allocation bytes", MAX_SOURCE_BYTES))
 }
 
 fn spend(
@@ -227,13 +300,18 @@ pub(crate) fn last(addr: &str) -> Option<&str> {
 
 /// `compare_addresses(left, right)`: by segment, shorter first.
 pub(crate) fn compare_addresses(left: &str, right: &str) -> Ordering {
-    let (a, b) = (address_parts(left), address_parts(right));
-    for (x, y) in a.iter().zip(&b) {
-        if x != y {
-            return compare_utf16(x, y);
+    if left.is_empty() || right.is_empty() {
+        return right.is_empty().cmp(&left.is_empty());
+    }
+    let mut a = left.split('/');
+    let mut b = right.split('/');
+    loop {
+        match (a.next(), b.next()) {
+            (Some(a), Some(b)) if a != b => return compare_utf16(a, b),
+            (Some(_), Some(_)) => {}
+            (a, b) => return a.is_some().cmp(&b.is_some()),
         }
     }
-    a.len().cmp(&b.len())
 }
 
 pub(crate) fn sorted_addresses<'s>(values: impl IntoIterator<Item = &'s String>) -> Vec<String> {
@@ -492,6 +570,7 @@ pub(crate) struct Graph<'a> {
     pub(crate) composes: OrderedMap<String, Compose<'a>>,
     pub(crate) edges: Vec<Edge<'a>>,
     pub(crate) root: Option<String>,
+    source: SourceBudget,
     successors: OnceCell<Adjacency>,
     predecessors: OnceCell<Adjacency>,
 }
@@ -508,6 +587,7 @@ impl<'a> Graph<'a> {
         document: &'a Object,
         in_branch: Option<Rc<InBranch>>,
         covered: Option<OrderedSet<String>>,
+        budget: &ExpansionBudget,
     ) -> GraphResult<Self> {
         Ok(Self {
             document,
@@ -519,6 +599,7 @@ impl<'a> Graph<'a> {
             composes: OrderedMap::new(),
             edges: Vec::new(),
             root: None,
+            source: budget.source.clone(),
             successors: OnceCell::new(),
             predecessors: OnceCell::new(),
         })
@@ -592,7 +673,7 @@ impl<'a> Graph<'a> {
         covered: Option<OrderedSet<String>>,
         budget: &mut ExpansionBudget,
     ) -> GraphResult<Self> {
-        let mut graph = Graph::new(document, in_branch, covered)?;
+        let mut graph = Graph::new(document, in_branch, covered, budget)?;
         let flow = Self::flow(document)?;
         let steps = object_of(member(flow, "steps", "flow")?, "steps")?;
         budget.scope(steps.len(), 0, None)?;
@@ -617,6 +698,7 @@ impl<'a> Graph<'a> {
     pub(crate) fn flow_error_covered(
         document: &'a Object,
         branch_members: &OrderedSet<String>,
+        budget: &ExpansionBudget,
     ) -> GraphResult<OrderedSet<String>> {
         let flow = Self::flow(document)?;
         let steps = object_of(member(flow, "steps", "flow")?, "steps")?;
@@ -627,6 +709,8 @@ impl<'a> Graph<'a> {
         if !steps.contains_key(entry) {
             return Ok(OrderedSet::new());
         }
+        budget.work(route_len(on_error), None)?;
+        budget.bytes(route_len(on_error) * 88, None)?;
         let targets: HashSet<&str> = route_targets(on_error, &[])?
             .into_iter()
             .filter(|item| item.kind == TargetKind::Step)
@@ -637,8 +721,11 @@ impl<'a> Graph<'a> {
         let mut queue = vec![entry.to_owned()];
         let mut i = 0;
         while i < queue.len() {
+            budget.work(1, None)?;
             let decl = object_of(member(steps, &queue[i], "steps")?, "step")?;
             for route in step_routes(decl, &[]) {
+                budget.work(route_len(route.route), None)?;
+                budget.bytes(route_len(route.route) * 88, None)?;
                 for item in route_targets(route.route, &[])? {
                     if item.kind == TargetKind::Step
                         && steps.contains_key(item.name)
@@ -674,6 +761,7 @@ impl<'a> Graph<'a> {
             document,
             None,
             if composition.is_none() { covered } else { None },
+            budget,
         )?;
         let (container, pointer) = match composition {
             None => (Self::flow(document)?, vec![key("flow"), key("steps")]),
@@ -695,6 +783,7 @@ impl<'a> Graph<'a> {
             compose_name: None,
         });
         for (name, decl) in steps.iter() {
+            budget.bytes(name.len() * 8, composition)?;
             let node = graph.node(name, Some(object_of(decl, "step")?), scope, name)?;
             graph.nodes.set(name.to_owned(), node);
         }
@@ -783,7 +872,7 @@ impl<'a> Graph<'a> {
         in_branch: Option<Rc<InBranch>>,
         budget: &mut ExpansionBudget,
     ) -> GraphResult<Self> {
-        let mut graph = Graph::new(document, in_branch, None)?;
+        let mut graph = Graph::new(document, in_branch, None, budget)?;
         let composition = graph.composition(name)?;
         let steps = object_of(member(composition, "steps", "composition")?, "steps")?;
         budget.scope(steps.len(), 1, Some(name))?;
@@ -836,7 +925,12 @@ impl<'a> Graph<'a> {
             let (name, decl) = frame.entries[frame.index];
             frame.index += 1;
             let decl = object_of(decl, "step")?;
-            let addr = address(&self.scopes[scope].prefix, name);
+            let scope_record = &self.scopes[scope];
+            budget.bytes(
+                8 * (scope_record.prefix.len() + name.len() + 1),
+                scope_record.composition.as_deref(),
+            )?;
+            let addr = address(&scope_record.prefix, name);
             if string_of(member(decl, "type", "step")?, "step type")? != "compose" {
                 let node = self.node(&addr, Some(decl), scope, name)?;
                 self.nodes.set(addr, node);
@@ -865,7 +959,10 @@ impl<'a> Graph<'a> {
                 None | Some(Value::Null) => empty_object(),
                 Some(value) => object_of(value, "compose agents")?,
             };
+            budget.work(agents.len(), Some(target))?;
+            budget.bytes(agents.len() * 96, Some(target))?;
             for (parameter, value) in agents.iter() {
+                budget.bytes(parameter.len() * 2, Some(target))?;
                 let bound = match value {
                     Value::String(name) => Some(name.clone()),
                     Value::Object(reference) => {
@@ -1081,7 +1178,23 @@ impl<'a> Graph<'a> {
         Ok(())
     }
 
+    fn composition_name(&self) -> Option<&str> {
+        self.scopes
+            .first()
+            .and_then(|scope| scope.composition.as_deref())
+    }
+
+    pub(crate) fn work(&self, units: usize) -> GraphResult<()> {
+        graph_work(&self.source, units, self.composition_name())
+    }
+
+    pub(crate) fn bytes(&self, bytes: usize) -> GraphResult<()> {
+        graph_bytes(&self.source, bytes, self.composition_name())
+    }
+
     fn adjacency(&self, source: bool) -> GraphResult<Adjacency> {
+        self.work(self.nodes.len() + self.edges.len())?;
+        self.bytes(self.nodes.len() * 96 + self.edges.len() * 16)?;
         let mut result: Adjacency = self
             .nodes
             .keys()
@@ -1136,16 +1249,20 @@ impl<'a> Graph<'a> {
         start: &str,
         blocked: &OrderedSet<String>,
     ) -> GraphResult<OrderedSet<String>> {
+        self.bytes(96 + start.len() * 3)?;
         let mut seen = OrderedSet::new();
         seen.insert(start.to_owned());
         let mut queue = vec![start.to_owned()];
         let mut i = 0;
         while i < queue.len() {
-            for &edge in self.outgoing(&queue[i])? {
+            let outgoing = self.outgoing(&queue[i])?;
+            self.work(1 + outgoing.len())?;
+            for &edge in outgoing {
                 let dst = &self.edges[edge].dst;
                 if blocked.contains(dst) || seen.contains(dst) {
                     continue;
                 }
+                self.bytes(96 + dst.len() * 3)?;
                 seen.insert(dst.clone());
                 queue.push(dst.clone());
             }
@@ -1160,15 +1277,19 @@ impl<'a> Graph<'a> {
         target: &str,
         blocked: &OrderedSet<String>,
     ) -> GraphResult<OrderedSet<String>> {
+        self.bytes(96 + target.len())?;
         let mut seen = OrderedSet::new();
         let mut queue = vec![target.to_owned()];
         let mut i = 0;
         while i < queue.len() {
-            for &edge in self.incoming(&queue[i])? {
+            let incoming = self.incoming(&queue[i])?;
+            self.work(1 + incoming.len())?;
+            for &edge in incoming {
                 let src = &self.edges[edge].src;
                 if blocked.contains(src) || seen.contains(src) || src == target {
                     continue;
                 }
+                self.bytes(96 + src.len() * 3)?;
                 seen.insert(src.clone());
                 queue.push(src.clone());
             }
@@ -1183,6 +1304,8 @@ impl<'a> Graph<'a> {
         let Some(root) = self.root.as_deref() else {
             return Ok(HashMap::new());
         };
+        self.work(self.nodes.len() + self.edges.len())?;
+        self.bytes(self.nodes.len() * 128)?;
         let mut seen = HashSet::from([root]);
         let mut order = Vec::new();
         let mut stack = vec![(root, self.outgoing(root)?.iter())];
@@ -1208,22 +1331,24 @@ impl<'a> Graph<'a> {
         loop {
             let mut changed = false;
             for (index, addr) in order.iter().enumerate().skip(1) {
-                let mut incoming = self
-                    .incoming(addr)?
+                let incoming = self.incoming(addr)?;
+                self.work(1 + incoming.len())?;
+                let mut incoming = incoming
                     .iter()
                     .filter_map(|&edge| positions.get(self.edges[edge].src.as_str()).copied())
                     .filter(|&i| parents[i].is_some());
                 let first = incoming.next().expect("reachable DFS predecessor");
-                let parent = incoming.fold(first, |mut a, mut b| {
+                let parent = incoming.try_fold(first, |mut a, mut b| {
                     while a != b {
+                        self.work(1)?;
                         if a > b {
                             a = parents[a].expect("known parent");
                         } else {
                             b = parents[b].expect("known parent");
                         }
                     }
-                    a
-                });
+                    Ok(a)
+                })?;
                 changed |= parents[index].replace(parent) != Some(parent);
             }
             if !changed {
@@ -1251,8 +1376,11 @@ pub(crate) fn route_groups(
     graph: &Graph<'_>,
     addr: &str,
 ) -> GraphResult<OrderedMap<(RouteKind, Option<String>), Vec<String>>> {
+    let outgoing = graph.outgoing(addr)?;
+    graph.work(1 + outgoing.len())?;
+    graph.bytes(outgoing.len() * 96)?;
     let mut groups: OrderedMap<(RouteKind, Option<String>), Vec<String>> = OrderedMap::new();
-    for &edge in graph.outgoing(addr)? {
+    for &edge in outgoing {
         let edge = &graph.edges[edge];
         match groups.get_mut(&edge.group()) {
             Some(list) => list.push(edge.dst.clone()),
@@ -1295,6 +1423,8 @@ pub(crate) fn open_body_forks(
             continue;
         }
         for (group, dsts) in route_groups(graph, &addr)?.iter() {
+            graph
+                .work(graph.outgoing(&addr)?.len() + infos.len().saturating_mul(dsts.len() + 1))?;
             let targets: OrderedSet<String> = dsts.iter().cloned().collect();
             let fans = graph.outgoing(&addr)?.iter().any(|&edge| {
                 let edge = &graph.edges[edge];
@@ -1333,13 +1463,18 @@ fn join_origin(graph: &Graph<'_>, join: &str, idom: &HashMap<&str, &str>) -> Gra
     let mut chain = Vec::new();
     let mut current = Some(first);
     while let Some(step) = current {
+        graph.work(1)?;
+        graph.bytes(64)?;
         current = idom.get(step).copied();
         chain.push(step);
     }
     let dominators: HashSet<_> = chain.iter().copied().collect();
     let fork = |step: &str, fanout_only: bool| -> GraphResult<bool> {
         let mut groups: OrderedMap<(RouteKind, Option<String>), Vec<usize>> = OrderedMap::new();
-        for &edge in graph.outgoing(step)? {
+        let outgoing = graph.outgoing(step)?;
+        graph.work(outgoing.len() * 3 + 1)?;
+        graph.bytes(outgoing.len() * 64)?;
+        for &edge in outgoing {
             let group = graph.edges[edge].group();
             match groups.get_mut(&group) {
                 Some(list) => list.push(edge),
@@ -1408,6 +1543,7 @@ pub(crate) fn analyse_joins(
         .scopes
         .first()
         .and_then(|scope| scope.composition.as_deref());
+    graph.work(graph.nodes.len())?;
     if !graph.nodes.iter().any(|(_, node)| node.kind == "join") {
         return Ok((infos, problems));
     }
@@ -1447,6 +1583,7 @@ pub(crate) fn analyse_joins(
             branches.set(start.clone(), members);
         }
         let mut record = |problem| {
+            budget.diagnostic(&problem, composition)?;
             budget.join_analysis(1, composition)?;
             problems.push(problem);
             Ok(())
@@ -1519,6 +1656,7 @@ pub(crate) fn analyse_joins(
                 continue;
             }
             for prior in &listed[..i] {
+                graph.work(members.len() + 1)?;
                 let shared = members
                     .iter()
                     .filter(|step| prior.contains(*step))
@@ -1538,7 +1676,9 @@ pub(crate) fn analyse_joins(
         }
         for (start, members) in branches.iter() {
             for member in members {
-                for &edge in graph.incoming(member)? {
+                let incoming = graph.incoming(member)?;
+                graph.work(incoming.len() + 1)?;
+                for &edge in incoming {
                     let edge = &graph.edges[edge];
                     if members.contains(&edge.src) || (edge.src == *origin && member == start) {
                         continue;
@@ -1580,6 +1720,9 @@ pub(crate) fn analyse_joins(
         for (start, members) in branches.iter() {
             for member in members {
                 for (group, dsts) in route_groups(graph, member)?.iter() {
+                    graph.work(
+                        dsts.len() + graph.outgoing(member)?.len().saturating_mul(dsts.len()),
+                    )?;
                     let inside: Vec<&String> = dsts
                         .iter()
                         .filter(|dst| members.contains(*dst) || *dst == addr)
@@ -1604,6 +1747,8 @@ pub(crate) fn analyse_joins(
                     if inside.iter().collect::<HashSet<_>>().len() < 2 && !fans {
                         continue;
                     }
+                    graph.work(members.len())?;
+                    graph.bytes(members.len() * 72)?;
                     let mut blocked: OrderedSet<String> = members
                         .iter()
                         .filter(|k| origins.get(*k) == Some(member))
@@ -1637,6 +1782,7 @@ pub(crate) fn analyse_joins(
                 let Value::Number(count) = count else {
                     return unshaped("quorum count is not a number");
                 };
+                graph.work(count.raw().len().div_ceil(8))?;
                 if compare_numbers(Num::Token(count), Num::Host(starts.len())) == Ordering::Greater
                 {
                     let mut pointer = node.pointer.clone();
@@ -1646,7 +1792,7 @@ pub(crate) fn analyse_joins(
                         addr: addr.clone(),
                         message: format!(
                             "count {} exceeds the {} branches of join '{}'",
-                            count.raw(),
+                            number_excerpt(count.raw()),
                             starts.len(),
                             last_of(addr)
                         ),

@@ -16,11 +16,11 @@ pub(crate) use scan::parse_shared;
 pub(crate) use values::{equal, stringify};
 
 use super::error::{fail, Failure};
-use std::mem;
+use std::{collections::HashMap, mem};
 
 /// An authored JSON number lexeme. Constructed only from text matching the
 /// JSON number grammar, the same domain the TS scanners produce.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct NumberToken {
     raw: String,
 }
@@ -57,6 +57,7 @@ pub(crate) enum Value {
 #[derive(Default)]
 pub(crate) struct Object {
     entries: Vec<(String, Value)>,
+    index: Option<HashMap<String, usize>>,
 }
 
 impl Object {
@@ -77,16 +78,26 @@ impl Object {
             *previous = value;
         } else {
             self.entries.push((key, value));
-            self.entries = scan::js_object_order(mem::take(&mut self.entries));
+            *self = Self::from_unique_entries(scan::js_object_order(mem::take(&mut self.entries)));
         }
     }
 
     /// Caller guarantees unique keys.
     pub(super) fn from_unique_entries(entries: Vec<(String, Value)>) -> Self {
-        Self { entries }
+        let index = (entries.len() > 16).then(|| {
+            entries
+                .iter()
+                .enumerate()
+                .map(|(index, (key, _))| (key.clone(), index))
+                .collect()
+        });
+        Self { entries, index }
     }
 
     pub(crate) fn get(&self, key: &str) -> Option<&Value> {
+        if let Some(index) = &self.index {
+            return index.get(key).map(|&index| &self.entries[index].1);
+        }
         self.entries
             .iter()
             .find(|(name, _)| name == key)
@@ -94,7 +105,7 @@ impl Object {
     }
 
     pub(crate) fn contains_key(&self, key: &str) -> bool {
-        self.entries.iter().any(|(name, _)| name == key)
+        self.get(key).is_some()
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -169,7 +180,7 @@ pub(crate) fn quote(text: &str) -> String {
     out
 }
 
-pub(super) fn quote_to(out: &mut impl std::fmt::Write, text: &str) -> std::fmt::Result {
+pub(super) fn quote_to(out: &mut (impl std::fmt::Write + ?Sized), text: &str) -> std::fmt::Result {
     out.write_char('"')?;
     let mut start = 0;
     for (index, byte) in text.bytes().enumerate() {
@@ -183,7 +194,7 @@ pub(super) fn quote_to(out: &mut impl std::fmt::Write, text: &str) -> std::fmt::
     out.write_char('"')
 }
 
-pub(super) fn quote_char(out: &mut impl std::fmt::Write, c: char) -> std::fmt::Result {
+pub(super) fn quote_char(out: &mut (impl std::fmt::Write + ?Sized), c: char) -> std::fmt::Result {
     match c {
         '"' => out.write_str("\\\""),
         '\\' => out.write_str("\\\\"),

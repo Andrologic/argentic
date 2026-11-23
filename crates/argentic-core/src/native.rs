@@ -71,7 +71,7 @@ impl Text {
     pub(crate) fn push(&mut self, s: &Self) {
         self.0.extend_from_slice(&s.0)
     }
-    fn quote_to(&self, out: &mut impl std::fmt::Write) -> std::fmt::Result {
+    fn quote_to(&self, out: &mut (impl std::fmt::Write + ?Sized)) -> std::fmt::Result {
         out.write_char('"')?;
         for c in char::decode_utf16(self.0.iter().copied()) {
             match c {
@@ -237,6 +237,22 @@ impl Value {
             _ => true,
         }
     }
+    /// JS property order, with duplicate keys replaced in their original slot.
+    pub(crate) fn from_entries(entries: impl IntoIterator<Item = (Text, Value)>) -> Self {
+        let mut positions = std::collections::HashMap::<Text, usize>::new();
+        let mut fields: Vec<(Text, Value)> = Vec::new();
+        for (key, value) in entries {
+            if let Some(&position) = positions.get(&key) {
+                fields[position].1 = value;
+            } else {
+                positions.insert(key.clone(), fields.len());
+                fields.push((key, value));
+            }
+        }
+        fields.sort_by_cached_key(|(key, _)| index(key).unwrap_or(u32::MAX));
+        Self::Object(fields)
+    }
+
     pub(crate) fn set(&mut self, key: impl Into<Text>, value: Value) {
         let key = key.into();
         let Self::Object(entries) = self else {
@@ -260,7 +276,10 @@ impl Value {
         out
     }
 
-    pub(crate) fn stringify_to(&self, out: &mut impl std::fmt::Write) -> std::fmt::Result {
+    pub(crate) fn stringify_to(
+        &self,
+        out: &mut (impl std::fmt::Write + ?Sized),
+    ) -> std::fmt::Result {
         enum Task<'a> {
             Value(&'a Value),
             Text(&'static str),

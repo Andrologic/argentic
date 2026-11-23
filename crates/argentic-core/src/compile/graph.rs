@@ -11,6 +11,7 @@ use crate::argentic_core::{
     native::{a, fail, o, s, Error, Text, Value},
     route::{self, NormalizedTarget},
 };
+use crate::SourceBudget;
 use std::{
     collections::{HashMap, HashSet},
     fmt,
@@ -25,6 +26,7 @@ pub(crate) struct CompiledGraph {
     pub(crate) joins: Vec<Value>,
     pub(crate) handlers: Vec<Value>,
     pub(crate) graphless: Value,
+    pub(crate) remaining_json: usize,
 }
 impl CompiledGraph {
     pub(crate) fn has_shared_stop(&self) -> bool {
@@ -45,8 +47,8 @@ impl CompiledGraph {
         false
     }
 
-    pub(crate) fn value(self) -> Value {
-        o([
+    pub(crate) fn append_to(self, target: &mut Value) {
+        for (key, value) in [
             ("entry", self.entry),
             ("scopes", a(self.scopes)),
             ("steps", a(self.steps)),
@@ -54,7 +56,9 @@ impl CompiledGraph {
             ("joins", a(self.joins)),
             ("handlers", a(self.handlers)),
             ("graphlessSubmissionContracts", self.graphless),
-        ])
+        ] {
+            target.set(key, value);
+        }
     }
 }
 fn addr(prefix: &[String], name: &str) -> Vec<String> {
@@ -72,14 +76,21 @@ fn optional(v: Option<&E>) -> Result<&Object> {
     }
 }
 enum JsonWriter {
-    Count { bytes: usize, units: usize },
+    Count {
+        bytes: usize,
+        units: usize,
+        max: usize,
+    },
     Text(Vec<u16>),
 }
 
 impl fmt::Write for JsonWriter {
     fn write_str(&mut self, text: &str) -> fmt::Result {
         match self {
-            Self::Count { bytes, units } => {
+            Self::Count { bytes, units, max } => {
+                if text.len() > *max - *bytes {
+                    return Err(fmt::Error);
+                }
                 *bytes += text.len();
                 *units += if text.is_ascii() {
                     text.len()
@@ -100,11 +111,16 @@ fn budgeted_json(
 ) -> Result<Value> {
     // Reserve the serialized byte length, then write directly into the plan's
     // native UTF-16 representation.
-    let mut output = JsonWriter::Count { bytes: 0, units: 0 };
-    write(&mut output).expect("counting writer");
-    let JsonWriter::Count { bytes, units } = output else {
+    let mut output = JsonWriter::Count {
+        bytes: 0,
+        units: 0,
+        max: budget.remaining_json(),
+    };
+    write(&mut output).map_err(|_| budget.json_limit(composition))?;
+    let JsonWriter::Count { bytes, units, .. } = output else {
         unreachable!()
     };
+    budget.work(bytes.div_ceil(8), composition)?;
     budget.json(bytes, composition)?;
     let mut output = JsonWriter::Text(Vec::with_capacity(units));
     write(&mut output).expect("text writer");
@@ -280,12 +296,20 @@ fn add_route<'a>(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn compile(document: &Object) -> Result<CompiledGraph> {
+    compile_with_budget(document, &SourceBudget::default())
+}
+
+pub(crate) fn compile_with_budget(
+    document: &Object,
+    source: &SourceBudget,
+) -> Result<CompiledGraph> {
     let agents = exact::record(document.get("agents"), "")?;
     let compositions = optional(document.get("compositions"))?;
     let mut scopes = vec![];
-    let mut budget = ExpansionBudget::default();
-    let mut local_budget = ExpansionBudget::default();
+    let mut budget = ExpansionBudget::new(source);
+    let mut local_budget = ExpansionBudget::new(source);
     let mut steps = vec![];
     let mut step_contexts = vec![];
 
@@ -295,13 +319,13 @@ pub(crate) fn compile(document: &Object) -> Result<CompiledGraph> {
     let mut cache: OrderedMap<Option<String>, OrderedMap<String, JoinInfo>> = OrderedMap::new();
     let mut covered = OrderedSet::new();
     if document.contains_key("flow") {
-        let graph = Graph::for_scope(document, None, None, &mut ExpansionBudget::default())?;
-        let (initial, _) = analyse_joins(&graph, &mut ExpansionBudget::default())?;
+        let graph = Graph::for_scope(document, None, None, &mut ExpansionBudget::new(source))?;
+        let (initial, _) = analyse_joins(&graph, &mut ExpansionBudget::new(source))?;
         let members = initial
             .values()
             .flat_map(|i| i.branches.values().flat_map(|b| b.iter().cloned()))
             .collect();
-        covered = Graph::flow_error_covered(document, &members)?;
+        covered = Graph::flow_error_covered(document, &members, &ExpansionBudget::new(source))?;
     }
     enum Task<'a> {
         Visit(
@@ -323,6 +347,7 @@ pub(crate) fn compile(document: &Object) -> Result<CompiledGraph> {
         tasks.push(Task::Visit(flow, vec![], None, None, vec![], vec![]));
     }
     while let Some(task) = tasks.pop() {
+        budget.work(1, None)?;
         match task {
             Task::Visit(container, prefix, parent, composition, bindings, stack) => {
                 let declarations = exact::record(container.get("steps"), "")?;
@@ -333,10 +358,11 @@ pub(crate) fn compile(document: &Object) -> Result<CompiledGraph> {
                         .map(|v| exact::text(Some(v), "").map(str::to_owned))
                         .collect::<std::result::Result<Vec<_>, _>>()?,
                 };
-                let mut binding_value = o([]);
-                for (k, v) in &bindings {
-                    binding_value.set(k.as_str(), s(v.clone()));
-                }
+                let binding_value = Value::from_entries(
+                    bindings
+                        .iter()
+                        .map(|(k, v)| (Text::from(k.as_str()), s(v.as_str()))),
+                );
                 scopes.push(o([
                     ("address", address(&prefix)),
                     (
@@ -632,7 +658,7 @@ pub(crate) fn compile(document: &Object) -> Result<CompiledGraph> {
         .filter(|route| route.kind == "normal")
         .map(|route| ((route.source.as_str(), route.choice), route))
         .collect();
-    let mut expectation_budget = ExpansionBudget::default();
+    let mut expectation_budget = ExpansionBudget::new(source);
     let mut expectation =
         |instructs, route: &CompiledRoute<'_>, composition: Option<&str>| -> Result<Value> {
             expectation_budget.edges(route.targets.len(), composition)?;
@@ -700,15 +726,16 @@ pub(crate) fn compile(document: &Object) -> Result<CompiledGraph> {
         } else {
             a(normal.iter().map(|r| r.value.get("key").clone()))
         };
-        let mut instructions = o([]);
+        let mut instructions = Vec::new();
         if !matches!(choices, Value::Null) {
             for route in &normal {
-                instructions.set(
-                    route.choice.unwrap(),
+                instructions.push((
+                    Text::from(route.choice.unwrap()),
                     expectation(instructs, route, composition)?,
-                );
+                ));
             }
         }
+        let instructions = Value::from_entries(instructions);
         let default = if matches!(choices, Value::Null) {
             expectation(instructs, normal[0], composition)?
         } else {
@@ -728,15 +755,15 @@ pub(crate) fn compile(document: &Object) -> Result<CompiledGraph> {
         );
     }
     drop(outward);
-    let mut graphless = o([]);
+    let mut graphless = Vec::with_capacity(agents.len());
     for (name, agent) in agents.iter() {
         let declaration = exact::record(Some(agent), "")?;
         let agent_json = encoded_json(Some(agent), &mut budget, None)?;
         let contract = contract::create_with_agent(&o([]), declaration, agent_json)?;
-        graphless.set(
-            name,
+        graphless.push((
+            Text::from(name),
             budgeted_json(&mut budget, None, |out| contract.stringify_to(out))?,
-        );
+        ));
     }
     Ok(CompiledGraph {
         entry: scopes
@@ -748,7 +775,8 @@ pub(crate) fn compile(document: &Object) -> Result<CompiledGraph> {
         routes: routes.into_iter().map(|route| route.value).collect(),
         joins,
         handlers,
-        graphless,
+        graphless: Value::from_entries(graphless),
+        remaining_json: budget.remaining_json(),
     })
 }
 

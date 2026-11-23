@@ -183,8 +183,9 @@ pub(crate) fn glob_matches(pattern: &str, text: &str, paths: bool, command: bool
     // current[j]: the tokens so far match subject[..j].
     let mut current = vec![false; subject.len() + 1];
     current[0] = true;
+    let mut next = vec![false; subject.len() + 1];
     for token in &tokens {
-        let mut next = vec![false; subject.len() + 1];
+        next[0] = false;
         match token {
             Token::Literal(c) => {
                 for j in 0..subject.len() {
@@ -204,7 +205,7 @@ pub(crate) fn glob_matches(pattern: &str, text: &str, paths: bool, command: bool
                 }
             }
         }
-        current = next;
+        std::mem::swap(&mut current, &mut next);
     }
     current[subject.len()]
 }
@@ -214,18 +215,27 @@ pub(crate) fn effect_for<'p>(
     permissions: Option<&'p Value>,
     action: &str,
     subject: &str,
+    budget: &crate::SourceBudget,
+    pointer: &str,
 ) -> Result<&'p str, Internal> {
     let (preset, rules) = normalize(permissions)?;
     let mut effect: Option<&'p str> = None;
     for rule in rules.iter().filter(|rule| rule.action == action) {
         let matched = match rule.matcher {
             None => true,
-            Some(pattern) => glob_matches(
-                pattern,
-                subject,
-                action == "read" || action == "write",
-                action == "shell",
-            ),
+            Some(pattern) => {
+                budget.work(pattern.len().saturating_mul(subject.len().max(1)), pointer)?;
+                budget.bytes(
+                    pattern.len().saturating_mul(16) + subject.len().saturating_mul(6),
+                    pointer,
+                )?;
+                glob_matches(
+                    pattern,
+                    subject,
+                    action == "read" || action == "write",
+                    action == "shell",
+                )
+            }
         };
         if matched {
             let current = effect.unwrap_or("allow");

@@ -47,6 +47,10 @@ pub fn compile(
     registry_json: &str,
     number: NativeNumber,
 ) -> Result<String, Failure> {
+    let budget = crate::SourceBudget::default();
+    budget.json_input(registry_json.as_bytes(), "/registry")?;
+    budget.json_input(source_json.as_bytes(), "/source")?;
+    budget.bytes(authored.len().saturating_mul(2), "")?;
     let decoder = Decoder(number);
     let registry = decoder.parse(&Text::from(registry_json)).map_err(syntax)?;
     if !registry.get("format").eq_str("macro-agsdl-registry/030") {
@@ -62,6 +66,7 @@ pub fn compile(
         &native::s(authored),
         &source,
         &registry,
+        &budget,
     )?)
 }
 
