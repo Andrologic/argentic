@@ -25,7 +25,7 @@ use sha2::{Digest, Sha256};
 use sqlx::{SqliteConnection, SqlitePool};
 use std::{
     fs::File,
-    io::Read,
+    io::{self, Read},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -242,6 +242,26 @@ impl ActionPolicySource for Policies {
     }
 }
 
+// flock follows the open file description on Unix. Unlock explicitly when
+// ownership ends so a descriptor inherited by a concurrent fork cannot keep it.
+struct DatabaseLock(Option<File>);
+
+impl DatabaseLock {
+    fn release(&mut self) -> io::Result<()> {
+        if let Some(file) = &self.0 {
+            file.unlock()?;
+            self.0 = None;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for DatabaseLock {
+    fn drop(&mut self) {
+        let _ = self.release();
+    }
+}
+
 /// Owns one database lock, engine incarnation and all execution resources.
 /// Keep it alive until `shutdown` succeeds, then call `close`. Dropping a value
 /// is not a physical Stop receipt. No credentials are read by this API.
@@ -251,7 +271,7 @@ pub struct Host {
     tasks: StreamTasks,
     policies: Policies,
     context: HostContext,
-    _database_lock: File,
+    database_lock: Mutex<DatabaseLock>,
     shutdown_complete: std::sync::atomic::AtomicBool,
 }
 impl Host {
@@ -311,13 +331,22 @@ impl Host {
             .truncate(false)
             .open(data.join("engine.lock"))
             .map_err(io_error)?;
-        lock.try_lock().map_err(|_| {
-            failure(
-                "RUNTIME_UNAVAILABLE",
-                "data",
-                "Standalone database is already owned",
-            )
-        })?;
+        loop {
+            match lock.try_lock() {
+                Ok(()) => break,
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    return Err(failure(
+                        "RUNTIME_UNAVAILABLE",
+                        "data",
+                        "Standalone database is already owned",
+                    ));
+                }
+                Err(std::fs::TryLockError::Error(error))
+                    if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(std::fs::TryLockError::Error(error)) => return Err(io_error(error)),
+            }
+        }
+        let lock = DatabaseLock(Some(lock));
         let retained = opened.retain(&data)?;
         let inputs = Inputs {
             scope: scope(&workspace, &policy_value.owner, &retained)?,
@@ -360,7 +389,7 @@ impl Host {
             tasks: StreamTasks::default(),
             policies,
             context,
-            _database_lock: lock,
+            database_lock: Mutex::new(lock),
             shutdown_complete: std::sync::atomic::AtomicBool::new(false),
         })
     }
@@ -659,7 +688,11 @@ impl Host {
             ));
         }
         self.pool.close().await;
-        Ok(())
+        self.database_lock
+            .lock()
+            .expect("database ownership lock")
+            .release()
+            .map_err(io_error)
     }
 }
 struct Prepared {
@@ -1312,6 +1345,34 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn close_releases_database_ownership_with_a_duplicated_descriptor() {
+        let f = Fixture::new(WAIT);
+        let host = f.open().await.unwrap();
+        // Duplicated descriptors share an open file description on Unix.
+        // A child can briefly keep one between fork and exec.
+        let duplicate = host
+            .database_lock
+            .lock()
+            .unwrap()
+            .0
+            .as_ref()
+            .unwrap()
+            .try_clone()
+            .unwrap();
+        assert_eq!(f.open().await.err().unwrap().code, "RUNTIME_UNAVAILABLE");
+        assert!(host.close().await.is_err());
+        assert_eq!(f.open().await.err().unwrap().code, "RUNTIME_UNAVAILABLE");
+        host.shutdown(&[]).await.unwrap();
+        host.close().await.unwrap();
+        let reopened = f.open().await.unwrap();
+        host.close().await.unwrap();
+        assert_eq!(f.open().await.err().unwrap().code, "RUNTIME_UNAVAILABLE");
+        drop(duplicate);
+        reopened.shutdown(&[]).await.unwrap();
+        reopened.close().await.unwrap();
     }
 
     #[tokio::test]
