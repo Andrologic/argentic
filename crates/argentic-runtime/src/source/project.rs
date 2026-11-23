@@ -540,6 +540,15 @@ impl<'a> Reader<'a> {
                             "Invalid secret name",
                         ));
                     }
+                    if super::mcp_secret_is_reserved(name) {
+                        return Err(project_failure(
+                            "MCP_SECRET_RESERVED",
+                            &path,
+                            &child(&pointer, &i.to_string()),
+                            SourceErrorKind::InvalidContent,
+                            "MCP secret name is reserved by the launcher",
+                        ));
+                    }
                 }
                 project.secrets.insert(server, names);
             }

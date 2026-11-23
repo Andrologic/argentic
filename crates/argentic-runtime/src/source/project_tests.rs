@@ -697,3 +697,36 @@ fn graph_limit_identifies_the_declaring_component_on_open() {
         assert_eq!(location.pointer, "");
     }
 }
+
+#[test]
+fn project_open_locates_secret_names_reserved_by_the_mcp_launcher() {
+    let temp = tempfile::tempdir().unwrap();
+    let requirements = temp.path().join("requirements.json");
+    std::fs::write(
+        temp.path().join("agsdl.json"),
+        json!({
+            "projectFormat":"agsdl-project-1", "contract":"agsdl-0.4.0",
+            "id":"secret-names", "agents":{},
+            "mcpServers":{"local":{"command":["true"]}},
+            "secrets":{"file":"requirements.json"}
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    for name in ["PATH", "BASH_ENV", "LD_PRELOAD", "DYLD_INSERT_LIBRARIES"] {
+        std::fs::write(&requirements, json!({"local":["TOKEN", name]}).to_string()).unwrap();
+        let error = OpenedSource::open_path(temp.path()).err().unwrap();
+        assert_eq!(error.code, "MCP_SECRET_RESERVED", "{name}");
+        let source = error.source.unwrap();
+        assert_eq!(source.path, "requirements.json");
+        assert_eq!(source.pointer, "/local/1");
+    }
+
+    std::fs::write(
+        &requirements,
+        r#"{"local":["HOME","TMPDIR","IFS","NODE_OPTIONS","PYTHONPATH"]}"#,
+    )
+    .unwrap();
+    OpenedSource::open_path(temp.path()).unwrap();
+}

@@ -579,25 +579,37 @@ async fn retained_stdio_refuses_unverified_programs_and_reserved_secrets_before_
             "shell":{"command":["/bin/sh",mutable]},
             "inline":{"command":["sh","-c","exit 0"]},
             "system":{"command":["/bin/echo"]},
+            "relative":{"command":["relative.sh"]},
             "path":{"command":["sh","server.sh"]},
             "loader":{"command":["sh","server.sh"]}
         },
-        "mcpFiles":{"path":["server.sh"],"loader":["server.sh"]},
+        "mcpFiles":{"relative":["relative.sh"],"path":["server.sh"],"loader":["server.sh"]},
         "secrets":{"file":"requirements.json"}
     });
     fs::write(project.path().join("agsdl.json"), doc.to_string()).unwrap();
     fs::write(project.path().join("server.sh"), "#!/bin/sh\nexit 0\n").unwrap();
+    let relative = project.path().join("relative.sh");
+    fs::write(&relative, "#!  tools/interp\nexit 0\n").unwrap();
+    fs::set_permissions(&relative, fs::Permissions::from_mode(0o700)).unwrap();
     fs::write(
         project.path().join("requirements.json"),
-        r#"{"absolute":["TOKEN"],"path":["PATH"],"loader":["DYLD_INSERT_LIBRARIES"]}"#,
+        r#"{"absolute":["TOKEN"],"relative":["TOKEN"]}"#,
     )
     .unwrap();
     let f = Fixture::new_with_project(r#"{"entry":{},"timeline":[]}"#, false, Some(project.path()))
         .await;
-    let capture = flow::inspect_run(f.host.flow030(), &f.host, &f.pool, &f.owner)
+    let mut capture = flow::inspect_run(f.host.flow030(), &f.host, &f.pool, &f.owner)
         .await
         .unwrap()
         .capture;
+    // Older retained captures could declare reserved names.
+    let mut private: Value = serde_json::from_str(&capture.private_capture_json).unwrap();
+    let mut scope: Value =
+        serde_json::from_str(private["callScopeJson"].as_str().unwrap()).unwrap();
+    scope["projectMcp"]["secrets"]["path"] = json!(["PATH"]);
+    scope["projectMcp"]["secrets"]["loader"] = json!(["DYLD_INSERT_LIBRARIES"]);
+    private["callScopeJson"] = json!(scope.to_string());
+    capture.private_capture_json = private.to_string();
     let config = f.config.clone().with_mcp_secrets(Arc::new(|_, _, _| {
         panic!("Refused MCP configuration must not query the vault")
     }));
@@ -606,6 +618,7 @@ async fn retained_stdio_refuses_unverified_programs_and_reserved_secrets_before_
         ("shell", "CALL_FAILED"),
         ("inline", "CALL_FAILED"),
         ("system", "CALL_FAILED"),
+        ("relative", "CALL_FAILED"),
         ("path", "MCP_SECRET_RESERVED"),
         ("loader", "MCP_SECRET_RESERVED"),
     ] {
@@ -618,6 +631,12 @@ async fn retained_stdio_refuses_unverified_programs_and_reserved_secrets_before_
             .err()
             .unwrap_or_else(|| panic!("MCP config for {server} was accepted"));
         assert_eq!(error.code, expected, "{server}: {error:?}");
+        if server == "relative" {
+            assert!(
+                error.detail.contains("absolute shebang interpreter"),
+                "{error:?}"
+            );
+        }
     }
 }
 

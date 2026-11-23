@@ -212,7 +212,8 @@ adapter qualification.
 The process runs with the captured workspace (`scope.root`) as its working
 directory. An AgSDL project selects its program by a relative path or bare
 name listed in that server's `mcpFiles`. Argentic verifies the retained bytes
-at launch and requires the executable flag. The system allowlist consists of
+at launch and requires the executable flag. A retained executable with a
+shebang must name an absolute interpreter path. The system allowlist consists of
 `/bin/sh`, which can also be written as `sh`. Its first argument must name a
 script listed in the server's `mcpFiles`. Argentic substitutes the verified
 retained path for the script and for other arguments that match declared
@@ -242,13 +243,21 @@ cleared environment with the fixed runtime PATH and that server's values.
 The launcher refuses secret names that match a variable it sets, including
 `PATH`, or that control shell startup or dynamic loading. Reserved names
 also include `ENV`, `BASH_ENV`, `BASHOPTS`, `SHELLOPTS`, `PS4` and names
-beginning with `LD_` or `DYLD_`.
+beginning with `LD_` or `DYLD_`. Project opening reports reserved names at
+their entries in the secrets requirements file. Variables such as `HOME`,
+`TMPDIR`, `IFS`, `NODE_OPTIONS` and `PYTHONPATH` remain available because
+their effects depend on the server and its interpreters. Macro must review
+how the approved server and its dependencies interpret the requested names
+and supplied values.
+
 Argentic keeps values in memory and in the child environment. It discards
 stderr and rejects literal secret echoes in tool results and MCP requests
-for human input before retaining them. Macro must approve the server code
-and ensure it keeps credentials out of files, derived output and child
-command lines. Restart fences interrupted work and does not respawn an
-earlier MCP call.
+for human input before retaining them. Macro's approval must cover the server
+code, its shebang interpreter and any program the interpreter dispatches,
+and every workspace file the server reads or executes. This includes files
+loaded by imports or sourced by shell scripts. The server must keep
+credentials out of files, derived output and child command lines. Restart
+fences interrupted work and does not respawn an earlier MCP call.
 
 Argentic checks the declared assets against the retained index before launch.
 The confined MCP process has read access to its declared assets and a write

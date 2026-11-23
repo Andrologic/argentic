@@ -328,6 +328,14 @@ fn valid_json_pointer(pointer: &str) -> bool {
             .all(|rest| rest.starts_with(['0', '1']))
 }
 
+pub(crate) fn mcp_secret_is_reserved(name: &str) -> bool {
+    matches!(
+        name,
+        "PATH" | "ENV" | "BASH_ENV" | "BASHOPTS" | "SHELLOPTS" | "PS4"
+    ) || name.starts_with("LD_")
+        || name.starts_with("DYLD_")
+}
+
 fn invalid(file: &str, pointer: &str, message: &str) -> EngineFailure {
     project_failure(
         "PROJECT",

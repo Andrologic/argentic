@@ -488,6 +488,15 @@ pub(crate) fn mcp_server(
                     "Retained MCP program is not executable",
                 ));
             }
+            if !project
+                .snapshot
+                .allows_shebang(path)
+                .map_err(|error| transport::CallError::new(&error.code, error.message))?
+            {
+                return Err(transport::CallError::transport(
+                    "Retained MCP program requires an absolute shebang interpreter",
+                ));
+            }
             path.to_owned()
         } else if matches!(program, "sh" | "/bin/sh")
             && command
@@ -535,13 +544,7 @@ pub(crate) fn mcp_server(
     let mut secret_values = Vec::new();
     if let Some(project) = project.filter(|project| !project.names.is_empty()) {
         if project.names.iter().any(|name| {
-            grant.environment.contains_key(name)
-                || matches!(
-                    name.as_str(),
-                    "PATH" | "ENV" | "BASH_ENV" | "BASHOPTS" | "SHELLOPTS" | "PS4"
-                )
-                || name.starts_with("LD_")
-                || name.starts_with("DYLD_")
+            grant.environment.contains_key(name) || crate::source::mcp_secret_is_reserved(name)
         }) {
             return Err(transport::CallError::new(
                 "MCP_SECRET_RESERVED",

@@ -316,6 +316,22 @@ impl Snapshot {
             .is_some_and(|entry| entry.executable)
     }
 
+    /// Read the interpreter prefix of a verified member. The host keeps the
+    /// retained directory unchanged between verification and launch.
+    pub(crate) fn allows_shebang(&self, path: &Path) -> Result<bool> {
+        let name = path.strip_prefix(&self.root).map_err(|_| unavailable())?;
+        let dir =
+            Dir::open_ambient_dir(&self.root, ambient_authority()).map_err(|_| unavailable())?;
+        let file = super::open_regular(&dir, name).map_err(|_| unavailable())?;
+        let mut prefix = Vec::with_capacity(256);
+        file.take(256)
+            .read_to_end(&mut prefix)
+            .map_err(|_| unavailable())?;
+        Ok(prefix.strip_prefix(b"#!").is_none_or(|line| {
+            line.iter().find(|&&byte| !matches!(byte, b' ' | b'\t')) == Some(&b'/')
+        }))
+    }
+
     /// Whether a path names a location inside the retained project.
     pub fn contains(&self, path: &Path) -> bool {
         path.starts_with(&self.uri_root) || path.starts_with(&self.root)
