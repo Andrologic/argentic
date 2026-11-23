@@ -105,12 +105,20 @@ fn member_open_requires_real_directories_at_each_component() {
     let root = open_project_root(temp.path()).unwrap();
     let path = Path::new("real/nested/notes.md");
     assert_eq!(
-        read_regular(&root, path, MAX_TOTAL).unwrap().bytes,
+        read_regular(&root, path, MAX_TOTAL, &SourceBudget::default())
+            .unwrap()
+            .bytes,
         b"Notes.\n"
     );
 
     std::os::unix::fs::symlink("real", temp.path().join("alias")).unwrap();
-    assert!(read_regular(&root, Path::new("alias/nested/notes.md"), MAX_TOTAL).is_err());
+    assert!(read_regular(
+        &root,
+        Path::new("alias/nested/notes.md"),
+        MAX_TOTAL,
+        &SourceBudget::default()
+    )
+    .is_err());
     std::os::unix::fs::symlink("nested", temp.path().join("real/alias")).unwrap();
     assert!(member::with_directory(&root, Path::new("real/alias"), Dir::entries).is_err());
 }
@@ -272,10 +280,7 @@ fn retain_never_publishes_an_index_it_cannot_reopen() {
     let files: Files = (0..3000)
         .map(|i| {
             let name = format!("{}/{i:05}", "p".repeat(3000));
-            let file = ProjectFile {
-                bytes: b"x".to_vec(),
-                executable: false,
-            };
+            let file = ProjectFile::new(b"x".to_vec(), false);
             (name, file)
         })
         .collect();
@@ -480,10 +485,7 @@ fn a_retained_copy_does_not_depend_on_file_modes() {
     let files: Files = [("run.sh", true), ("notes.md", false)]
         .into_iter()
         .map(|(name, executable)| {
-            let file = ProjectFile {
-                bytes: b"x".to_vec(),
-                executable,
-            };
+            let file = ProjectFile::new(b"x".to_vec(), executable);
             (name.to_owned(), file)
         })
         .collect();

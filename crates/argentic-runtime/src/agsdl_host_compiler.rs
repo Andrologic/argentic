@@ -1,6 +1,9 @@
 //! Native calculations bind the compiler to captured source and registry bytes.
 //! They authenticate the component, not its semantics against a compromised host.
-use crate::persistence::{dto::EngineSourceRevision, failure, validate_json, Result};
+#[cfg(test)]
+use crate::persistence::validate_json;
+use crate::persistence::{dto::EngineSourceRevision, failure, Result};
+use argentic_core::{SourceBudget, GRAPH_LIMIT_CODE};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -92,7 +95,12 @@ impl CompileBroker {
         authored_source: String,
         registry_json: String,
     ) -> Result<CompileReceipt> {
-        validate_input(&source, &authored_source, &registry_json)?;
+        validate_input(
+            &source,
+            &authored_source,
+            &registry_json,
+            &SourceBudget::default(),
+        )?;
         let ticket = uuid::Uuid::new_v4().to_string();
         let (reply, receiver) = oneshot::channel();
         {
@@ -147,7 +155,8 @@ impl CompileBroker {
         registry_json: String,
         cancelled: &tokio_util::sync::CancellationToken,
     ) -> Result<CompileReceipt> {
-        validate_input(&source, &authored_source, &registry_json)?;
+        let budget = SourceBudget::default();
+        let registry = validate_input(&source, &authored_source, &registry_json, &budget)?;
         #[cfg(test)]
         if self.queue.lock().expect("compiler queue").closed {
             return Err(failure(
@@ -163,8 +172,25 @@ impl CompileBroker {
             authored_source,
             registry_json,
         };
-        let raw_job = serde_json::to_string(&job)?;
-        let captured = job.clone();
+        #[cfg(any(test, feature = "dev-support"))]
+        let raw_job = {
+            // The test probe receives a serialized copy of the original ticket.
+            budget
+                .bytes(
+                    (job.authored_source.len() + job.registry_json.len()) * 12 + 4096,
+                    "/source",
+                )
+                .map_err(native_limit)?;
+            serde_json::to_string(&job)?
+        };
+        #[cfg(not(any(test, feature = "dev-support")))]
+        let raw_job = String::new();
+        let source_json = serde_json::to_string(&job.source)?;
+        let authored_source = std::sync::Arc::new(job.authored_source);
+        let captured_authored = authored_source.clone();
+        let registry_json = job.registry_json;
+        let registry_bytes = registry_json.len();
+        let compute_budget = budget.clone();
         let result_json = tokio::time::timeout(
             std::time::Duration::from_secs(30),
             self.native.run(
@@ -173,17 +199,22 @@ impl CompileBroker {
                 cancelled,
                 raw_job,
                 move || {
-                    crate::calculation::compile(
-                        &captured.authored_source,
-                        &serde_json::to_string(&captured.source)?,
-                        &captured.registry_json,
+                    crate::calculation::compile_with_budget(
+                        &captured_authored,
+                        &source_json,
+                        &registry_json,
+                        &compute_budget,
                     )
-                    .map_err(|_| {
-                        failure(
-                            "RUNTIME_UNAVAILABLE",
-                            "",
-                            "Native calculation could not produce a result",
-                        )
+                    .map_err(|error| {
+                        if error.code == GRAPH_LIMIT_CODE {
+                            native_limit(error)
+                        } else {
+                            failure(
+                                "RUNTIME_UNAVAILABLE",
+                                "",
+                                "Native calculation could not produce a result",
+                            )
+                        }
                     })
                 },
             ),
@@ -198,13 +229,20 @@ impl CompileBroker {
         })??;
         if result_json.len() > 8_000_000 {
             return Err(failure(
-                "CORRELATION",
-                "compiler",
+                "INPUT_LIMIT",
+                "/compiler",
                 "Compiler result exceeds its limit",
             ));
         }
-        validate_json(&result_json)?;
-        validate_result(&job, generation, &serde_json::from_str(&result_json)?)?;
+        check_json(&result_json, "/compiler", &budget)?;
+        validate_result(
+            &job.source,
+            &authored_source,
+            &registry,
+            registry_bytes,
+            &serde_json::from_str(&result_json)?,
+            &budget,
+        )?;
         Ok(CompileReceipt {
             generation: generation.into(),
             result_json,
@@ -263,7 +301,21 @@ impl CompileBroker {
                 "Compiler result does not describe its native ticket",
             ));
         }
-        validate_result(job, generation, &result)?;
+        if job.generation != generation {
+            return Err(failure(
+                "CORRELATION",
+                "compiler",
+                "Compiler ticket generation has changed",
+            ));
+        }
+        validate_result(
+            &job.source,
+            &job.authored_source,
+            &serde_json::from_str(&job.registry_json)?,
+            job.registry_json.len(),
+            &result,
+            &SourceBudget::default(),
+        )?;
         if let Some(pending) = queue.pending.remove(ticket) {
             let _ = pending.reply.send(Ok(CompileReceipt {
                 generation: generation.into(),
@@ -278,23 +330,77 @@ impl CompileBroker {
     }
 }
 
+const INPUT_LIMIT: usize = 4_000_000;
+
+fn native_limit(
+    error: argentic_core::calculation::Failure,
+) -> crate::persistence::dto::EngineFailure {
+    failure(&error.code, &error.pointer, &error.message)
+}
+
+fn native_json_failure(
+    error: argentic_core::calculation::Failure,
+) -> crate::persistence::dto::EngineFailure {
+    if error.code == GRAPH_LIMIT_CODE {
+        native_limit(error)
+    } else {
+        failure("CORRELATION", "", "Invalid execution data")
+    }
+}
+
+fn check_json(raw: &str, pointer: &str, budget: &SourceBudget) -> Result<()> {
+    argentic_core::check_source_json(raw, pointer, budget).map_err(native_json_failure)?;
+    // The host parses this checked text once more to correlate the receipt.
+    budget
+        .json_input(raw.as_bytes(), pointer)
+        .map_err(native_limit)
+}
+
 fn validate_input(
     source: &EngineSourceRevision,
     authored_source: &str,
     registry_json: &str,
-) -> Result<()> {
-    validate_json(&registry_json)?;
-    if authored_source.len() > 4_000_000
-        || registry_json.len() > 4_000_000
-        || format!("{:x}", Sha256::digest(authored_source.as_bytes())) != source.source_sha256
-    {
+    budget: &SourceBudget,
+) -> Result<Value> {
+    for (raw, pointer) in [(authored_source, "/source"), (registry_json, "/registry")] {
+        if raw.len() > INPUT_LIMIT {
+            return Err(failure(
+                "INPUT_LIMIT",
+                pointer,
+                "Compiler input exceeds 4,000,000 bytes",
+            ));
+        }
+    }
+    let identity_bytes = source.owner.project_id.len()
+        + source.owner.plan_id.len()
+        + source.owner.branch.len()
+        + source.revision.len()
+        + source.source_sha256.len();
+    if identity_bytes > INPUT_LIMIT {
+        return Err(failure(
+            "INPUT_LIMIT",
+            "/source",
+            "Compiler source identity exceeds 4,000,000 bytes",
+        ));
+    }
+    budget
+        .work(identity_bytes.div_ceil(8), "/source")
+        .map_err(native_limit)?;
+    budget
+        .bytes(identity_bytes * 24 + 512, "/source")
+        .map_err(native_limit)?;
+    check_json(registry_json, "/registry", budget)?;
+    budget
+        .work(authored_source.len().div_ceil(256), "/source")
+        .map_err(native_limit)?;
+    if format!("{:x}", Sha256::digest(authored_source.as_bytes())) != source.source_sha256 {
         return Err(failure(
             "CORRELATION",
             "source",
             "Compiler input does not match the native capture",
         ));
     }
-    let registry: Value = serde_json::from_str(&registry_json)?;
+    let registry: Value = serde_json::from_str(registry_json)?;
     if registry
         .get("version")
         .and_then(Value::as_str)
@@ -306,15 +412,20 @@ fn validate_input(
             "Captured registry version is absent",
         ));
     }
-    Ok(())
+    Ok(registry)
 }
 
-fn validate_result(job: &HostCompileJob, generation: &str, result: &Value) -> Result<()> {
-    let registry: Value = serde_json::from_str(&job.registry_json)?;
-    if job.generation != generation
-        || result.get("runtime").and_then(|v| v.get("registryVersion")) != registry.get("version")
+fn validate_result(
+    source: &EngineSourceRevision,
+    authored_source: &str,
+    registry: &Value,
+    registry_bytes: usize,
+    result: &Value,
+    budget: &SourceBudget,
+) -> Result<()> {
+    if result.get("runtime").and_then(|v| v.get("registryVersion")) != registry.get("version")
         || result.get("runtime").and_then(|v| v.get("source"))
-            != Some(&serde_json::to_value(&job.source)?)
+            != Some(&serde_json::to_value(source)?)
     {
         return Err(failure(
             "CORRELATION",
@@ -376,7 +487,7 @@ fn validate_result(job: &HostCompileJob, generation: &str, result: &Value) -> Re
             .get("capturedRegistryJson")
             .and_then(Value::as_str)
             .ok_or_else(|| failure("CORRELATION", "registry", "Compiled registry is absent"))?;
-        validate_json(captured_json)?;
+        check_json(captured_json, "/registry", budget)?;
         let captured: Value = serde_json::from_str(captured_json)?;
         if captured.get("version") != registry.get("version")
             || captured.get("models") != registry.get("models")
@@ -433,9 +544,9 @@ fn validate_result(job: &HostCompileJob, generation: &str, result: &Value) -> Re
         }
     }
     if let Some(plan_json) = result.get("compiledPlanJson").and_then(Value::as_str) {
-        validate_json(plan_json)?;
+        check_json(plan_json, "/compiler", budget)?;
         let plan: Value = serde_json::from_str(plan_json)?;
-        if plan.get("source") != Some(&serde_json::to_value(&job.source)?)
+        if plan.get("source") != Some(&serde_json::to_value(source)?)
             || plan.pointer("/versions/registry") != registry.get("version")
         {
             return Err(failure(
@@ -455,10 +566,13 @@ fn validate_result(job: &HostCompileJob, generation: &str, result: &Value) -> Re
                 "Unsupported compiled plan edition",
             ));
         }
-        let same_document = crate::persistence::json_lexemes030::document_tokens_equal(
+        let same_document = argentic_core::source_document_tokens_equal(
             document,
-            &job.authored_source,
-        )?;
+            authored_source,
+            "/source",
+            budget,
+        )
+        .map_err(native_json_failure)?;
         if !same_document {
             return Err(failure(
                 "CORRELATION",
@@ -468,25 +582,57 @@ fn validate_result(job: &HostCompileJob, generation: &str, result: &Value) -> Re
         }
         match plan.get("format").and_then(Value::as_str) {
             Some("macro-agsdl-compiled-plan/2") => {
-                let authored: Value = serde_json::from_str(&job.authored_source)?;
+                budget
+                    .json_input(authored_source.as_bytes(), "/source")
+                    .map_err(native_limit)?;
+                let authored: Value = serde_json::from_str(authored_source)?;
                 let captured = result
                     .get("capturedRegistryJson")
                     .and_then(Value::as_str)
                     .ok_or_else(|| {
                         failure("CORRELATION", "registry", "Compiled registry is absent")
                     })?;
-                validate_json(captured)?;
-                let mut registry_capture = registry.clone();
-                if let Some(object) = registry_capture.as_object_mut() {
-                    for field in [
-                        "startEntry",
-                        "deliveryInput",
-                        "callInput",
-                        "toolPolicyInput",
-                        "callPermissions",
-                        "callScope",
-                    ] {
-                        object.remove(field);
+                check_json(captured, "/registry", budget)?;
+                let captured_json = captured;
+                let captured: Value = serde_json::from_str(captured_json)?;
+                let ignored = [
+                    "startEntry",
+                    "deliveryInput",
+                    "callInput",
+                    "toolPolicyInput",
+                    "callPermissions",
+                    "callScope",
+                ];
+                budget
+                    .work(registry_bytes.div_ceil(16), "/registry")
+                    .map_err(native_limit)?;
+                let mut same_registry = registry.as_object().zip(captured.as_object()).is_some_and(
+                    |(registry, captured)| {
+                        registry
+                            .iter()
+                            .filter(|(key, _)| !ignored.contains(&key.as_str()))
+                            .eq(captured.iter())
+                    },
+                );
+                // The native decoder may change a decimal's spelling, such
+                // as 1.0 to 1. Preserve exact numeric equality in that case.
+                if !same_registry {
+                    if let Some(fields) = registry.as_object() {
+                        budget
+                            .bytes(registry_bytes * 4 + fields.len() * 96, "/registry")
+                            .map_err(native_limit)?;
+                        let observed: std::collections::BTreeMap<_, _> = fields
+                            .iter()
+                            .filter(|(key, _)| !ignored.contains(&key.as_str()))
+                            .collect();
+                        let observed = serde_json::to_string(&observed)?;
+                        same_registry = argentic_core::source_json_equal(
+                            captured_json,
+                            &observed,
+                            "/registry",
+                            budget,
+                        )
+                        .map_err(native_json_failure)?;
                     }
                 }
                 let contract = authored.get("contract").and_then(Value::as_str);
@@ -499,7 +645,7 @@ fn validate_result(job: &HostCompileJob, generation: &str, result: &Value) -> Re
                         != Some("macro-agsdl-030-v1")
                     || result.pointer("/runtime/profile").and_then(Value::as_str)
                         != Some("macro-agsdl-030-v1")
-                    || !argentic_core::durable_json::equal(captured, &registry_capture.to_string())?
+                    || !same_registry
                 {
                     return Err(failure(
                         "CORRELATION",
@@ -507,7 +653,7 @@ fn validate_result(job: &HostCompileJob, generation: &str, result: &Value) -> Re
                         "Compiled 0.3 plan or native observations contradict their ticket",
                     ));
                 }
-                let observed_agents = registry_capture
+                let observed_agents = registry
                     .get("agents")
                     .and_then(Value::as_array)
                     .ok_or_else(|| {
@@ -529,39 +675,50 @@ fn validate_result(job: &HostCompileJob, generation: &str, result: &Value) -> Re
                     .ok_or_else(|| {
                         failure("CORRELATION", "compiler", "Authored agents are absent")
                     })?;
+                budget
+                    .work(
+                        (compiled_agents.len() + observed_agents.len()) * 16,
+                        "/agents",
+                    )
+                    .map_err(native_limit)?;
+                budget
+                    .bytes(
+                        (compiled_agents.len() + observed_agents.len()) * 96,
+                        "/agents",
+                    )
+                    .map_err(native_limit)?;
+                let observed: std::collections::HashMap<_, _> = observed_agents
+                    .iter()
+                    .filter_map(|item| Some((item.get("agentName")?.as_str()?, item)))
+                    .collect();
+                let mut seen = std::collections::HashSet::new();
                 if compiled_agents.len() != observed_agents.len()
                     || compiled_agents.len() != authored_agents.len()
+                    || observed.len() != observed_agents.len()
                     || compiled_agents.iter().any(|agent| {
-                        let name = agent.get("agentName");
-                        name.and_then(Value::as_str).is_none_or(str::is_empty)
-                            || name
-                                .and_then(Value::as_str)
-                                .is_none_or(|name| !authored_agents.contains_key(name))
-                            || observed_agents
+                        let Some(name) = agent
+                            .get("agentName")
+                            .and_then(Value::as_str)
+                            .filter(|name| !name.is_empty())
+                        else {
+                            return true;
+                        };
+                        !seen.insert(name)
+                            || !authored_agents.contains_key(name)
+                            || observed.get(name).is_none_or(|observed| {
+                                [
+                                    "agentDeclarationJson",
+                                    "settingsJson",
+                                    "permissionsJson",
+                                    "scopeJson",
+                                    "evidenceJson",
+                                    "provenanceJson",
+                                ]
                                 .iter()
-                                .filter(|observed| observed.get("agentName") == name)
-                                .count()
-                                != 1
-                            || compiled_agents
-                                .iter()
-                                .filter(|compiled| compiled.get("agentName") == name)
-                                .count()
-                                != 1
-                            || !observed_agents.iter().any(|observed| {
-                                observed.get("agentName") == name
-                                    && [
-                                        "agentDeclarationJson",
-                                        "settingsJson",
-                                        "permissionsJson",
-                                        "scopeJson",
-                                        "evidenceJson",
-                                        "provenanceJson",
-                                    ]
-                                    .iter()
-                                    .all(|field| {
-                                        observed.get(*field).is_some()
-                                            && observed.get(*field) == agent.get(*field)
-                                    })
+                                .any(|field| {
+                                    observed.get(*field).is_none()
+                                        || observed.get(*field) != agent.get(*field)
+                                })
                             })
                     })
                 {
@@ -576,10 +733,13 @@ fn validate_result(job: &HostCompileJob, generation: &str, result: &Value) -> Re
                     let declaration = agent["agentDeclarationJson"].as_str().ok_or_else(|| {
                         failure("CORRELATION", "agent", "Agent declaration is absent")
                     })?;
-                    if !argentic_core::durable_json::equal(
-                        declaration,
-                        &authored_agents[name].to_string(),
-                    )? {
+                    budget
+                        .bytes(declaration.len() * 8 + 256, "/agents")
+                        .map_err(native_limit)?;
+                    let authored = serde_json::to_string(&authored_agents[name])?;
+                    if !argentic_core::source_json_equal(declaration, &authored, "/agents", budget)
+                        .map_err(native_json_failure)?
+                    {
                         return Err(failure(
                             "CORRELATION",
                             "agent",

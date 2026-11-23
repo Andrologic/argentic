@@ -1,4 +1,6 @@
-use super::{archive::hex, file_url, invalid, read_regular, sha256, Files, MAX_JSON_TOTAL};
+use super::{
+    archive::hex, file_url, invalid, read_regular, sha256, Files, SourceBudget, MAX_JSON_TOTAL,
+};
 use crate::persistence::{failure, Result};
 use cap_std::{ambient_authority, fs::Dir};
 use serde::{Deserialize, Serialize};
@@ -107,7 +109,7 @@ pub(super) fn retain(
                     name.clone(),
                     Entry {
                         size: file.bytes.len() as u64,
-                        sha256: sha256(&file.bytes),
+                        sha256: file.digest.clone(),
                         executable: file.executable,
                     },
                 )
@@ -184,10 +186,11 @@ pub(super) fn retain(
     let root =
         Dir::open_ambient_dir(&snapshot.root, ambient_authority()).map_err(|_| unavailable())?;
     for (name, entry) in &snapshot.manifest.files {
-        let file = read_regular(&root, Path::new(name), entry.size).map_err(|_| unavailable())?;
+        let file = read_regular(&root, Path::new(name), entry.size, &SourceBudget::default())
+            .map_err(|_| unavailable())?;
         // The index records the executable flag. The disk mode depends on the
         // umask and on filesystems with fixed modes, so only bytes are checked.
-        if sha256(&file.bytes) != entry.sha256 {
+        if file.digest != entry.sha256 {
             return Err(unavailable());
         }
     }
@@ -222,9 +225,14 @@ impl Snapshot {
         }
         let dir =
             Dir::open_ambient_dir(&directory, ambient_authority()).map_err(|_| unavailable())?;
-        let index =
-            read_regular(&dir, Path::new(INDEX), MAX_JSON_TOTAL).map_err(|_| unavailable())?;
-        if sha256(&index.bytes) != id {
+        let index = read_regular(
+            &dir,
+            Path::new(INDEX),
+            MAX_JSON_TOTAL,
+            &SourceBudget::default(),
+        )
+        .map_err(|_| unavailable())?;
+        if index.digest != id {
             return Err(unavailable());
         }
         let manifest: Manifest = serde_json::from_slice(&index.bytes).map_err(|_| unavailable())?;

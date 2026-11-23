@@ -42,6 +42,18 @@ type Files = BTreeMap<String, ProjectFile>;
 struct ProjectFile {
     bytes: Vec<u8>,
     executable: bool,
+    digest: String,
+}
+
+impl ProjectFile {
+    fn new(bytes: Vec<u8>, executable: bool) -> Self {
+        let digest = sha256(&bytes);
+        Self {
+            bytes,
+            executable,
+            digest,
+        }
+    }
 }
 
 /// One of the original files selected by a project or archive.
@@ -67,13 +79,17 @@ impl OpenedSource {
     /// Open a local JSON document, a project directory or manifest, or an archive.
     /// Only a trusted local caller should select a path on the host machine.
     pub fn open_path(path: &Path) -> Result<Self> {
+        Self::open_path_with_budget(path, SourceBudget::default())
+    }
+
+    /// Open a local source using the supplied operation budget.
+    pub fn open_path_with_budget(path: &Path, budget: SourceBudget) -> Result<Self> {
         // Rebuild from components: with a trailing separator, `lstat` would
         // follow a symlinked project root.
         let path: PathBuf = std::path::absolute(path)
             .map_err(|e| io(path, e))?
             .components()
             .collect();
-        let budget = SourceBudget::default();
         let meta = std::fs::symlink_metadata(&path).map_err(|_| source_unavailable())?;
         if meta.is_dir() || (meta.is_symlink() && path.is_dir()) {
             return Self::assembled(project::assemble_folder_with_budget(
@@ -113,11 +129,13 @@ impl OpenedSource {
             None
         };
         let file = match &dir {
-            Some(dir) => read_regular(dir, Path::new(MANIFEST), MAX_JSON_TOTAL),
-            None => read_local(&path, MAX_JSON_TOTAL),
+            Some(dir) => read_regular(dir, Path::new(MANIFEST), MAX_JSON_TOTAL, &budget),
+            None => read_local(&path, MAX_JSON_TOTAL, &budget),
         }
         .map_err(|e| {
-            if e.kind() == std::io::ErrorKind::FileTooLarge {
+            if let Some(error) = read_limit(name.to_str().unwrap_or(""), &e) {
+                error
+            } else if e.kind() == std::io::ErrorKind::FileTooLarge {
                 failure("INPUT_LIMIT", "host", "Input grew beyond 8 MiB")
             } else {
                 source_unavailable()
@@ -134,13 +152,9 @@ impl OpenedSource {
                 )?);
             }
         }
-        let authored = std::str::from_utf8(&file.bytes)
+        let authored = String::from_utf8(file.bytes)
             .map_err(|_| failure("PARSE", "source", "Source must be UTF-8"))?;
-        budget
-            .json_input(authored.as_bytes(), "")
-            .map_err(|e| source_limit(name.to_str().unwrap_or(""), e))?;
-        crate::persistence::validate_json(authored)?;
-        let authored = authored.to_owned();
+        validate_source_syntax(&authored, name.to_str().unwrap_or(""), &budget)?;
         Ok(Self {
             authored,
             origin: Some(path.canonicalize().map_err(|_| source_unavailable())?),
@@ -151,7 +165,12 @@ impl OpenedSource {
     /// Open untrusted uploaded bytes. References are resolved inside the
     /// archive only. This API never uses a client-supplied local path.
     pub fn open_archive_bytes(bytes: &[u8]) -> Result<Self> {
-        Self::open_archive(Cursor::new(bytes), SourceBudget::default())
+        Self::open_archive_bytes_with_budget(bytes, SourceBudget::default())
+    }
+
+    /// Open uploaded archive bytes using the supplied operation budget.
+    pub fn open_archive_bytes_with_budget(bytes: &[u8], budget: SourceBudget) -> Result<Self> {
+        Self::open_archive(Cursor::new(bytes), budget)
     }
 
     #[cfg(test)]
@@ -164,17 +183,17 @@ impl OpenedSource {
         Self::assembled(project::assemble_archive(files, budget)?)
     }
 
-    fn assembled(project: project::Project) -> Result<Self> {
+    fn assembled(mut project: project::Project) -> Result<Self> {
         // A folder accepts only what its archive could list, which also bounds
         // the retained index that a later run reopens.
-        if archive::inventory(&project.files)?.len() as u64 > archive::INDEX_LIMIT {
+        if archive::inventory_size(&project.files, &project.budget)? > archive::INDEX_LIMIT {
             return Err(invalid(
                 MANIFEST,
                 "",
                 "Project inventory exceeds the 2 MiB archive limit; select fewer or shorter paths",
             ));
         }
-        let authored = encode_document(&project.document, &project.budget)?;
+        let authored = encode_document(&std::mem::take(&mut project.document), &project.budget)?;
         Ok(Self {
             authored,
             origin: None,
@@ -358,6 +377,16 @@ fn source_limit(file: &str, error: argentic_core::calculation::Failure) -> Engin
     )
 }
 
+fn validate_source_syntax(authored: &str, file: &str, budget: &SourceBudget) -> Result<()> {
+    argentic_core::check_source_json(authored, "", budget).map_err(|error| {
+        if error.code == GRAPH_LIMIT_CODE {
+            source_limit(file, error)
+        } else {
+            failure("CORRELATION", "", "Invalid execution data")
+        }
+    })
+}
+
 fn encode_document(value: &Value, budget: &SourceBudget) -> Result<String> {
     struct Writer<'a> {
         budget: &'a SourceBudget,
@@ -368,8 +397,8 @@ fn encode_document(value: &Value, budget: &SourceBudget) -> Result<String> {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
             if let Err(error) = self
                 .budget
-                .bytes(bytes.len(), "")
-                .and_then(|()| self.budget.work(bytes.len().div_ceil(8), ""))
+                .work(bytes.len().div_ceil(8), "")
+                .and_then(|()| reserve_buffer(&mut self.bytes, bytes.len(), self.budget))
             {
                 self.limit = Some(error);
                 return Err(std::io::ErrorKind::FileTooLarge.into());
@@ -520,42 +549,91 @@ fn open_local(path: &Path) -> std::io::Result<std::fs::File> {
     Ok(file)
 }
 
-fn read_local(path: &Path, limit: u64) -> std::io::Result<ProjectFile> {
-    let file = open_local(path)?;
-    let meta = file.metadata()?;
-    let mut bytes = Vec::new();
-    if meta.len() <= limit {
-        (&file).take(limit + 1).read_to_end(&mut bytes)?;
+// Charge the full allocation on growth, as realloc can move the buffer.
+fn reserve_buffer(
+    bytes: &mut Vec<u8>,
+    additional: usize,
+    budget: &SourceBudget,
+) -> std::result::Result<(), argentic_core::calculation::Failure> {
+    let needed = bytes.len() + additional;
+    if needed > bytes.capacity() {
+        let capacity = needed.max(bytes.capacity() * 2);
+        budget.bytes(capacity, "")?;
+        bytes.reserve_exact(capacity - bytes.len());
     }
-    if meta.len() > limit || bytes.len() as u64 > limit {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::FileTooLarge,
-            "File exceeds the read limit",
-        ));
-    }
-    #[cfg(unix)]
-    let executable = {
-        use std::os::unix::fs::PermissionsExt;
-        meta.permissions().mode() & 0o111 != 0
-    };
-    #[cfg(not(unix))]
-    let executable = false;
-    Ok(ProjectFile { bytes, executable })
+    Ok(())
 }
 
-fn read_regular(dir: &Dir, path: &Path, limit: u64) -> std::io::Result<ProjectFile> {
-    let file = open_regular(dir, path)?;
-    let meta = file.metadata()?;
-    let mut bytes = Vec::new();
-    if meta.len() <= limit {
-        file.take(limit + 1).read_to_end(&mut bytes)?;
-    }
-    if meta.len() > limit || bytes.len() as u64 > limit {
-        return Err(std::io::Error::new(
+fn read_limit(file: &str, error: &std::io::Error) -> Option<EngineFailure> {
+    error
+        .get_ref()?
+        .downcast_ref::<argentic_core::calculation::Failure>()
+        .map(|error| source_limit(file, error.clone()))
+}
+
+fn budget_io(error: argentic_core::calculation::Failure) -> std::io::Error {
+    std::io::Error::other(error)
+}
+
+fn bounded_read(
+    mut file: impl Read,
+    size: u64,
+    limit: u64,
+    budget: &SourceBudget,
+) -> std::io::Result<Vec<u8>> {
+    let too_large = || {
+        std::io::Error::new(
             std::io::ErrorKind::FileTooLarge,
             "File exceeds the read limit",
-        ));
+        )
+    };
+    if size > limit {
+        return Err(too_large());
     }
+    let mut bytes = Vec::new();
+    // The observed size normally gives one allocation. Continue with charged
+    // chunks if a concurrently edited file has grown since metadata was read.
+    budget
+        .work((size as usize).div_ceil(256), "")
+        .map_err(budget_io)?;
+    reserve_buffer(&mut bytes, size as usize, budget).map_err(budget_io)?;
+    let mut chunk = [0; 8192];
+    loop {
+        let take = chunk.len().min((limit + 1 - bytes.len() as u64) as usize);
+        let count = match file.read(&mut chunk[..take]) {
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            result => result?,
+        };
+        if count == 0 {
+            return Ok(bytes);
+        }
+        let end = bytes.len() + count;
+        if end as u64 > limit {
+            return Err(too_large());
+        }
+        let growth = end.saturating_sub((size as usize).max(bytes.len()));
+        budget.work(growth.div_ceil(256), "").map_err(budget_io)?;
+        reserve_buffer(&mut bytes, count, budget).map_err(budget_io)?;
+        bytes.extend_from_slice(&chunk[..count]);
+    }
+}
+
+fn read_local(path: &Path, limit: u64, budget: &SourceBudget) -> std::io::Result<ProjectFile> {
+    let file = open_local(path)?;
+    let meta = file.metadata()?;
+    let bytes = bounded_read(file, meta.len(), limit, budget)?;
+    Ok(ProjectFile::new(bytes, false))
+}
+
+fn read_regular(
+    dir: &Dir,
+    path: &Path,
+    limit: u64,
+    budget: &SourceBudget,
+) -> std::io::Result<ProjectFile> {
+    let file = open_regular(dir, path)?;
+    let meta = file.metadata()?;
+    let bytes = bounded_read(file, meta.len(), limit, budget)?;
     #[cfg(unix)]
     let executable = {
         use cap_std::fs::PermissionsExt;
@@ -563,7 +641,7 @@ fn read_regular(dir: &Dir, path: &Path, limit: u64) -> std::io::Result<ProjectFi
     };
     #[cfg(not(unix))]
     let executable = false;
-    Ok(ProjectFile { bytes, executable })
+    Ok(ProjectFile::new(bytes, executable))
 }
 
 fn file_url(path: &Path) -> Result<Url> {

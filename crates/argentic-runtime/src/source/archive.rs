@@ -1,5 +1,8 @@
 //! AgSDL archive format 1. Read or write one bounded ZIP32 member at a time.
-use super::{invalid, parse_json, sha256, Files, ProjectFile, MANIFEST, MAX_FILES, MAX_TOTAL};
+use super::{
+    invalid, parse_json, sha256, source_limit, Files, ProjectFile, SourceBudget, MANIFEST,
+    MAX_FILES, MAX_TOTAL,
+};
 use crate::persistence::{dto::EngineFailure, failure, Result};
 use serde::Deserialize;
 use std::{
@@ -46,21 +49,71 @@ pub(super) fn hex(value: &str, len: usize) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
-pub(super) fn inventory(files: &Files) -> Result<Vec<u8>> {
-    let rows = files
-        .iter()
-        .map(|(name, file)| {
-            (
-                name.clone(),
-                serde_json::json!({"executable":file.executable,
-                    "sha256":sha256(&file.bytes),"size":file.bytes.len()}),
-            )
-        })
-        .collect::<serde_json::Map<_, _>>();
-    let index = serde_json::json!({"archiveFormat":FORMAT,"files":rows});
-    let mut bytes = serde_json::to_vec(&index)?;
-    bytes.push(b'\n');
-    Ok(bytes)
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExportIndex<'a> {
+    archive_format: &'static str,
+    files: ExportFiles<'a>,
+}
+
+struct ExportFiles<'a>(&'a Files);
+
+impl serde::Serialize for ExportFiles<'_> {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        #[derive(serde::Serialize)]
+        struct Entry<'a> {
+            executable: bool,
+            sha256: &'a str,
+            size: usize,
+        }
+
+        let mut map = serializer.serialize_map(Some(self.0.len()))?;
+        for (name, file) in self.0 {
+            map.serialize_entry(
+                name,
+                &Entry {
+                    executable: file.executable,
+                    sha256: &file.digest,
+                    size: file.bytes.len(),
+                },
+            )?;
+        }
+        map.end()
+    }
+}
+
+fn export_index(files: &Files) -> ExportIndex<'_> {
+    ExportIndex {
+        archive_format: FORMAT,
+        files: ExportFiles(files),
+    }
+}
+
+pub(super) fn inventory_size(files: &Files, budget: &SourceBudget) -> Result<u64> {
+    let mut size = 1;
+    // The portable path rules exclude all characters escaped by serde_json.
+    // Count the exact encoded index using the same serializer as export.
+    struct Size<'a>(&'a mut u64);
+    impl Write for Size<'_> {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            *self.0 += bytes.len() as u64;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    for name in files.keys() {
+        budget
+            .work(16 + name.len().div_ceil(8), "")
+            .map_err(|e| source_limit(MANIFEST, e))?;
+    }
+    serde_json::to_writer(Size(&mut size), &export_index(files))?;
+    Ok(size)
 }
 
 fn check_export_limits(files: usize, total: u64, index: u64, directory: u64) -> Result<()> {
@@ -87,7 +140,8 @@ pub(super) fn write(files: &Files, output: impl Write) -> Result<()> {
             "No selected project files to archive",
         ));
     }
-    let index = inventory(files)?;
+    let mut index = serde_json::to_vec(&export_index(files))?;
+    index.push(b'\n');
     let total = files.values().map(|file| file.bytes.len() as u64).sum();
     let directory = 46
         + INDEX_NAME.len() as u64
@@ -284,7 +338,12 @@ impl Member {
         u64::from(u32_at(&self.header, 24))
     }
 
-    fn read(&self, input: &mut (impl Read + Seek), name: &str) -> Result<Vec<u8>> {
+    fn read(
+        &self,
+        input: &mut (impl Read + Seek),
+        name: &str,
+        budget: &SourceBudget,
+    ) -> Result<Vec<u8>> {
         let malformed = |detail| invalid(name, "", detail);
         let io = |e: std::io::Error| invalid(name, "", &e.to_string());
         let header = read_at::<30>(input, self.offset).map_err(io)?;
@@ -316,14 +375,28 @@ impl Member {
         if !descriptor && tail_len != 0 {
             return Err(layout("Unaccounted bytes after ZIP member data"));
         }
+        budget
+            .work((name.len() + extra_len).div_ceil(8) + 1, "")
+            .and_then(|()| budget.bytes(name.len() + extra_len, ""))
+            .map_err(|e| source_limit(name, e))?;
         let mut fields = vec![0; name.len() + extra_len];
         input.read_exact(&mut fields).map_err(io)?;
         if &fields[..name.len()] != name.as_bytes() || !plain_extras(&fields[name.len()..], name) {
             return Err(malformed("Invalid ZIP local name or extra fields"));
         }
+        let size = self.size() as usize;
+        // Account for CRC, later SHA-256, and both sides of inflation. The
+        // decoder also needs its input buffer and at most a 32 KiB window.
+        budget
+            .work(
+                size.div_ceil(256) * 2 + (compressed as usize).div_ceil(256),
+                "",
+            )
+            .and_then(|()| budget.bytes(size + if method == 8 { 48 * 1024 } else { 0 }, ""))
+            .map_err(|e| source_limit(name, e))?;
         let bytes = if method == 0 {
-            let mut bytes = Vec::new();
-            input.take(compressed).read_to_end(&mut bytes).map_err(io)?;
+            let mut bytes = vec![0; size];
+            input.read_exact(&mut bytes).map_err(io)?;
             bytes
         } else {
             inflate(input.take(compressed), compressed, self.size()).map_err(io)?
@@ -357,7 +430,7 @@ fn inflate(input: impl Read, compressed: u64, size: u64) -> std::io::Result<Vec<
     let mut stream = BufReader::new(input);
     let mut decoder = Decompress::new(false);
     let mut output = [0; 8192];
-    let mut bytes = Vec::new();
+    let mut bytes = Vec::with_capacity(size as usize);
     loop {
         let data = stream.fill_buf()?;
         let before = (decoder.total_in(), decoder.total_out());
@@ -449,6 +522,10 @@ fn members(
                 "Invalid ZIP directory entry or exceeded archive limits",
             ));
         }
+        budget
+            .work((name_len + extra_len).div_ceil(8), "")
+            .and_then(|()| budget.bytes(name_len * 3, ""))
+            .map_err(|e| source_limit("archive.json", e))?;
         let mut fields = vec![0; name_len + extra_len];
         input.read_exact(&mut fields).map_err(io)?;
         let name = std::str::from_utf8(&fields[..name_len])
@@ -508,7 +585,7 @@ pub(super) fn read_with_budget(
         .remove(INDEX_NAME)
         .filter(|entry| entry.size() <= INDEX_LIMIT)
         .ok_or_else(|| invalid("archive.json", "", "Missing or oversized inventory"))?;
-    let raw = manifest.read(&mut input, "archive.json")?;
+    let raw = manifest.read(&mut input, "archive.json", budget)?;
     let value = parse_json(&raw, "archive.json", false, budget)?;
     if value.get("history").is_some_and(serde_json::Value::is_null) {
         return Err(invalid(
@@ -578,16 +655,17 @@ pub(super) fn read_with_budget(
         let member = entries
             .remove(name)
             .ok_or_else(|| invalid(name, "", "Missing ZIP member"))?;
-        if !argentic_core::durable_json::equal(&member.size().to_string(), &size.to_string())
-            .unwrap_or(false)
+        let size = size.to_string();
+        budget
+            .work(size.len().div_ceil(8) + 1, "")
+            .and_then(|()| budget.bytes(size.len() * 8 + 256, ""))
+            .map_err(|e| source_limit(name, e))?;
+        if !argentic_core::durable_json::equal(&member.size().to_string(), &size).unwrap_or(false)
             || !hex(digest, 64)
         {
             return Err(invalid(name, "", "Invalid inventory size or SHA-256"));
         }
-        budget
-            .work((member.size() as usize).div_ceil(256) * 2, "")
-            .map_err(|e| super::source_limit(name, e))?;
-        let bytes = member.read(&mut input, name)?;
+        let bytes = member.read(&mut input, name, budget)?;
         if sha256(&bytes) != digest {
             return Err(invalid(name, "", "SHA-256 does not match the inventory"));
         }
@@ -611,6 +689,7 @@ pub(super) fn read_with_budget(
             ProjectFile {
                 bytes,
                 executable: file.executable,
+                digest: file.sha256,
             },
         );
     }
@@ -667,10 +746,16 @@ pub(super) mod tests {
         let budget = super::super::SourceBudget::default();
         let mut directory = members(&mut input, &budget).unwrap();
         let member = directory.get_mut("archive.json").unwrap();
-        assert_eq!(member.read(&mut input, "archive.json").unwrap(), b"{}");
+        assert_eq!(
+            member.read(&mut input, "archive.json", &budget).unwrap(),
+            b"{}"
+        );
         member.end += 1;
         assert_eq!(
-            member.read(&mut input, "archive.json").unwrap_err().code,
+            member
+                .read(&mut input, "archive.json", &budget)
+                .unwrap_err()
+                .code,
             "ARCHIVE_LAYOUT"
         );
         zip.push(0);

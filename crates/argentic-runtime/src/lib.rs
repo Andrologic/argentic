@@ -12,6 +12,21 @@ pub mod calculation {
             super::native_numbers::normalize,
         )
     }
+    /// Compile as part of a source operation with a shared budget.
+    pub fn compile_with_budget(
+        authored: &str,
+        source: &str,
+        registry: &str,
+        budget: &argentic_core::SourceBudget,
+    ) -> Result<String, Failure> {
+        argentic_core::calculation::compile_with_budget(
+            authored,
+            source,
+            registry,
+            super::native_numbers::normalize,
+            budget,
+        )
+    }
     pub fn work(input: &str) -> Result<String, Failure> {
         argentic_core::calculation::work(input, super::native_numbers::normalize)
     }

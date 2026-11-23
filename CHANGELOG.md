@@ -6,6 +6,10 @@
   parsing, expansion, validation and output. `GRAPH_LIMIT` locates refusals,
   including when diagnostics or the retained compiled plan exceed their limits.
   Approval prompt checks reuse results across converging routes.
+- Project readers reserve selected file and ZIP buffers before allocation and
+  reuse verified file digests. Diagnostic producers stop at the report cap,
+  including JSON escapes. The native compiler preserves `GRAPH_LIMIT` pointers
+  and reports its 4,000,000-byte input limit as `INPUT_LIMIT`.
 - Project folders pin their root before reading the manifest and members,
   and restore executable flags from the first matching lowercase AgSDL
   sidecar on Windows. Direct local file opens reject reparse points.

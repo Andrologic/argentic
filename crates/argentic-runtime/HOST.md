@@ -153,20 +153,30 @@ Each operation permits 8,000,000 work units and 256 MiB of estimated cumulative
 allocation. Work units count input scans, visits and comparisons. The byte
 allowance includes temporary allocations and retained output. JSON parsing
 allows 128 levels of nesting and property names up to 4,096 source bytes.
-The archive file and project component limits above also apply.
+Folder and ZIP opens reserve selected file bytes before reading them. ZIP opens
+also charge decompression buffers. The archive and component size limits still
+apply, and temporary allocations share the 256 MiB budget with retained data.
+
+The native compiler accepts up to 4,000,000 UTF-8 bytes each for the assembled
+document and the registry. A project can open successfully and assemble a
+document above that limit. `Engine::compile_document` then returns
+`INPUT_LIMIT` at `/source` or `/registry`. The native compiler result has a
+separate 8,000,000-byte transport limit.
 
 Expansion allows 8,192 graph nodes, 32,768 route targets and 32 nested
 composition bodies. Join analysis allows 131,072 branch records, memberships
-and diagnostics per pass. Validation allows 1,024 diagnostics and 512 KiB of
-diagnostic data before adding a limit diagnostic. Messages retain up to 2 KiB,
-with short excerpts of long authored values. The compiler charges retained
+and diagnostics per pass. Validation retains up to 1,024 diagnostics and
+reserves space for a final limit diagnostic within 512 KiB of encoded
+diagnostics. The limit includes JSON escapes. Join metadata has its own
+expansion limits. Messages retain up to 2 KiB, with short excerpts of long
+authored values. The compiler charges retained
 graph JSON and the encoded plan together against the 32 MiB graph JSON cap.
 
 `GRAPH_LIMIT` covers source work, bytes, nesting, expansion and diagnostic
 limits. Its pointer identifies the relevant field, composition or `/flow`.
 Project open maps that location to the declaring file and returns a structured
-`SourceDiagnostic` with kind `invalidContent`. The existing native result size
-limit still uses `INPUT_LIMIT`.
+`SourceDiagnostic` with kind `invalidContent`. The native compiler preserves
+`GRAPH_LIMIT` and its pointer when a calculation refuses an input.
 
 Plain JSON read failures retain their host codes, `SOURCE_UNAVAILABLE`
 and `INPUT_LIMIT`. For project diagnostics, `EngineFailure.source` can carry

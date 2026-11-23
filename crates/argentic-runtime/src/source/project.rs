@@ -1,7 +1,7 @@
 use super::{
-    archive, encode_document, invalid, io, member, open_regular, parse_json, project_failure,
-    read_regular, source_limit, Files, SourceBudget, GRAPH_LIMIT_CODE, MANIFEST, MAX_FILES,
-    MAX_JSON, MAX_JSON_TOTAL, MAX_TOTAL,
+    archive, bounded_read, encode_document, invalid, io, member, open_regular, parse_json,
+    project_failure, read_limit, read_regular, source_limit, Files, SourceBudget, GRAPH_LIMIT_CODE,
+    MANIFEST, MAX_FILES, MAX_JSON, MAX_JSON_TOTAL, MAX_TOTAL,
 };
 use crate::persistence::{dto::SourceErrorKind, Result};
 use cap_std::fs::Dir;
@@ -114,6 +114,12 @@ fn restore_executable_modes(dir: &Dir, files: &mut Files, budget: &SourceBudget)
     let root = Path::new(MANIFEST);
     // Both folder and archive assembly preserve the project's selection.
     // Only a root file outside it can carry unpacker metadata.
+    for name in files.keys() {
+        budget
+            .work(name.len().div_ceil(8) + 1, "")
+            .and_then(|()| budget.bytes(name.len() * 3 + 64, ""))
+            .map_err(|e| source_limit(MANIFEST, e))?;
+    }
     let selected = files
         .keys()
         .map(|name| archive::path_key(name))
@@ -142,18 +148,23 @@ fn restore_executable_modes(dir: &Dir, files: &mut Files, budget: &SourceBudget)
             Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => continue,
             Err(error) => return Err(io(path, error)),
         }
-        let mut bytes = Vec::new();
-        input
-            .take(archive::INDEX_LIMIT + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|e| io(path, e))?;
-        if bytes.len() as u64 > archive::INDEX_LIMIT {
-            return Err(invalid(
-                name,
-                "",
-                "Executable metadata exceeds the 2 MiB limit",
-            ));
-        }
+        let size = input
+            .metadata()
+            .map_err(|e| io(path, e))?
+            .len()
+            .saturating_sub(MODE_HEADER.len() as u64);
+        let bytes = bounded_read(input, size, archive::INDEX_LIMIT, budget).map_err(|e| {
+            if let Some(error) = read_limit(name, &e) {
+                error
+            } else if e.kind() == std::io::ErrorKind::FileTooLarge {
+                invalid(name, "", "Executable metadata exceeds the 2 MiB limit")
+            } else {
+                io(path, e)
+            }
+        })?;
+        budget
+            .work(bytes.len().div_ceil(8), "")
+            .map_err(|e| source_limit(name, e))?;
         let paths = std::str::from_utf8(&bytes)
             .map_err(|_| invalid(name, "", "Executable metadata must be UTF-8"))?;
         for path in paths.split_terminator('\n') {
@@ -188,6 +199,7 @@ impl<'a> Reader<'a> {
         // Folder and archive inputs select the same portable names.
         self.budget
             .work(1 + path.len().div_ceil(8), "")
+            .and_then(|()| self.budget.bytes(128 + path.len() * 4, ""))
             .map_err(|e| source_limit(path, e))?;
         archive::portable(path)?;
         for (end, _) in path
@@ -206,18 +218,23 @@ impl<'a> Reader<'a> {
                 .as_ref()
                 .ok_or_else(|| invalid(path, "", "File absent from archive inventory"))?;
             let remaining = MAX_TOTAL - self.total;
-            let file = read_regular(dir, Path::new(path), limit.min(remaining)).map_err(|e| {
-                let own_size = member::metadata(dir, Path::new(path)).map_or(0, |meta| meta.len());
-                match e.kind() {
-                    std::io::ErrorKind::FileTooLarge if own_size <= limit => {
-                        invalid(path, "", "Project selection exceeds the 256 MiB total")
+            let file = read_regular(dir, Path::new(path), limit.min(remaining), &self.budget)
+                .map_err(|e| {
+                    if let Some(error) = read_limit(path, &e) {
+                        return error;
                     }
-                    std::io::ErrorKind::FileTooLarge | std::io::ErrorKind::InvalidData => {
-                        invalid(path, "", &e.to_string())
+                    let own_size =
+                        member::metadata(dir, Path::new(path)).map_or(0, |meta| meta.len());
+                    match e.kind() {
+                        std::io::ErrorKind::FileTooLarge if own_size <= limit => {
+                            invalid(path, "", "Project selection exceeds the 256 MiB total")
+                        }
+                        std::io::ErrorKind::FileTooLarge | std::io::ErrorKind::InvalidData => {
+                            invalid(path, "", &e.to_string())
+                        }
+                        _ => io(Path::new(path), e),
                     }
-                    _ => io(Path::new(path), e),
-                }
-            })?;
+                })?;
             self.total += file.bytes.len() as u64;
             self.files.insert(path.to_owned(), file);
         }
