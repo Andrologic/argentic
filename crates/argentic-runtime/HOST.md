@@ -271,6 +271,48 @@ need them. Existing
 standalone restart rules still apply. A new process shows prior interrupted
 runs and reconciles their pending Stops.
 
+## Per-run model selection
+
+For each Start, Macro can provide a map from agent ID to a replacement
+model. Prepare the observed registry for the authored document as usual.
+Apply the replacement choices before calculating the registry version and
+calling `Engine::compile_document`.
+
+```rust
+use argentic_runtime::{
+    capture::{apply_model_overrides, ModelOverride},
+    persistence::Result,
+};
+use serde_json::Value;
+use std::collections::BTreeMap;
+
+fn apply_launch_models(
+    registry: &mut Value,
+    models: &BTreeMap<String, ModelOverride>,
+) -> Result<()> {
+    apply_model_overrides(registry, models)
+}
+```
+
+`ModelOverride { name: String, effort: Option<String> }` replaces the
+complete authored model choice for that agent. Omit `effort` to use the
+replacement model's observed default. The compiler checks the harness
+module, installed adapter capabilities and observed catalogue. The
+document's harness, version constraint and permissions govern the run
+as authored, with the harness module selected by the validator.
+
+Pass the compiler's plan and `capturedRegistryJson` into the usual native
+Start capture. Keep the same authored bytes, `source_sha256`, project
+snapshot and bound scope. Use the same choices when rechecking inputs
+before commit. A Start request ID always returns its original admitted
+capture on retry. Use a new request ID to submit different choices.
+
+Inspection returns the selected replacements and effective effort in
+`RuntimeProjectionPage030::model_overrides` (`modelOverrides` in JSON).
+The run stores the requested choices in the registry and plan, alongside
+the plan's resolved model and effort. Replay checks their agreement with
+the retained catalogue without contacting the provider.
+
 ## Build and open
 
 Keep `argentic-core` beside `argentic-runtime`. Each owns a manifest and lockfile.

@@ -2,7 +2,138 @@
 use crate::persistence::{failure, Result};
 use semver::{Version, VersionReq};
 use serde_json::{json, Value};
-use std::{collections::BTreeSet, path::Path, sync::OnceLock};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+    sync::OnceLock,
+};
+
+/// A host-selected model and optional effort for one agent in a run.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ModelOverride {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+}
+
+/// Add a run's model choices to its native observations before versioning
+/// the registry and compiling. Keep all authored agent declarations intact.
+pub fn apply_model_overrides(
+    registry: &mut Value,
+    overrides: &BTreeMap<String, ModelOverride>,
+) -> Result<()> {
+    if overrides.is_empty() {
+        return Ok(());
+    }
+    let agents = registry["agents"]
+        .as_array_mut()
+        .ok_or_else(model_correlation)?;
+    let mut entries = Vec::with_capacity(overrides.len());
+    let mut seen = BTreeSet::new();
+    for (index, agent) in agents.iter().enumerate() {
+        let Some(name) = agent["agentName"].as_str() else {
+            continue;
+        };
+        let Some(model) = overrides.get(name) else {
+            continue;
+        };
+        if !seen.insert(name) || agent.get("modelOverride").is_some() {
+            return Err(model_correlation());
+        }
+        entries.push((index, serde_json::to_value(model)?));
+    }
+    if entries.len() != overrides.len() {
+        return Err(failure(
+            "MODEL_OVERRIDE",
+            "modelOverrides",
+            "No native observation exists for the agent",
+        ));
+    }
+    for (index, model) in entries {
+        agents[index]["modelOverride"] = model;
+    }
+    Ok(())
+}
+
+fn model_correlation() -> crate::persistence::dto::EngineFailure {
+    failure(
+        "CORRELATION",
+        "modelOverrides",
+        "Retained model selection differs from the native registry",
+    )
+}
+
+/// Match the frozen choice to the native request and recorded catalogue.
+/// Old captures omit the optional field on both sides.
+pub(crate) fn verify_model_overrides(
+    plan: &crate::persistence::flow030::FlowPlan030,
+    registry: &Value,
+) -> Result<BTreeMap<String, ModelOverride>> {
+    let observed: BTreeMap<_, _> = registry["agents"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|agent| Some((agent["agentName"].as_str()?, agent.get("modelOverride")?)))
+        .collect();
+    let mut effective = BTreeMap::new();
+    for agent in &plan.agents {
+        let name = agent["agentName"].as_str().unwrap_or_default();
+        let replacement = agent.get("modelOverride");
+        if replacement != observed.get(name).copied() {
+            return Err(model_correlation());
+        }
+        let Some(replacement) = replacement else {
+            continue;
+        };
+        let requested: ModelOverride =
+            serde_json::from_value(replacement.clone()).map_err(|_| model_correlation())?;
+        let harness = registry["harnesses"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|candidate| {
+                candidate["harness"] == agent["harness"]
+                    && candidate["version"] == agent["harnessVersion"]
+                    && candidate["adapterId"] == agent["adapterId"]
+            })
+            .ok_or_else(model_correlation)?;
+        let model = harness["models"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|model| model["name"] == requested.name)
+            .ok_or_else(model_correlation)?;
+        let effort = requested
+            .effort
+            .as_deref()
+            .or_else(|| model["defaultEffort"].as_str());
+        if agent["modelName"] != requested.name
+            || agent["modelEffort"].as_str() != effort
+            || (effort.is_none() && !agent["modelEffort"].is_null())
+            || effort.is_some_and(|effort| {
+                !model["efforts"]
+                    .as_array()
+                    .is_some_and(|levels| levels.iter().any(|level| level == effort))
+            })
+            || effective
+                .insert(
+                    name.to_owned(),
+                    ModelOverride {
+                        name: requested.name,
+                        effort: effort.map(str::to_owned),
+                    },
+                )
+                .is_some()
+        {
+            return Err(model_correlation());
+        }
+    }
+    if effective.len() != observed.len() {
+        return Err(model_correlation());
+    }
+    Ok(effective)
+}
 
 pub(crate) fn document_location(scope: &Value) -> Result<Option<url::Url>> {
     scope

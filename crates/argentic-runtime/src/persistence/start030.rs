@@ -146,6 +146,7 @@ pub fn validate_capture(
             "Compiled plan does not match the authenticated capture",
         ));
     }
+    crate::capture::verify_model_overrides(&plan, &registry)?;
     Ok(plan)
 }
 

@@ -5,6 +5,9 @@
 - Native local stdio MCP call steps can launch verified project assets from
   a retained snapshot. `HostContext::with_mcp_secrets` supplies each server's
   declared environment variables at spawn.
+- Native hosts can select a replacement model and effort per agent at Start.
+  Inspection and replay read the frozen selection with the original source
+  identity.
 
 - Project opening and compilation share work and allocation budgets across
   parsing, expansion, validation and output. `GRAPH_LIMIT` locates refusals,

@@ -246,6 +246,12 @@ impl Fixture {
             .values()
             .all(|a| a["harness"] == "codex")
         {
+            let mut models = vec![
+                json!({"name":"fixture","efforts":["medium"],"defaultEffort":"medium","isDefault":true}),
+            ];
+            if fixture.get("modelOverrides").is_some() {
+                models.push(json!({"name":"fixture-replacement","efforts":["high","low"],"defaultEffort":"high","isDefault":false}));
+            }
             let observed = crate::agsdl_host_codex::CodexObservation030 {
                 profile: crate::agsdl_host_codex::profile::Profile {
                     executable: workspace.join("bin/codex"),
@@ -255,9 +261,7 @@ impl Fixture {
                     digest: "synthetic-profile".into(),
                 },
                 version: "0.167.0".into(),
-                models: vec![
-                    json!({"name":"fixture","efforts":["medium"],"defaultEffort":"medium","isDefault":true}),
-                ],
+                models,
                 account_digest: "synthetic-account".into(),
             };
             let (harness, agents) = crate::test_context::codex_registry030(
@@ -279,6 +283,13 @@ impl Fixture {
                 .unwrap()
         };
         registry["format"] = "macro-agsdl-registry/030".into();
+        if let Some(models) = fixture.get("modelOverrides") {
+            crate::capture::apply_model_overrides(
+                &mut registry,
+                &serde_json::from_value(models.clone()).unwrap(),
+            )
+            .unwrap();
+        }
         registry["version"] = json!(format!(
             "sha256:{:x}",
             Sha256::digest(registry.to_string().as_bytes())
@@ -2251,4 +2262,121 @@ async fn native_approval_roundtrip_in_shared_sqlite_memory() {
         "{observed}"
     );
     f.pool.close().await;
+}
+
+#[tokio::test]
+async fn model_override_is_admitted_projected_and_replay_checked() {
+    let document = json!({
+        "contract":"agsdl-0.4.0","id":"model-override",
+        "agents":{"worker":{"harness":"codex","permissions":"read-only",
+            "model":{"name":"not-installed","effort":"medium"}}},
+        "flow":{"entry":"check","steps":{"check":{"type":"agent","agent":"worker"}}}
+    });
+    let f = Fixture::new(
+        &json!({
+            "document":document,"entry":{},"timeline":[],
+            "modelOverrides":{"worker":{"name":"fixture-replacement"}}
+        })
+        .to_string(),
+    )
+    .await;
+    let capture_json: String =
+        sqlx::query_scalar("SELECT capture_json FROM engine_start030_requests")
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+    let capture: StartCapture030 = serde_json::from_str(&capture_json).unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&capture.authored_source).unwrap(),
+        document
+    );
+    assert_eq!(f.plan.document_json, capture.authored_source);
+    assert_eq!(
+        capture.source.source_sha256,
+        format!("{:x}", Sha256::digest(capture.authored_source.as_bytes()))
+    );
+    assert_eq!(f.plan.agents[0]["modelName"], "fixture-replacement");
+    assert_eq!(f.plan.agents[0]["modelEffort"], "high");
+    assert_eq!(
+        f.plan.agents[0]["modelOverride"],
+        json!({"name":"fixture-replacement"})
+    );
+    let page = f
+        .host
+        .runtime_projection(
+            &f.pool,
+            crate::api::RuntimeProjectionQuery030 {
+                system_start_id: f.identity.system_start_id.clone(),
+                source: capture.source.clone(),
+                snapshot_id: Some(f.identity.snapshot_id.clone()),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        page.model_overrides["worker"],
+        crate::capture::ModelOverride {
+            name: "fixture-replacement".into(),
+            effort: Some("high".into()),
+        }
+    );
+    let path = f._temp.path().join("run.db");
+    let run_path = &path;
+    let replay = || {
+        crate::persistence::replay_verify030::verify_path030(
+            run_path,
+            &f.identity.system_start_id,
+            &f.identity.flow_invocation_id,
+        )
+    };
+    let positive = replay().await;
+    assert!(positive.ok, "{:?}", positive.divergence);
+
+    let registry: Value = serde_json::from_str(&capture.registry_json).unwrap();
+    for (replacement, capability, diagnostic) in [
+        (json!({"name":"unavailable"}), None, "MODEL_UNAVAILABLE"),
+        (
+            json!({"name":"fixture-replacement","effort":"medium"}),
+            None,
+            "MODEL_UNAVAILABLE",
+        ),
+        (
+            json!({"name":"fixture-replacement","effort":"low"}),
+            Some("model.effort"),
+            "HARNESS_CAPABILITY",
+        ),
+    ] {
+        let mut registry = registry.clone();
+        registry["agents"][0]["modelOverride"] = replacement;
+        if let Some(capability) = capability {
+            registry["harnesses"][0]["capabilities"]
+                .as_array_mut()
+                .unwrap()
+                .retain(|entry| entry["name"] != capability);
+        }
+        let result = f
+            .host
+            .compile_document(
+                capture.source.clone(),
+                capture.authored_source.clone(),
+                registry.to_string(),
+            )
+            .await
+            .unwrap();
+        let report: Value = serde_json::from_str(&result.result_json).unwrap();
+        assert_eq!(report["runtime"]["diagnostics"][0]["code"], diagnostic);
+    }
+
+    // Deliberately bypass redundant immutability guards on the private test DB
+    // to prove that replay checks the choice independently of plan equality.
+    sqlx::raw_sql(
+        "DROP TRIGGER engine_flow030_capture_immutable;
+         DROP TRIGGER engine_start030_immutable;
+         UPDATE engine_flow030_runs SET plan_json = json_set(plan_json, '$.agents[0].modelEffort', 'low');
+         UPDATE engine_start030_requests SET capture_json =
+           json_set(capture_json, '$.compiledPlanJson', (SELECT plan_json FROM engine_flow030_runs));",
+    ).execute(&f.pool).await.unwrap();
+    let divergence = replay().await.divergence.unwrap();
+    assert_eq!(divergence.field, "start.modelOverrides");
 }

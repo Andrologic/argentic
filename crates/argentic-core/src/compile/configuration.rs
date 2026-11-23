@@ -437,7 +437,7 @@ pub(crate) fn capture_registry(input: &Value, budget: &SourceBudget) -> Result<C
                 budget,
             )?;
         }
-        agents.push(o([
+        let mut agent = o([
             (
                 "agentName",
                 s(m::identity(
@@ -487,7 +487,30 @@ pub(crate) fn capture_registry(input: &Value, budget: &SourceBudget) -> Result<C
                     budget,
                 )?),
             ),
-        ]));
+        ]);
+        let model = entry.get("modelOverride");
+        if !matches!(model, Value::Undefined) {
+            let pointer = format!("{p}/modelOverride");
+            if m::object(model, &pointer, "MODEL_OVERRIDE")?
+                .iter()
+                .any(|(key, _)| !["name", "effort"].iter().any(|field| key.eq_str(field)))
+            {
+                return fail("MODEL_OVERRIDE", pointer, "Unknown model override field.");
+            }
+            let name = m::identity(
+                model.get("name"),
+                &format!("{pointer}/name"),
+                "MODEL_OVERRIDE",
+            )?;
+            let mut replacement = o([("name", s(name))]);
+            let effort = model.get("effort");
+            if !matches!(effort, Value::Undefined) {
+                let effort = m::identity(effort, &format!("{pointer}/effort"), "MODEL_OVERRIDE")?;
+                replacement.set("effort", s(effort));
+            }
+            agent.set("modelOverride", replacement);
+        }
+        agents.push(agent);
     }
     unique(
         agents
@@ -964,8 +987,63 @@ pub(crate) fn capture_agent(
             );
         }
     }
+    let replacement = proof.get("modelOverride");
+    if !matches!(replacement, Value::Undefined) {
+        for key in ["name", "effort"] {
+            let value = replacement.get(key);
+            if matches!(value, Value::Undefined) {
+                continue;
+            }
+            let capability_name = format!("model.{key}");
+            let pointer = format!("{p}/model/{key}");
+            capability(observation, &capability_name, &pointer, false)?;
+            let support = module
+                .and_then(E::as_object)
+                .and_then(|m| m.get("properties"))
+                .and_then(E::as_object)
+                .and_then(|properties| properties.get(&capability_name))
+                .and_then(E::as_object)
+                .filter(|support| {
+                    matches!(
+                        support.get("support").and_then(E::as_str),
+                        Some("native" | "approximate")
+                    )
+                })
+                .ok_or_else(|| {
+                    Error::new(
+                        "HARNESS_CAPABILITY",
+                        pointer.as_str(),
+                        "The harness module does not support the replacement model property.",
+                    )
+                })?;
+            if let Some(E::Array(values)) = support.get("values") {
+                let chosen = value.text().and_then(Text::utf8);
+                if !values
+                    .iter()
+                    .any(|allowed| allowed.as_str() == chosen.as_deref())
+                {
+                    return fail(
+                        "HARNESS_VALUE",
+                        pointer,
+                        "The replacement model property is outside the harness vocabulary.",
+                    );
+                }
+            }
+            if let Some(versions) = support.get("versions") {
+                range(
+                    observation,
+                    verified_ranges,
+                    exact::text(Some(versions), "")?,
+                    &pointer,
+                    budget,
+                )?;
+            }
+        }
+    }
     let requested = optional_object(agent.get("model"), &format!("{p}/model"))?;
-    let model_name = if let Some(v) = requested.get("name") {
+    let model_name = if !matches!(replacement, Value::Undefined) {
+        replacement.get("name").clone()
+    } else if let Some(v) = requested.get("name") {
         s(exact::text(Some(v), "")?)
     } else {
         observation.get("defaultModel").clone()
@@ -990,7 +1068,13 @@ pub(crate) fn capture_agent(
             "The requested or default model is not observed as available.",
         );
     };
-    let effort = if let Some(v) = requested.get("effort") {
+    let effort = if !matches!(replacement, Value::Undefined) {
+        if matches!(replacement.get("effort"), Value::Undefined) {
+            model.get("defaultEffort").clone()
+        } else {
+            replacement.get("effort").clone()
+        }
+    } else if let Some(v) = requested.get("effort") {
         s(exact::text(Some(v), "")?)
     } else {
         model.get("defaultEffort").clone()

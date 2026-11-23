@@ -71,6 +71,8 @@ pub struct RuntimeProjectionPage030 {
     pub interrupted_while_paused: bool,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub operator_works: std::collections::BTreeMap<String, OperatorWorkState>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub model_overrides: std::collections::BTreeMap<String, crate::capture::ModelOverride>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub termination_uncertain: bool,
     pub verdict: Option<String>,
@@ -153,6 +155,7 @@ fn page(
         paused: false,
         interrupted_while_paused: false,
         operator_works: Default::default(),
+        model_overrides: Default::default(),
         termination_uncertain: false,
         verdict: view.verdict,
         total: total.to_string(),
@@ -216,6 +219,10 @@ pub(crate) async fn read(
             )
         })?;
     let mut page = page(scope, continuation, projection)?;
+    page.model_overrides = crate::capture::verify_model_overrides(
+        &plan,
+        &serde_json::from_str(&capture.registry_json)?,
+    )?;
     if plan.versions.contract == argentic_core::AGSDL_040 {
         let interrupted: bool = row.try_get("interrupted")?;
         let revoked: bool = row.try_get("revoked")?;

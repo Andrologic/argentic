@@ -706,19 +706,20 @@ fn validate_result(
                         !seen.insert(name)
                             || !authored_agents.contains_key(name)
                             || observed.get(name).is_none_or(|observed| {
-                                [
-                                    "agentDeclarationJson",
-                                    "settingsJson",
-                                    "permissionsJson",
-                                    "scopeJson",
-                                    "evidenceJson",
-                                    "provenanceJson",
-                                ]
-                                .iter()
-                                .any(|field| {
-                                    observed.get(*field).is_none()
-                                        || observed.get(*field) != agent.get(*field)
-                                })
+                                observed.get("modelOverride") != agent.get("modelOverride")
+                                    || [
+                                        "agentDeclarationJson",
+                                        "settingsJson",
+                                        "permissionsJson",
+                                        "scopeJson",
+                                        "evidenceJson",
+                                        "provenanceJson",
+                                    ]
+                                    .iter()
+                                    .any(|field| {
+                                        observed.get(*field).is_none()
+                                            || observed.get(*field) != agent.get(*field)
+                                    })
                             })
                     })
                 {

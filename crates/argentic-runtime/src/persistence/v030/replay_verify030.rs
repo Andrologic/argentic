@@ -225,6 +225,8 @@ struct CaptureRead {
     identity: FlowIdentity030,
     source: Value,
     compiled_plan_json: String,
+    // Historical replay fixtures predate native registry retention.
+    registry_json: Option<String>,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -410,6 +412,19 @@ async fn verify(db: &mut SqliteConnection, system: &str, invocation: &str) -> Re
         &plan,
         &parse("start.plan", &capture.compiled_plan_json)?,
     )?;
+    let registry = capture
+        .registry_json
+        .as_deref()
+        .map(|raw| parse("start.registry", raw))
+        .transpose()?
+        .unwrap_or(Value::Null);
+    crate::capture::verify_model_overrides(&plan, &registry).map_err(|_| {
+        mismatch(
+            "start.modelOverrides",
+            "frozen choices match the retained registry",
+            "model selections differ",
+        )
+    })?;
     equal(
         "start.entry",
         &plan.entry.is_some(),
