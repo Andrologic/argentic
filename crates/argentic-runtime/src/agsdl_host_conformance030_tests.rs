@@ -567,6 +567,7 @@ impl AgentExecutor030 for Executor {
                                 }
                             })).is_none());
                         } else {
+                            drop(delivery.wire_admission().await?);
                             delivery.acknowledge(&work.tasks, &work.attempt)?;
                         }
                         wake.send_modify(|n| *n += 1);

@@ -54,6 +54,8 @@ pub(crate) async fn control(
         .supervisors
         .dispatcher(system)
         .ok_or_else(|| conflict("The run has no live supervisor"))?;
+    #[cfg(test)]
+    runtime.operator_test_yield("operator.dispatch").await;
     let _dispatch = dispatch.lock().await;
     let inspection = inspect_run(runtime, host, pool, &owner).await?;
     let capture = &inspection.capture;
@@ -79,6 +81,8 @@ pub(crate) async fn control(
     if !inspection.flow.state.stopping && inspection.flow.state.verdict.is_none() {
         broker.pump(host, &CancellationToken::new()).await?;
     }
+    #[cfg(test)]
+    runtime.operator_test_yield("operator.admission").await;
     let _admission = host.admission_lock().lock_owned().await;
     let authority = Authority {
         runtime,
@@ -233,6 +237,8 @@ pub(crate) async fn control(
     let applied =
         apply_native_event_transaction030(runtime, &lease, tx, &event, Some((&broker, state)))
             .await?;
+    #[cfg(test)]
+    runtime.operator_test_yield("operator.return").await;
     runtime.supervisors.wake(system);
     operator_receipt(applied)
 }
@@ -276,6 +282,13 @@ impl AgentOperator030 {
     pub(crate) async fn admit_turn(&self) -> Result<Option<OwnedMutexGuard<()>>> {
         let lease = self.host.start_lease().await?;
         let guard = self.host.admission_lock().lock_owned().await;
+        reconcile_admission030(
+            self.host.flow030(),
+            &self.pool,
+            &lease,
+            self.attempt.identity(),
+        )
+        .await?;
         lease.ensure_live()?;
         let raw: String = sqlx::query_scalar("SELECT r.state_json FROM engine_flow030_runs r JOIN engine_flow030_owners o USING(system_id,invocation_id) WHERE r.system_id=? AND r.invocation_id=? AND o.generation=? AND o.owner_epoch=? AND o.status='live'")
             .bind(&self.attempt.identity().system_start_id).bind(&self.attempt.identity().flow_invocation_id)

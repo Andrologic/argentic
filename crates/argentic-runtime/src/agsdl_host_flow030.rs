@@ -50,6 +50,8 @@ pub(crate) struct FlowHost030 {
     controls: Mutex<BTreeMap<String, Arc<FlowControl030>>>,
     joined_diagnostics: Mutex<BTreeMap<(String, String, String), JoinedOwnedAgent030>>,
     #[cfg(test)]
+    operator_test_hooks: Mutex<BTreeMap<&'static str, Arc<CommitTestHook030>>>,
+    #[cfg(test)]
     stop_commit_hooks: Mutex<BTreeMap<String, Arc<CommitTestHook030>>>,
     #[cfg(test)]
     work_commit_hooks: Mutex<BTreeMap<(String, String), Arc<CommitTestHook030>>>,
@@ -83,6 +85,30 @@ impl FlowWorkCommitMarker030 {
 
 #[cfg(test)]
 impl FlowHost030 {
+    pub(crate) fn install_operator_test_hook(&self, point: &'static str) -> Arc<CommitTestHook030> {
+        let hook = Arc::new(CommitTestHook030 {
+            reached: tokio::sync::Semaphore::new(0),
+            proceed: tokio::sync::Semaphore::new(0),
+        });
+        assert!(
+            self.operator_test_hooks
+                .lock()
+                .unwrap()
+                .insert(point, hook.clone())
+                .is_none(),
+            "{point}"
+        );
+        hook
+    }
+
+    pub(crate) async fn operator_test_yield(&self, point: &'static str) {
+        let hook = self.operator_test_hooks.lock().unwrap().remove(point);
+        if let Some(hook) = hook {
+            hook.reached.add_permits(1);
+            hook.proceed.acquire().await.unwrap().forget();
+        }
+    }
+
     pub(crate) fn install_runtime_fixture_control(
         &self,
         host: &HostState,
@@ -1275,7 +1301,7 @@ pub(crate) async fn apply_native_event_transaction030(
             .await?
             .ok_or_else(uncertain);
     }
-    runtime.available(&event.identity)?;
+    reconcile_events_tx(runtime, &authority, &mut tx, &event.identity).await?;
     let result = flow_store030::apply_tx(&mut tx, &authority, event)
         .await
         .map_err(store_error)?;
@@ -1286,7 +1312,17 @@ pub(crate) async fn apply_native_event_transaction030(
     }
     lease.ensure_live()?;
     runtime.begin_event_commit(event)?;
+    #[cfg(test)]
+    let point = match &event.kind {
+        FlowEventKind030::Operator(_) => ["operator.commit", "operator.ack"],
+        FlowEventKind030::Deliver { .. } => ["delivery.commit", "delivery.ack"],
+        _ => ["flow.commit", "flow.ack"],
+    };
+    #[cfg(test)]
+    runtime.operator_test_yield(point[0]).await;
     tx.commit().await.map_err(|_| uncertain())?;
+    #[cfg(test)]
+    runtime.operator_test_yield(point[1]).await;
     lease.ensure_live().map_err(|_| uncertain())?;
     runtime.acknowledge_event_commit(event);
     Ok(result)
@@ -1368,20 +1404,26 @@ pub(crate) async fn reconcile_dispatch_events030(
 }
 
 // The caller holds the admission gate across readback and its next mutation.
+pub(crate) async fn reconcile_admission030(
+    runtime: &FlowHost030,
+    pool: &SqlitePool,
+    lease: &HostStartLease,
+    identity: &FlowIdentity030,
+) -> Result<()> {
+    let owner = lease.owner(&identity.system_start_id)?;
+    if !reconcile_event_commits_locked030(runtime, pool, lease, &owner).await? {
+        return Err(uncertain());
+    }
+    runtime.available(identity)
+}
+
 pub(crate) async fn reconcile_event_commits_locked030(
     runtime: &FlowHost030,
     pool: &SqlitePool,
     lease: &HostStartLease,
     owner: &EngineOwner,
 ) -> Result<bool> {
-    let pending = runtime
-        .event_committing
-        .lock()
-        .map_err(|_| unavailable())?
-        .values()
-        .filter(|event| event.identity.system_start_id == owner.system_start_id)
-        .cloned()
-        .collect::<Vec<_>>();
+    let pending = pending_flow_events(runtime, &owner.system_start_id)?;
     if pending.is_empty() {
         return Ok(true);
     }
@@ -1392,29 +1434,8 @@ pub(crate) async fn reconcile_event_commits_locked030(
     };
     let mut db = pool.acquire().await?;
     let mut tx = db.begin_with("BEGIN IMMEDIATE").await?;
-    for event in &pending {
-        authority
-            .owner(&mut tx, &event.identity)
-            .await
-            .map_err(store_error)?;
-        let committed = if let Some(request_id) = event.event_id.strip_prefix("system-stop:") {
-            let request = EngineStopRequest {
-                system_start_id: owner.system_start_id.clone(),
-                request_id: request_id.into(),
-                activation_id: None,
-            };
-            let control = system_stop_control(runtime, &request)?;
-            match stored_system_stop(&mut tx, &control, &request).await? {
-                Some(receipt) if stop_marker(&receipt) == *event => true,
-                Some(_) => return Err(refused()),
-                None => false,
-            }
-        } else {
-            read_event_commit_tx(&mut tx, event).await?.is_some()
-        };
-        if !committed {
-            return Ok(false);
-        }
+    if !read_pending_events_tx(runtime, &authority, &mut tx, &pending).await? {
+        return Ok(false);
     }
     tx.commit().await?;
     lease.ensure_live()?;
@@ -1422,6 +1443,67 @@ pub(crate) async fn reconcile_event_commits_locked030(
         runtime.acknowledge_event_commit(event);
     }
     Ok(true)
+}
+
+fn pending_flow_events(runtime: &FlowHost030, system_id: &str) -> Result<Vec<FlowEvent030>> {
+    Ok(runtime
+        .event_committing
+        .lock()
+        .map_err(|_| unavailable())?
+        .values()
+        .filter(|event| event.identity.system_start_id == system_id)
+        .cloned()
+        .collect())
+}
+
+async fn read_pending_events_tx<A: Authority030>(
+    runtime: &FlowHost030,
+    authority: &A,
+    tx: &mut SqliteConnection,
+    pending: &[FlowEvent030],
+) -> Result<bool> {
+    for event in pending {
+        authority
+            .owner(tx, &event.identity)
+            .await
+            .map_err(store_error)?;
+        let committed = if let Some(request_id) = event.event_id.strip_prefix("system-stop:") {
+            let request = EngineStopRequest {
+                system_start_id: event.identity.system_start_id.clone(),
+                request_id: request_id.into(),
+                activation_id: None,
+            };
+            let control = system_stop_control(runtime, &request)?;
+            match stored_system_stop(tx, &control, &request).await? {
+                Some(receipt) if stop_marker(&receipt) == *event => true,
+                Some(_) => return Err(refused()),
+                None => false,
+            }
+        } else {
+            read_event_commit_tx(tx, event).await?.is_some()
+        };
+        if !committed {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Read an already-durable commit under the same gate as a new mutation.
+async fn reconcile_events_tx<A: Authority030>(
+    runtime: &FlowHost030,
+    authority: &A,
+    db: &mut SqliteConnection,
+    identity: &FlowIdentity030,
+) -> Result<()> {
+    let pending = pending_flow_events(runtime, &identity.system_start_id)?;
+    if !read_pending_events_tx(runtime, authority, db, &pending).await? {
+        return Err(uncertain());
+    }
+    for event in &pending {
+        runtime.acknowledge_event_commit(event);
+    }
+    runtime.available(identity)
 }
 
 /// Supplied only by the native receipt resolver. JSON fields are data, never grants.
@@ -1643,7 +1725,7 @@ pub(crate) async fn capture_route_preparation<V: RouteMaterialVerifier030>(
     {
         return Err(refused());
     }
-    runtime.available(&reference.identity)?;
+    reconcile_admission030(runtime, pool, &lease, &reference.identity).await?;
     let authority = Authority {
         runtime,
         lease: &lease,
@@ -1799,7 +1881,7 @@ pub(crate) async fn apply_route_preparation<V: RouteMaterialVerifier030>(
     {
         return Err(refused());
     }
-    runtime.available(&job.reference.identity)?;
+    reconcile_admission030(runtime, pool, &lease, &job.reference.identity).await?;
     let authority = Authority {
         runtime,
         lease: &lease,
@@ -2183,16 +2265,14 @@ impl DispatchLease030<'_> {
             }
             None => (false, "not-received"),
         };
-        let _resolution_admission = match gate {
-            Some(gate) => Some(gate.admission.lock_owned().await),
+        #[cfg(test)]
+        self.runtime.operator_test_yield("steer.receipt").await;
+        let _resolution_admission = match &gate {
+            Some(gate) => Some(gate.admission.clone().lock_owned().await),
             None => None,
         };
-        if !reconcile_event_commits_locked030(self.runtime, &self.pool, &self.lease, &self.owner)
-            .await?
-        {
-            return Err(uncertain());
-        }
-        self.runtime.available(&self.effect.identity)?;
+        reconcile_admission030(self.runtime, &self.pool, &self.lease, &self.effect.identity)
+            .await?;
         self.lease.ensure_live().map_err(|_| uncertain())?;
         let authority = Authority {
             runtime: self.runtime,
@@ -2253,6 +2333,10 @@ impl DispatchLease030<'_> {
             .bind(&self.effect.identity.system_start_id).bind(&self.effect.identity.flow_invocation_id).fetch_one(&mut *tx).await?;
         let revision: String = sqlx::query_scalar("SELECT state_json ->> '$.revision' FROM engine_flow030_runs WHERE system_id=? AND invocation_id=?")
             .bind(&self.effect.identity.system_start_id).bind(&self.effect.identity.flow_invocation_id).fetch_one(&mut *tx).await?;
+        let wire_checkpoint = gate.as_ref().and_then(|gate| gate.wire_checkpoint());
+        if current && consumed && wire_checkpoint.is_none() {
+            return Err(refused());
+        }
         let event = FlowEvent030 {
             identity: self.effect.identity.clone(),
             event_id: format!(
@@ -2283,10 +2367,13 @@ impl DispatchLease030<'_> {
             return Err(uncertain());
         }
         if consumed && !withdrawn {
-            let receipt = json!({"kind":"nativeSteerConsumed030", "effectId":self.effect.id,
+            let mut receipt = json!({"kind":"nativeSteerConsumed030", "effectId":self.effect.id,
             "identity":self.effect.identity, "ownerEpoch":self.owner.owner_epoch, "generation":self.lease.generation(),
             "work":work, "deliveryActivationId":delivery_activation_id, "messageJson":message_json,
             "consumedAfterEventId":head, "consumedEventId":event.event_id});
+            if let Some(checkpoint) = wire_checkpoint {
+                receipt["wireAdmissionEventId"] = json!(checkpoint);
+            }
             sqlx::query("INSERT INTO engine_flow030_handoffs(system_id,invocation_id,effect_id,owner_epoch,generation,receipt_json) VALUES(?,?,?,?,?,?)")
             .bind(&self.effect.identity.system_start_id).bind(&self.effect.identity.flow_invocation_id).bind(&self.effect.id)
             .bind(&self.owner.owner_epoch).bind(self.lease.generation()).bind(receipt.to_string()).execute(&mut *tx).await?;
@@ -2439,9 +2526,15 @@ impl DispatchLease030<'_> {
         )
         .await
         .map_err(|_| uncertain())?;
+        #[cfg(test)]
+        self.runtime
+            .operator_test_yield("effect.handoff.commit")
+            .await;
         tx.commit().await.map_err(|_| uncertain())?;
         #[cfg(test)]
         self.runtime.pause_after_handoff_commit(&self.effect).await;
+        #[cfg(test)]
+        self.runtime.operator_test_yield("effect.handoff.ack").await;
         // Revocation and release share one synchronous boundary. The owner
         // removes its no-admission witness only after life/ownership validation
         // under that guard, before the future can perform any IO.
@@ -2511,15 +2604,20 @@ async fn claim_selected<'a>(
     expected_effect_id: Option<&str>,
     expected_stop: Option<(&FlowEffect030, &FlowWorkAttempt030)>,
 ) -> Result<Option<DispatchLease030<'a>>> {
+    #[cfg(test)]
+    runtime
+        .operator_test_yield(if expected_stop.is_some() {
+            "stopWork.admission"
+        } else {
+            "effect.admission"
+        })
+        .await;
     let lease = host.start_lease().await?;
     let admission = host.admission_lock().lock_owned().await;
     // Even an empty queue is not a successful claim while a commit is unknown.
     // Retirement uses its separate opaque FlowControl, never this dispatcher.
     let owner = lease.owner(&id.system_start_id)?;
-    if !reconcile_event_commits_locked030(runtime, pool, &lease, &owner).await? {
-        return Err(uncertain());
-    }
-    runtime.available(id)?;
+    reconcile_admission030(runtime, pool, &lease, id).await?;
     let authority = Authority {
         runtime,
         lease: &lease,
@@ -2640,7 +2738,11 @@ async fn claim_selected<'a>(
                     }),
                 };
                 lease.ensure_live()?;
+                #[cfg(test)]
+                runtime.operator_test_yield("effect.claim.commit").await;
                 tx.commit().await.map_err(|_| uncertain())?;
+                #[cfg(test)]
+                runtime.operator_test_yield("effect.claim.ack").await;
                 lease.ensure_live().map_err(|_| uncertain())?;
                 return Ok(Some(DispatchLease030 {
                     unadmitted,
@@ -2680,12 +2782,30 @@ pub(crate) async fn revoke_generation(pool: &SqlitePool, generation: &str) -> Re
     Ok(())
 }
 
+async fn pending_clock_ticket(
+    db: &mut SqliteConnection,
+    system_id: &str,
+) -> Result<Option<SupersededClockTicket030>> {
+    let pending = sqlx::query(
+        "SELECT event_id,ticket_json
+         FROM engine_flow030_clock_events
+         JOIN engine_flow030_owners USING(system_id,invocation_id)
+         WHERE system_id=? AND output_json IS NULL",
+    )
+    .bind(system_id)
+    .fetch_optional(db)
+    .await?;
+    Ok(pending.map(|ticket| {
+        SupersededClockTicket030::new(ticket.get("event_id"), ticket.get("ticket_json"))
+    }))
+}
+
 async fn mark_interrupted_tx(
     db: &mut SqliteConnection,
     generation: Option<&str>,
     system: Option<&str>,
 ) -> Result<()> {
-    sqlx::query(
+    let interrupted = sqlx::query_scalar::<_, String>(
         "INSERT OR IGNORE INTO engine_flow030_interruptions(system_id)
          SELECT o.system_id FROM engine_flow030_owners o
          JOIN engine_flow030_runs r USING(system_id,invocation_id)
@@ -2694,8 +2814,27 @@ async fn mark_interrupted_tx(
          AND NOT (json_extract(r.plan_json,'$.versions.contract')='agsdl-0.4.0'
              AND json_extract(r.state_json,'$.stopping')
              AND EXISTS(SELECT 1 FROM engine_flow030_system_stop_requests s
-                 WHERE s.system_id=r.system_id AND s.invocation_id=r.invocation_id AND s.event_id IS NOT NULL))"
-    ).bind(generation).bind(generation).bind(system).bind(system).execute(db).await?;
+                 WHERE s.system_id=r.system_id AND s.invocation_id=r.invocation_id AND s.event_id IS NOT NULL))
+         RETURNING system_id"
+    ).bind(generation).bind(generation).bind(system).bind(system).fetch_all(&mut *db).await?;
+    if !interrupted.is_empty() {
+        sqlx::query(crate::sqlite::INTERRUPTION_CLOCK_SCHEMA)
+            .execute(&mut *db)
+            .await?;
+    }
+    for system_id in interrupted {
+        let pending = pending_clock_ticket(db, &system_id)
+            .await?
+            .map(|ticket| serde_json::to_string(&ticket))
+            .transpose()?;
+        sqlx::query(
+            "INSERT INTO engine_flow030_interruption_clock(system_id,ticket_json) VALUES(?,?)",
+        )
+        .bind(system_id)
+        .bind(pending)
+        .execute(&mut *db)
+        .await?;
+    }
     Ok(())
 }
 
@@ -2714,14 +2853,25 @@ pub(crate) async fn interrupt_run030(pool: &SqlitePool, system: &str) -> Result<
 }
 
 /// Fence unfinished runs left by an earlier application process.
-pub(crate) async fn interrupt_previous_runs030(pool: &SqlitePool) -> Result<()> {
+pub(crate) async fn interrupt_previous_runs030(
+    pool: &SqlitePool,
+    #[cfg(test)] runtime: Option<&FlowHost030>,
+) -> Result<()> {
     let mut db = pool.acquire().await?;
     let mut tx = db.begin_with("BEGIN IMMEDIATE").await?;
     mark_interrupted_tx(&mut tx, None, None).await?;
     sqlx::query("UPDATE engine_flow030_owners SET status='revoked' WHERE status='live'")
         .execute(&mut *tx)
         .await?;
+    #[cfg(test)]
+    if let Some(runtime) = runtime {
+        runtime.operator_test_yield("recovery.commit").await;
+    }
     tx.commit().await?;
+    #[cfg(test)]
+    if let Some(runtime) = runtime {
+        runtime.operator_test_yield("recovery.ack").await;
+    }
     Ok(())
 }
 
@@ -2809,6 +2959,8 @@ pub(crate) struct NativeSystemStopReceipt030 {
     pub flow_event_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub superseded_clock_ticket: Option<SupersededClockTicket030>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub superseded_timeout_controls: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2932,6 +3084,8 @@ pub(crate) async fn request_system_stop030(
     request: &EngineStopRequest,
 ) -> Result<NativeSystemStop030> {
     let control = system_stop_control(runtime, request)?;
+    #[cfg(test)]
+    runtime.operator_test_yield("stop.admission").await;
     let _admission = control.admission.clone().lock_owned().await;
     let mut db = pool.acquire().await?;
     sqlx::query("PRAGMA synchronous=FULL")
@@ -2943,9 +3097,16 @@ pub(crate) async fn request_system_stop030(
         runtime.acknowledge_event_commit(&stop_marker(&receipt));
         return Ok(NativeSystemStop030 { receipt, control });
     }
-    // An absent receipt never establishes rollback. Reconcile an existing
-    // uncertain commit before attempting any new Stop or alias mutation.
-    runtime.available(&control.identity)?;
+    // A new Stop can read through a durable operator or delivery commit.
+    // An outstanding Stop still requires its exact request to be read back
+    // by the caller or the supervisor before admitting a new request ID.
+    if pending_flow_events(runtime, &control.identity.system_start_id)?
+        .iter()
+        .any(|event| event.event_id.starts_with("system-stop:"))
+    {
+        return Err(uncertain());
+    }
+    reconcile_events_tx(runtime, control.as_ref(), &mut tx, &control.identity).await?;
     let view = flow_store030::read_tx(&mut tx, control.as_ref(), &control.identity)
         .await
         .map_err(store_error)?;
@@ -2960,6 +3121,7 @@ pub(crate) async fn request_system_stop030(
         verdict: view.state.verdict,
         flow_event_id: None,
         superseded_clock_ticket: None,
+        superseded_timeout_controls: BTreeMap::new(),
     };
     let marker = stop_marker(&receipt);
     if !receipt.stopping && receipt.verdict.is_none() {
@@ -2982,24 +3144,78 @@ pub(crate) async fn request_system_stop030(
         receipt.stopping = after.stopping;
         receipt.verdict = after.verdict;
         receipt.flow_event_id = Some(marker.event_id.clone());
-        let pending = sqlx::query("SELECT event_id,ticket_json FROM engine_flow030_clock_events WHERE system_id=? AND invocation_id=? AND output_json IS NULL")
-            .bind(&control.identity.system_start_id).bind(&control.identity.flow_invocation_id)
-            .fetch_optional(&mut *tx).await?;
-        receipt.superseded_clock_ticket = pending.map(|ticket| {
-            SupersededClockTicket030::new(ticket.get("event_id"), ticket.get("ticket_json"))
-        });
+        receipt.superseded_clock_ticket =
+            pending_clock_ticket(&mut tx, &control.identity.system_start_id).await?;
+        receipt.superseded_timeout_controls = sqlx::query_as::<_, (String, String)>(
+            "SELECT activation_id,receipt_id FROM engine_flow030_clock_controls
+             WHERE system_id=? AND invocation_id=? AND joined=0",
+        )
+        .bind(&control.identity.system_start_id)
+        .bind(&control.identity.flow_invocation_id)
+        .fetch_all(&mut *tx)
+        .await?
+        .into_iter()
+        .collect();
     }
     sqlx::query("INSERT INTO engine_flow030_system_stop_requests(request_id,system_id,invocation_id,owner_epoch,generation,request_json,receipt_json,event_id) VALUES(?,?,?,?,?,?,?,?)")
         .bind(&request.request_id).bind(&control.identity.system_start_id).bind(&control.identity.flow_invocation_id).bind(&control.owner.owner_epoch).bind(&control.generation)
         .bind(serde_json::to_string(request)?).bind(serde_json::to_string(&receipt)?).bind(&receipt.flow_event_id).execute(&mut *tx).await?;
     runtime.begin_event_commit(&marker)?;
+    #[cfg(test)]
+    runtime.operator_test_yield("stop.commit").await;
     tx.commit().await.map_err(|_| uncertain())?;
+    #[cfg(test)]
+    runtime.operator_test_yield("stop.ack").await;
     #[cfg(test)]
     runtime
         .pause_after_system_stop_commit(&request.request_id)
         .await;
     runtime.acknowledge_event_commit(&marker);
     Ok(NativeSystemStop030 { receipt, control })
+}
+
+/// The caller has already validated a joined native PhysicalEnded for this
+/// activation. A previously committed machine deadline remains in history.
+pub(crate) async fn settle_stopped_timeout_tx(
+    db: &mut SqliteConnection,
+    identity: &FlowIdentity030,
+    activation_id: &str,
+) -> Result<()> {
+    let receipt_id: Option<String> = sqlx::query_scalar(
+        "SELECT receipt_id FROM engine_flow030_clock_controls
+         WHERE system_id=? AND invocation_id=? AND activation_id=? AND joined=0",
+    )
+    .bind(&identity.system_start_id)
+    .bind(&identity.flow_invocation_id)
+    .bind(activation_id)
+    .fetch_optional(&mut *db)
+    .await?;
+    let Some(receipt_id) = receipt_id else {
+        return Ok(());
+    };
+    let raw: Option<String> = sqlx::query_scalar(
+        "SELECT receipt_json FROM engine_flow030_system_stop_requests
+         WHERE system_id=? AND invocation_id=? AND event_id IS NOT NULL",
+    )
+    .bind(&identity.system_start_id)
+    .bind(&identity.flow_invocation_id)
+    .fetch_optional(&mut *db)
+    .await?;
+    if let Some(raw) = raw {
+        let stop: NativeSystemStopReceipt030 = serde_json::from_str(&raw)?;
+        if stop.identity != *identity
+            || stop.superseded_timeout_controls.get(activation_id) != Some(&receipt_id)
+        {
+            return Err(refused());
+        }
+        sqlx::query(
+            "UPDATE engine_flow030_clock_controls SET joined=1 WHERE receipt_id=? AND joined=0",
+        )
+        .bind(&receipt_id)
+        .execute(db)
+        .await?;
+    }
+    Ok(())
 }
 
 /// Only a matching committed request resolves an unknown Stop COMMIT. None
@@ -3445,6 +3661,8 @@ impl FlowControl030 {
             runtime.forget_diagnostic_join(joined);
             return Ok(result);
         }
+        #[cfg(test)]
+        runtime.operator_test_yield("stopWork.commit").await;
         let expected_status = if claim.is_some() {
             "uncertain"
         } else {
@@ -3464,8 +3682,14 @@ impl FlowControl030 {
         if changed != 1 {
             return Err(refused());
         }
+        if view.state.stopping {
+            settle_stopped_timeout_tx(&mut tx, &self.identity, &attempt.work().activation_id)
+                .await?;
+        }
         runtime.begin_event_commit(&event)?;
         tx.commit().await.map_err(|_| uncertain())?;
+        #[cfg(test)]
+        runtime.operator_test_yield("stopWork.ack").await;
         runtime.acknowledge_event_commit(&event);
         runtime.forget_diagnostic_join(joined);
         Ok(result)

@@ -226,7 +226,12 @@ impl StartSession<'_> {
 }
 /// Startup fencing retains Macro's existing interruption semantics.
 pub async fn interrupt_previous_runs(pool: &SqlitePool) -> Result<()> {
-    flow::interrupt_previous_runs030(pool).await
+    flow::interrupt_previous_runs030(
+        pool,
+        #[cfg(test)]
+        None,
+    )
+    .await
 }
 
 pub const CODEX_ADAPTER: &str = crate::agsdl_host_codex::ADAPTER;

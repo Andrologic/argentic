@@ -433,7 +433,10 @@ async fn verify(db: &mut SqliteConnection, system: &str, invocation: &str) -> Re
         };
         let receipt: Value = parse("outbox.settlement", &raw)?;
         if receipt["kind"] == "nativeSteerConsumed030" {
-            if let Some(head) = receipt["consumedAfterEventId"].as_str() {
+            let checkpoint = receipt
+                .get("wireAdmissionEventId")
+                .unwrap_or(&receipt["consumedAfterEventId"]);
+            if let Some(head) = checkpoint.as_str() {
                 let effect = parse(
                     "outbox.effect",
                     row.try_get("effect_json").map_err(storage)?,
@@ -595,8 +598,8 @@ async fn verify(db: &mut SqliteConnection, system: &str, invocation: &str) -> Re
                 produced.push(effect.clone());
             }
             state = transition.state;
-            // Validate consumption at the actual reduce() prefix, rather than
-            // inferring liveness from the final state or another scheduler.
+            // The send and its later settlement can straddle a hold. Verify
+            // dispatch eligibility at the prefix where the wire was admitted.
             if let Some(deliveries) = steer_checkpoints.get(&event_id) {
                 for (effect, receipt) in deliveries {
                     let FlowEffectKind030::Steer {
@@ -606,7 +609,12 @@ async fn verify(db: &mut SqliteConnection, system: &str, invocation: &str) -> Re
                     else {
                         return Err(mismatch("steer.effect", "Steer effect", &effect.kind));
                     };
-                    if !steer_effect_eligible030(&state, effect)
+                    let eligible = if receipt.get("wireAdmissionEventId").is_some() {
+                        crate::agsdl_host_steer030::wire_eligible030(&state, effect)
+                    } else {
+                        steer_effect_eligible030(&state, effect)
+                    };
+                    if !eligible
                         || !state
                             .activations
                             .iter()
@@ -905,6 +913,21 @@ fn verify_steer_settlement(
             &event.expected_revision,
             &checkpoint.unwrap().receipt.revision,
         )?;
+        if let Some(wire) = receipt.get("wireAdmissionEventId") {
+            let admission_revision = wire
+                .as_str()
+                .and_then(|id| state.events.get(id))
+                .map(|event| event.receipt.revision.as_str());
+            if !admission_revision.is_some_and(|revision| {
+                argentic_core::flow::number::cmp(revision, &event.expected_revision).is_le()
+            }) {
+                return Err(mismatch(
+                    "steer.wireAdmissionEventId",
+                    "admission at or before the settlement checkpoint",
+                    wire,
+                ));
+            }
+        }
     }
     Ok(())
 }

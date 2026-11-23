@@ -296,6 +296,8 @@ pub(crate) async fn start_agent_work030(
     let operator_parked = parked.clone();
     let operator_host = host.clone();
     let operator_pool = pool.clone();
+    #[cfg(test)]
+    let test_host = host.clone();
     let mut started = None;
     let work_cancel = cancel.clone();
     let timeout = CancellationToken::new();
@@ -361,6 +363,8 @@ pub(crate) async fn start_agent_work030(
                             )
                             .await;
                         if let Err(error) = diagnostics::at(&events.attempt, Stage::ExecutorStop, failure) {
+                            #[cfg(test)]
+                            test_host.flow030().operator_test_yield("work.failure.rejected").await;
                             returned.send_replace(Some(Err(error)));
                             return;
                         }
@@ -484,6 +488,8 @@ pub(crate) async fn drain_effects030(
         .supervisors
         .dispatcher(&owner.system_start_id);
     for _ in 0..256 {
+        #[cfg(test)]
+        host.flow030().operator_test_yield("supervisor.pass").await;
         let _dispatch = match &dispatcher {
             Some((gate, _)) => Some(gate.lock().await),
             None => None,
@@ -522,7 +528,19 @@ pub(crate) async fn drain_effects030(
                 }
             }
             FlowEffectKind030::Start { agent: None, .. } => {
-                driver.start_host(inspection, effect).await?
+                #[cfg(test)]
+                host.flow030()
+                    .operator_test_yield("supervisor.host.selected")
+                    .await;
+                if let Err(error) = driver.start_host(inspection, effect).await {
+                    if error.code != "STALE_REFERENCE" {
+                        return Err(error);
+                    }
+                    let fresh = flow::inspect_run(host.flow030(), host, pool, owner).await?;
+                    if !fresh.flow.state.stopping {
+                        return Err(error);
+                    }
+                }
             }
             FlowEffectKind030::Steer { .. } => driver.steer(effect).await?,
             FlowEffectKind030::StopWork { .. } => driver.stop(effect).await?,
@@ -713,6 +731,21 @@ impl RuntimeRegistry030 {
                 .map_err(|_| failure("INTERRUPTED", "runtime", "Supervisor wake channel closed"))?;
         }
     }
+    #[cfg(test)]
+    pub(crate) async fn crash_operator_fixture(&self, system: &str) {
+        let task = self
+            .0
+            .lock()
+            .unwrap()
+            .get_mut(system)
+            .unwrap()
+            .task
+            .take()
+            .unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+    }
+
     pub(crate) fn outcome(&self, system: &str) -> Option<Result<()>> {
         self.0.lock().ok()?.get(system)?.outcome.clone()
     }
@@ -727,6 +760,11 @@ struct LiveAgent030 {
     operator: watch::Sender<Option<String>>,
     parked: Arc<AtomicBool>,
 }
+struct AgentJoin030 {
+    joined: JoinedOwnedAgent030,
+    returned: Result<()>,
+}
+
 struct NativeDriver030<'a> {
     app: Option<&'a HostState>,
     emitter: Arc<dyn Fn(String) -> EventEmitter030 + Send + Sync>,
@@ -737,7 +775,7 @@ struct NativeDriver030<'a> {
     owner: &'a EngineOwner,
     executors: &'a Executors030,
     active: BTreeMap<String, LiveAgent030>,
-    joining: FuturesUnordered<BoxFuture<'a, (String, Result<JoinedOwnedAgent030>)>>,
+    joining: FuturesUnordered<BoxFuture<'a, (String, Result<AgentJoin030>)>>,
     joined: BTreeMap<String, JoinedOwnedAgent030>,
     ready: BTreeMap<String, JoinedOwnedAgent030>,
     approvals: BTreeMap<String, String>,
@@ -771,6 +809,11 @@ impl EffectDriver030 for NativeDriver030<'_> {
                 .filter(|clock| clock.tracks_humans())
             {
                 clock.tick().await?;
+                #[cfg(test)]
+                self.host
+                    .flow030()
+                    .operator_test_yield("supervisor.clock.return")
+                    .await;
                 let fresh =
                     flow::inspect_run(self.host.flow030(), self.host, self.pool, self.owner)
                         .await?;
@@ -920,16 +963,9 @@ impl EffectDriver030 for NativeDriver030<'_> {
             );
             let tasks = self.tasks;
             self.joining.push(Box::pin(async move {
-                // Even executor errors do not bypass the physical join.
-                let result = started.returned().await;
+                let returned = started.returned().await;
                 let joined = dispatch::join_owned_agent030(tasks, &started.attempt).await;
-                (
-                    key,
-                    match joined {
-                        Ok(joined) => result.map(|_| joined),
-                        Err(error) => Err(error),
-                    },
-                )
+                (key, joined.map(|joined| AgentJoin030 { joined, returned }))
             }));
             Ok(())
         })
@@ -1411,6 +1447,8 @@ pub(crate) async fn supervise_with_steer_port030(
             if let Some((_, stop)) = &live.stop {
                 stop.control().settle_joined_diagnostic(host.flow030(), pool, &joined, Some(stop)).await?;
             } else {
+                #[cfg(test)]
+                host.flow030().operator_test_yield("supervisor.joined").await;
                 let result = flow_work_protocol030::finish_joined_agent030(host, pool, &joined, &CancellationToken::new()).await;
                 let fresh = flow::inspect_run(host.flow030(), host, pool, owner).await?;
                 let physical = fresh.flow.state.activations.iter().any(|a| a.id == key && a.physical);
@@ -1424,6 +1462,8 @@ pub(crate) async fn supervise_with_steer_port030(
                 if physical { return Err(failure("UNCERTAIN", "work", "Joined work has no terminal controller result")); }
             }
             if executors.clock.as_ref().is_some_and(|clock| clock.tracks_humans()) && live.stop.is_none() {
+                #[cfg(test)]
+                host.flow030().operator_test_yield("supervisor.retirement").await;
                 let broker = host.flow030().humans.broker(host, pool, joined.attempt().identity()).await?;
                 let _operation = broker.operation.lock().await;
                 let fresh=flow::inspect_run(host.flow030(),host,pool,owner).await?;
@@ -1492,8 +1532,19 @@ pub(crate) async fn supervise_with_steer_port030(
                 }
                 if let Some((_, effect, _)) = driver.calls.remove(&key) { driver.in_flight.remove(&effect); }
             },
-            Some((key, joined)) = driver.joining.next(), if !driver.joining.is_empty() => {
-                driver.ready.insert(key, joined?);
+            Some((key, result)) = driver.joining.next(), if !driver.joining.is_empty() => {
+                let AgentJoin030 { joined, returned } = result?;
+                if let Err(error) = returned {
+                    // An executor can lose its last work event to Stop before
+                    // it sees cancellation. Preserve the physical join for
+                    // StopWork. Acquire admission only after selection, since
+                    // the next dispatch pass also needs that gate.
+                    let fresh = flow::inspect_run(host.flow030(), host, pool, owner).await?;
+                    if !fresh.flow.state.activations.iter().any(|a| a.id == key && a.stop_effect_id.is_some()) {
+                        return Err(error);
+                    }
+                }
+                driver.ready.insert(key, joined);
             },
             _ = async { if let Some(duration) = deadline { tokio::time::sleep(duration).await; } else { std::future::pending::<()>().await; } } => {
                 // The next dispatch pass arbitrates deadlines and joins.
@@ -1528,7 +1579,7 @@ pub(crate) async fn supervise_with_steer_port030(
         }
     }
     while let Some((_, result)) = driver.joining.next().await {
-        if let Err(error) = result {
+        if let Err(error) = result.and_then(|join| join.returned) {
             cleanup_error.get_or_insert(error);
         }
     }
@@ -1557,8 +1608,7 @@ pub(crate) async fn emit_work_event030(
     let policies = PolicyLeases030::acquire(config, project_id).await?;
     let lease = host.start_lease().await?;
     let gate = host.admission_lock().lock_owned().await;
-    flow::reconcile_event_commits_locked030(host.flow030(), pool, &lease, attempt.owner()).await?;
-    host.flow030().available(attempt.identity())?;
+    flow::reconcile_admission030(host.flow030(), pool, &lease, attempt.identity()).await?;
     let parent = format!(
         "flow030:{}:{}",
         attempt.identity().system_start_id,

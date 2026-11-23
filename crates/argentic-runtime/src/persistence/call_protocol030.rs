@@ -1372,7 +1372,14 @@ async fn apply_terminal_tx<A: CallAuthority030>(
     };
     let pending: i64 = sqlx::query_scalar("SELECT count(*) FROM engine_flow030_clock_controls WHERE system_id=? AND invocation_id=? AND activation_id=? AND joined=0")
         .bind(&receipt.attempt.identity.system_start_id).bind(&receipt.attempt.identity.flow_invocation_id).bind(&work.activation_id).fetch_one(&mut *db).await?;
-    if pending > 0 {
+    if pending > 0 && state.stopping {
+        crate::agsdl_host_flow030::settle_stopped_timeout_tx(
+            db,
+            &receipt.attempt.identity,
+            &work.activation_id,
+        )
+        .await?;
+    } else if pending > 0 {
         require(
             stopped || matches!(&receipt.result, CallResult030::Failed {code} if code=="TIMEOUT"),
             "Call deadline requires its timeout result",

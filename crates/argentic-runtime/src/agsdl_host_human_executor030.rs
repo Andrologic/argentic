@@ -32,6 +32,8 @@ impl HostExecutor030 for HumanExecutor030 {
         let (pool, tasks) = (self.pool.clone(), self.tasks.clone());
         Box::pin(async move {
             let host = app.clone();
+            #[cfg(test)]
+            host.flow030().operator_test_yield("approval.claim").await;
             let claim =
                 flow::claim_expected(host.flow030(), &host, &pool, &effect.identity, &effect.id)
                     .await?
@@ -46,6 +48,10 @@ impl HostExecutor030 for HumanExecutor030 {
                     .broker(&host, &pool, &effect.identity)
                     .await?;
                 let _operation = broker.operation.lock().await;
+                #[cfg(test)]
+                host.flow030()
+                    .operator_test_yield("approval.admission")
+                    .await;
                 broker.admit_host_work(&host, &effect.id).await?;
                 broker.pump(&host, &CancellationToken::new()).await?;
                 Ok::<_, crate::persistence::dto::EngineFailure>(())

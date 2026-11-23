@@ -2610,6 +2610,14 @@ for line in sys.stdin:
             .execute(&pool)
             .await
             .unwrap();
+        sqlx::query(
+            "INSERT INTO engine_flow030_events VALUES(?,?, 'wire-admission', '{}', '{}',NULL)",
+        )
+        .bind(&identity.system_start_id)
+        .bind(&identity.flow_invocation_id)
+        .execute(&pool)
+        .await
+        .unwrap();
         pool
     }
 

@@ -10,6 +10,14 @@ use std::{path::Path, time::Duration};
 pub const INITIAL_SCHEMA: &str = include_str!("../assets/schema/post042.sql");
 pub const SCHEMA_REVISION: &str = "post-042";
 
+// Created with the first fenced interruption. Embedded hosts and existing
+// standalone files can retain the post-042 schema until recovery needs it.
+pub(crate) const INTERRUPTION_CLOCK_SCHEMA: &str =
+    "CREATE TABLE IF NOT EXISTS engine_flow030_interruption_clock (
+    system_id TEXT PRIMARY KEY NOT NULL REFERENCES engine_flow030_interruptions(system_id),
+    ticket_json TEXT CHECK(ticket_json IS NULL OR json_valid(ticket_json))
+)";
+
 fn options() -> SqliteConnectOptions {
     SqliteConnectOptions::new()
         .foreign_keys(true)
@@ -99,14 +107,22 @@ pub async fn open_file(path: &Path) -> Result<SqlitePool, sqlx::Error> {
 async fn validate_existing(connection: &mut SqliteConnection) -> Result<(), sqlx::Error> {
     let expected = memory().await?;
     let query = "SELECT type,name,tbl_name,coalesce(sql,'') FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name";
-    let wanted = sqlx::query_as::<_, (String, String, String, String)>(query)
-        .fetch_all(&expected)
-        .await?;
-    expected.close().await;
     let mut tx = connection.begin().await?;
     let actual = sqlx::query_as::<_, (String, String, String, String)>(query)
         .fetch_all(&mut *tx)
         .await?;
+    if actual
+        .iter()
+        .any(|(_, name, _, _)| name == "engine_flow030_interruption_clock")
+    {
+        sqlx::query(INTERRUPTION_CLOCK_SCHEMA)
+            .execute(&expected)
+            .await?;
+    }
+    let wanted = sqlx::query_as::<_, (String, String, String, String)>(query)
+        .fetch_all(&expected)
+        .await?;
+    expected.close().await;
     if actual != wanted {
         return Err(sqlx::Error::Protocol(
             "Incompatible standalone engine schema".into(),

@@ -468,7 +468,15 @@ impl HumanBroker030 {
             json!({"kind":"admit","workId":owned.work_id(),"timeoutMs":timeout,"answerTimeoutMs":answer_timeout,"startedAtMs":started})
         };
         self.reserve(&mut tx, event, &now).await?;
+        #[cfg(test)]
+        host.flow030()
+            .operator_test_yield("approval.clock.reserve")
+            .await;
         tx.commit().await?;
+        #[cfg(test)]
+        host.flow030()
+            .operator_test_yield("approval.clock.ack")
+            .await;
         Ok(owned)
     }
     async fn verify_work(&self, db: &mut SqliteConnection, work: &OwnedHumanWork030) -> Result<()> {
@@ -934,19 +942,27 @@ impl HumanBroker030 {
         let Some(input) = input else {
             return Ok(None);
         };
+        #[cfg(test)]
+        host.flow030().operator_test_yield("clock.reserved").await;
         let output = self
             .jobs
             .evaluate(&self.generation, input.clone(), cancelled)
             .await?;
+        #[cfg(test)]
+        host.flow030().operator_test_yield("clock.evaluated").await;
         let lease = host.start_lease().await?;
         let _gate = host.admission_lock().lock_owned().await;
         let mut connection = self.durable_connection().await?;
         let mut tx = connection.begin_with("BEGIN IMMEDIATE").await?;
         let capture = self.guard(&mut tx, &lease).await?;
+        #[cfg(test)]
+        host.flow030().operator_test_yield("clock.commit").await;
         self.commit(&mut tx, &input, &output, &capture.versions.contract)
             .await?;
         lease.ensure_live()?;
         tx.commit().await?;
+        #[cfg(test)]
+        host.flow030().operator_test_yield("clock.ack").await;
         Ok(Some(output))
     }
     async fn commit(

@@ -157,6 +157,31 @@ pub(super) async fn verify(
     } else {
         None
     };
+    let interrupted = native_owner.get::<&str, _>("status") == "revoked"
+        && native_owner.get::<bool, _>("interrupted");
+    let interruption_schema: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='engine_flow030_interruption_clock')",
+    ).fetch_one(&mut *db).await?;
+    let interruption: Option<Option<String>> = if interruption_schema {
+        sqlx::query_scalar(
+            "SELECT ticket_json FROM engine_flow030_interruption_clock WHERE system_id=?",
+        )
+        .bind(&id.system_start_id)
+        .fetch_optional(&mut *db)
+        .await?
+    } else {
+        None
+    };
+    require(
+        interruption.is_none() || interrupted,
+        "Clock interruption has no fenced owner",
+    )?;
+    let interrupted_ticket: Option<SupersededClockTicket030> = interruption
+        .as_ref()
+        .and_then(|raw| raw.as_deref())
+        .map(serde_json::from_str)
+        .transpose()?;
+    let mut observed_interruption = false;
     let superseded = stop
         .as_ref()
         .and_then(|stop| stop.superseded_clock_ticket.as_ref());
@@ -478,19 +503,20 @@ pub(super) async fn verify(
         let Some(output) = row.try_get::<Option<&str>, _>("output_json")? else {
             // Verify facts written at reservation above. A fenced Stop can
             // retain an undecided tail, but it contributes no clock output.
-            observed_supersession = superseded
-                == Some(&SupersededClockTicket030::new(
-                    &ticket.event_id,
-                    row.try_get("ticket_json")?,
-                ));
-            if observed_supersession && kind == "retire" {
+            let exact =
+                SupersededClockTicket030::new(&ticket.event_id, row.try_get("ticket_json")?);
+            observed_supersession = superseded == Some(&exact);
+            observed_interruption = interrupted_ticket.as_ref() == Some(&exact);
+            if (observed_supersession || observed_interruption) && kind == "retire" {
                 superseded_retirement = event["workId"].as_str().map(str::to_owned);
             }
-            let fenced_operator = kind == "operatorHold"
-                && native_owner.get::<&str, _>("status") == "revoked"
-                && native_owner.get::<bool, _>("interrupted");
+            let legacy_interrupted_hold =
+                interruption.is_none() && interrupted && kind == "operatorHold";
             require(
-                (observed_supersession || fenced_stop || fenced_operator)
+                (observed_supersession
+                    || observed_interruption
+                    || fenced_stop
+                    || legacy_interrupted_hold)
                     && index + 1 == events.len(),
                 "Uncommitted clock ticket",
             )?;
@@ -557,6 +583,10 @@ pub(super) async fn verify(
         observed = now;
         last = receipt;
     }
+    require(
+        interrupted_ticket.is_none() || observed_interruption,
+        "Interrupted clock ticket differs",
+    )?;
     require(
         superseded.is_none() || observed_supersession,
         "Superseded clock ticket differs",
@@ -628,15 +658,16 @@ pub(super) async fn verify(
                 "answerTimeout"
             });
             let delivery: &str = row.get("delivery");
-            let stopped_before_delivery =
-                stop.is_some() && !r.acknowledged && matches!(delivery, "pending" | "reserved");
+            let fenced_before_delivery = (stop.is_some() || interrupted)
+                && !r.acknowledged
+                && matches!(delivery, "pending" | "reserved");
             require(
                 parsed(row, "resolution_json")? == expected
                     && row.get::<&str, _>("revision") == "1"
                     && (resolution["operatorCancelled"] == true
                         || (delivery == "acknowledged" && r.acknowledged)
                         || (delivery == "reserved" && closed_asks.contains(&r.id))
-                        || stopped_before_delivery),
+                        || fenced_before_delivery),
                 "Resolution/readback differs",
             )?;
             let proof=sqlx::query("SELECT p.resolution_json,e.output_json FROM engine_flow030_human_resolution_proofs p JOIN engine_flow030_clock_events e USING(system_id,invocation_id,event_id) WHERE p.system_id=? AND p.invocation_id=? AND p.request_id=?")
@@ -698,7 +729,7 @@ pub(super) async fn verify(
                 };
                 require(
                     serde_json::to_value(&a.result)? == expected
-                        || (stopped_before_delivery && a.result.is_none()),
+                        || (fenced_before_delivery && a.result.is_none()),
                     "Approval terminal differs",
                 )?;
             } else if resolution["expired"] == true {
@@ -739,6 +770,10 @@ pub(super) async fn verify(
             )?;
         }
     }
+    let mut stopped_controls = stop
+        .as_ref()
+        .map(|stop| stop.superseded_timeout_controls.clone())
+        .unwrap_or_default();
     for row in controls {
         let id = row.get::<&str, _>("activation_id");
         let w = works
@@ -746,9 +781,7 @@ pub(super) async fn verify(
             .find(|w| w.id == id)
             .ok_or("Timeout work absent")?;
         require(
-            w.snapshot["expired"] == true
-                && row.get::<i64, _>("joined") == 1
-                && row.get::<&str, _>("reason") == "TIMEOUT",
+            w.snapshot["expired"] == true && row.get::<&str, _>("reason") == "TIMEOUT",
             "Timeout control differs",
         )?;
         let a = state
@@ -756,10 +789,37 @@ pub(super) async fn verify(
             .iter()
             .find(|a| a.id == id)
             .ok_or("Timed out activation absent")?;
-        require(
-            matches!(&a.result,Some(WorkResultRecord030::Failed {error}) if error.code=="TIMEOUT"),
-            "Timeout terminal differs",
-        )?;
+        let joined = row.get::<i64, _>("joined");
+        if let Some(receipt_id) = stopped_controls.remove(id) {
+            require(
+                receipt_id == row.get::<&str, _>("receipt_id"),
+                "Stop deadline receipt differs",
+            )?;
+            let stop = stop.as_ref().unwrap();
+            let physical_end = state.events.values().any(|record| {
+                let Ok(ReadEvent(event)) = serde_json::from_str::<ReadEvent>(&record.event_json) else {
+                    return false;
+                };
+                matches!(&event.kind, FlowEventKind030::PhysicalEnded {
+                    work, stop_effect_id: Some(effect), evidence,
+                } if work.activation_id == id
+                    && a.stop_effect_id.as_ref() == Some(effect)
+                    && evidence.descendants_joined
+                    && argentic_core::flow::number::cmp(&event.expected_revision, &stop.revision).is_ge())
+            });
+            require(
+                a.result.is_none()
+                    && (joined, physical_end) == (if a.physical { (0, false) } else { (1, true) }),
+                "Stopped timeout lacks its physical proof",
+            )?;
+        } else {
+            require(
+                (joined == 1
+                    && matches!(&a.result,Some(WorkResultRecord030::Failed {error}) if error.code=="TIMEOUT"))
+                    || (joined == 0 && a.physical && a.result.is_none()),
+                "Timeout terminal differs",
+            )?;
+        }
         let observed = row.get::<&str, _>("observed_ms");
         let mut proven = false;
         for event in events.iter().take(journal.len()) {
@@ -784,5 +844,6 @@ pub(super) async fn verify(
         require(proven, "Timeout control has no native clock decision")?;
         projection.timeout_ids.push(id.into());
     }
+    require(stopped_controls.is_empty(), "Stop names an absent deadline")?;
     Ok(projection)
 }

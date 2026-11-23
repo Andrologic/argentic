@@ -2,6 +2,9 @@
 use super::*;
 use crate::persistence::dto::EngineStopRequest;
 
+#[path = "operator_schedules.rs"]
+mod schedules;
+
 async fn operator_scope(f: &Fixture) -> crate::api::RuntimeProjectionScope030 {
     let capture = flow::inspect_run(f.host.flow030(), &f.host, &f.pool, &f.owner)
         .await
@@ -885,6 +888,7 @@ struct PausableAgent {
     finish_work: Arc<Notify>,
     disconnect_on_hold: bool,
     deferred_steer: Option<Arc<DeferredSteer>>,
+    confirm_deferred_steer: bool,
 }
 impl AgentExecutor030 for PausableAgent {
     fn supports_operator_hold(&self) -> bool {
@@ -916,6 +920,7 @@ impl AgentExecutor030 for PausableAgent {
         let finish = self.finish_work.clone();
         let disconnect = self.disconnect_on_hold;
         let deferred_steer = self.deferred_steer.clone();
+        let confirm = self.confirm_deferred_steer;
         Box::pin(async move {
             let sibling = disconnect && step == "sibling";
             if step == "work" || sibling {
@@ -925,6 +930,9 @@ impl AgentExecutor030 for PausableAgent {
                     let report = deferred.clone();
                     steer.handoff_observation(&work.tasks, &work.attempt, async move {
                         report.report.notified().await;
+                        if confirm {
+                            return Ok(Some(true));
+                        }
                         Err(crate::persistence::failure(
                             "CORRELATION",
                             "steer",

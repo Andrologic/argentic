@@ -103,6 +103,10 @@ pub(crate) async fn deliver030(
                 .dispatcher(&request.scope.system_start_id)
         })
         .flatten();
+    #[cfg(test)]
+    host.flow030()
+        .operator_test_yield("delivery.dispatch")
+        .await;
     let _dispatch = match &dispatcher {
         Some((gate, _)) => Some(gate.lock().await),
         None => None,
@@ -129,6 +133,10 @@ pub(crate) async fn deliver030(
         }
         None => None,
     };
+    #[cfg(test)]
+    host.flow030()
+        .operator_test_yield("delivery.admission")
+        .await;
     let _admission = host.admission_lock().lock_owned().await;
     let authority = Authority {
         runtime: host.flow030(),
