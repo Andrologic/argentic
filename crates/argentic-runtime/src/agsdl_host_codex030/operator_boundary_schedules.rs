@@ -170,14 +170,21 @@ async fn operator_schedule_lost_control_ack_before_supervisor_pass_and_retry() {
         let pass = freeze_pass(&f).await;
         cancel_command(&f, &scope, "scheduled", command.action(&id), "operator.ack").await;
         let receipt = last_operator_receipt(&f).await;
-        assert!(f.host.flow030().available(&f.identity).is_err());
+        let pending = || {
+            f.host
+                .flow030()
+                .pending_event_commit(&f.identity, &receipt.event_id)
+                .unwrap()
+                .is_some()
+        };
+        assert!(pending(), "{command:?} lost its marker before the pass");
 
         // Let the blocked pass run once before the caller retries.
         let next = arm(&f, "supervisor.pass");
         f.host.flow030().supervisors.wake(&scope.system_start_id);
         pass.release();
         reached(&next, "supervisor.pass").await;
-        assert!(f.host.flow030().available(&f.identity).is_ok());
+        assert!(!pending(), "{command:?} was not reconciled in one pass");
         assert_eq!(
             operator_control(&f, &scope, "scheduled", command.action(&id))
                 .await

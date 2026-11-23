@@ -591,7 +591,7 @@ impl FlowHost030 {
             }
         }
     }
-    fn pending_event_commit(
+    pub(crate) fn pending_event_commit(
         &self,
         identity: &FlowIdentity030,
         event_id: &str,
