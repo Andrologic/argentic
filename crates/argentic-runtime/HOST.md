@@ -285,6 +285,9 @@ on the sender path. Inspect the destination activation's message for
 For new work, `delivered` requires the durable executor handoff. For a
 steer to existing work, the Codex RPC reply leaves receipt pending until
 the matching input notification arrives or the evidence deadline expires.
+A hold can commit while an admitted steer is awaiting confirmation. The
+receipt retains the checkpoint where the provider send was admitted and
+the later checkpoint where the host recorded the outcome.
 
 A 0.4.0 `stop` response with kind `requested` acknowledges a durable whole-run
 stop. Poll `inspect` for `stopping: true` while the executors are still
@@ -356,8 +359,10 @@ with `scope`, `requestId` and `action`. The action takes one of these forms.
   run is paused.
 - **Stop.** Use the existing whole-run Stop for a paused run or a run with a
   held agent. It discards pending dispatch, records any unevaluated clock
-  ticket it supersedes, and continues native termination until physical
-  confirmation.
+  ticket or pending machine deadline it supersedes, and continues native
+  termination until physical confirmation. A superseded deadline stays in
+  history and produces no timeout result. Results committed before Stop keep
+  their clock retirement in the same transaction.
 
 Operator transitions and clock changes are journaled. A new host cannot
 reattach to the held Codex work. On reopening an unfinished run, `inspect`
@@ -365,15 +370,18 @@ reports `verdict: "interrupted"`. Each retained hold has `kind: "interrupted"`
 and `code: "INTERRUPTED"`. `interruptedWhilePaused` records a pause at
 the restart boundary. The work-level code is a host status. The whole-run
 AgSDL recovery outcome follows no normal or error route and creates no
-step failure. A previously committed Stop keeps its existing recovery rules.
+step failure. If a clock ticket was outstanding, fencing retains its exact
+identity and digest for replay without applying its output. A previously
+committed Stop keeps its existing recovery rules.
 
 ## Storage, API and limits
 
 `standalone::Host::open` owns an exclusive OS file lock for its lifetime. It
 opens a new engine-only database or verifies the complete existing schema and
 `post-042` revision before interruption/fencing. Extra, missing or modified DDL,
-unknown revisions and Macro databases are refused. There are no implicit
-migrations. `sqlite::memory()` is an independent shared-memory pool; file and
+unknown revisions and Macro databases are refused. The verified schema may
+include the clock evidence table created when fencing an interrupted run.
+`sqlite::memory()` is an independent shared-memory pool; file and
 memory use the same engine SQL. Raw-pool embedders own their process exclusion.
 After a crash, an ordinary unfinished 0.4.0 run reports
 `verdict: "interrupted"` in `inspect`. The `runs` list also reports
