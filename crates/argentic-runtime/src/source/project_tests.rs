@@ -494,3 +494,82 @@ fn folder_reads_from_the_opened_directory_after_a_rename() {
     let source = OpenedSource::folder(dir, None).unwrap();
     assert_eq!(files(&source)["notes.md"], b"Notes.\n");
 }
+
+#[test]
+fn folder_sidecar_round_trip_preserves_archive_modes() {
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/conformance-050");
+    let input = std::fs::File::open(fixtures.join("review-project.agsdl")).unwrap();
+    let mut original = archive::read(input).unwrap();
+    original.values_mut().next_back().unwrap().executable = true;
+    let mut zipped = Vec::new();
+    archive::write(&original, &mut zipped).unwrap();
+    let original = OpenedSource::open_archive_bytes(&zipped).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let selected = original.selected_files().unwrap();
+    let mut modes = BTreeMap::new();
+    for file in selected {
+        write(temp.path(), file.path, file.bytes);
+        modes.insert(file.path, file.executable);
+    }
+    let mut metadata = String::from("AgSDL executable paths v1\n");
+    for (&path, _) in modes.iter().filter(|(_, executable)| **executable) {
+        metadata.push_str(path);
+        metadata.push('\n');
+    }
+    assert!(modes.values().any(|&executable| executable));
+    metadata.push_str("removed.sh");
+    write(temp.path(), ".agsdl-executables.1", metadata);
+
+    let open = |native_modes| {
+        let dir = open_project_root(temp.path())?;
+        OpenedSource::assembled(project::assemble_folder(dir, None, native_modes)?)
+    };
+    let folder = open(false).unwrap();
+    let mut exported = Vec::new();
+    folder.write_archive(&mut exported).unwrap();
+    let reopened = OpenedSource::open_archive_bytes(&exported).unwrap();
+    assert_eq!(
+        reopened
+            .selected_files()
+            .unwrap()
+            .map(|file| (file.path, file.executable))
+            .collect::<BTreeMap<_, _>>(),
+        modes,
+    );
+    #[cfg(unix)]
+    assert!(open(true)
+        .unwrap()
+        .selected_files()
+        .unwrap()
+        .all(|file| !file.executable));
+
+    write(
+        temp.path(),
+        ".agsdl-executables.1",
+        "AgSDL executable paths v1\n../outside",
+    );
+    let error = open(false).err().unwrap();
+    assert_eq!(error.source.unwrap().path, ".agsdl-executables.1");
+    assert!(error.message.contains("Invalid executable path"));
+}
+
+#[test]
+fn reserved_sidecar_contents_cannot_become_a_project_member() {
+    let temp = tempfile::tempdir().unwrap();
+    project(temp.path(), "../.agsdl-executables", None);
+    write(
+        temp.path(),
+        ".agsdl-executables",
+        "ordinary project content",
+    );
+    assert!(
+        files(&OpenedSource::open_path(temp.path()).unwrap()).contains_key(".agsdl-executables")
+    );
+    write(
+        temp.path(),
+        ".agsdl-executables",
+        "AgSDL executable paths v1\nnotes.md",
+    );
+    assert!(refused(OpenedSource::open_path(temp.path()))
+        .contains("Executable metadata cannot be a selected"));
+}

@@ -1,6 +1,6 @@
 use super::{
-    archive, invalid, io, parse_json, read_regular, Files, MANIFEST, MAX_FILES, MAX_JSON,
-    MAX_JSON_TOTAL, MAX_TOTAL,
+    archive, invalid, io, open_regular, parse_json, read_regular, Files, MANIFEST, MAX_FILES,
+    MAX_JSON, MAX_JSON_TOTAL, MAX_TOTAL,
 };
 use crate::persistence::Result;
 use cap_std::fs::Dir;
@@ -8,9 +8,13 @@ use percent_encoding::{percent_decode_str, utf8_percent_encode, NON_ALPHANUMERIC
 use serde_json::{Map, Value};
 use std::{
     collections::{BTreeMap, BTreeSet},
+    io::Read,
     path::{Path, PathBuf},
     sync::OnceLock,
 };
+
+const MODE_SIDECAR: &str = ".agsdl-executables";
+const MODE_HEADER: &[u8] = b"AgSDL executable paths v1\n";
 
 const SECTIONS: &[&str] = &["agents", "compositions", "content", "skills", "mcpServers"];
 
@@ -50,8 +54,8 @@ fn scheme(uri: &str) -> Option<&str> {
     .then_some(prefix)
 }
 
-struct Reader {
-    dir: Option<Dir>,
+struct Reader<'a> {
+    dir: Option<&'a Dir>,
     files: Files,
     selected: BTreeSet<String>,
     skills: BTreeSet<String>,
@@ -60,22 +64,107 @@ struct Reader {
     total: u64,
 }
 
-pub(super) fn assemble_folder(dir: Dir, manifest: Option<super::ProjectFile>) -> Result<Project> {
-    let mut reader = Reader::new(Some(dir), Files::new());
+pub(super) fn assemble_folder(
+    dir: Dir,
+    manifest: Option<super::ProjectFile>,
+    native_modes: bool,
+) -> Result<Project> {
+    let mut reader = Reader::new(Some(&dir), Files::new());
     if let Some(file) = manifest {
         let canonical = reader.resolve(MANIFEST, MANIFEST, "")?;
         reader.total = file.bytes.len() as u64;
         reader.files.insert(canonical, file);
     }
-    reader.assemble()
+    let mut project = reader.assemble()?;
+    for (name, file) in &project.files {
+        if sidecar_name(name) && file.bytes.starts_with(MODE_HEADER) {
+            return Err(invalid(
+                name,
+                "",
+                "Executable metadata cannot be a selected project file",
+            ));
+        }
+    }
+    if !native_modes {
+        for file in project.files.values_mut() {
+            file.executable = false;
+        }
+        restore_executable_modes(&dir, &mut project.files)?;
+    }
+    Ok(project)
+}
+
+fn sidecar_name(name: &str) -> bool {
+    let Some((prefix, suffix)) = name.split_at_checked(MODE_SIDECAR.len()) else {
+        return false;
+    };
+    prefix.eq_ignore_ascii_case(MODE_SIDECAR)
+        && (suffix.is_empty()
+            || suffix.strip_prefix('.').is_some_and(|suffix| {
+                !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit())
+            }))
+}
+
+fn restore_executable_modes(dir: &Dir, files: &mut Files) -> Result<()> {
+    let root = Path::new(MANIFEST);
+    let mut found = false;
+    for entry in dir.entries().map_err(|e| io(root, e))? {
+        let entry = entry.map_err(|e| io(root, e))?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str().filter(|name| sidecar_name(name)) else {
+            continue;
+        };
+        if !entry
+            .file_type()
+            .map_err(|e| io(Path::new(name), e))?
+            .is_file()
+        {
+            continue;
+        }
+        let path = Path::new(name);
+        let mut input = open_regular(dir, path).map_err(|e| io(path, e))?;
+        let mut header = [0; MODE_HEADER.len()];
+        match input.read_exact(&mut header) {
+            Ok(()) if header == MODE_HEADER => {}
+            Ok(()) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => continue,
+            Err(error) => return Err(io(path, error)),
+        }
+        if found {
+            return Err(invalid(name, "", "Multiple executable sidecars"));
+        }
+        found = true;
+        let mut bytes = Vec::new();
+        input
+            .take(archive::INDEX_LIMIT + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|e| io(path, e))?;
+        if bytes.len() as u64 > archive::INDEX_LIMIT {
+            return Err(invalid(
+                name,
+                "",
+                "Executable metadata exceeds the 2 MiB limit",
+            ));
+        }
+        let paths = std::str::from_utf8(&bytes)
+            .map_err(|_| invalid(name, "", "Executable metadata must be UTF-8"))?;
+        for path in paths.split_terminator('\n') {
+            archive::portable(path).map_err(|_| invalid(name, "", "Invalid executable path"))?;
+            // The reference tool ignores portable files removed from the project.
+            if let Some(file) = files.get_mut(path) {
+                file.executable = true;
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn assemble_archive(files: Files) -> Result<Project> {
     Reader::new(None, files).assemble()
 }
 
-impl Reader {
-    fn new(dir: Option<Dir>, files: Files) -> Self {
+impl<'a> Reader<'a> {
+    fn new(dir: Option<&'a Dir>, files: Files) -> Self {
         Self {
             dir,
             files,

@@ -137,7 +137,7 @@ impl OpenedSource {
     }
 
     fn folder(dir: Dir, manifest: Option<ProjectFile>) -> Result<Self> {
-        Self::assembled(project::assemble_folder(dir, manifest)?)
+        Self::assembled(project::assemble_folder(dir, manifest, cfg!(unix))?)
     }
 
     fn archived(files: Files) -> Result<Self> {
