@@ -397,19 +397,38 @@ async fn http_connect_preserves_pinned_ipv6_link_local_scope() {
         return;
     };
     let listener = tokio::net::TcpListener::bind(address).await.unwrap();
+    let destination = SocketAddrV6::new(
+        *address.ip(),
+        listener.local_addr().unwrap().port(),
+        0,
+        address.scope_id(),
+    );
+    #[cfg(target_os = "macos")]
+    {
+        // A bound link-local address can complete connect without delivering a
+        // connection to the listener on macOS. Check the local fixture before
+        // exercising the HTTP connector so that failure is attributable.
+        let direct = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::try_join!(
+                tokio::net::TcpStream::connect(destination),
+                listener.accept()
+            )
+        })
+        .await;
+        if !matches!(direct, Ok(Ok(_))) {
+            eprintln!(
+                "Skipping scoped MCP HTTP: macOS did not accept the direct link-local TCP probe"
+            );
+            return;
+        }
+    }
     let (mut server, fixture, task) =
         http_fixture_at("legacy-2025-06-18", listener, "mcp.invalid").await;
     let ServerTransport::Http(http) = &mut server.transport else {
         unreachable!()
     };
     // Some platforms omit the scope when reporting the bound address.
-    http.addresses = vec![SocketAddrV6::new(
-        *address.ip(),
-        http.addresses[0].port(),
-        0,
-        address.scope_id(),
-    )
-    .into()];
+    http.addresses = vec![destination.into()];
     let (result, _) = isolated(&dummy_host(), server).await;
     result.unwrap();
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
