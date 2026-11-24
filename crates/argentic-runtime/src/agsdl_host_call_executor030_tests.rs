@@ -327,7 +327,7 @@ fn native_preflight_allows_https_mcp_and_qualifies_endpoint_schemes() {
     assert!(
         crate::agsdl_host_qualification030::product_slice030(&steer.to_string(), None).is_none()
     );
-    let mut doc = base.clone();
+    let mut doc = document(json!({"type":"call","mcp":{"server":"remote","tool":"check"}}));
     doc["mcpServers"] = json!({"remote":{"url":"https://example.invalid/mcp"}});
     assert!(crate::agsdl_host_qualification030::product_slice030(&doc.to_string(), None).is_none());
     doc["mcpServers"]["remote"]["url"] = json!("http://example.invalid/mcp");
@@ -346,6 +346,75 @@ fn native_preflight_allows_https_mcp_and_qualifies_endpoint_schemes() {
         Some(&plan.to_string())
     )
     .is_none());
+}
+
+#[test]
+fn mcp_qualification_reports_direct_and_equipped_usage_after_permission_exclusions() {
+    use crate::api::{product_slice, qualify_product};
+    use crate::permissions::RequestedPermissions;
+
+    let mut doc = document(json!({"type":"call","mcp":{"server":"remote","tool":"check"}}));
+    doc["mcpServers"] = json!({
+        "remote":{"url":"https://example.invalid/mcp"},
+        "issues":{"url":"http://example.invalid/mcp"},
+        "unused":{"url":"https://example.invalid:65536/mcp"}
+    });
+    doc["agents"] = json!({"reviewer":{
+        "harness":"codex","mcpServers":["issues","remote"],
+        "permissions":{"preset":"workspace","rules":[
+            {"action":"mcp","match":"issues/check","effect":"allow"},
+            {"action":"mcp","match":"issues/*","effect":"deny"}
+        ]}
+    }});
+    doc["compositions"] = json!({"review":{"steps":{"lookup":{
+        "type":"call","mcp":{"server":"remote","tool":"check"}
+    }}}});
+
+    let report = qualify_product(&doc, None, None).unwrap();
+    assert!(report.blocking_diagnostic().is_none());
+    assert_eq!(
+        report.mcp_servers["remote"].direct_call_steps,
+        ["/flow/steps/check", "/compositions/review/steps/lookup"]
+    );
+    assert_eq!(report.mcp_servers["remote"].agent_equipment, ["reviewer"]);
+    for name in ["issues", "unused"] {
+        let server = &report.mcp_servers[name];
+        assert!(!server.is_used());
+        assert!(server.blocking_diagnostic().is_none());
+        let issue = server.diagnostic.as_ref().unwrap();
+        assert_eq!(issue.code, "MCP_ENDPOINT_UNSUPPORTED");
+        assert_eq!(issue.pointer, format!("/mcpServers/{name}/url"));
+    }
+    assert!(product_slice(&doc.to_string(), None).is_none());
+
+    // A denial for one tool still permits discovery.
+    doc["agents"]["reviewer"]["permissions"]["rules"][1]["match"] = json!("issues/write*");
+    let report = qualify_product(&doc, None, None).unwrap();
+    assert_eq!(report.mcp_servers["issues"].agent_equipment, ["reviewer"]);
+    assert_eq!(
+        report.blocking_diagnostic().unwrap().pointer,
+        "/mcpServers/issues/url"
+    );
+
+    let host: RequestedPermissions = serde_json::from_value(json!({"preset":"workspace","rules":[
+        {"action":"mcp","match":"issues/*","effect":"deny"}
+    ]}))
+    .unwrap();
+    let report = qualify_product(&doc, None, Some(&host)).unwrap();
+    assert!(report.blocking_diagnostic().is_none());
+    assert_eq!(report.mcp_servers["remote"].agent_equipment, ["reviewer"]);
+    assert!(!report.mcp_servers["issues"].is_used());
+
+    doc["flow"]["steps"]["check"]["mcp"]["server"] = json!("issues");
+    let report = qualify_product(&doc, None, Some(&host)).unwrap();
+    assert_eq!(
+        report.mcp_servers["issues"].direct_call_steps,
+        ["/flow/steps/check"]
+    );
+    assert_eq!(
+        report.blocking_diagnostic().unwrap().pointer,
+        "/mcpServers/issues/url"
+    );
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -799,9 +868,12 @@ async fn native_http_mcp_isolates_server_secrets_and_rejects_echoes_before_persi
     use crate::test_context::mcp::*;
     let peer = Peer::start().await;
     let project = tempfile::tempdir().unwrap();
+    let mut servers = peer.servers();
+    // A URI allowed by AgSDL that the native HTTP client cannot use.
+    servers["unused"] = json!({"url":"https://example.invalid:65536/mcp"});
     let doc = json!({
         "projectFormat":"agsdl-project-1","contract":"agsdl-0.4.0","id":"remote-calls","agents":{},
-        "mcpServers":peer.servers(), "secrets":{"file":"requirements.json"},
+        "mcpServers":servers, "secrets":{"file":"requirements.json"},
         "flow":{"entry":"first","steps":{
             "first":{"type":"call","mcp":{"server":"first","tool":"check"},"arguments":{"value":{"value":9007199254740993u64}},"next":"echo"},
             "echo":{"type":"call","mcp":{"server":"first","tool":"echo"},"onError":"second"},

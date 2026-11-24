@@ -345,6 +345,25 @@ declares `issues` but gives it no usable tools under `read-only`, so Argentic
 starts the reviewer without an issues connection. A deny that covers every tool
 on a server, such as `issues/*`, skips consent and discovery for that server.
 
+A direct call qualifies the endpoint of its own server. Codex qualifies
+endpoints only for servers eligible for discovery under the agent permissions
+and approved host ceiling. An unsupported endpoint on a server with neither
+kind of use is reported without blocking launch.
+
+Embeddings can call `api::qualify_product(document, compiled_plan_json, host_permissions)`
+with the assembled document, optional compiled plan and the approved
+`RequestedPermissions` ceiling. The `mcp_servers` map is keyed by server name.
+Each entry contains `direct_call_steps`, the authored JSON pointers to direct
+calls including calls in compositions, and `agent_equipment`, the names of
+eligible Codex agents. Two empty lists mean the server is unused. The optional
+`diagnostic` reports a URL outside the native HTTP profile. Use
+`blocking_diagnostic()` to distinguish endpoint blockers from diagnostics on
+unused servers. The report's `product_diagnostic` covers other native product
+capability blockers. Without a host ceiling the report uses the agents'
+requested permissions. Standalone preflight returns the per-server map as
+`mcpQualification`. AgSDL document validation, platform qualification and
+live endpoint consent still apply.
+
 Implement `ActionPolicySource::lock_current` for requests with
 `nativeRequest.method == "mcp/tool/requestApproval"`. Present the
 `nativeRequest.params.server`, `.tool` and `.arguments` on the existing

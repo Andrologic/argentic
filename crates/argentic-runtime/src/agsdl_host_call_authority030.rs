@@ -102,8 +102,8 @@ impl CallAuthority030 for NativeCallAuthority030<'_> {
             }
             let step: serde_json::Value = serde_json::from_str(declaration)?;
             let document: serde_json::Value = serde_json::from_str(&capture.authored_source)?;
-            if crate::agsdl_host_qualification030::product_slice030(
-                &capture.authored_source,
+            if crate::agsdl_host_qualification030::product_diagnostic030(
+                &document,
                 Some(&capture.compiled_plan_json),
             )
             .is_some()
@@ -115,7 +115,13 @@ impl CallAuthority030 for NativeCallAuthority030<'_> {
             if let Some(mcp) = step.get("mcp") {
                 let server = mcp["server"].as_str().ok_or(StoreError030::Authority)?;
                 let declaration = &document["mcpServers"][server];
-                if !declaration["command"].is_array() && !declaration["url"].is_string() {
+                if (!declaration["command"].is_array() && !declaration["url"].is_string())
+                    || crate::agsdl_host_qualification030::mcp_endpoint_diagnostic(
+                        server,
+                        declaration,
+                    )
+                    .is_some()
+                {
                     return Err(StoreError030::Authority);
                 }
             }

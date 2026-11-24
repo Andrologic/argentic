@@ -27,6 +27,9 @@
   handing off the HTTP body. Expiry before handoff returns a tool error.
   Unconfirmed termination closes MCP admission immediately, interrupts the
   active Codex turn and reports `MCP_TERMINATION_UNCERTAIN` to the run.
+- Native MCP preflight reports direct call and Codex equipment usage per
+  server. Unsupported endpoints block only when a direct call or eligible
+  Codex equipment uses that server.
 - Native hosts can select a replacement model and effort per agent at Start.
   Inspection and replay read the frozen selection with the original source
   identity.

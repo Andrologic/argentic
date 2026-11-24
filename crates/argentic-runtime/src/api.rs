@@ -295,17 +295,24 @@ pub fn qualify_skill_folders(document: &Value, root: &std::path::Path) -> Result
 pub fn declared_steps(document: &Value) -> impl Iterator<Item = (String, &Value)> {
     crate::agsdl_host_qualification030::declared_steps030(document)
 }
-pub struct Diagnostic {
-    pub code: String,
-    pub pointer: String,
-    pub message: String,
+pub use crate::agsdl_host_qualification030::{
+    Diagnostic, McpServerQualification, ProductQualification,
+};
+
+/// Checks native product capabilities for an assembled AgSDL document. Supply
+/// the approved host ceiling to match Codex equipment admission. With no ceiling
+/// the report uses the agents' requested permissions alone.
+pub fn qualify_product(
+    document: &Value,
+    compiled: Option<&str>,
+    host_permissions: Option<&crate::permissions::RequestedPermissions>,
+) -> Result<ProductQualification> {
+    crate::agsdl_host_qualification030::qualify_product030(document, compiled, host_permissions)
 }
+
+/// Returns the first native product blocker under the authored permissions.
 pub fn product_slice(authored: &str, compiled: Option<&str>) -> Option<Diagnostic> {
-    crate::agsdl_host_qualification030::product_slice030(authored, compiled).map(|d| Diagnostic {
-        code: d.code,
-        pointer: d.pointer,
-        message: d.message,
-    })
+    crate::agsdl_host_qualification030::product_slice030(authored, compiled)
 }
 
 impl StartSession<'_> {

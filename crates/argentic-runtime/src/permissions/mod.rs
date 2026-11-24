@@ -381,54 +381,61 @@ impl EffectivePolicy {
 /// Avoid discovery for servers denied by an entire ceiling. Tool-specific
 /// grants can still override a deny-by-default preset for a candidate server.
 pub(crate) fn may_equip_mcp(policy: &EffectivePolicy, server: &str) -> Result<bool> {
-    let request = ActionRequest::Mcp {
-        server: server.to_owned(),
-        tool: None,
-    };
+    paths::check_mcp_identity(server, None)?;
     for ceiling in policy.policies() {
-        let subject = paths::Subject::new(ceiling.context(), &request)?;
-        for rule in ceiling.rules() {
-            if rule.action != Action::Mcp || rule.effect != Effect::Deny {
-                continue;
-            }
-            let all_tools = match rule.pattern.as_deref().and_then(|p| p.split_once('/')) {
-                Some((server_pattern, tool_pattern)) => {
-                    !tool_pattern.is_empty()
-                        && tool_pattern.bytes().all(|byte| byte == b'*')
-                        && paths::glob(server_pattern, server, false, false)?
-                }
-                None => rule.matches(Action::Mcp, &subject)?,
-            };
-            if all_tools {
-                return Ok(false);
-            }
-        }
-        if evaluate_requested(ceiling, &request)? != Effect::Deny {
-            continue;
-        }
-        let mut tool_grant = false;
-        for rule in ceiling.rules() {
-            let Some((pattern, tool_pattern)) = rule
-                .pattern
-                .as_deref()
-                .and_then(|pattern| pattern.split_once('/'))
-            else {
-                continue;
-            };
-            if rule.action == Action::Mcp
-                && rule.effect != Effect::Deny
-                && !tool_pattern.contains('/')
-                && paths::glob(pattern, server, false, false)?
-            {
-                tool_grant = true;
-                break;
-            }
-        }
-        if !tool_grant {
+        let rules = ceiling
+            .rules()
+            .iter()
+            .filter(|rule| rule.action == Action::Mcp)
+            .map(|rule| (rule.pattern.as_deref(), rule.effect));
+        if !mcp_ceiling_allows_equipment(ceiling.preset(), rules, server)? {
             return Ok(false);
         }
     }
     Ok(true)
+}
+
+pub(crate) fn requested_may_equip_mcp(policy: &RequestedPermissions, server: &str) -> Result<bool> {
+    paths::check_mcp_identity(server, None)?;
+    let (preset, rules) = match policy {
+        RequestedPermissions::Preset(preset) => (Some(*preset), &[][..]),
+        RequestedPermissions::Object(policy) => (policy.preset, policy.rules.as_slice()),
+    };
+    let rules = rules
+        .iter()
+        .filter(|rule| rule.action == Action::Mcp)
+        .map(|rule| (rule.pattern.as_deref(), rule.effect));
+    mcp_ceiling_allows_equipment(preset, rules, server)
+}
+
+fn mcp_ceiling_allows_equipment<'a>(
+    preset: Option<Preset>,
+    rules: impl Iterator<Item = (Option<&'a str>, Effect)>,
+    server: &str,
+) -> Result<bool> {
+    let mut allowed = matches!(preset, Some(Preset::Workspace | Preset::Full));
+    for (pattern, effect) in rules {
+        let (server_pattern, tool_pattern) =
+            match pattern.and_then(|pattern| pattern.split_once('/')) {
+                Some((server_pattern, tool_pattern)) => (Some(server_pattern), Some(tool_pattern)),
+                None => (pattern, None),
+            };
+        if let Some(pattern) = server_pattern {
+            if !paths::glob(pattern, server, false, false)? {
+                continue;
+            }
+        }
+        if effect == Effect::Deny {
+            if tool_pattern.is_none_or(|pattern| {
+                !pattern.is_empty() && pattern.bytes().all(|byte| byte == b'*')
+            }) {
+                return Ok(false);
+            }
+        } else {
+            allowed |= tool_pattern.is_none_or(|pattern| !pattern.contains('/'));
+        }
+    }
+    Ok(allowed)
 }
 
 pub fn evaluate_effective(

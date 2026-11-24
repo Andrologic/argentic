@@ -426,7 +426,9 @@ impl Host {
     async fn prepare(&self, entry: Option<&EngineEntry>, allow_codex: bool) -> Result<Prepared> {
         let inputs = self.policies.acquire().await?;
         let doc: Value = serde_json::from_str(inputs.opened.authored_json())?;
-        if let Some(d) = api::product_slice(inputs.opened.authored_json(), None) {
+        let qualification = api::qualify_product(&doc, None, Some(&inputs.policy.permissions))
+            .map_err(|error| inputs.opened.locate_error(error))?;
+        if let Some(d) = qualification.blocking_diagnostic() {
             return Err(inputs
                 .opened
                 .locate_error(failure(&d.code, &d.pointer, &d.message)));
@@ -514,7 +516,7 @@ impl Host {
                 registry.to_string(),
             )
             .await?;
-        let result: Value = serde_json::from_str(&compiled.result_json)?;
+        let mut result: Value = serde_json::from_str(&compiled.result_json)?;
         if result.pointer("/static/valid") != Some(&json!(true))
             || result.pointer("/runtime/supported") != Some(&json!(true))
         {
@@ -549,6 +551,7 @@ impl Host {
             }
             return Err(failure("UNSUPPORTED", "source", &result.to_string()));
         }
+        result["mcpQualification"] = serde_json::to_value(qualification.mcp_servers)?;
         Ok(Prepared {
             result,
             observation,
@@ -1050,10 +1053,16 @@ mod tests {
     }
     #[tokio::test]
     async fn standalone_real_start_human_submission_stop_and_reopen() {
-        let f = Fixture::new(WAIT);
+        let mut document: Value = serde_json::from_str(WAIT).unwrap();
+        document["mcpServers"] = json!({"unused":{"url":"http://example.invalid/mcp"}});
+        let f = Fixture::new(&document.to_string());
         let host = f.open().await.unwrap();
         let result = host.preflight(entry().as_ref(), false).await.unwrap();
         assert_eq!(result["runtime"]["supported"], true);
+        let unused = &result["mcpQualification"]["unused"];
+        assert_eq!(unused["diagnostic"]["code"], "MCP_ENDPOINT_UNSUPPORTED");
+        assert_eq!(unused["directCallSteps"], json!([]));
+        assert_eq!(unused["agentEquipment"], json!([]));
         let started = host.start("start".into(), entry(), false).await.unwrap();
         let replay = host.start("start".into(), entry(), false).await.unwrap();
         assert_eq!(started.receipt, replay.receipt);

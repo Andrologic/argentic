@@ -176,12 +176,14 @@ fn profile_accepts_the_official_example_and_locates_unsupported_options() {
 
         let mut doc: Value = serde_json::from_str(opened.authored_json()).unwrap();
         doc["mcpServers"]["issues"]["url"] = json!("http://example.invalid/issues");
-        let slice = crate::api::product_slice(&doc.to_string(), None).unwrap();
+        let report = crate::api::qualify_product(&doc, None, None).unwrap();
+        assert!(report.blocking_diagnostic().is_none());
+        let issue = report.mcp_servers["issues"].diagnostic.as_ref().unwrap();
         assert_eq!(
-            (slice.code.as_str(), slice.pointer.as_str()),
+            (issue.code.as_str(), issue.pointer.as_str()),
             ("MCP_ENDPOINT_UNSUPPORTED", "/mcpServers/issues/url")
         );
-        let located = opened.locate_error(failure(&slice.code, &slice.pointer, &slice.message));
+        let located = opened.locate_error(failure(&issue.code, &issue.pointer, &issue.message));
         assert!(
             located.message.starts_with("mcp/issues.json"),
             "{}",

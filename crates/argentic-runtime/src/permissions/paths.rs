@@ -289,6 +289,18 @@ fn windows_path_spelling(path: &str) -> String {
     let path = if volume_path { &path[4..] } else { path };
     path.replace('\\', "/")
 }
+pub(super) fn check_mcp_identity(server: &str, tool: Option<&str>) -> Result<()> {
+    if server.is_empty()
+        || server.contains(['/', '*', '\0'])
+        || tool.is_some_and(|tool| tool.is_empty() || tool.contains(['/', '*', '\0']))
+    {
+        return Err(invalid(
+            "MCP identity requires separate unambiguous server and tool names",
+        ));
+    }
+    Ok(())
+}
+
 pub(super) struct Subject {
     pub logical: String,
     pub physical: Option<PathBuf>,
@@ -357,16 +369,7 @@ impl Subject {
                 subject.logical = ip.map_or_else(|_| host.to_owned(), |ip| ip.to_string());
             }
             ActionRequest::Mcp { server, tool } => {
-                if server.is_empty()
-                    || server.contains(['/', '*', '\0'])
-                    || tool
-                        .as_ref()
-                        .is_some_and(|t| t.is_empty() || t.contains(['/', '*', '\0']))
-                {
-                    return Err(invalid(
-                        "MCP identity requires separate unambiguous server and tool names",
-                    ));
-                }
+                check_mcp_identity(server, tool.as_deref())?;
                 subject.server = server.clone();
                 subject.logical = tool
                     .as_ref()
