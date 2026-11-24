@@ -33,9 +33,10 @@
 - Native hosts can select a replacement model and effort per agent at Start.
   Inspection and replay read the frozen selection with the original source
   identity.
-- Codex 0.171.0 is qualified on Linux ARM64 for the read-only profile
-  with private login. The adapter supports the package's bundled exec-server
-  and isolates its runtime sockets.
+- Codex 0.171.0 is qualified on macOS ARM64 and Linux ARM64 for the
+  read-only profile with private login. The adapter isolates runtime sockets
+  and checks the platform's package layout, including the macOS exec-server
+  sibling.
 
 - Project opening and compilation share work and allocation budgets across
   parsing, expansion, validation and output. `GRAPH_LIMIT` locates refusals,

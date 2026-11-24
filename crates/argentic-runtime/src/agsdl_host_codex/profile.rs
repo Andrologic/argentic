@@ -553,7 +553,7 @@ pub(super) fn qualified_version(version: &str) -> bool {
     version
         .strip_prefix("0.167.")
         .is_some_and(|patch| !patch.is_empty() && patch.bytes().all(|byte| byte.is_ascii_digit()))
-        || cfg!(all(target_os = "linux", target_arch = "aarch64")) && version == READ_ONLY_RELEASE
+        || qualified_platform() && version == READ_ONLY_RELEASE
 }
 fn qualified_platform() -> bool {
     cfg!(any(
@@ -591,12 +591,7 @@ pub(crate) async fn prepare_physical_qa(manager: &HostContext) -> Result<Profile
         )
     };
     let version = version.as_deref().ok_or_else(unqualified)?;
-    // Only these opt-in physical tests can exercise the macOS candidate
-    // before authenticated smoke qualifies it for host admission.
-    let macos_candidate = cfg!(all(target_os = "macos", target_arch = "aarch64"))
-        && version == READ_ONLY_RELEASE
-        && manager.codex_auth_file().is_none();
-    if !qualified_version(version) && !macos_candidate {
+    if !qualified_version(version) {
         return Err(unqualified());
     }
     prepare_profile(manager, version, profile)
@@ -834,7 +829,10 @@ mod tests {
         }
         assert_eq!(
             qualified_version(READ_ONLY_RELEASE),
-            cfg!(all(target_os = "linux", target_arch = "aarch64"))
+            cfg!(all(
+                target_arch = "aarch64",
+                any(target_os = "linux", target_os = "macos")
+            ))
         );
         for version in [
             "0.163.0",
