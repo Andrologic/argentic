@@ -358,7 +358,11 @@ calls including calls in compositions, and `agent_equipment`, the names of
 eligible Codex agents. Two empty lists mean the server is unused. The optional
 `diagnostic` reports a URL outside the native HTTP profile. Use
 `blocking_diagnostic()` to distinguish endpoint blockers from diagnostics on
-unused servers. The report's `product_diagnostic` covers other native product
+unused servers. `direct_call_steps` follows declaration order, flow steps
+before composition steps, and `agent_equipment` is sorted by name. Standalone preflight serializes the
+`mcp_servers` map under `mcpQualification`, keyed by server name, with
+camelCase entry keys (`directCallSteps`, `agentEquipment`, `diagnostic`); a
+`diagnostic` has the shape `{code, pointer, message}`. The report's `product_diagnostic` covers other native product
 capability blockers. Without a host ceiling the report uses the agents'
 requested permissions. Standalone preflight returns the per-server map as
 `mcpQualification`. AgSDL document validation, platform qualification and

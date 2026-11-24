@@ -175,6 +175,9 @@ pub(crate) fn qualify_product030(
             report.agent_equipment.push(agent_name.clone());
         }
     }
+    for report in mcp_servers.values_mut() {
+        report.agent_equipment.sort();
+    }
     Ok(ProductQualification {
         product_diagnostic: product_diagnostic030(document, compiled),
         mcp_servers,
