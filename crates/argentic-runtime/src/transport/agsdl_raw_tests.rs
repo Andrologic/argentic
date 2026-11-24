@@ -73,6 +73,7 @@ async fn http_handler(
     }
     let result: String = match method {
         "initialize" if state.mode == "initialize-stall" => std::future::pending().await,
+        "initialize" if state.mode == "invalid-version" => r#"{"protocolVersion":"unknown"}"#.into(),
         "tools/list" if state.mode == "list-stall" => std::future::pending().await,
         "initialize" if state.mode == "legacy-2025-06-18" => {
             r#"{"protocolVersion":"2025-06-18","capabilities":{},"serverInfo":{"name":"synthetic","version":"1"}}"#.into()
@@ -148,9 +149,17 @@ async fn delete_session(
     headers: axum::http::HeaderMap,
 ) -> axum::http::StatusCode {
     assert_eq!(headers["mcp-session-id"], "captured");
-    if state.mode == "legacy-2025-06-18" {
-        assert_eq!(headers["mcp-protocol-version"], "2025-06-18");
-    }
+    let expected = match state.mode {
+        "invalid-version" => None,
+        "legacy-2025-06-18" => Some("2025-06-18"),
+        _ => Some("2025-11-25"),
+    };
+    assert_eq!(
+        headers
+            .get("mcp-protocol-version")
+            .map(|h| h.to_str().unwrap()),
+        expected
+    );
     state.requests.lock().await.push("DELETE captured".into());
     // Servers may refuse session deletion.
     axum::http::StatusCode::METHOD_NOT_ALLOWED
@@ -163,13 +172,25 @@ async fn http_fixture(
     Arc<HttpFixture>,
     tokio::task::JoinHandle<()>,
 ) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    http_fixture_at(mode, listener, "127.0.0.1").await
+}
+
+async fn http_fixture_at(
+    mode: &'static str,
+    listener: tokio::net::TcpListener,
+    host: &str,
+) -> (
+    CapturedServer,
+    Arc<HttpFixture>,
+    tokio::task::JoinHandle<()>,
+) {
     let state = Arc::new(HttpFixture {
         requests: tokio::sync::Mutex::new(vec![]),
         calls: AtomicUsize::new(0),
         mode,
         answer_seen: tokio::sync::Notify::new(),
     });
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let app = axum::Router::new()
         .route(
@@ -193,7 +214,7 @@ async fn http_fixture(
             },
             transport: ServerTransport::Http(HttpServer {
                 secret_values: Vec::new(),
-                url: format!("http://127.0.0.1:{}/mcp", address.port())
+                url: format!("http://{host}:{}/mcp", address.port())
                     .parse()
                     .unwrap(),
                 addresses: vec![address],
@@ -321,6 +342,78 @@ async fn http_exact_receipts_human_waits_modern_continuation_and_no_replay() {
         task.abort();
         let _ = task.await;
     }
+}
+
+#[tokio::test]
+async fn deletes_http_session_without_a_protocol_version_when_negotiation_fails() {
+    let (server, fixture, task) = http_fixture("invalid-version").await;
+    let mut session = start(server).unwrap();
+    let host = dummy_host();
+    assert!(session
+        .initialize(host.clone(), &identity(), &host.control)
+        .await
+        .is_err());
+    let _ = session.shutdown(false).await;
+    assert!(fixture
+        .requests
+        .lock()
+        .await
+        .iter()
+        .any(|r| r == "DELETE captured"));
+    task.abort();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn http_connect_preserves_pinned_ipv6_link_local_scope() {
+    use std::net::{Ipv6Addr, SocketAddrV6};
+
+    let mut interfaces = std::ptr::null_mut();
+    assert_eq!(unsafe { libc::getifaddrs(&mut interfaces) }, 0);
+    let mut current = interfaces;
+    let mut address = None;
+    // The list and its socket addresses remain valid until freeifaddrs.
+    while let Some(entry) = unsafe { current.as_ref() } {
+        if let Some(raw) = unsafe { entry.ifa_addr.as_ref() } {
+            if raw.sa_family as i32 == libc::AF_INET6 {
+                let raw = unsafe { &*entry.ifa_addr.cast::<libc::sockaddr_in6>() };
+                let ip = Ipv6Addr::from(raw.sin6_addr.s6_addr);
+                if ip.is_unicast_link_local() && entry.ifa_flags & libc::IFF_UP as u32 != 0 {
+                    let scope = unsafe { libc::if_nametoindex(entry.ifa_name) };
+                    if scope != 0 {
+                        address = Some(SocketAddrV6::new(ip, 0, 0, scope));
+                        break;
+                    }
+                }
+            }
+        }
+        current = entry.ifa_next;
+    }
+    if !interfaces.is_null() {
+        unsafe { libc::freeifaddrs(interfaces) };
+    }
+    let Some(address) = address else {
+        eprintln!("Skipping scoped MCP HTTP: no IPv6 link-local address");
+        return;
+    };
+    let listener = tokio::net::TcpListener::bind(address).await.unwrap();
+    let (mut server, fixture, task) =
+        http_fixture_at("legacy-2025-06-18", listener, "mcp.invalid").await;
+    let ServerTransport::Http(http) = &mut server.transport else {
+        unreachable!()
+    };
+    // Some platforms omit the scope when reporting the bound address.
+    http.addresses = vec![SocketAddrV6::new(
+        *address.ip(),
+        http.addresses[0].port(),
+        0,
+        address.scope_id(),
+    )
+    .into()];
+    let (result, _) = isolated(&dummy_host(), server).await;
+    result.unwrap();
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+    task.abort();
 }
 
 #[tokio::test]
