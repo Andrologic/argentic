@@ -79,12 +79,16 @@ jobs:
         if: inputs.suite != 'reader'
         working-directory: crates/argentic-runtime
         run: |
+          cargo_args=(--locked --all-targets)
           test_args=(--test-threads=1)
+          if [[ "$RUNNER_OS" == Linux ]]; then
+            cargo_args+=(--features agsdl-engine-qa)
+          fi
           if [[ "$RUNNER_OS" != Windows ]]; then
             # The no-Bun test already runs all 37 scenarios in both storage modes.
             test_args+=(--skip agsdl030_conformance_all_37_scenarios)
           fi
-          cargo test --locked --all-targets -- "${test_args[@]}"
+          cargo test "${cargo_args[@]}" -- "${test_args[@]}"
           cargo test --locked --doc
 
       - name: Build standalone host

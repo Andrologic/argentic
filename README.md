@@ -65,6 +65,14 @@ cargo build --locked --manifest-path "$manifest" --example argentic-host
 cargo test --locked --manifest-path "$manifest" --features dev-support --test approval_boundary -- --test-threads=1
 ```
 
+Le profil CI Linux exécute aussi les tests du moteur activés par `agsdl-engine-qa`.
+Pour les exécuter localement, utilisez le profil de test Cargo par défaut.
+
+```sh
+cargo test --locked --manifest-path crates/argentic-runtime/Cargo.toml \
+  --features agsdl-engine-qa --lib -- --test-threads=1
+```
+
 **Recettes des lots 3 à 5.** Utiliser les fixtures `human-only.json`, `write-review.json` et `policy.json` du dossier `crates/argentic-runtime/examples/fixtures`. Le protocole et les formes exactes des messages figurent dans le `HOST.md` importé.
 
 1. Démarrer avec un répertoire de données privé distinct du workspace et le condensat SHA-256 de la politique examinée. Sur macOS ARM64, exécuter le flux humain sans fournisseur. Lire `ready`, appeler `preflight` puis `start`, lire la demande via `humans`, répondre avec son identifiant et sa révision, puis vérifier le résultat par `inspect`. Réutiliser la même clé Start après une réponse perdue et vérifier qu’il existe une seule exécution.

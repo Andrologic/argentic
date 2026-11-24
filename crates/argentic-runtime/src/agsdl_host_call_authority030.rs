@@ -131,7 +131,8 @@ mod tests {
 
     #[tokio::test]
     async fn native_authority_refuses_unqualified_transport_and_foreign_generation() {
-        let f = Fixture::new(r#"{"type":"call","command":"true"}"#).await;
+        // This call names an MCP server absent from the retained capture.
+        let f = Fixture::new(r#"{"type":"call","mcp":{"server":"missing","tool":"check"}}"#).await;
         let owner = EngineOwner {
             system_start_id: f.id.system_start_id.clone(),
             owner_epoch: "owner".into(),
@@ -140,9 +141,10 @@ mod tests {
         let authority = NativeCallAuthority030::capture(&host, &owner)
             .await
             .unwrap();
-        assert!(calls::reserve_call030(&f.pool, &authority, &f.effect)
-            .await
-            .is_err());
+        let Err(error) = calls::reserve_call030(&f.pool, &authority, &f.effect).await else {
+            panic!("Native authority reserved a call with no captured server");
+        };
+        assert_eq!(error.code, "AUTHORITY");
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM engine_flow030_calls")
             .fetch_one(&f.pool)
             .await
@@ -154,7 +156,10 @@ mod tests {
             .await
             .unwrap();
         let mut tx = f.pool.begin().await.unwrap();
-        assert!(authority.owner(&mut tx, &f.id).await.is_err());
+        assert!(matches!(
+            authority.owner(&mut tx, &f.id).await,
+            Err(StoreError030::Authority)
+        ));
     }
 
     #[tokio::test]
