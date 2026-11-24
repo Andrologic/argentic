@@ -175,6 +175,8 @@ pub(super) fn retain(
             .write_all(&bytes)
             .and_then(|()| output.sync_all())
             .map_err(|e| storage(&index, e))?;
+        // Windows requires the staging directory's files to be closed before renaming it.
+        drop(output);
         #[cfg(unix)]
         for directory in directories.iter().rev() {
             sync_directory(directory)?;
