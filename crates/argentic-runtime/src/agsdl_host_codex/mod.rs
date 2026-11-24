@@ -360,6 +360,77 @@ time.sleep(30)
         }
     }
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[tokio::test]
+    #[ignore = "requires the physical Codex 0.171.0 macOS ARM64 package"]
+    async fn physical_codex_macos_read_only_without_auth_or_model() {
+        use std::os::unix::{fs::PermissionsExt, net::UnixListener};
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let manager = crate::test_context::context(root.join("config"));
+        let workspace = root.join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let input = workspace.join("input");
+        let outside = root.join("outside");
+        std::fs::write(&input, "synthetic").unwrap();
+        std::fs::write(&outside, "outside").unwrap();
+
+        let profile = profile::prepare_physical_qa(&manager).await.unwrap();
+        let runtime = profile.runtime.as_ref().expect("Codex 0.171.0 required");
+        assert_eq!(
+            runtime.path().metadata().unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert!(profile.app_server_command(&workspace, false).is_err());
+        assert!(profile.app_server_command(runtime.path(), true).is_err());
+        let private = profile.directory.join("private-guard");
+        std::fs::write(&private, "private").unwrap();
+        let socket = runtime.path().join("probe.sock");
+        let unix_listener = UnixListener::bind(&socket).unwrap();
+        unix_listener.set_nonblocking(true).unwrap();
+        let tcp_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        tcp_listener.set_nonblocking(true).unwrap();
+        let port = tcp_listener.local_addr().unwrap().port().to_string();
+
+        let mut process = ContainedBackgroundProcess::spawn(
+            profile.app_server_command(&workspace, true).unwrap(),
+        )
+        .unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            let mut client = Client::new(process.take_stdin().unwrap(), process.take_stdout().unwrap());
+            client.initialize().await?;
+            client.preflight(&profile, workspace.to_str().unwrap(), true).await?;
+
+            let probe = r#"set -e
+test "$(/bin/cat "$1")" = synthetic
+if /bin/cat "$2" || /bin/cat "$3" || /usr/bin/touch "$4" ||
+   /usr/bin/nc -G 1 -z 127.0.0.1 "$5" || /usr/bin/nc -d -w 1 -U "$6"; then
+    exit 98
+fi
+printf '%s' confined
+"#;
+            client.request("command/exec", json!({"command":["/bin/sh","-c",probe,"sandbox-probe",input,private,outside,workspace.join("forbidden"),port,socket],
+                "cwd": profile.bootstrap, "permissionProfile":"macro-agsdl","timeoutMs":5000,"outputBytesCap":4096})).await
+        }).await;
+        process
+            .terminate_bounded()
+            .await
+            .expect("physical app-server and descendants end");
+        let command = result.expect("bounded native profile check").unwrap();
+        assert_eq!(command["exitCode"], 0, "{command}");
+        assert_eq!(command["stdout"], "confined", "{command}");
+        assert!(!workspace.join("forbidden").exists());
+        assert_eq!(
+            unix_listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        assert_eq!(
+            tcp_listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
     #[tokio::test]
     #[ignore = "requires an explicitly assigned empty native QA profile and the physical Codex executable"]
     async fn physical_codex_profile_without_auth_or_model() {

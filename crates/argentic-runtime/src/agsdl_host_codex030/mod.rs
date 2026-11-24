@@ -2973,7 +2973,7 @@ for line in sys.stdin:
         )))
         .await
         .unwrap();
-        let profile = profile::prepare(&config, profile::VERSION).unwrap();
+        let profile = profile::prepare_physical_qa(&config).await.unwrap();
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         let mut process =
@@ -3061,7 +3061,7 @@ for line in sys.stdin:
         )))
         .await
         .unwrap();
-        let profile = profile::prepare(&config, profile::VERSION).unwrap();
+        let profile = profile::prepare_physical_qa(&config).await.unwrap();
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         let mut process =
@@ -3134,8 +3134,11 @@ for line in sys.stdin:
         let root = base.join("workspace");
         std::fs::create_dir(&root).unwrap();
         let outside = base.join("outside.txt");
-        let profile = profile::prepare(&config, profile::VERSION).unwrap();
-        for read_only in [false, true] {
+        let profile = profile::prepare_physical_qa(&config).await.unwrap();
+        for read_only in [false, true]
+            .into_iter()
+            .filter(|read_only| *read_only || profile.runtime.is_none())
+        {
             let inside = root.join(if read_only { "review.txt" } else { "write.txt" });
             let mut process = ContainedBackgroundProcess::spawn(
                 profile.app_server_command(&root, read_only).unwrap(),
@@ -3151,7 +3154,7 @@ for line in sys.stdin:
                 .await
                 .unwrap();
             // Pass file arguments separately, so no path can become shell code.
-            let result = client.request("command/exec", json!({"command":["/bin/sh","-c","printf inside > \"$1\"; printf outside > \"$2\"","sandbox-test",inside,outside],"cwd":profile.bootstrap,"runtimeWorkspaceRoots":[root],"permissionProfile":"macro-agsdl","timeoutMs":5000,"outputBytesCap":4096})).await;
+            let result = client.request("command/exec", json!({"command":["/bin/sh","-c","printf inside > \"$1\"; printf outside > \"$2\"","sandbox-test",inside,outside],"cwd":profile.bootstrap,"permissionProfile":"macro-agsdl","timeoutMs":5000,"outputBytesCap":4096})).await;
             drop(client);
             process.terminate_bounded().await.unwrap();
             let result = result.unwrap();
