@@ -46,7 +46,7 @@ struct Bridge {
     stop: CancellationToken,
     auth: String,
     work: FlowWorkAttempt030,
-    authored_budget: bool,
+    remote_tool_budget: Option<Duration>,
     approvals: Option<Arc<dyn CommandApprovals030>>,
     admission: crate::agsdl_host_flow030::operator030::AgentOperator030,
     upstreams: BTreeMap<String, Upstream>,
@@ -74,7 +74,8 @@ impl Equipment {
         let token = uuid::Uuid::new_v4().to_string();
         let mut state = Bridge::new(
             work,
-            authored_budget,
+            (!authored_budget)
+                .then(|| Duration::from_millis(context.remote_mcp_tool_budget_ms().get())),
             approvals,
             cancel,
             format!("Bearer {token}"),
@@ -182,8 +183,8 @@ impl Equipment {
                             "default_tools_approval_mode": "approve",
                             "required": true,
                             "startup_timeout_sec": 10.0,
-                            // Codex requires a finite duration. The engine's durable
-                            // clock and human waits govern this work.
+                            // Codex requires a finite duration. Argentic owns the
+                            // work clock, human waits and remote tool budget.
                             "tool_timeout_sec": f64::from(u32::MAX),
                         }),
                     )
@@ -304,7 +305,7 @@ impl Upstream {
 impl Bridge {
     fn new(
         work: &AgentWork030,
-        authored_budget: bool,
+        remote_tool_budget: Option<Duration>,
         approvals: Option<Arc<dyn CommandApprovals030>>,
         cancel: &CancellationToken,
         auth: String,
@@ -313,7 +314,7 @@ impl Bridge {
             stop: cancel.child_token(),
             auth,
             work: work.attempt.clone(),
-            authored_budget,
+            remote_tool_budget,
             approvals,
             admission: work.operator.clone(),
             upstreams: BTreeMap::new(),
@@ -409,22 +410,33 @@ impl Bridge {
                 .ok()?;
             pending?
         } else {
-            let _admission = self.admit(&control).await.ok()?;
-            self.dispatch(session, tool, &arguments_json, &control)
-                .await
-                .ok()?
+            let admission = self.admit(&control).await.ok()?;
+            #[cfg(test)]
+            let admission = self.admission.track_mcp_gate(admission);
+            let sent = self
+                .dispatch(session, tool, &arguments_json, &control)
+                .await;
+            drop(admission);
+            sent.ok()?
         };
         #[cfg(test)]
         self.admission.test_yield("mcp.dispatch.wait").await;
+        let budget = self.remote_tool_budget.filter(|_| session.is_remote());
         let result = session.finish_tool_call(pending, &NoHuman, &upstream.identity, &control);
-        let receipt = if self.authored_budget {
-            result.await
+        let receipt = if let Some(deadline) = budget.and_then(|budget| started.checked_add(budget)) {
+            match tokio::time::timeout_at(deadline, result).await {
+                Ok(result) => result,
+                Err(_) => {
+                    let message = if session.tool_in_flight() {
+                        "MCP_TERMINATION_UNCERTAIN: remote MCP tool budget expired before termination could be confirmed"
+                    } else {
+                        "Remote MCP tool budget expired"
+                    };
+                    return Some(json!({"isError":true,"content":[{"type":"text","text":message}]}));
+                }
+            }
         } else {
-            let budget =
-                Duration::from_millis(crate::persistence::call_protocol030::DEFAULT_MCP_TOOL_MS);
-            tokio::time::timeout_at(started + budget, result)
-                .await
-                .ok()?
+            result.await
         }
         .ok()?;
         serde_json::from_str(&receipt.raw_result_json).ok()
@@ -516,15 +528,19 @@ fn mcp_error(code: &str, message: &str) -> crate::persistence::dto::EngineFailur
 #[cfg(all(test, unix))]
 pub(crate) async fn call_test_session(
     work: &AgentWork030,
-    approvals: Arc<dyn CommandApprovals030>,
+    approvals: Option<Arc<dyn CommandApprovals030>>,
     cancel: &CancellationToken,
     session: raw_mcp::Session,
-) -> Result<Option<Value>> {
-    let mut state = Bridge::new(work, false, Some(approvals), cancel, String::new());
+    budget: Option<Duration>,
+) -> Result<(Option<Value>, Result<()>)> {
+    let effect = if approvals.is_some() {
+        Effect::Ask
+    } else {
+        Effect::Allow
+    };
+    let mut state = Bridge::new(work, budget, approvals, cancel, String::new());
     let mut upstream = Upstream::new(session, &work.attempt);
-    upstream
-        .tools
-        .insert("check".into(), (Effect::Ask, Value::Null));
+    upstream.tools.insert("check".into(), (effect, Value::Null));
     state.upstreams.insert("issues".into(), upstream);
     let equipment = Equipment {
         state: Arc::new(state),
@@ -549,6 +565,5 @@ pub(crate) async fn call_test_session(
         .state
         .call(upstream, "issues", &json!({"name":"check"}))
         .await;
-    equipment.close().await?;
-    Ok(result)
+    Ok((result, equipment.close().await))
 }

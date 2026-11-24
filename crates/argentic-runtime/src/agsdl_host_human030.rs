@@ -303,7 +303,7 @@ impl HumanBroker030 {
                 && attempt.generation() == self.generation,
             "Foreign agent attempt",
         )?;
-        self.admit(host, attempt.start_effect_id(), Some(attempt))
+        self.admit(host, attempt.start_effect_id(), Some(attempt), None)
             .await
     }
     /// For Call/Approval this authenticates the owned host handoff and capture.
@@ -313,13 +313,29 @@ impl HumanBroker030 {
         host: &HostState,
         start_effect_id: &str,
     ) -> Result<OwnedHumanWork030> {
-        self.admit(host, start_effect_id, None).await
+        self.admit(
+            host,
+            start_effect_id,
+            None,
+            Some(crate::host::HostContext::DEFAULT_REMOTE_MCP_TOOL_BUDGET_MS),
+        )
+        .await
+    }
+    pub(crate) async fn admit_call(
+        &self,
+        host: &HostState,
+        start_effect_id: &str,
+        remote_mcp_budget_ms: std::num::NonZeroU64,
+    ) -> Result<OwnedHumanWork030> {
+        self.admit(host, start_effect_id, None, Some(remote_mcp_budget_ms))
+            .await
     }
     async fn admit(
         &self,
         host: &HostState,
         effect_id: &str,
         attempt: Option<&FlowWorkAttempt030>,
+        remote_mcp_budget_ms: Option<std::num::NonZeroU64>,
     ) -> Result<OwnedHumanWork030> {
         self.settle_pending_flow_clock(host).await?;
         let lease = host.start_lease().await?;
@@ -419,10 +435,14 @@ impl HumanBroker030 {
             .transpose()?
             .unwrap_or(Value::Null);
         let timeout = timeout.or_else(|| {
-            crate::persistence::call_protocol030::remote_mcp_default_timeout(
-                &document,
-                &declaration,
-            )
+            remote_mcp_budget_ms
+                .filter(|_| {
+                    crate::persistence::call_protocol030::is_remote_mcp_call(
+                        &document,
+                        &declaration,
+                    )
+                })
+                .map(|budget| budget.to_string())
         });
         let answer_timeout = if let Some(agent) = agent {
             document["agents"][agent]
@@ -1407,6 +1427,8 @@ impl HumanBroker030 {
             .await?;
         tx.commit().await?;
         lease.ensure_live()?;
+        #[cfg(test)]
+        let gate = host.flow030().track_mcp_gate(gate);
         deliver(
             decision.resolution["expired"] != true
                 && decision.resolution["answer"]["decision"] == "yes",

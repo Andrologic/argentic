@@ -7,6 +7,7 @@ use serde_json::Value;
 use std::{
     collections::BTreeMap,
     future::Future,
+    num::NonZeroU64,
     path::{Path, PathBuf},
     pin::Pin,
     sync::Arc,
@@ -98,8 +99,12 @@ pub struct HostContext {
     codex_auth_file: Option<PathBuf>,
     mcp_secrets: Option<Arc<McpSecretProvider>>,
     mcp_http: Option<Arc<McpHttpAuthorizer>>,
+    remote_mcp_tool_budget_ms: NonZeroU64,
 }
 impl HostContext {
+    pub(crate) const DEFAULT_REMOTE_MCP_TOOL_BUDGET_MS: NonZeroU64 =
+        NonZeroU64::new(60_000).unwrap();
+
     pub fn new(root: PathBuf, policy: Arc<dyn PolicySource>) -> Self {
         Self {
             root,
@@ -108,6 +113,7 @@ impl HostContext {
             codex_auth_file: None,
             mcp_secrets: None,
             mcp_http: None,
+            remote_mcp_tool_budget_ms: Self::DEFAULT_REMOTE_MCP_TOOL_BUDGET_MS,
         }
     }
     pub fn with_network(
@@ -138,6 +144,15 @@ impl HostContext {
     pub fn with_mcp_http(mut self, authorize: Arc<McpHttpAuthorizer>) -> Self {
         self.mcp_http = Some(authorize);
         self
+    }
+    /// Sets the remote MCP machine budget in milliseconds for work without an
+    /// authored timeoutMs. The default is 60 seconds.
+    pub fn with_remote_mcp_tool_budget_ms(mut self, budget: NonZeroU64) -> Self {
+        self.remote_mcp_tool_budget_ms = budget;
+        self
+    }
+    pub(crate) fn remote_mcp_tool_budget_ms(&self) -> NonZeroU64 {
+        self.remote_mcp_tool_budget_ms
     }
     pub(crate) fn mcp_http(&self) -> Option<&McpHttpAuthorizer> {
         self.mcp_http.as_deref()

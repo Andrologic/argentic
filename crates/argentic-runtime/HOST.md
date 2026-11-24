@@ -300,8 +300,9 @@ loopback. The transport accepts JSON and SSE replies over Streamable HTTP.
 Legacy MCP initialization proposes a protocol version in the JSON body.
 Subsequent HTTP requests carry the negotiated version. On shutdown Argentic
 gives a stateful server up to two seconds to accept a session DELETE at the
-same pinned endpoint. Argentic relies on the tool's terminal response to
-confirm that a dispatched remote call ended.
+same pinned endpoint. The DELETE carries the protocol version when known.
+Argentic relies on the tool's terminal response to confirm that a dispatched
+remote call ended.
 
 Remote DNS resolution and HTTP connection establishment each have a
 five-second limit. Remote initialization and tool discovery each have a
@@ -309,11 +310,20 @@ ten-second limit, including the initialized notification and all tool list
 pages respectively. A tool handoff has a separate five-second limit for both
 HTTP and stdio.
 
-A direct remote call without an authored `timeoutMs` gets 60 seconds on the
-durable work clock. Time awaiting a person's form answer pauses that clock.
-For Codex MCP tools, an authored work deadline governs the invocation. With
-no authored work deadline, each tool invocation gets 60 seconds starting at
-dispatch, after any tool approval.
+`HostContext::with_remote_mcp_tool_budget_ms(NonZeroU64)` sets the host's
+default budget for remote MCP tools. It defaults to 60 seconds. A direct call
+step uses the durable work clock, which pauses while waiting for a person's
+form answer. Codex's MCP bridge counts from dispatch after any tool approval.
+Local stdio MCP has no default tool budget. An authored `timeoutMs` replaces
+the host default for that work, so a larger authored value opts out of the
+default limit.
+
+If the host budget expires and Argentic can confirm the call ended safely,
+a direct step reports `CALL_FAILED` and can follow `onError`. A Codex
+invocation returns an MCP tool error. If Argentic cannot confirm termination,
+it reports `MCP_TERMINATION_UNCERTAIN` and interrupts the run. A dispatched
+call without a terminal response stays uncertain even if session DELETE
+succeeds. AgSDL `TIMEOUT` is reserved for an authored `timeoutMs`.
 
 Endpoint syntax outside this profile reports `MCP_ENDPOINT_UNSUPPORTED`.
 Absent or refused consent reports `MCP_ENDPOINT_REFUSED`. An invalid or

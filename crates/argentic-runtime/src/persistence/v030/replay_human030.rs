@@ -42,6 +42,7 @@ pub(super) async fn verify(
 ) -> Result<HumanProjection030> {
     let id = &state.identity;
     let mut document = None;
+    let mut host_budget_calls = std::collections::BTreeSet::new();
     let exists: i64 = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='engine_flow030_clock')",
     )
@@ -271,10 +272,17 @@ pub(super) async fn verify(
                     if document.is_none() {
                         document = Some(serde_json::from_str(&plan.document_json)?);
                     }
-                    timeout = crate::persistence::call_protocol030::remote_mcp_default_timeout(
-                        document.as_ref().expect("parsed call document"),
-                        &declaration,
-                    );
+                    require(
+                        crate::persistence::call_protocol030::is_remote_mcp_call(
+                            document.as_ref().expect("parsed call document"),
+                            &declaration,
+                        ) && recorded_timeout
+                            .as_deref()
+                            .is_some_and(|value| value.parse::<std::num::NonZeroU64>().is_ok()),
+                        "Invalid host remote MCP budget",
+                    )?;
+                    timeout = recorded_timeout.clone();
+                    host_budget_calls.insert(work_id.to_owned());
                 }
                 require(
                     r.get::<&str, _>("owner_epoch") == clock.get::<&str, _>("owner_epoch")
@@ -843,7 +851,9 @@ pub(super) async fn verify(
         } else {
             require(
                 (joined == 1
-                    && matches!(&a.result,Some(WorkResultRecord030::Failed {error}) if error.code=="TIMEOUT"))
+                    && matches!(&a.result, Some(WorkResultRecord030::Failed {error})
+                        if error.code == "TIMEOUT"
+                            || (error.code == "CALL_FAILED" && host_budget_calls.contains(id))))
                     || (joined == 0 && a.physical && a.result.is_none()),
                 "Timeout terminal differs",
             )?;

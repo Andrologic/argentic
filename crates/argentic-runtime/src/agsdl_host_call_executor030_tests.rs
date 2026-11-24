@@ -857,6 +857,152 @@ async fn native_http_mcp_default_deadline_pauses_for_forms() {
 }
 
 #[cfg(unix)]
+#[tokio::test]
+async fn native_remote_mcp_routes_safe_budget_expiration_and_honors_authored_timeout() {
+    use crate::test_context::mcp::Peer;
+    use futures::FutureExt;
+    use std::{num::NonZeroU64, time::Duration};
+
+    for (before_launch, authored, deadline, code) in [
+        (true, None, 20, "CALL_FAILED"),
+        (false, None, 20, "CALL_FAILED"),
+        (false, Some(120_000), 120_000, "TIMEOUT"),
+    ] {
+        let peer = Peer::start().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let initializing = Arc::new(tokio::sync::Notify::new());
+        let server = tokio::spawn({
+            let initializing = initializing.clone();
+            async move {
+                let app = axum::Router::new().route(
+                    "/first",
+                    axum::routing::post(move |axum::Json(message): axum::Json<Value>| async move {
+                        assert_eq!(message["method"], "initialize");
+                        initializing.notify_one();
+                        std::future::pending::<axum::http::StatusCode>().await
+                    }),
+                );
+                axum::serve(listener, app).await.unwrap();
+            }
+        });
+        let mut step =
+            json!({"type":"call","mcp":{"server":"first","tool":"check"},"onError":"after"});
+        if let Some(authored) = authored {
+            step["timeoutMs"] = json!(authored);
+        }
+        let project = tempfile::tempdir().unwrap();
+        let mut servers = peer.servers();
+        servers["first"]["url"] = json!(format!("http://{addr}/first"));
+        let doc = json!({
+            "projectFormat":"agsdl-project-1","contract":"agsdl-0.4.0","id":"expire-remote","agents":{},
+            "mcpServers":servers,"secrets":{"file":"requirements.json"},
+            "flow":{"entry":"first","steps":{
+                "first":step,
+                "after":{"type":"call","mcp":{"server":"second","tool":"check"}}
+            }}
+        });
+        std::fs::write(project.path().join("agsdl.json"), doc.to_string()).unwrap();
+        std::fs::write(
+            project.path().join("requirements.json"),
+            r#"{"second":["SECOND_TOKEN"]}"#,
+        )
+        .unwrap();
+        let f =
+            Fixture::new_with_project(r#"{"entry":{},"timeline":[]}"#, false, Some(project.path()))
+                .await;
+        let clock = f
+            .host
+            .flow030()
+            .human_runtime()
+            .virtual_clock()
+            .await
+            .unwrap();
+        let authorize = peer.authorize();
+        let config = peer
+            .configure(f.config.clone())
+            .with_remote_mcp_tool_budget_ms(NonZeroU64::new(20).unwrap())
+            .with_mcp_http(Arc::new(move |source, server, url, addresses, names| {
+                if server == "first" {
+                    assert_eq!(addresses, [addr]);
+                    assert!(names.is_empty());
+                    Some(BTreeMap::new())
+                } else {
+                    authorize(source, server, url, addresses, names)
+                }
+            }));
+        let gate = before_launch.then(|| {
+            f.host
+                .flow030()
+                .install_operator_test_hook("call.before_launch")
+        });
+        let _tasks = start_calls(
+            &f,
+            config.clone(),
+            Arc::new(crate::agsdl_host_call_executor030::NativeCallTransport030 {
+                config,
+                humans: None,
+            }),
+        );
+        if let Some(gate) = &gate {
+            tokio::time::timeout(Duration::from_secs(10), gate.reached())
+                .await
+                .unwrap();
+        } else {
+            tokio::time::timeout(Duration::from_secs(10), initializing.notified())
+                .await
+                .unwrap();
+        }
+        let recorded: String = sqlx::query_scalar(
+            "SELECT timeout_json FROM engine_flow030_clock_works WHERE kind='call'",
+        )
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+        assert_eq!(recorded, deadline.to_string());
+        clock.advance_to(deadline + 1).unwrap();
+        if let Some(gate) = gate {
+            let broker = f
+                .host
+                .flow030()
+                .humans
+                .broker(&f.host, &f.pool, &f.identity)
+                .await
+                .unwrap();
+            let _operation = broker.operation.lock().await;
+            broker.tick(&f.host).await.unwrap();
+            broker
+                .pump(&f.host, &CancellationToken::new())
+                .await
+                .unwrap();
+            assert_eq!(broker.timeout_controls().await.unwrap().len(), 1);
+            gate.release();
+        }
+        f.host
+            .flow030()
+            .supervisors
+            .wake(&f.identity.system_start_id);
+        let view = finish(&f).await;
+        assert_eq!(view.state.verdict.as_deref(), Some("succeeded"));
+        assert!(
+            matches!(&view.state.activations[0].result, Some(WorkResultRecord030::Failed { error }) if error.code == code)
+        );
+        assert_eq!(peer.calls(), [("second".into(), "check".into())]);
+        if before_launch {
+            assert!(initializing.notified().now_or_never().is_none());
+        }
+        let replay = crate::persistence::replay_verify030::verify_path030(
+            &f._temp.path().join("run.db"),
+            &f.identity.system_start_id,
+            &f.identity.flow_invocation_id,
+        )
+        .await;
+        assert!(replay.ok, "{:?}", replay.divergence);
+        server.abort();
+    }
+}
+
+#[cfg(unix)]
 async fn remote_mcp_unconfirmed(expire: bool) {
     use crate::test_context::mcp::*;
     let peer = Peer::start().await;
@@ -909,7 +1055,7 @@ async fn remote_mcp_unconfirmed(expire: bool) {
     .await
     .unwrap();
     if let Some(clock) = clock {
-        let budget = crate::persistence::call_protocol030::DEFAULT_MCP_TOOL_MS;
+        let budget = crate::host::HostContext::DEFAULT_REMOTE_MCP_TOOL_BUDGET_MS.get();
         let recorded: String = sqlx::query_scalar(
             "SELECT timeout_json FROM engine_flow030_clock_works WHERE kind='call'",
         )

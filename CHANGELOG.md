@@ -17,8 +17,15 @@
 - Streamable HTTP preserves IPv6 interface scopes, sends the negotiated
   protocol version after initialization, and attempts to close stateful
   sessions on shutdown. Remote connection and discovery have deadlines.
-  MCP tool calls without an authored deadline use a 60-second machine budget
-  after approval or excluding waits for a form answer.
+  Session DELETE uses the protocol version when known.
+- `HostContext::with_remote_mcp_tool_budget_ms` configures the remote MCP
+  tool budget for direct call steps and Codex tools. It defaults to 60
+  seconds. Local stdio MCP has no default tool budget. An authored
+  `timeoutMs` replaces the default and can grant more time. On host budget
+  expiry, a direct call with confirmed termination reports `CALL_FAILED`
+  and may follow `onError`. A Codex invocation returns a tool error.
+  Unconfirmed termination reports `MCP_TERMINATION_UNCERTAIN` and interrupts
+  the run.
 - Native hosts can select a replacement model and effort per agent at Start.
   Inspection and replay read the frozen selection with the original source
   identity.

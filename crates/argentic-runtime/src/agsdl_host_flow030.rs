@@ -52,6 +52,8 @@ pub(crate) struct FlowHost030 {
     #[cfg(test)]
     operator_test_hooks: Mutex<BTreeMap<&'static str, (usize, Arc<CommitTestHook030>)>>,
     #[cfg(test)]
+    mcp_dispatch_gate: Mutex<std::sync::Weak<()>>,
+    #[cfg(test)]
     stop_commit_hooks: Mutex<BTreeMap<String, Arc<CommitTestHook030>>>,
     #[cfg(test)]
     work_commit_hooks: Mutex<BTreeMap<(String, String), Arc<CommitTestHook030>>>,
@@ -84,7 +86,28 @@ impl FlowWorkCommitMarker030 {
 }
 
 #[cfg(test)]
+pub(crate) struct TrackedMcpGate {
+    _owner: Arc<()>,
+    _guard: OwnedMutexGuard<()>,
+}
+
+#[cfg(test)]
 impl FlowHost030 {
+    // Tie the observation to the handoff guard's lifetime. Other holders of
+    // the shared admission lock cannot satisfy the schedule assertion.
+    pub(crate) fn track_mcp_gate(&self, guard: OwnedMutexGuard<()>) -> TrackedMcpGate {
+        let owner = Arc::new(());
+        *self.mcp_dispatch_gate.lock().unwrap() = Arc::downgrade(&owner);
+        TrackedMcpGate {
+            _guard: guard,
+            _owner: owner,
+        }
+    }
+
+    pub(crate) fn mcp_dispatch_holds_gate(&self) -> bool {
+        self.mcp_dispatch_gate.lock().unwrap().upgrade().is_some()
+    }
+
     pub(crate) fn install_operator_test_hook(&self, point: &'static str) -> Arc<CommitTestHook030> {
         self.install_nth_operator_test_hook(point, 1)
     }

@@ -89,6 +89,7 @@ impl HostExecutor030 for CallExecutor030 {
             let machine_timeout = timeout.clone();
             let (owned_attempt, owned_cancel) = (attempt.clone(), cancel.clone());
             let (clock_ready, wait_clock) = tokio::sync::oneshot::channel();
+            let remote_mcp_budget_ms = config.remote_mcp_tool_budget_ms();
             let worker_app = app.clone();
             let clock_pool = pool.clone();
             claim
@@ -128,6 +129,10 @@ impl HostExecutor030 for CallExecutor030 {
                                 "Current project permissions do not allow calls",
                             ));
                         }
+                        #[cfg(test)]
+                        host.flow030()
+                            .operator_test_yield("call.before_launch")
+                            .await;
                         let started = calls::launch_native030(
                             &pool,
                             &authority,
@@ -157,8 +162,9 @@ impl HostExecutor030 for CallExecutor030 {
                         drop(global);
                         // A Stop can win the preparation/launch race. It authorizes no IO.
                         let end = match started {
-                            Ok(Ok(started)) => started.await?,
-                            Ok(Err(_)) => {
+                            Ok(Some(Ok(started))) => started.await?,
+                            Ok(None) => crate::persistence::call_protocol030::CallEnd030::TimedOut,
+                            Ok(Some(Err(_))) => {
                                 crate::persistence::call_protocol030::CallEnd030::Returned {
                                     event: CallEvent030::StartFailed,
                                 }
@@ -193,7 +199,9 @@ impl HostExecutor030 for CallExecutor030 {
                 .await?;
             {
                 let _operation = human.operation.lock().await;
-                human.admit_host_work(&host, &effect.id).await?;
+                human
+                    .admit_call(&host, &effect.id, remote_mcp_budget_ms)
+                    .await?;
                 human.pump(&host, &CancellationToken::new()).await?;
             }
             let _ = clock_ready.send(());

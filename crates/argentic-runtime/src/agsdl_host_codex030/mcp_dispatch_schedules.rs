@@ -100,6 +100,27 @@ printf '%s\n' '{"jsonrpc":"2.0","id":"2","result":{"content":[]}}'
         })
     }
 
+    async fn start(
+        &self,
+        transport: Transport,
+    ) -> (raw_mcp::Session, Option<tokio::task::JoinHandle<()>>) {
+        let (wire, http) = match transport {
+            Transport::Http => {
+                let (wire, task) = self.clone().http().await;
+                (wire, Some(task))
+            }
+            Transport::Stdio => (self.stdio(), None),
+        };
+        let session = raw_mcp::start_test_stdio(raw_mcp::CapturedServer {
+            document_name: "issues".into(),
+            capture_digest: "test".into(),
+            protocol: raw_mcp::Protocol::Legacy,
+            transport: wire,
+        })
+        .unwrap();
+        (session, http)
+    }
+
     async fn sent(&self) {
         operator_wait(async || self.sent.exists().then_some(())).await;
     }
@@ -131,7 +152,9 @@ async fn http_reply(
 }
 
 struct Agent {
-    approvals: Arc<AgentActionHumans030>,
+    approvals: Option<Arc<AgentActionHumans030>>,
+    budget: Option<std::time::Duration>,
+    expect_budget_expiration: bool,
     session: StdMutex<Option<raw_mcp::Session>>,
     expected_reply: Option<bool>,
 }
@@ -153,13 +176,28 @@ impl AgentExecutor030 for Agent {
         let approvals = self.approvals.clone();
         let session = self.session.lock().unwrap().take().unwrap();
         let expected_reply = self.expected_reply;
+        let budget = self.budget;
+        let expect_budget_expiration = self.expect_budget_expiration;
         Box::pin(async move {
-            let reply = crate::agsdl_host_codex030::mcp::call_test_session(
-                &work, approvals, &cancel, session,
+            let (reply, closed) = crate::agsdl_host_codex030::mcp::call_test_session(
+                &work,
+                approvals.map(|port| port as _),
+                &cancel,
+                session,
+                budget,
             )
             .await?;
+            if expect_budget_expiration {
+                let reply = reply.as_ref().expect("Codex receives an MCP tool error");
+                assert_eq!(reply["isError"], true);
+                assert!(reply["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("MCP_TERMINATION_UNCERTAIN"));
+            }
+            closed?;
             if let Some(expected_reply) = expected_reply {
-                assert_eq!(reply.is_some(), expected_reply);
+                assert_eq!(reply, expected_reply.then(|| json!({"content":[]})));
                 events
                     .emit(
                         json!({"kind":"submit","callId":"mcp","argumentsJson":"{\"results\":{}}"}),
@@ -206,32 +244,55 @@ async fn submit_yes(f: &Fixture) {
 }
 
 #[tokio::test]
-async fn operator_schedule_mcp_tool_handoff_orders_current_policy_and_stop() {
+async fn operator_schedule_mcp_http_ask_handoff() {
+    handoff_schedules(Transport::Http, true).await;
+}
+
+#[tokio::test]
+async fn operator_schedule_mcp_stdio_ask_handoff() {
+    handoff_schedules(Transport::Stdio, true).await;
+}
+
+#[tokio::test]
+async fn operator_schedule_mcp_http_allow_handoff() {
+    handoff_schedules(Transport::Http, false).await;
+}
+
+#[tokio::test]
+async fn operator_schedule_mcp_stdio_allow_handoff() {
+    handoff_schedules(Transport::Stdio, false).await;
+}
+
+async fn handoff_schedules(transport: Transport, ask: bool) {
     let contenders: &[_] = if exhaustive() {
         &[
-            Contender::Revocation,
             Contender::Stop(StopPath::Public),
             Contender::Stop(StopPath::Internal),
+            Contender::Revocation,
         ]
     } else {
-        &[Contender::Revocation, Contender::Stop(StopPath::Public)]
+        &[Contender::Stop(StopPath::Public), Contender::Revocation]
     };
-    for transport in [Transport::Http, Transport::Stdio] {
-        for &contender in contenders {
-            for point in [
-                "mcp.approval.resolved",
-                "mcp.approval.policy",
-                "mcp.dispatch.before",
-                "mcp.dispatch.handed_off",
-                "mcp.dispatch.wait",
-            ] {
-                schedule(transport, contender, point).await;
+    for &contender in contenders {
+        if ask {
+            for point in ["mcp.approval.resolved", "mcp.approval.policy"] {
+                schedule(transport, contender, point, ask).await;
             }
+        } else if matches!(contender, Contender::Revocation) {
+            continue;
+        }
+        for point in [
+            "mcp.dispatch.before",
+            "mcp.dispatch.handed_off",
+            "mcp.dispatch.wait",
+        ] {
+            schedule(transport, contender, point, ask).await;
         }
     }
 }
 
-async fn schedule(transport: Transport, contender: Contender, point: &'static str) {
+#[tokio::test]
+async fn remote_mcp_bridge_reports_budget_expiration_and_uncertain_termination() {
     let f = Arc::new(
         Fixture::with_document(document(
             json!({"work":{"type":"agent","agent":"worker"}}),
@@ -244,20 +305,52 @@ async fn schedule(transport: Transport, contender: Contender, point: &'static st
         sent: workspace.join("mcp-sent"),
         reply: workspace.join("mcp-reply"),
     };
-    let (wire, http) = match transport {
-        Transport::Http => {
-            let (wire, task) = peer.clone().http().await;
-            (wire, Some(task))
-        }
-        Transport::Stdio => (peer.stdio(), None),
+    let (session, http) = peer.start(Transport::Http).await;
+    let tasks = StreamTasks::default();
+    let gap = arm(&f, "mcp.dispatch.wait");
+    start(
+        &f,
+        &tasks,
+        Arc::new(Agent {
+            approvals: None,
+            budget: Some(std::time::Duration::ZERO),
+            expect_budget_expiration: true,
+            session: StdMutex::new(Some(session)),
+            expected_reply: None,
+        }),
+    )
+    .await;
+    reached(&gap, "mcp.dispatch.wait").await;
+    peer.sent().await;
+    gap.release();
+    let error = tokio::time::timeout(
+        WAIT,
+        f.host
+            .flow030()
+            .supervisors
+            .wait(&f.identity.system_start_id),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert_eq!(error.code, "MCP_TERMINATION_UNCERTAIN");
+    http.unwrap().abort();
+}
+
+async fn schedule(transport: Transport, contender: Contender, point: &'static str, ask: bool) {
+    let f = Arc::new(
+        Fixture::with_document(document(
+            json!({"work":{"type":"agent","agent":"worker"}}),
+            "work",
+        ))
+        .await,
+    );
+    let workspace = f._temp.path().join("workspace").canonicalize().unwrap();
+    let peer = Peer {
+        sent: workspace.join("mcp-sent"),
+        reply: workspace.join("mcp-reply"),
     };
-    let session = raw_mcp::start_test_stdio(raw_mcp::CapturedServer {
-        document_name: "issues".into(),
-        capture_digest: "test".into(),
-        protocol: raw_mcp::Protocol::Legacy,
-        transport: wire,
-    })
-    .unwrap();
+    let (session, http) = peer.start(transport).await;
     let policy = Arc::new(RwLock::new(true));
     let approval = Arc::new(AgentActionHumans030 {
         host: f.host.as_ref().clone(),
@@ -278,14 +371,23 @@ async fn schedule(transport: Transport, contender: Contender, point: &'static st
         &f,
         &tasks,
         Arc::new(Agent {
-            approvals: approval,
+            approvals: ask.then_some(approval),
+            budget: matches!(transport, Transport::Stdio).then_some(std::time::Duration::ZERO),
+            expect_budget_expiration: false,
             session: StdMutex::new(Some(session)),
             expected_reply: matches!(contender, Contender::Revocation).then_some(will_send),
         }),
     )
     .await;
-    submit_yes(&f).await;
+    if ask {
+        submit_yes(&f).await;
+    }
     reached(&gap, point).await;
+    assert_eq!(
+        f.host.flow030().mcp_dispatch_holds_gate(),
+        gate_held,
+        "{transport:?} {contender:?} {point}, ask={ask}"
+    );
     if sent_before {
         peer.sent().await;
     } else {
@@ -308,12 +410,6 @@ async fn schedule(transport: Transport, contender: Contender, point: &'static st
                 async move { stop(&f, &tasks, path).await }
             });
             reached(&admission, "stop.admission").await;
-            if gate_held {
-                assert!(
-                    f.host.admission_lock().try_lock().is_err(),
-                    "{transport:?} {point}"
-                );
-            }
             admission.release();
             change
         }
@@ -336,8 +432,8 @@ async fn schedule(transport: Transport, contender: Contender, point: &'static st
         reached(&sent, "mcp.dispatch.handed_off").await;
         peer.sent().await;
         assert!(
-            !change.as_ref().unwrap().is_finished(),
-            "{transport:?} {contender:?}"
+            f.host.flow030().mcp_dispatch_holds_gate(),
+            "{transport:?} {contender:?} at handoff, ask={ask}"
         );
         sent.release();
     } else {

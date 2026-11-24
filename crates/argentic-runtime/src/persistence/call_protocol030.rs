@@ -19,15 +19,22 @@ use sqlx::{Row, SqliteConnection};
 use std::collections::BTreeMap;
 
 type Object = BTreeMap<String, Box<RawValue>>;
-pub(crate) const DEFAULT_MCP_TOOL_MS: u64 = 60_000;
+pub(crate) fn is_remote_mcp_call(document: &Value, step: &Value) -> bool {
+    step["type"] == "call"
+        && step["mcp"]["server"]
+            .as_str()
+            .is_some_and(|server| document["mcpServers"][server]["url"].is_string())
+}
 
-pub(crate) fn remote_mcp_default_timeout(document: &Value, step: &Value) -> Option<String> {
-    if step["type"] != "call" {
-        return None;
-    }
-    let server = step["mcp"]["server"].as_str()?;
-    document["mcpServers"][server]["url"].as_str()?;
-    Some(DEFAULT_MCP_TOOL_MS.to_string())
+fn clock_failure(attempt: &CallAttempt030) -> Result<CallResult030> {
+    let declaration: Object = serde_json::from_str(attempt.declaration_json())?;
+    Ok(CallResult030::failure(
+        if declaration.contains_key("timeoutMs") {
+            "TIMEOUT"
+        } else {
+            "CALL_FAILED"
+        },
+    ))
 }
 
 pub(crate) fn denied(detail: &str) -> EngineFailure {
@@ -487,8 +494,12 @@ impl CallStopCause030 {
             }
             (None, None) => {
                 let document = serde_json::from_str(&plan.document_json)?;
-                remote_mcp_default_timeout(&document, &declaration)
-                    .ok_or_else(|| denied("Captured call has no machine timeout budget"))?
+                require(
+                    is_remote_mcp_call(&document, &declaration)
+                        && timeout.parse::<std::num::NonZeroU64>().is_ok(),
+                    "Captured call has no host remote MCP budget",
+                )?;
+                timeout.to_owned()
             }
             _ => {
                 return Err(denied(
@@ -597,7 +608,7 @@ pub(crate) async fn record_cause_tx<A: CallAuthority030>(
 /// Settlement also checks the source decision itself: a return may win the
 /// admission lock between the clock's COMMIT and the supervisor's notification.
 /// Never attach a newly arrived cause to an already published terminal.
-async fn settlement_cause_tx<A: CallAuthority030>(
+pub(crate) async fn settlement_cause_tx<A: CallAuthority030>(
     db: &mut SqliteConnection,
     authority: &A,
     attempt: &CallAttempt030,
@@ -1292,12 +1303,15 @@ async fn validate_result_tx(
     received: &ReceivedCall030,
     result: &CallResult030,
 ) -> Result<()> {
-    if matches!(result,CallResult030::Failed { code } if code == "TIMEOUT") {
-        require(
-            read_cause_tx(db, attempt).await?.is_some(),
-            "TIMEOUT has no durable native cause",
-        )?;
-        return Ok(());
+    if matches!(result, CallResult030::Failed { code } if matches!(code.as_str(), "TIMEOUT" | "CALL_FAILED"))
+    {
+        // Older remote MCP receipts used TIMEOUT for the host budget.
+        if read_cause_tx(db, attempt).await?.is_some()
+            && (matches!(result, CallResult030::Failed { code } if code == "TIMEOUT")
+                || result == &clock_failure(attempt)?)
+        {
+            return Ok(());
+        }
     }
     match (result, &received.end) {
         (CallResult030::Completed { output_json }, CallEnd030::Returned { event }) => {
@@ -1419,8 +1433,8 @@ async fn apply_terminal_tx<A: CallAuthority030>(
         .await?;
     } else if pending > 0 {
         require(
-            stopped || matches!(&receipt.result, CallResult030::Failed {code} if code=="TIMEOUT"),
-            "Call deadline requires its timeout result",
+            stopped || receipt.result == clock_failure(&receipt.attempt)?,
+            "Call deadline requires its clock failure result",
         )?;
         sqlx::query("UPDATE engine_flow030_clock_controls SET joined=1 WHERE system_id=? AND invocation_id=? AND activation_id=?")
             .bind(&receipt.attempt.identity.system_start_id).bind(&receipt.attempt.identity.flow_invocation_id).bind(&work.activation_id).execute(&mut *db).await?;
@@ -1486,7 +1500,7 @@ pub(crate) async fn finish_controlled_tx<A: CallAuthority030>(
         .await?
         .is_some()
     {
-        CallResult030::failure("TIMEOUT")
+        clock_failure(joined.attempt())?
     } else {
         return Ok(None);
     };
@@ -1520,7 +1534,7 @@ pub(crate) async fn finish_tx<A: CallAuthority030>(
     if call_stopped(&state, attempt)? {
         result = CallResult030::Stopped;
     } else if settlement_cause_tx(db, authority, attempt).await?.is_some() {
-        result = CallResult030::failure("TIMEOUT");
+        result = clock_failure(attempt)?;
     }
 
     if row.get::<&str, _>("status") == "terminal" {

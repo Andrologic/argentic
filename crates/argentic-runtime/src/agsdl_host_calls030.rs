@@ -433,14 +433,23 @@ pub(crate) async fn launch_native030<A: CallAuthority030, T>(
     attempt: &CallAttempt030,
     control: &Control,
     start: impl FnOnce() -> T,
-) -> Result<T> {
+) -> Result<Option<T>> {
     let _gate = authority.admission_lock().lock_owned().await;
     authority.call_commits().require_clear(attempt.identity())?;
     let mut db = pool.acquire().await?;
     let mut tx = db.begin_with("BEGIN IMMEDIATE").await?;
-    protocol::launch_tx(&mut tx, authority, attempt, control).await?;
+    // Consume the owned launch even when the work clock has already expired.
+    // In that case the join settles the clock failure without starting IO.
+    let admission = Control {
+        stop: control.stop.clone(),
+        machine_timeout: CancellationToken::new(),
+    };
+    protocol::launch_tx(&mut tx, authority, attempt, &admission).await?;
+    let expired = protocol::settlement_cause_tx(&mut tx, authority, attempt)
+        .await?
+        .is_some();
     commit_call_tx(tx, authority, attempt).await?;
-    Ok(start())
+    Ok((!expired).then(start))
 }
 
 // Kept in a private child module so even this module's transport/data paths

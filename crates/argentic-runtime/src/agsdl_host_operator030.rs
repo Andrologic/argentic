@@ -312,6 +312,14 @@ impl AgentOperator030 {
     }
 
     #[cfg(test)]
+    pub(crate) fn track_mcp_gate(
+        &self,
+        guard: OwnedMutexGuard<()>,
+    ) -> crate::agsdl_host_flow030::TrackedMcpGate {
+        self.host.flow030().track_mcp_gate(guard)
+    }
+
+    #[cfg(test)]
     pub(crate) async fn test_yield(&self, point: &'static str) {
         self.host.flow030().operator_test_yield(point).await;
     }
