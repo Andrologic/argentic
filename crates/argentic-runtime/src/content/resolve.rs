@@ -419,7 +419,7 @@ async fn read_uri(
                         .admit(
                             ActionRequest::Read { path: logical },
                             base_effect,
-                            member_read,
+                            expected_path.as_deref(),
                         )
                         .await
                     {
@@ -525,7 +525,7 @@ async fn read_uri(
                             .or_else(|| target.host_str().map(str::to_owned))
                             .unwrap_or_default();
                         context
-                            .admit(ActionRequest::Network { host }, effect, false)
+                            .admit(ActionRequest::Network { host }, effect, None)
                             .await
                             .map(|_| ())
                             .map_err(|e| {
