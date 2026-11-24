@@ -893,7 +893,7 @@ impl CodexExecutor030 {
                 &mission,
                 &resources,
                 &sink,
-                &cancel,
+                equipment.turn_cancel(),
                 Some(SteerContext030 {
                     operator: Some(work.operator),
                     inbox: work.steer,
@@ -944,8 +944,9 @@ impl CodexExecutor030 {
         // Keep correlation alive when cancellation drops the session future.
         let mut pending_steer = PendingSteer030::default();
         let mut result = tokio::select! {
-            result = self.session(&mut client, profile, root, read_only, model, frozen, key, instructions, mission, resources, sink, cancel, &mut current_thread, &mut current_turn, &mut pending_steer, steer.as_mut()) => result,
+            biased;
             _ = cancel.cancelled() => Ok(()),
+            result = self.session(&mut client, profile, root, read_only, model, frozen, key, instructions, mission, resources, sink, cancel, &mut current_thread, &mut current_turn, &mut pending_steer, steer.as_mut()) => result,
         };
         let current_steer = steer
             .as_ref()
@@ -1921,6 +1922,16 @@ for line in sys.stdin:
       result=rpc('tools/call', {'name':tool,'arguments':{'value':9007199254740993}})
       if expected is None: assert result['isError']
       else: assert result['structuredContent']=={'checked':expected,'value':9007199254740993}
+     if checks.get('budgetExpired'):
+      assert result['content'][0]['text'].startswith('MCP_TERMINATION_UNCERTAIN:')
+      try:
+       rpc('ping', {})
+      except urllib.error.HTTPError as error:
+       assert error.code==503
+      except urllib.error.URLError as error:
+       assert isinstance(error.reason, ConnectionRefusedError)
+      else:
+       raise AssertionError('MCP admission remained open after budget expiry')
    if envelope.pop('_waitForSteer', False):
     pending_envelope=envelope
     continue

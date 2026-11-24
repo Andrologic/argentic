@@ -18,8 +18,20 @@ use axum::{
     Json, Router,
 };
 use serde_json::{json, Value};
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
-use tokio::{net::TcpListener, sync::Mutex, task::JoinHandle};
+use std::{
+    collections::BTreeMap,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
+use tokio::{
+    net::TcpListener,
+    sync::{oneshot, Mutex},
+    task::JoinHandle,
+    time::Instant,
+};
 use tokio_util::sync::CancellationToken;
 
 pub(crate) const TOKEN_ENV: &str = "ARGENTIC_MCP_BRIDGE_TOKEN";
@@ -44,6 +56,7 @@ pub(super) struct Equipment {
 
 struct Bridge {
     stop: CancellationToken,
+    termination_uncertain: AtomicBool,
     auth: String,
     work: FlowWorkAttempt030,
     remote_tool_budget: Option<Duration>,
@@ -56,6 +69,11 @@ struct Upstream {
     session: Mutex<Option<raw_mcp::Session>>,
     tools: BTreeMap<String, (Effect, Value)>,
     identity: CallIdentity,
+}
+
+enum Dispatch {
+    HandedOff(raw_mcp::PendingToolCall, Option<Instant>),
+    BudgetExpired(Value),
 }
 
 impl Equipment {
@@ -230,6 +248,10 @@ impl Equipment {
         self.config.as_ref()
     }
 
+    pub(super) fn turn_cancel(&self) -> &CancellationToken {
+        &self.state.stop
+    }
+
     pub(super) async fn close(mut self) -> Result<()> {
         self.state.stop.cancel();
         let mut uncertain = false;
@@ -263,7 +285,7 @@ impl Equipment {
                 let _ = server.await;
             }
         }
-        if uncertain {
+        if uncertain || self.state.termination_uncertain.load(Ordering::Relaxed) {
             return Err(mcp_error(
                 "MCP_TERMINATION_UNCERTAIN",
                 "Agent MCP tool termination could not be confirmed",
@@ -312,6 +334,7 @@ impl Bridge {
     ) -> Self {
         Self {
             stop: cancel.child_token(),
+            termination_uncertain: AtomicBool::new(false),
             auth,
             work: work.attempt.clone(),
             remote_tool_budget,
@@ -343,17 +366,48 @@ impl Bridge {
         tool: &str,
         args: &str,
         control: &Control,
-    ) -> Result<(raw_mcp::PendingToolCall, tokio::time::Instant)> {
+    ) -> Result<Dispatch> {
+        let deadline = self
+            .remote_tool_budget
+            .filter(|_| session.is_remote())
+            .and_then(|budget| Instant::now().checked_add(budget));
         #[cfg(test)]
         self.admission.test_yield("mcp.dispatch.before").await;
-        let started = tokio::time::Instant::now();
-        let pending = session
-            .dispatch_tool(tool, args, control)
-            .await
-            .map_err(|error| mcp_error(&error.code, "Cannot deliver the admitted MCP tool call"))?;
+        let pending = match session.dispatch_tool(tool, args, control, deadline).await {
+            Ok(pending) => pending,
+            Err(error) if error.code == raw_mcp::TOOL_BUDGET_EXPIRED => {
+                return Ok(Dispatch::BudgetExpired(self.budget_expired(session)));
+            }
+            Err(error) => {
+                self.stop_if_remote_uncertain(session);
+                return Err(mcp_error(
+                    &error.code,
+                    "Cannot deliver the admitted MCP tool call",
+                ));
+            }
+        };
         #[cfg(test)]
         self.admission.test_yield("mcp.dispatch.handed_off").await;
-        Ok((pending, started))
+        Ok(Dispatch::HandedOff(pending, deadline))
+    }
+
+    fn stop_if_remote_uncertain(&self, session: &raw_mcp::Session) -> bool {
+        let uncertain = session.is_remote() && session.tool_in_flight();
+        if uncertain {
+            self.termination_uncertain.store(true, Ordering::Relaxed);
+            // Close bridge admission and wake the Codex driver's interrupt path.
+            self.stop.cancel();
+        }
+        uncertain
+    }
+
+    fn budget_expired(&self, session: &raw_mcp::Session) -> Value {
+        let message = if self.stop_if_remote_uncertain(session) {
+            "MCP_TERMINATION_UNCERTAIN: remote MCP tool budget expired before termination could be confirmed"
+        } else {
+            "Remote MCP tool budget expired"
+        };
+        json!({"isError":true,"content":[{"type":"text","text":message}]})
     }
 
     async fn call(&self, upstream: &Upstream, server: &str, params: &Value) -> Option<Value> {
@@ -374,15 +428,13 @@ impl Bridge {
             _ = self.stop.cancelled() => return None,
             lock = upstream.session.lock() => lock,
         };
-        let session = session.as_mut()?;
-        if session.tool_in_flight() || session.guard_secrets(&arguments_json).is_err() {
+        let wire = session.as_mut()?;
+        if wire.tool_in_flight() || wire.guard_secrets(&arguments_json).is_err() {
             return None;
         }
-        let (pending, started) = if *effect == Effect::Ask {
+        if *effect == Effect::Ask {
             let approvals = self.approvals.as_ref()?;
-            let mut pending = None;
-            let dispatched = &mut pending;
-            let wire = &mut *session;
+            let (handed_off, dispatched) = oneshot::channel();
             let args = arguments_json.as_str();
             let control = &control;
             let payload = json!({"nativeRequest":{
@@ -390,56 +442,81 @@ impl Bridge {
                 "method":"mcp/tool/requestApproval",
                 "params":{"reason":format!("Allow MCP tool {server}/{tool}?"),"server":server,"tool":tool,"arguments":arguments}
             }});
-            approvals
-                .answer(
-                    &self.work,
-                    payload,
-                    &self.stop,
-                    Box::new(move |yes| {
-                        Box::pin(async move {
-                            // The broker already holds the policy lease and
-                            // Stop's admission gate while delivering this answer.
-                            if yes {
-                                *dispatched = Some(self.dispatch(wire, tool, args, control).await?);
-                            }
-                            Ok(())
-                        })
-                    }),
-                )
-                .await
-                .ok()?;
-            pending?
-        } else {
-            let admission = self.admit(&control).await.ok()?;
+            let answer = approvals.answer(
+                &self.work,
+                payload,
+                &self.stop,
+                Box::new(move |yes| {
+                    Box::pin(async move {
+                        // The broker holds the policy lease and Stop's gate
+                        // while handing off the approved request.
+                        if yes {
+                            let wire = session.as_mut().expect("locked MCP session");
+                            let dispatch = self.dispatch(wire, tool, args, control).await?;
+                            let _ = handed_off.send((session, dispatch));
+                        }
+                        Ok(())
+                    })
+                }),
+            );
             #[cfg(test)]
-            let admission = self.admission.track_mcp_gate(admission);
-            let sent = self
-                .dispatch(session, tool, &arguments_json, &control)
-                .await;
-            drop(admission);
-            sent.ok()?
+            let answer = async {
+                let result = answer.await;
+                self.admission.test_yield("mcp.approval.acknowledged").await;
+                result
+            };
+            let reply = async {
+                let (mut session, dispatch) = dispatched.await.ok()?;
+                let reply = self
+                    .finish(session.as_mut()?, upstream, dispatch, control)
+                    .await;
+                Some((session, reply))
+            };
+            // Enforce the tool deadline even while the broker records its
+            // acknowledgement. Hold the session lock until both futures settle.
+            let (answer, received) = tokio::join!(answer, reply);
+            answer.ok()?;
+            let (_session, reply) = received?;
+            return reply;
+        }
+
+        let admission = self.admit(&control).await.ok()?;
+        #[cfg(test)]
+        let admission = self.admission.track_mcp_gate(admission);
+        let sent = self.dispatch(wire, tool, &arguments_json, &control).await;
+        drop(admission);
+        self.finish(wire, upstream, sent.ok()?, &control).await
+    }
+
+    async fn finish(
+        &self,
+        session: &mut raw_mcp::Session,
+        upstream: &Upstream,
+        dispatch: Dispatch,
+        control: &Control,
+    ) -> Option<Value> {
+        let (pending, deadline) = match dispatch {
+            Dispatch::HandedOff(pending, deadline) => (pending, deadline),
+            Dispatch::BudgetExpired(error) => return Some(error),
         };
         #[cfg(test)]
         self.admission.test_yield("mcp.dispatch.wait").await;
-        let budget = self.remote_tool_budget.filter(|_| session.is_remote());
-        let result = session.finish_tool_call(pending, &NoHuman, &upstream.identity, &control);
-        let receipt = if let Some(deadline) = budget.and_then(|budget| started.checked_add(budget)) {
+        if deadline.is_some_and(|deadline| deadline <= Instant::now()) {
+            return Some(self.budget_expired(session));
+        }
+        let result = session.finish_tool_call(pending, &NoHuman, &upstream.identity, control);
+        let receipt = if let Some(deadline) = deadline {
             match tokio::time::timeout_at(deadline, result).await {
-                Ok(result) => result,
-                Err(_) => {
-                    let message = if session.tool_in_flight() {
-                        "MCP_TERMINATION_UNCERTAIN: remote MCP tool budget expired before termination could be confirmed"
-                    } else {
-                        "Remote MCP tool budget expired"
-                    };
-                    return Some(json!({"isError":true,"content":[{"type":"text","text":message}]}));
-                }
+                Ok(result) if Instant::now() < deadline => result,
+                _ => return Some(self.budget_expired(session)),
             }
         } else {
             result.await
+        };
+        if receipt.is_err() {
+            self.stop_if_remote_uncertain(session);
         }
-        .ok()?;
-        serde_json::from_str(&receipt.raw_result_json).ok()
+        serde_json::from_str(&receipt.ok()?.raw_result_json).ok()
     }
 }
 

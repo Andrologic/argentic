@@ -313,17 +313,21 @@ HTTP and stdio.
 `HostContext::with_remote_mcp_tool_budget_ms(NonZeroU64)` sets the host's
 default budget for remote MCP tools. It defaults to 60 seconds. A direct call
 step uses the durable work clock, which pauses while waiting for a person's
-form answer. Codex's MCP bridge counts from dispatch after any tool approval.
+form answer. Codex's MCP bridge starts the budget after any tool approval.
+It applies the same deadline to HTTP body handoff and the tool response.
 Local stdio MCP has no default tool budget. An authored `timeoutMs` replaces
 the host default for that work, so a larger authored value opts out of the
 default limit.
 
 If the host budget expires and Argentic can confirm the call ended safely,
 a direct step reports `CALL_FAILED` and can follow `onError`. A Codex
-invocation returns an MCP tool error. If Argentic cannot confirm termination,
-it reports `MCP_TERMINATION_UNCERTAIN` and interrupts the run. A dispatched
-call without a terminal response stays uncertain even if session DELETE
-succeeds. AgSDL `TIMEOUT` is reserved for an authored `timeoutMs`.
+invocation returns an MCP tool error. Expiry before HTTP body handoff also
+returns a tool error and the Codex turn can continue. If Argentic cannot
+confirm termination, it immediately closes MCP admission for that work
+and interrupts the active Codex turn before cleaning up its MCP sessions.
+The run reports `MCP_TERMINATION_UNCERTAIN`. A dispatched call without a
+terminal response stays uncertain even if session DELETE succeeds. AgSDL
+`TIMEOUT` is reserved for an authored `timeoutMs`.
 
 Endpoint syntax outside this profile reports `MCP_ENDPOINT_UNSUPPORTED`.
 Absent or refused consent reports `MCP_ENDPOINT_REFUSED`. An invalid or

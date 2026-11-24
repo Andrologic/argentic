@@ -5,6 +5,7 @@ pub(crate) const MAX_MCP_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 pub(crate) const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const HTTP_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
 const TOOL_HANDOFF_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const TOOL_BUDGET_EXPIRED: &str = "MCP_TOOL_BUDGET_EXPIRED";
 const HTTP_SESSION_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 
 use std::{
@@ -17,7 +18,11 @@ use std::{
 
 use serde::Serialize;
 use serde_json::value::RawValue;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::{
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    sync::oneshot,
+    time::Instant,
+};
 
 use crate::agsdl_host_calls::{
     CallError, CallIdentity, CommandGrant, Control, HostPort, PhysicalEvidence, Result,
@@ -719,7 +724,7 @@ impl Session {
     ) -> Result<McpReceipt> {
         object(args)?;
         self.initialize(host.clone(), identity, control).await?;
-        let pending = self.dispatch_tool(tool, args, control).await?;
+        let pending = self.dispatch_tool(tool, args, control, None).await?;
         self.finish_tool_call(pending, host.as_ref(), identity, control)
             .await
     }
@@ -731,6 +736,7 @@ impl Session {
         tool: &str,
         args: &str,
         control: &Control,
+        budget_deadline: Option<Instant>,
     ) -> Result<PendingToolCall> {
         object(args)?;
         if matches!(self.protocol, Protocol::Modern) {
@@ -753,20 +759,39 @@ impl Session {
         let base = format!("\"name\":{},\"arguments\":{args}", encode(&tool)?);
         let (id, message) = self.rpc_request("tools/call", &format!("{{{base}}}"))?;
         control.check()?;
+        let now = Instant::now();
+        if budget_deadline.is_some_and(|deadline| deadline <= now) {
+            return Err(tool_budget_expired());
+        }
+        let handoff_limit = now + TOOL_HANDOFF_TIMEOUT;
+        let deadline = budget_deadline.map_or(handoff_limit, |budget| budget.min(handoff_limit));
+        let remote = self.is_remote();
         let listener_failed = match &self.wire {
             Wire::Http(http) => http.listener_failed.clone(),
             Wire::Stdio { .. } => Default::default(),
         };
-        self.tool_in_flight = true;
+        let (handoff, mut accepted) = oneshot::channel();
+        // A partial stdio write may already have reached the process.
+        self.tool_in_flight |= !remote;
         let response = tokio::select! {
             biased;
-            error = control.cancelled() => return Err(error),
-            _ = listener_failed.cancelled() => return Err(CallError::new("UNCERTAIN", "MCP listener failed during delivery")),
-            sent = tokio::time::timeout(TOOL_HANDOFF_TIMEOUT, self.wire.dispatch(message)) => {
-                sent.map_err(|_| CallError::new("TIMEOUT", "MCP tool delivery timed out"))??
-            }
+            error = control.cancelled() => Err(error),
+            _ = listener_failed.cancelled() => Err(CallError::new("UNCERTAIN", "MCP listener failed during delivery")),
+            _ = tokio::time::sleep_until(deadline) => Err(CallError::new("TIMEOUT", "MCP tool delivery timed out")),
+            sent = self.wire.dispatch(message, deadline, handoff, &mut accepted) => sent,
         };
-        Ok(PendingToolCall { base, id, response })
+        // Close before checking so a concurrent HTTP body poll either handed
+        // off the payload already or can no longer do so.
+        accepted.close();
+        self.tool_in_flight |= response.is_ok() || accepted.try_recv().is_ok();
+        if response.is_err() && budget_deadline.is_some_and(|budget| budget <= Instant::now()) {
+            return Err(tool_budget_expired());
+        }
+        Ok(PendingToolCall {
+            base,
+            id,
+            response: response?,
+        })
     }
 
     pub(crate) async fn finish_tool_call(
@@ -1420,6 +1445,10 @@ async fn process_listener_message(
     Ok(())
 }
 
+fn tool_budget_expired() -> CallError {
+    CallError::new(TOOL_BUDGET_EXPIRED, "Remote MCP tool budget expired")
+}
+
 impl Wire {
     async fn send(&mut self, message: &str) -> Result<()> {
         match self {
@@ -1449,24 +1478,29 @@ impl Wire {
         }
     }
 
-    async fn dispatch(&mut self, message: String) -> Result<Option<PostResponse>> {
+    async fn dispatch(
+        &mut self,
+        message: String,
+        deadline: Instant,
+        handoff: oneshot::Sender<()>,
+        accepted: &mut oneshot::Receiver<()>,
+    ) -> Result<Option<PostResponse>> {
         let Self::Http(http) = self else {
             self.send(&message).await?;
             return Ok(None);
         };
         let request = http.post(&message)?;
         let length = message.len();
-        let (handoff, mut accepted) = tokio::sync::oneshot::channel();
         let stream = futures::stream::once(async move {
-            // The HTTP connection pulls the complete payload. If admission
-            // timed out before this point, the receiver is gone and the HTTP
-            // connection cannot get the tool request body.
-            handoff.send(()).map(|()| message).map_err(|_| {
-                std::io::Error::new(
-                    std::io::ErrorKind::Interrupted,
-                    "MCP tool delivery cancelled",
-                )
-            })
+            // The connection can poll the body on another task before the
+            // caller observes its timer. Check the deadline at the handoff.
+            if Instant::now() < deadline && handoff.send(()).is_ok() {
+                return Ok(message);
+            }
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "MCP tool delivery cancelled",
+            ))
         });
         let mut response: PostResponse = Box::pin(
             request
@@ -1476,7 +1510,7 @@ impl Wire {
         );
         tokio::select! {
             biased;
-            handed_off = &mut accepted => {
+            handed_off = &mut *accepted => {
                 handed_off.map_err(|_| CallError::transport("MCP request body was discarded"))?;
                 Ok(Some(response))
             }

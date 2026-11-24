@@ -23,9 +23,10 @@
   seconds. Local stdio MCP has no default tool budget. An authored
   `timeoutMs` replaces the default and can grant more time. On host budget
   expiry, a direct call with confirmed termination reports `CALL_FAILED`
-  and may follow `onError`. A Codex invocation returns a tool error.
-  Unconfirmed termination reports `MCP_TERMINATION_UNCERTAIN` and interrupts
-  the run.
+  and may follow `onError`. The Codex bridge checks the deadline before
+  handing off the HTTP body. Expiry before handoff returns a tool error.
+  Unconfirmed termination closes MCP admission immediately, interrupts the
+  active Codex turn and reports `MCP_TERMINATION_UNCERTAIN` to the run.
 - Native hosts can select a replacement model and effort per agent at Start.
   Inspection and replay read the frozen selection with the original source
   identity.

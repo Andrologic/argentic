@@ -154,9 +154,15 @@ async fn http_reply(
 struct Agent {
     approvals: Option<Arc<AgentActionHumans030>>,
     budget: Option<std::time::Duration>,
-    expect_budget_expiration: bool,
     session: StdMutex<Option<raw_mcp::Session>>,
-    expected_reply: Option<bool>,
+    expected_reply: Option<ExpectedReply>,
+}
+
+#[derive(Clone, Copy)]
+enum ExpectedReply {
+    Success,
+    Refused,
+    BudgetExpired,
 }
 
 impl AgentExecutor030 for Agent {
@@ -177,7 +183,6 @@ impl AgentExecutor030 for Agent {
         let session = self.session.lock().unwrap().take().unwrap();
         let expected_reply = self.expected_reply;
         let budget = self.budget;
-        let expect_budget_expiration = self.expect_budget_expiration;
         Box::pin(async move {
             let (reply, closed) = crate::agsdl_host_codex030::mcp::call_test_session(
                 &work,
@@ -187,17 +192,20 @@ impl AgentExecutor030 for Agent {
                 budget,
             )
             .await?;
-            if expect_budget_expiration {
-                let reply = reply.as_ref().expect("Codex receives an MCP tool error");
-                assert_eq!(reply["isError"], true);
-                assert!(reply["content"][0]["text"]
-                    .as_str()
-                    .unwrap()
-                    .contains("MCP_TERMINATION_UNCERTAIN"));
-            }
             closed?;
             if let Some(expected_reply) = expected_reply {
-                assert_eq!(reply, expected_reply.then(|| json!({"content":[]})));
+                match expected_reply {
+                    ExpectedReply::Success => assert_eq!(reply, Some(json!({"content":[]}))),
+                    ExpectedReply::Refused => assert!(reply.is_none(), "{reply:?}"),
+                    ExpectedReply::BudgetExpired => {
+                        let reply = reply.expect("Codex receives a tool error");
+                        assert_eq!(reply["isError"], true);
+                        assert_eq!(
+                            reply["content"][0]["text"],
+                            "Remote MCP tool budget expired"
+                        );
+                    }
+                }
                 events
                     .emit(
                         json!({"kind":"submit","callId":"mcp","argumentsJson":"{\"results\":{}}"}),
@@ -292,37 +300,150 @@ async fn handoff_schedules(transport: Transport, ask: bool) {
 }
 
 #[tokio::test]
-async fn remote_mcp_bridge_reports_budget_expiration_and_uncertain_termination() {
-    let f = Arc::new(
-        Fixture::with_document(document(
-            json!({"work":{"type":"agent","agent":"worker"}}),
-            "work",
-        ))
-        .await,
-    );
+async fn operator_schedule_mcp_http_budget_expires_before_handoff() {
+    budget_before_handoff(Transport::Http).await;
+}
+
+#[tokio::test]
+async fn operator_schedule_mcp_stdio_ignores_remote_budget() {
+    budget_before_handoff(Transport::Stdio).await;
+}
+
+async fn budget_before_handoff(transport: Transport) {
+    let f = Fixture::with_document(document(
+        json!({"work":{"type":"agent","agent":"worker"}}),
+        "work",
+    ))
+    .await;
     let workspace = f._temp.path().join("workspace").canonicalize().unwrap();
     let peer = Peer {
         sent: workspace.join("mcp-sent"),
         reply: workspace.join("mcp-reply"),
     };
-    let (session, http) = peer.start(Transport::Http).await;
+    let (session, http) = peer.start(transport).await;
+    let gap = arm(&f, "mcp.dispatch.before");
     let tasks = StreamTasks::default();
-    let gap = arm(&f, "mcp.dispatch.wait");
+    let remote = matches!(transport, Transport::Http);
     start(
         &f,
         &tasks,
         Arc::new(Agent {
             approvals: None,
-            budget: Some(std::time::Duration::ZERO),
-            expect_budget_expiration: true,
+            budget: Some(std::time::Duration::from_millis(5)),
             session: StdMutex::new(Some(session)),
-            expected_reply: None,
+            expected_reply: Some(if remote {
+                ExpectedReply::BudgetExpired
+            } else {
+                ExpectedReply::Success
+            }),
         }),
     )
     .await;
-    reached(&gap, "mcp.dispatch.wait").await;
-    peer.sent().await;
+    reached(&gap, "mcp.dispatch.before").await;
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     gap.release();
+    if !remote {
+        peer.sent().await;
+        std::fs::write(&peer.reply, b"reply").unwrap();
+    }
+    tokio::time::timeout(
+        WAIT,
+        f.host
+            .flow030()
+            .supervisors
+            .wait(&f.identity.system_start_id),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(peer.sent.exists(), !remote);
+    assert_eq!(
+        inspect(&f).await.state.verdict.as_deref(),
+        Some("succeeded")
+    );
+    if let Some(http) = http {
+        http.abort();
+        assert!(http.await.unwrap_err().is_cancelled());
+    }
+}
+
+struct AcknowledgeAfterExpiry;
+
+impl crate::agsdl_host_codex030::approvals::CommandApprovals030 for AcknowledgeAfterExpiry {
+    fn answer<'a>(
+        &'a self,
+        _: &'a crate::agsdl_host_flow030::FlowWorkAttempt030,
+        _: Value,
+        cancel: &'a CancellationToken,
+        respond: crate::agsdl_host_codex030::approvals::Respond030<'a>,
+    ) -> BoxFuture<'a, HostResult<()>> {
+        Box::pin(async move {
+            respond(true).await?;
+            tokio::time::timeout(WAIT, cancel.cancelled()).await.expect(
+                "the tool budget must expire while the approval acknowledgement is pending",
+            );
+            Ok(())
+        })
+    }
+}
+
+#[tokio::test]
+async fn operator_schedule_mcp_http_budget_interrupts_the_active_codex_turn() {
+    budget_interrupts_turn(false).await;
+    budget_interrupts_turn(true).await;
+}
+
+async fn budget_interrupts_turn(ask: bool) {
+    use crate::test_context::mcp::Peer as HttpPeer;
+
+    let peer = HttpPeer::start().await;
+    let project = tempfile::tempdir().unwrap();
+    let document = json!({
+        "projectFormat":"agsdl-project-1","contract":"agsdl-0.4.0","id":"agent-mcp-budget",
+        "mcpServers":{"first":peer.servers()["first"]},
+        "secrets":{"file":"requirements.json"},
+        "agents":{"worker":{"harness":"codex","permissions":{"preset":"read-only","reviewer":"person","rules":[
+            {"action":"mcp","match":"first/blocked","effect":if ask { "ask" } else { "allow" }}
+        ]},"mcpServers":["first"]}},
+        "flow":{"entry":"work","steps":{"work":{"type":"agent","agent":"worker"}}}
+    });
+    std::fs::write(project.path().join("agsdl.json"), document.to_string()).unwrap();
+    std::fs::write(
+        project.path().join("requirements.json"),
+        r#"{"first":["FIRST_TOKEN"]}"#,
+    )
+    .unwrap();
+    let mut f = Fixture::from_project(project.path()).await;
+    f.config = peer
+        .configure(f.config.clone())
+        .with_remote_mcp_tool_budget_ms(std::num::NonZeroU64::new(500).unwrap());
+    f.policy.workspace().await;
+    let trace = f._temp.path().join("mcp.jsonl");
+    let mut scripted = envelope(json!({"results":{}}));
+    scripted["_mcp"] = json!({"first":{
+        "tools":["blocked"],"calls":{"blocked":null},"budgetExpired":true
+    }});
+    scripted["_waitForSteer"] = json!(true);
+    std::fs::write(
+        trace.with_extension("jsonl.script"),
+        json!([scripted]).to_string(),
+    )
+    .unwrap();
+
+    let dispatched = arm(&f, "mcp.dispatch.wait");
+    let tasks = StreamTasks::default();
+    let agent = executor(&f, &trace, None);
+    let agent = if ask {
+        agent.with_approvals(Arc::new(AcknowledgeAfterExpiry))
+    } else {
+        agent
+    };
+    start(&f, &tasks, Arc::new(agent)).await;
+    reached(&dispatched, "mcp.dispatch.wait").await;
+    operator_wait(async || (!peer.calls().is_empty()).then_some(())).await;
+    assert!(requests(&trace, "turn/interrupt").is_empty());
+    dispatched.release();
+
     let error = tokio::time::timeout(
         WAIT,
         f.host
@@ -334,7 +455,10 @@ async fn remote_mcp_bridge_reports_budget_expiration_and_uncertain_termination()
     .unwrap()
     .unwrap_err();
     assert_eq!(error.code, "MCP_TERMINATION_UNCERTAIN");
-    http.unwrap().abort();
+    let interrupts = requests(&trace, "turn/interrupt");
+    assert_eq!(interrupts.len(), 1);
+    assert_eq!(interrupts[0]["turnId"], "turn1");
+    assert_eq!(peer.calls(), [("first".into(), "blocked".into())]);
 }
 
 async fn schedule(transport: Transport, contender: Contender, point: &'static str, ask: bool) {
@@ -367,15 +491,19 @@ async fn schedule(transport: Transport, contender: Contender, point: &'static st
             Contender::Stop(_) => gate_held,
         };
     let gap = arm(&f, point);
+    let ack = (ask && point == "mcp.dispatch.wait").then(|| arm(&f, "mcp.approval.acknowledged"));
     start(
         &f,
         &tasks,
         Arc::new(Agent {
             approvals: ask.then_some(approval),
             budget: matches!(transport, Transport::Stdio).then_some(std::time::Duration::ZERO),
-            expect_budget_expiration: false,
             session: StdMutex::new(Some(session)),
-            expected_reply: matches!(contender, Contender::Revocation).then_some(will_send),
+            expected_reply: matches!(contender, Contender::Revocation).then_some(if will_send {
+                ExpectedReply::Success
+            } else {
+                ExpectedReply::Refused
+            }),
         }),
     )
     .await;
@@ -383,6 +511,10 @@ async fn schedule(transport: Transport, contender: Contender, point: &'static st
         submit_yes(&f).await;
     }
     reached(&gap, point).await;
+    if let Some(ack) = ack {
+        reached(&ack, "mcp.approval.acknowledged").await;
+        ack.release();
+    }
     assert_eq!(
         f.host.flow030().mcp_dispatch_holds_gate(),
         gate_held,
