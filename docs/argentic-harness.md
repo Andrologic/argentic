@@ -98,7 +98,21 @@ crates/argentic-core/assets/harnesses/argentic/module.json
 Les `harnessSettings` exposent les réglages que la spec laisse au harnais :
 limites de tours et de tokens, compaction, exposition des outils, surcouches du
 prompt système, hooks et plafonds de ressources. La configuration est en
-couches avec provenance. Une couche de projet ne peut que restreindre.
+couches avec provenance. Une couche de projet ne peut qu’abaisser les plafonds.
+
+La compaction d’Argentic utilise le champ optionnel `contextWindowTokens`
+du fournisseur dans la configuration du Host. Cette taille s’applique à tous
+les modèles de cette entrée. Le réglage `harnessSettings.compaction` accepte
+`enabled`, `threshold` et `keepRecentTurns`. Le seuil par défaut est de 80 %
+de la fenêtre estimée, sous réserve de la place nécessaire à la réponse.
+Argentic garde les quatre derniers tours par défaut.
+L’historique retenu a un plafond de 32 Mio, même si la compaction est désactivée.
+L’événement `argentic.contextCompaction` contient les compteurs de réduction.
+
+Les instances partagées et nommées conservent leur conversation en mémoire
+pendant le run, y compris après l’arrêt d’un travail. Un redémarrage du Host
+marque les runs actifs comme interrompus. Le journal permet de rejouer les
+transitions du moteur. Les transcriptions des outils restent en mémoire.
 
 ## Reprises depuis Macro
 

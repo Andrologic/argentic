@@ -101,6 +101,22 @@ impl WorkPort for Trace {
             Event::Reasoning { .. } => "reasoning".into(),
             Event::ToolResult { call, content, .. } => format!("{} {content}", call.id),
             Event::SteerConsumed { id } => format!("consumed {id}"),
+            Event::Compaction {
+                summarized_messages,
+                truncated_tool_results,
+                ..
+            } => {
+                format!("compacted {summarized_messages} messages and truncated {truncated_tool_results} tool results")
+            }
+            Event::HistoryPruned {
+                before_bytes,
+                after_bytes,
+                dropped_messages,
+            } => {
+                assert!(before_bytes > 32 * 1024 * 1024);
+                assert!(after_bytes <= 32 * 1024 * 1024);
+                format!("pruned {dropped_messages} messages")
+            }
         };
         self.0.lock().unwrap().push(entry);
         Ok(())
@@ -250,6 +266,379 @@ impl Provider for RecordingProvider {
     }
 }
 
+fn recorded_tool_turn(id: &str, output: String) -> [Message; 2] {
+    [
+        Message::Assistant {
+            text: String::new(),
+            reasoning: String::new(),
+            replay: None,
+            calls: vec![ToolCall {
+                id: id.into(),
+                name: "read".into(),
+                arguments: "{}".into(),
+            }],
+        },
+        Message::Tool {
+            call_id: id.into(),
+            content: output,
+        },
+    ]
+}
+
+#[tokio::test]
+async fn compaction_can_truncate_an_old_tool_result_without_a_summary_request() {
+    let (_dir, harness) = fixture(
+        vec![vec![
+            submit("done", json!({"answer":42})),
+            end(Finish::ToolCalls),
+        ]],
+        json!({"compaction":{"keepRecentTurns":1}}),
+    );
+    let mut work = work(true);
+    work.messages
+        .extend(recorded_tool_turn("old", "€".repeat(7000)));
+    let recent = recorded_tool_turn("recent", "Recent tool result".into());
+    work.messages.extend(recent.clone());
+    let trace = Trace::default();
+    let (_, steer) = mpsc::channel(1);
+    let report = harness
+        .with_context_window(Some(8192))
+        .run(work, &trace, steer, CancellationToken::new())
+        .await;
+    assert!(report.outcome.is_ok(), "{:?}", report.outcome);
+    assert!(
+        matches!(&report.messages[2], Message::Tool { call_id, content }
+        if call_id == "old" && content.len() <= 4096 && content.ends_with("[truncated]"))
+    );
+    assert_eq!(&report.messages[3..5], &recent);
+    assert_eq!(
+        trace.0.lock().unwrap()[0],
+        "compacted 0 messages and truncated 1 tool results"
+    );
+}
+
+#[tokio::test]
+async fn compaction_leaves_pending_submission_feedback_in_the_next_request() {
+    let requests = Arc::new(Requests::default());
+    let provider = Arc::new(RecordingProvider {
+        requests: requests.clone(),
+        provider: scripted(vec![
+            vec![
+                Chunk::Text("earlier evidence ".repeat(730)),
+                call("read", "list", json!({})),
+                end(Finish::ToolCalls),
+            ],
+            vec![
+                Chunk::Text("recent attempt ".repeat(825)),
+                submit("invalid", json!({"answer":"wrong"})),
+                end(Finish::ToolCalls),
+            ],
+            vec![
+                Chunk::Text("Remember the earlier evidence.".into()),
+                end(Finish::Stop),
+            ],
+            vec![submit("done", json!({"answer":42})), end(Finish::ToolCalls)],
+        ]),
+    });
+    let (_dir, harness) = fixture_with_provider(
+        provider,
+        json!({
+            "maxOutputTokens":256, "compaction":{"threshold":0.60,"keepRecentTurns":1}
+        }),
+    );
+    let (_, steer) = mpsc::channel(1);
+    let report = harness
+        .with_context_window(Some(8192))
+        .run(work(true), &(), steer, CancellationToken::new())
+        .await;
+    assert!(report.outcome.is_ok(), "{:?}", report.outcome);
+    let requests = requests.0.lock().unwrap();
+    assert_eq!(requests.len(), 4);
+    assert!(matches!(&requests[2][0], Message::System(prompt) if prompt.contains("Summarize")));
+    assert_eq!(&requests[3][0], &requests[0][0]);
+    assert!(
+        matches!(&requests[3][1], Message::User(summary) if summary.contains("Remember the earlier evidence."))
+    );
+    assert!(
+        matches!(&requests[3][2], Message::Assistant { calls, .. } if calls[0].id == "invalid")
+    );
+    assert!(matches!(&requests[3][3], Message::Tool { call_id, content }
+        if call_id == "invalid" && content.contains("/results/answer")));
+}
+
+#[tokio::test]
+async fn steer_arriving_during_summary_reaches_the_next_agent_request() {
+    struct SteerDuringSummary {
+        recording: RecordingProvider,
+        send: mpsc::Sender<Steer>,
+        late: Mutex<Option<Steer>>,
+    }
+
+    #[async_trait]
+    impl Provider for SteerDuringSummary {
+        async fn stream(
+            &self,
+            request: Request<'_>,
+            cancel: CancellationToken,
+        ) -> Result<ProviderStream, ProviderError> {
+            if request.tools.is_empty() {
+                self.send
+                    .try_send(self.late.lock().unwrap().take().unwrap())
+                    .unwrap();
+            }
+            self.recording.stream(request, cancel).await
+        }
+    }
+
+    let (send, steer) = mpsc::channel(2);
+    let (early, early_receipt) = oneshot::channel();
+    let (late, late_receipt) = oneshot::channel();
+    send.try_send(Steer {
+        id: "early".into(),
+        message: "Earlier steer".into(),
+        consumed: early,
+    })
+    .unwrap();
+    let requests = Arc::new(Requests::default());
+    let provider = Arc::new(SteerDuringSummary {
+        recording: RecordingProvider {
+            requests: requests.clone(),
+            provider: scripted(vec![
+                vec![
+                    Chunk::Text("recent ".repeat(1800)),
+                    call("read", "list", json!({})),
+                    end(Finish::ToolCalls),
+                ],
+                vec![Chunk::Text("Earlier evidence".into()), end(Finish::Stop)],
+                vec![submit("done", json!({"answer":42})), end(Finish::ToolCalls)],
+            ]),
+        },
+        send,
+        late: Mutex::new(Some(Steer {
+            id: "late".into(),
+            message: "Steer during summary".into(),
+            consumed: late,
+        })),
+    });
+    let (_dir, harness) = fixture_with_provider(
+        provider,
+        json!({"maxOutputTokens":256,"compaction":{"threshold":0.60,"keepRecentTurns":1}}),
+    );
+    let mut work = work(true);
+    let mut older = recorded_tool_turn("old", "earlier evidence".into());
+    if let Message::Assistant { text, .. } = &mut older[0] {
+        *text = "old ".repeat(3000);
+    }
+    work.messages.extend(older);
+    let report = harness
+        .with_context_window(Some(8192))
+        .run(work, &(), steer, CancellationToken::new())
+        .await;
+    assert!(report.outcome.is_ok(), "{:?}", report.outcome);
+    assert!(requests.0.lock().unwrap()[2].ends_with(&[
+        Message::User("Earlier steer".into()),
+        Message::User("Steer during summary".into()),
+    ]));
+    early_receipt.await.unwrap();
+    late_receipt.await.unwrap();
+}
+
+#[tokio::test]
+async fn compaction_reserves_tokens_for_the_next_agent_request() {
+    struct BudgetProvider;
+
+    #[async_trait]
+    impl Provider for BudgetProvider {
+        fn min_output_tokens(&self) -> u32 {
+            16
+        }
+
+        async fn stream(
+            &self,
+            request: Request<'_>,
+            _: CancellationToken,
+        ) -> Result<ProviderStream, ProviderError> {
+            let (chunk, finish, prompt_tokens, completion_tokens) = if request.tools.is_empty() {
+                (
+                    Chunk::Text("Earlier evidence".into()),
+                    Finish::Stop,
+                    200,
+                    10,
+                )
+            } else {
+                (
+                    submit("done", json!({"answer":42})),
+                    Finish::ToolCalls,
+                    3960,
+                    255,
+                )
+            };
+            Ok(Box::pin(futures::stream::iter([
+                Ok(chunk),
+                Ok(Chunk::End {
+                    finish,
+                    usage: Some(Usage {
+                        prompt_tokens,
+                        completion_tokens,
+                        cache_read_tokens: 0,
+                        cache_creation_tokens: 0,
+                    }),
+                }),
+            ])))
+        }
+    }
+
+    let (_dir, harness) = fixture_with_provider(
+        Arc::new(BudgetProvider),
+        json!({"maxTotalTokens":4400,"maxOutputTokens":256,
+            "compaction":{"threshold":0.60,"keepRecentTurns":1}}),
+    );
+    let mut work = work(true);
+    work.messages
+        .extend(recorded_tool_turn("old", "x".repeat(3000)));
+    work.messages
+        .extend(recorded_tool_turn("recent", "x".repeat(12_000)));
+    let (_, steer) = mpsc::channel(1);
+    let report = harness
+        .with_context_window(Some(6000))
+        .run(work, &(), steer, CancellationToken::new())
+        .await;
+    assert!(report.outcome.is_ok(), "{:?}", report.outcome);
+    assert!(matches!(&report.messages[2], Message::Tool { call_id, .. } if call_id == "old"));
+}
+
+#[tokio::test]
+async fn compaction_rechecks_the_input_budget_after_summarizing_each_old_range() {
+    let requests = Arc::new(Requests::default());
+    let provider = Arc::new(RecordingProvider {
+        requests: requests.clone(),
+        provider: scripted(vec![
+            vec![
+                Chunk::Text("first ".repeat(670)),
+                call("first", "list", json!({})),
+                end(Finish::ToolCalls),
+            ],
+            vec![
+                Chunk::Text("recent ".repeat(2450)),
+                call("recent", "list", json!({})),
+                end(Finish::ToolCalls),
+            ],
+            vec![Chunk::Text("Prior work".into()), end(Finish::Stop)],
+            vec![Chunk::Text("Earlier tool turn".into()), end(Finish::Stop)],
+            vec![submit("done", json!({"answer":42})), end(Finish::ToolCalls)],
+        ]),
+    });
+    let (_dir, harness) = fixture_with_provider(
+        provider,
+        json!({"maxOutputTokens":256,"compaction":{"threshold":0.99,"keepRecentTurns":1}}),
+    );
+    let mut work = work(true);
+    let mut old = recorded_tool_turn("old", "Old tool result".into());
+    if let Message::Assistant { text, .. } = &mut old[0] {
+        *text = "old ".repeat(3000);
+    }
+    work.messages.extend(old);
+    let mission = Message::User("mission ".repeat(1500));
+    work.messages.push(mission.clone());
+    let (_, steer) = mpsc::channel(1);
+    let report = harness
+        .with_context_window(Some(8192))
+        .run(work, &(), steer, CancellationToken::new())
+        .await;
+    assert!(report.outcome.is_ok(), "{:?}", report.outcome);
+    let requests = requests.0.lock().unwrap();
+    assert_eq!(requests.len(), 5);
+    for request in &requests[2..4] {
+        assert!(matches!(&request[0], Message::System(prompt) if prompt.contains("Summarize")));
+    }
+    assert_eq!(requests[4][2], mission);
+    assert!(matches!(&requests[4][1], Message::User(summary) if summary.ends_with("Prior work")));
+    assert!(
+        matches!(&requests[4][3], Message::User(summary) if summary.ends_with("Earlier tool turn"))
+    );
+    assert!(matches!(&requests[4][5], Message::Tool { call_id, .. } if call_id == "recent"));
+}
+
+#[tokio::test]
+async fn compaction_leaves_history_intact_when_the_summary_finishes_at_its_limit() {
+    let (_dir, harness) = fixture(
+        vec![
+            vec![Chunk::Text("A partial summary".into()), end(Finish::Length)],
+            vec![submit("done", json!({"answer":42})), end(Finish::ToolCalls)],
+        ],
+        json!({"compaction":{"keepRecentTurns":1}}),
+    );
+    let mut work = work(true);
+    work.messages
+        .extend(recorded_tool_turn("old", "earlier evidence".into()));
+    work.messages
+        .extend(recorded_tool_turn("recent", "x".repeat(40_000)));
+    let initial = work.messages.clone();
+    let (_, steer) = mpsc::channel(1);
+    let report = harness
+        .with_context_window(Some(8192))
+        .run(work, &(), steer, CancellationToken::new())
+        .await;
+    assert!(report.outcome.is_ok(), "{:?}", report.outcome);
+    assert_eq!(&report.messages[..initial.len()], &initial);
+}
+
+#[tokio::test]
+async fn compaction_skips_an_incomplete_tool_exchange() {
+    let (_dir, harness) = fixture(
+        vec![vec![
+            submit("done", json!({"answer":42})),
+            end(Finish::ToolCalls),
+        ]],
+        json!({"compaction":{"keepRecentTurns":1}}),
+    );
+    let mut work = work(true);
+    let [unanswered, _] = recorded_tool_turn("unanswered", String::new());
+    work.messages.push(unanswered);
+    work.messages
+        .extend(recorded_tool_turn("recent", "x".repeat(40_000)));
+    let initial = work.messages.clone();
+    let (_, steer) = mpsc::channel(1);
+    let report = harness
+        .with_context_window(Some(8192))
+        .run(work, &(), steer, CancellationToken::new())
+        .await;
+    assert!(report.outcome.is_ok(), "{:?}", report.outcome);
+    assert_eq!(&report.messages[..initial.len()], &initial);
+}
+
+#[tokio::test]
+async fn starting_work_prunes_complete_old_exchanges_to_make_room_for_the_mission() {
+    let requests = Arc::new(Requests::default());
+    let provider = Arc::new(RecordingProvider {
+        requests: requests.clone(),
+        provider: scripted(vec![vec![end(Finish::Stop)]]),
+    });
+    let (_dir, harness) = fixture_with_provider(provider, json!({"compaction":{"enabled":false}}));
+    let mut work = work(false);
+    work.messages
+        .insert(0, Message::System("Instructions".into()));
+    let mut expected = work.messages.clone();
+    work.messages
+        .push(Message::User("x".repeat(32 * 1024 * 1024 - 4096)));
+    work.messages
+        .extend(recorded_tool_turn("old", "Discarded together".into()));
+    let recent = recorded_tool_turn("recent", "Retained together".into());
+    work.messages.extend(recent.clone());
+    expected.extend(recent);
+    let mission = Message::User("m".repeat(4096));
+    work.messages.push(mission.clone());
+    expected.push(mission);
+    let (_, steer) = mpsc::channel(1);
+    let trace = Trace::default();
+    let report = harness
+        .run(work, &trace, steer, CancellationToken::new())
+        .await;
+    assert!(report.outcome.is_ok(), "{:?}", report.outcome);
+    assert_eq!(requests.0.lock().unwrap().as_slice(), &[expected]);
+    assert_eq!(trace.0.lock().unwrap().as_slice(), &["pruned 3 messages"]);
+}
+
 #[tokio::test]
 async fn mid_tool_steer_waits_for_results() {
     let requests = Arc::new(Requests::default());
@@ -329,6 +718,13 @@ async fn cancellation_during_tool_call_physically_ends_before_return() {
     .unwrap();
     assert!(matches!(report.outcome, Err(Failure::Cancelled)));
     assert!(report.physical_end.forced());
+    assert!(
+        matches!(&report.messages[1], Message::Assistant { calls, .. } if calls[0].id == "read")
+    );
+    assert!(
+        matches!(&report.messages[2], Message::Tool { call_id, content }
+        if call_id == "read" && content.contains("stopped before a tool result"))
+    );
     tokio::time::timeout(Duration::from_millis(100), pause.dropped.notified())
         .await
         .unwrap();

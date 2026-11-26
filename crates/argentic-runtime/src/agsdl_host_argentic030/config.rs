@@ -33,6 +33,8 @@ struct ProviderConfig {
     models: Vec<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     prompt_caching: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    context_window_tokens: Option<u32>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -125,6 +127,11 @@ impl ArgenticConfig030 {
             if provider.prompt_caching && !matches!(provider.protocol, Protocol::AnthropicMessages)
             {
                 return Err(config_error("promptCaching requires anthropic-messages"));
+            }
+            if provider.context_window_tokens == Some(0) {
+                return Err(config_error(
+                    "Provider contextWindowTokens must be positive",
+                ));
             }
             if provider.models.is_empty()
                 || provider
@@ -274,6 +281,10 @@ impl ArgenticConfig030 {
             ),
         };
         Ok((client, key))
+    }
+
+    pub(super) fn context_window(&self, model: &ModelName) -> Option<u32> {
+        self.providers.get(model.provider())?.context_window_tokens
     }
 }
 

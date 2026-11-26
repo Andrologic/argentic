@@ -1,4 +1,6 @@
-//! A fresh AgSDL instance for one work, with one conversation across turns.
+//! Runs one AgSDL work in a fresh or continuing conversation.
+
+mod compaction;
 
 use std::{
     borrow::Cow,
@@ -49,6 +51,8 @@ pub enum Failure {
     TurnLimit,
     #[error("Token limit reached")]
     TokenLimit,
+    #[error("Instance conversation exceeds the history limit")]
+    HistoryLimit,
     #[error("Provider omitted usage while a total token limit was active")]
     MissingUsage,
     #[error("Provider filtered the response")]
@@ -112,6 +116,18 @@ pub enum Event<'a> {
     },
     SteerConsumed {
         id: &'a str,
+    },
+    Compaction {
+        turn: u32,
+        before_tokens: usize,
+        after_tokens: usize,
+        truncated_tool_results: usize,
+        summarized_messages: usize,
+    },
+    HistoryPruned {
+        before_bytes: usize,
+        after_bytes: usize,
+        dropped_messages: usize,
     },
 }
 
@@ -230,6 +246,7 @@ pub struct Harness {
     provider: Arc<dyn Provider>,
     registry: Arc<Registry>,
     settings: Settings,
+    context_window: Option<u32>,
     hooks: Vec<Arc<dyn Hook>>,
 }
 
@@ -239,8 +256,14 @@ impl Harness {
             provider,
             registry,
             settings,
+            context_window: None,
             hooks: Vec::new(),
         }
+    }
+
+    pub fn with_context_window(mut self, context_window: Option<u32>) -> Self {
+        self.context_window = context_window;
+        self
     }
 
     pub fn with_hook(mut self, hook: Arc<dyn Hook>) -> Self {
@@ -268,7 +291,13 @@ impl Harness {
             artifacts: Vec::new(),
             corrections: 0,
             history_end: work.messages.len(),
+            protected_prefix: compaction::prefix_len(&work.messages),
+            mission_index: matches!(work.messages.last(), Some(Message::User(_)))
+                .then(|| work.messages.len() - 1),
+            correction_start: None,
+            response_text_start: None,
             pending_steer: VecDeque::new(),
+            host_steer_pending: false,
             accepted_steer: Vec::new(),
             delivery: DeliveryProgress::default(),
         };
@@ -298,7 +327,12 @@ impl Harness {
         while instance.steer.try_recv().is_ok() {}
         tracker.close();
         tracker.wait().await;
-        work.messages.truncate(instance.history_end);
+        if matches!(outcome, Err(Failure::Cancelled)) {
+            instance.finish_interrupted_history(&mut work.messages);
+        } else {
+            work.messages.truncate(instance.history_end);
+        }
+        compaction::bound_history(&mut work.messages, instance.protected_prefix);
         RunReport {
             outcome,
             physical_end: PhysicalEnd { forced },
@@ -318,7 +352,12 @@ struct Instance<'a> {
     artifacts: Vec<Artifact>,
     corrections: u32,
     history_end: usize,
+    protected_prefix: usize,
+    mission_index: Option<usize>,
+    correction_start: Option<usize>,
+    response_text_start: Option<usize>,
     pending_steer: VecDeque<Steer>,
+    host_steer_pending: bool,
     accepted_steer: Vec<Message>,
     delivery: DeliveryProgress,
 }
@@ -339,30 +378,44 @@ impl Instance<'_> {
             .definitions()
             .map(|(_, def)| def.clone())
             .collect();
+        let tool_bytes = compaction::tool_bytes(&definitions);
         for turn in 1..=turn_limit {
             self.active()?;
+            let remaining = total.map(|limit| limit.saturating_sub(spent));
+            let max_output = u64::from(settings.limit("maxOutputTokens"))
+                .min(remaining.unwrap_or(u64::MAX)) as u32;
+            if max_output < min_output {
+                return Err(Failure::TokenLimit);
+            }
+            if turn == 1 {
+                self.prune_start_history(work).await?;
+            }
+            let charged = self
+                .compact(turn, work, tool_bytes, remaining, max_output)
+                .await?;
+            spent = spent.saturating_add(charged);
             let remaining = total.map_or(u64::MAX, |limit| limit.saturating_sub(spent));
             let max_output = u64::from(settings.limit("maxOutputTokens")).min(remaining) as u32;
             if max_output < min_output {
                 return Err(Failure::TokenLimit);
             }
+            if turn > 1 && compaction::history_bytes(&work.messages) > compaction::MAX_HISTORY_BYTES
+            {
+                return Err(Failure::HistoryLimit);
+            }
+            self.response_text_start = Some(self.text.len());
             let response = self.request(turn, work, &definitions, max_output).await;
             self.persist_steer(&mut work.messages);
             let response = response?;
-            if let Some(usage) = response.usage {
-                spent = spent
-                    .saturating_add(usage.prompt_tokens)
-                    .saturating_add(usage.completion_tokens);
-                if total.is_some_and(|limit| spent > limit)
-                    || usage.completion_tokens > u64::from(max_output)
-                {
-                    return Err(Failure::TokenLimit);
-                }
-            } else if total.is_some() {
-                return Err(Failure::MissingUsage);
-            }
+            spent = spent.saturating_add(compaction::token_charge(
+                response.usage,
+                total.map(|_| remaining),
+                max_output,
+            )?);
             let finish = response.finish;
             let calls = response.calls;
+            self.response_text_start = None;
+            self.correction_start = None;
             work.messages.push(Message::Assistant {
                 text: response.text,
                 reasoning: response.reasoning,
@@ -410,6 +463,7 @@ impl Instance<'_> {
                         break;
                     }
                     Some(error) => {
+                        self.correction_start = Some(response_index);
                         self.publish_tool(turn, call, &error, &mut work.messages)
                             .await?;
                     }
@@ -451,7 +505,11 @@ impl Instance<'_> {
                             "Required submission is missing".into(),
                         ))
                     }
-                    Some(error) => work.messages.push(Message::User(error)),
+                    Some(error) => {
+                        self.correction_start = Some(response_index);
+                        work.messages.push(Message::User(error));
+                        self.history_end = work.messages.len();
+                    }
                 }
             }
         }
@@ -728,8 +786,12 @@ impl Instance<'_> {
                 self.pending_steer.push_back(steer);
             }
         }
-        if let Some(steer) = self.port.take_steer(self.cancel).await? {
-            self.pending_steer.push_back(steer);
+        // The host owns one outstanding offer until it is settled.
+        if !self.host_steer_pending {
+            if let Some(steer) = self.port.take_steer(self.cancel).await? {
+                self.pending_steer.push_back(steer);
+                self.host_steer_pending = true;
+            }
         }
         Ok(!self.pending_steer.is_empty())
     }
@@ -748,6 +810,7 @@ impl Instance<'_> {
                 }
             }
         }
+        self.host_steer_pending = false;
         Ok(())
     }
 
@@ -756,6 +819,30 @@ impl Instance<'_> {
             messages.truncate(self.history_end);
             messages.append(&mut self.accepted_steer);
             self.history_end = messages.len();
+        }
+    }
+
+    fn finish_interrupted_history(&self, messages: &mut Vec<Message>) {
+        if let Some(Message::Assistant { calls, .. }) = messages.get(self.history_end) {
+            let unanswered: Vec<_> = calls
+                .iter()
+                .skip(messages.len() - self.history_end - 1)
+                .map(|call| Message::Tool {
+                    call_id: call.id.clone(),
+                    content: "Work stopped before a tool result was recorded.".into(),
+                })
+                .collect();
+            messages.extend(unanswered);
+        } else if let Some(start) = self
+            .response_text_start
+            .filter(|&start| start < self.text.len())
+        {
+            messages.push(Message::Assistant {
+                text: self.text[start..].to_owned(),
+                reasoning: String::new(),
+                replay: None,
+                calls: Vec::new(),
+            });
         }
     }
 

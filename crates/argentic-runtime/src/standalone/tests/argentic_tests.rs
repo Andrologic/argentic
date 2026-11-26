@@ -653,6 +653,252 @@ async fn steers_active_shared_work_and_preserves_the_conversation() {
 }
 
 #[tokio::test]
+async fn queues_works_on_one_named_instance_and_isolates_other_names() {
+    let mut server = Server::start().await;
+    let mut doc = document();
+    doc["flow"] = json!({"entry":"lead","steps":{
+        "lead":{"type":"agent","agent":"worker","instance":"new","prompt":"Lead work","next":["one","two"]},
+        "one":{"type":"agent","agent":"worker","instance":"alpha","delivery":"queue","prompt":"Alpha one","next":"join"},
+        "two":{"type":"agent","agent":"worker","instance":"alpha","delivery":"queue","prompt":"Alpha two","next":"join"},
+        "join":{"type":"join","next":"other"},
+        "other":{"type":"agent","agent":"worker","instance":"beta","prompt":"Beta work","next":[]}
+    }});
+    let f = Fixture::new(&doc.to_string());
+    let host = open(&f, false)
+        .await
+        .with_argentic(server.config(None))
+        .unwrap();
+    let run = start(&host).await;
+    let result = json!({"results":{"report":{"body":"first alpha result"}}});
+    server.next().await.tool(
+        "agsdl_submit_result",
+        json!({"results":{"report":{"body":"lead"}}}),
+    );
+    let first = server.next().await;
+    assert!(first.body["messages"].to_string().contains("Alpha one"));
+    assert!(!first.body["messages"].to_string().contains("Lead work"));
+    first.tool("agsdl_submit_result", result.clone());
+    let second = server.next().await;
+    let messages = second.body["messages"].to_string();
+    for expected in [
+        "Alpha one",
+        "Alpha two",
+        "first alpha result",
+        "Result accepted.",
+    ] {
+        assert!(messages.contains(expected), "{messages}");
+    }
+    second.tool("agsdl_submit_result", result.clone());
+    let other = server.next().await;
+    assert!(other.body["messages"].to_string().contains("Beta work"));
+    assert!(!other.body["messages"].to_string().contains("Alpha"));
+    other.tool("agsdl_submit_result", result);
+    let state = finish(&host, &run).await;
+    assert_eq!(state["verdict"], "succeeded", "{state}");
+    close(&host).await;
+}
+
+#[tokio::test]
+async fn remaining_stop_joins_a_work_and_keeps_its_shared_conversation() {
+    let mut server = Server::start().await;
+    let mut doc = document();
+    doc["agents"]["winner"] = doc["agents"]["worker"].clone();
+    doc["flow"] = json!({"entry":"lead","steps":{
+        "lead":{"type":"agent","agent":"winner","instance":"new","prompt":"Lead","next":["slow","fast"]},
+        "slow":{"type":"agent","agent":"worker","delivery":"queue","prompt":"Stopped mission","next":{"approve":"join"}},
+        "fast":{"type":"agent","agent":"winner","instance":"new","prompt":"Winning mission","next":{"approve":"join"}},
+        "join":{"type":"join","quorum":{"count":1,"accept":["approve"]},"remaining":"stop",
+            "next":{"reached":"resume","missed":[]}},
+        "resume":{"type":"agent","agent":"worker","prompt":"Resumed mission","next":[]}
+    }});
+    let f = Fixture::new(&doc.to_string());
+    let host = open(&f, false)
+        .await
+        .with_argentic(server.config(None))
+        .unwrap();
+    let run = start(&host).await;
+    let result = json!({"results":{"report":{"body":"done"}}});
+    server
+        .next()
+        .await
+        .tool("agsdl_submit_result", result.clone());
+    let a = server.next().await;
+    let b = server.next().await;
+    let (slow, fast) = if a.body["messages"].to_string().contains("Stopped mission") {
+        (a, b)
+    } else {
+        (b, a)
+    };
+    slow.tool("list", json!({}));
+    let inflight = server.next().await;
+    assert_eq!(
+        inflight.body["messages"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap()["role"],
+        "tool"
+    );
+    let (dropped, did_drop) = oneshot::channel::<()>();
+    let body = futures::stream::once(async move {
+        let _held = dropped;
+        std::future::pending::<std::io::Result<String>>().await
+    });
+    inflight.send(StatusCode::OK, Body::from_stream(body), "text/event-stream");
+    let mut winning = result.clone();
+    winning["choice"] = json!("approve");
+    fast.tool("agsdl_submit_result", winning);
+    let resumed = server.next().await;
+    let messages = resumed.body["messages"].to_string();
+    for expected in ["Stopped mission", "Resumed mission", "\"role\":\"tool\""] {
+        assert!(messages.contains(expected), "{messages}");
+    }
+    assert!(tokio::time::timeout(WAIT_FOR, did_drop)
+        .await
+        .unwrap()
+        .is_err());
+    resumed.tool("agsdl_submit_result", result);
+    let state = finish(&host, &run).await;
+    assert_eq!(state["verdict"], "succeeded", "{state}");
+    close(&host).await;
+}
+
+#[tokio::test]
+async fn a_host_restart_interrupts_argentic_runs_and_new_runs_start_fresh() {
+    const ROOT: &str = "ARGENTIC_INSTANCE_CRASH_ROOT";
+    const URL: &str = "ARGENTIC_INSTANCE_CRASH_URL";
+    if let Some(root) = std::env::var_os(ROOT) {
+        let root = PathBuf::from(root);
+        let bytes = std::fs::read(root.join("policy.json")).unwrap();
+        let host = Host::open(
+            &root.join("data"),
+            &root.join("workspace"),
+            &root.join("source.json"),
+            &root.join("policy.json"),
+            &digest(bytes),
+        )
+        .await
+        .unwrap()
+        .with_argentic(serde_json::from_value(config(&std::env::var(URL).unwrap(), None)).unwrap())
+        .unwrap();
+        start(&host).await;
+        std::future::pending::<()>().await;
+        return;
+    }
+    let mut server = Server::start().await;
+    let mut doc = document();
+    doc["flow"] = json!({"entry":"one","steps":{
+        "one":{"type":"agent","agent":"worker","prompt":"First shared work","next":"two"},
+        "two":{"type":"agent","agent":"worker","prompt":"Second shared work","next":[]}
+    }});
+    let f = Fixture::new(&doc.to_string());
+    let mut child = tokio::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "standalone::tests::argentic_tests::a_host_restart_interrupts_argentic_runs_and_new_runs_start_fresh"])
+        .env(ROOT, f._temp.path())
+        .env(URL, &server.base_url)
+        .kill_on_drop(true)
+        .spawn().unwrap();
+    let old = json!({"results":{"report":{"body":"before restart"}}});
+    server.next().await.tool("agsdl_submit_result", old);
+    let active = server.next().await;
+    assert!(active.body["messages"]
+        .to_string()
+        .contains("before restart"));
+    child.kill().await.unwrap();
+    drop(active);
+
+    let host = open(&f, false)
+        .await
+        .with_argentic(server.config(None))
+        .unwrap();
+    assert_eq!(host.runs().await.unwrap()[0]["interrupted"], true);
+    assert!(host.active_runs().await.unwrap().is_empty());
+    let mut fresh_entry = entry().unwrap();
+    fresh_entry.delivery_id = "after-restart-entry".into();
+    let fresh = host
+        .start_with_harnesses("after-restart".into(), Some(fresh_entry), &opt_in())
+        .await
+        .unwrap();
+    let request = server.next().await;
+    let messages = request.body["messages"].to_string();
+    assert!(messages.contains("First shared work"), "{messages}");
+    assert!(!messages.contains("before restart"), "{messages}");
+    let result = json!({"results":{"report":{"body":"after restart"}}});
+    request.tool("agsdl_submit_result", result.clone());
+    server.next().await.tool("agsdl_submit_result", result);
+    assert_eq!(finish(&host, &fresh).await["verdict"], "succeeded");
+    close(&host).await;
+}
+
+#[tokio::test]
+async fn compaction_summarizes_old_turns_and_preserves_the_active_wire_prefix() {
+    let mut server = Server::start().await;
+    let mut doc = document();
+    doc["agents"]["worker"]["instructions"] = json!("Stable rules for this run.");
+    doc["agents"]["worker"]["harnessSettings"]["compaction"] =
+        json!({"threshold":0.60,"keepRecentTurns":1});
+    let mut provider = config(&server.base_url, None);
+    provider["providers"]["local"]["contextWindowTokens"] = json!(8192);
+    let f = Fixture::new(&doc.to_string());
+    let host = open(&f, false)
+        .await
+        .with_argentic(serde_json::from_value(provider).unwrap())
+        .unwrap();
+    let run = start(&host).await;
+
+    let first = server.next().await;
+    let prefix = first.body["messages"].clone();
+    let tools = first.body["tools"].clone();
+    let long_tool_turn = |request: Request, marker: &str, padding: char| {
+        let content = format!("{marker} {}", padding.to_string().repeat(12_000));
+        let chunk = json!({"choices":[{"index":0,"delta":{"content":content}}]});
+        let tool = Request::tool_response("list", json!({}));
+        request.send(
+            StatusCode::OK,
+            format!("data: {chunk}\n\n{tool}"),
+            "text/event-stream",
+        );
+    };
+    long_tool_turn(first, "Old turn marker", 'a');
+    long_tool_turn(server.next().await, "Recent turn marker", 'b');
+    let summary = server.next().await;
+    assert!(summary.body.get("tools").is_none(), "{}", summary.body);
+    let transcript = summary.body["messages"].to_string();
+    assert!(transcript.contains("Summarize this older conversation"));
+    assert!(transcript.contains("Old turn marker"));
+    assert!(!transcript.contains("Recent turn marker"));
+    let output = json!({"choices":[{"index":0,"delta":{"content":"Remember the old directory listing."},"finish_reason":"stop"}]});
+    summary.send(
+        StatusCode::OK,
+        format!("data: {output}\n\ndata: [DONE]\n\n"),
+        "text/event-stream",
+    );
+    let compacted = server.next().await;
+    let messages = compacted.body["messages"].as_array().unwrap();
+    assert_eq!(&messages[..2], prefix.as_array().unwrap());
+    assert_eq!(compacted.body["tools"], tools);
+    assert!(messages[2]["content"]
+        .as_str()
+        .unwrap()
+        .contains("Remember the old directory listing."));
+    assert!(messages[3]["content"]
+        .as_str()
+        .unwrap()
+        .contains("Recent turn marker"));
+    assert_eq!(
+        messages[3]["tool_calls"][0]["id"],
+        messages[4]["tool_call_id"]
+    );
+    assert_eq!(messages.len(), 5);
+    compacted.tool(
+        "agsdl_submit_result",
+        json!({"results":{"report":{"body":"compacted work"}}}),
+    );
+    assert_eq!(finish(&host, &run).await["verdict"], "succeeded");
+    close(&host).await;
+}
+
+#[tokio::test]
 async fn provider_failure_does_not_persist_the_echoed_credential() {
     // Cargo supplies this fixture value to the test process without mutating
     // the environment of concurrently running tests.
