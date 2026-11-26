@@ -668,6 +668,60 @@ fn forbid_shell() -> Value {
     json!({"action":"shell","effect":"deny"})
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn qualification_rejects_read_restrictions_on_shell_runtime_paths() {
+    for (restriction, suffix) in [
+        (
+            json!({"rules":[{"action":"read","match":"/proc/cmdline","effect":"deny"}]}),
+            "rules/0/match",
+        ),
+        (
+            json!({"rules":[{"action":"read","match":"/etc/**","effect":"ask"}]}),
+            "rules/0/match",
+        ),
+        (json!({"outside":"deny"}), "outside"),
+    ] {
+        for shell in [true, false] {
+            let mut doc = document();
+            let mut permissions = restriction.clone();
+            permissions["preset"] = json!("workspace");
+            permissions["reviewer"] = json!("person");
+            if !shell {
+                if permissions["rules"].is_null() {
+                    permissions["rules"] = json!([]);
+                }
+                permissions["rules"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(forbid_shell());
+            }
+            doc["agents"]["worker"]["permissions"] = permissions;
+            let f = Fixture::new(&doc.to_string());
+            let host = f
+                .open()
+                .await
+                .unwrap()
+                .with_argentic(
+                    serde_json::from_value(config("http://127.0.0.1:1/v1", None)).unwrap(),
+                )
+                .unwrap();
+            let report = host
+                .preflight_with_harnesses(entry().as_ref(), &opt_in())
+                .await;
+            if shell {
+                assert_eq!(
+                    report.unwrap_err().pointer,
+                    format!("/agents/worker/permissions/{suffix}")
+                );
+            } else {
+                report.unwrap();
+            }
+            close(&host).await;
+        }
+    }
+}
+
 #[tokio::test]
 async fn workspace_edits_and_denied_writes_go_through_the_host() {
     let mut server = Server::start().await;

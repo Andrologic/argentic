@@ -185,12 +185,20 @@ macOS and Windows refuse shell at qualification.
 To use file mutations without shell, declare a global `shell` denial.
 
 The sandbox starts with a cleared environment, a private PID namespace and
-a private network namespace. It mounts the system runtime read-only and
-provides private `/tmp`, `/dev` and `/proc`. The process drops capabilities
-and seccomp blocks tracing, process introspection syscalls and other privileged
-kernel interfaces. Shell networking requires a blanket grant from every
-ceiling. The network-enabled profile allows IPv4 and IPv6 sockets. Per-host
+a private network namespace. It provides private `/tmp`, `/dev` and `/proc`.
+It mounts the available executable and library directories `/bin`, `/usr/bin`,
+`/lib`, `/lib64`, `/usr/lib` and `/usr/lib64` read-only, along with
+`/etc/ld.so.cache` when present. The process drops capabilities and seccomp
+blocks tracing, process introspection syscalls and other privileged kernel
+interfaces. Shell networking requires a blanket grant from every ceiling.
+The network-enabled profile allows IPv4 and IPv6 sockets and mounts
+`/etc/resolv.conf`, `/etc/hosts` and `/etc/ssl/certs` when present. Per-host
 grants cannot enable networking.
+
+The default outside denial leaves the system runtime readable as AgSDL
+specifies. Qualification refuses shell with an explicit `outside: "deny"`
+or any read denial or approval rule that overlaps a required runtime mount.
+The executor checks all effective policy layers before enabling shell.
 
 Bash sees a private copy at `/workspace` built from verified directory and
 file handles. A scan checks at most 20,000 entries and copies at most 64 MiB.

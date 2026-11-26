@@ -236,20 +236,11 @@ fn run_inner(
     ]);
     // Explicit execution prerequisites. Hosts may not place application data
     // or secrets in these system directories.
-    for system in [
-        "/bin",
-        "/usr/bin",
-        "/lib",
-        "/lib64",
-        "/usr/lib",
-        "/usr/lib64",
-        "/usr/libexec",
-        "/etc/ld.so.cache",
-    ] {
+    for &system in super::RUNTIME_DIRS.iter().chain(&[super::LOADER_CACHE]) {
         child.args(["--ro-bind-try", system, system]);
     }
     if network {
-        for system in ["/etc/resolv.conf", "/etc/hosts", "/etc/ssl/certs"] {
+        for &(system, _) in super::NETWORK_MOUNTS {
             // Resolve distro-managed resolv.conf links without mounting /run.
             if let Ok(source) = fs::canonicalize(system) {
                 child.arg("--ro-bind").arg(source).arg(system);

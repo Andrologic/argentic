@@ -33,7 +33,11 @@ pub struct ReadRule {
 
 /// Only '*' and '**' are special. All other characters are literal.
 #[derive(Clone, Debug)]
-pub struct PathGlob(Regex);
+pub struct PathGlob {
+    regex: Regex,
+    prefix: String,
+    pattern: String,
+}
 
 impl PathGlob {
     pub fn compile(pattern: &str) -> Result<Self, regex::Error> {
@@ -56,11 +60,46 @@ impl PathGlob {
             }
         }
         expression.push_str("\\z");
-        Regex::new(&expression).map(Self)
+        Ok(Self {
+            regex: Regex::new(&expression)?,
+            prefix: prefix.into(),
+            pattern: pattern.into(),
+        })
     }
 
     pub fn matches(&self, path: &str) -> bool {
-        self.0.is_match(path)
+        self.regex.is_match(path)
+    }
+
+    // A tree overlaps when a matching path can begin with its directory
+    // prefix. Track the number of prefix bytes consumed by each glob token.
+    fn may_match_prefix(&self, path: &str) -> bool {
+        if self.prefix.starts_with(path) {
+            return true;
+        }
+        let Some(path) = path.strip_prefix(&self.prefix) else {
+            return false;
+        };
+        let mut reachable = vec![false; path.len() + 1];
+        reachable[0] = true;
+        let mut pattern = self.pattern.bytes().peekable();
+        while let Some(byte) = pattern.next() {
+            if byte == b'*' {
+                let cross_slash = pattern.next_if_eq(&b'*').is_some();
+                for (index, byte) in path.bytes().enumerate() {
+                    reachable[index + 1] |= reachable[index] && (cross_slash || byte != b'/');
+                }
+            } else {
+                for (index, path_byte) in path.bytes().enumerate().rev() {
+                    reachable[index + 1] = reachable[index] && byte == path_byte;
+                }
+                reachable[0] = false;
+            }
+            if reachable[path.len()] {
+                return true;
+            }
+        }
+        false
     }
 }
 
@@ -222,6 +261,39 @@ impl Policy {
 
     pub fn shell_effect(&self, source: &str) -> Effect {
         parse_shell(source).map_or(Effect::Deny, |parsed| self.parsed_shell_effect(&parsed))
+    }
+
+    pub fn may_run_shell(&self, authorizer: bool) -> bool {
+        let permits = |effect| effect == Effect::Allow || effect == Effect::Ask && authorizer;
+        let mut allowed = permits(self.default_effect(Action::Shell, Zone::Workspace));
+        for (_, matcher, effect) in self
+            .rules
+            .iter()
+            .filter(|(action, _, _)| *action == Action::Shell)
+        {
+            if matcher.is_none() && !permits(*effect) {
+                return false;
+            }
+            allowed |= permits(*effect);
+        }
+        allowed
+    }
+
+    pub(crate) fn explicitly_denies_outside_reads(&self) -> bool {
+        self.outside_read == Some(false)
+    }
+
+    pub(crate) fn restricted_read_rule(&self, path: &str, tree: bool) -> Option<usize> {
+        self.rules.iter().position(|(action, matcher, effect)| {
+            *action == Action::Read
+                && *effect != Effect::Allow
+                && matcher.as_ref().is_none_or(|matcher| match matcher {
+                    Matcher::Path(glob) => {
+                        glob.matches(path) || tree && glob.may_match_prefix(&format!("{path}/"))
+                    }
+                    Matcher::Text(_) => unreachable!("file rules use path globs"),
+                })
+        })
     }
 
     pub(crate) fn parsed_shell_effect(&self, parsed: &shell::ParsedShell<'_>) -> Effect {

@@ -14,7 +14,7 @@ use crate::{
         HarnessAdapter030, HarnessObservation030, PreparedEffectiveAgentWork030, WorkEventSink030,
     },
     host::HostContext,
-    permissions::{RequestedPermissions, Reviewer},
+    permissions::Reviewer,
     persistence::{
         failure,
         flow030::{FlowEffectKind030, FlowPlan030},
@@ -185,6 +185,11 @@ impl AgentExecutor030 for Executor {
         ArgenticAdapter030(self.config.clone())
             .qualify_agent(&work.document()["agents"][agent], &pointer)?;
         admission::validate_document(work.document(), work.document_location())?;
+        admission::admit_shell(
+            &admission::compile_policy(work.policy())?,
+            work.policy().reviewer() == Some(Reviewer::Person),
+            &pointer,
+        )?;
         AttestedWorkPolicy030::new(
             work,
             ADAPTER,
@@ -316,8 +321,6 @@ impl Executor {
             .context()
             .workspace;
         let root = admitted_root(&work.capture, workspace)?;
-        let permissions: RequestedPermissions =
-            serde_json::from_value(definition["permissions"].clone())?;
         let private: Value = serde_json::from_str(&work.capture.private_capture_json)?;
         let captured_tools: Value =
             serde_json::from_str(required(&private, "callPermissionsJson")?)?;
@@ -328,16 +331,18 @@ impl Executor {
         let writable = !crate::tool_policy::agsdl_native_read_only(&captured_tools)
             && project.tools["readOnly"] != true;
         drop(project);
-        let mut registry =
-            Registry::with_open_roots(vec![root], admission::compile_policy(&work.policy)?, schema)
-                .map_err(|_| missing("toolRegistry"))?;
+        let policies = admission::compile_policy(&work.policy)?;
+        let person = work.policy.reviewer() == Some(Reviewer::Person);
+        let shell = admission::admit_shell(&policies, person, &admission::agent_pointer(agent))?;
+        let mut registry = Registry::with_open_roots(vec![root], policies, schema)
+            .map_err(|_| missing("toolRegistry"))?;
         if writable {
             registry = registry.with_writes();
         }
-        if admission::shell_requested(&permissions) {
+        if shell {
             registry = registry.with_shell();
         }
-        if work.policy.reviewer() == Some(Reviewer::Person) {
+        if person {
             registry = registry.with_authorizer(Arc::new(approval::Human {
                 approvals: self.approvals.clone(),
                 attempt: work.attempt.clone(),

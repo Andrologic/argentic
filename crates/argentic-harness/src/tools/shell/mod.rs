@@ -11,7 +11,7 @@ mod workspace;
 
 use super::{output, Page, Registry};
 use crate::{
-    policy::{Action, Effect, Zone},
+    policy::{Action, Effect, Policy, Zone},
     providers::ToolCall,
 };
 use serde::Deserialize;
@@ -28,6 +28,71 @@ struct Arguments {
 
 fn default_timeout() -> u64 {
     30_000
+}
+
+// Keep the launcher and its permission check on the same mount list.
+pub(super) const RUNTIME_DIRS: &[&str] = &[
+    "/bin",
+    "/usr/bin",
+    "/lib",
+    "/lib64",
+    "/usr/lib",
+    "/usr/lib64",
+];
+pub(super) const LOADER_CACHE: &str = "/etc/ld.so.cache";
+pub(super) const NETWORK_MOUNTS: &[(&str, bool)] = &[
+    ("/etc/resolv.conf", false),
+    ("/etc/hosts", false),
+    ("/etc/ssl/certs", true),
+];
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ShellReadConflict {
+    Outside,
+    Rule { index: usize, mount: &'static str },
+}
+
+impl std::fmt::Display for ShellReadConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Outside => f.write_str(
+                "Explicit outside read denial conflicts with required shell runtime mounts",
+            ),
+            Self::Rule { mount, .. } => write!(
+                f,
+                "Read restriction overlaps required shell runtime mount {mount}"
+            ),
+        }
+    }
+}
+
+pub fn shell_read_conflict(policy: &Policy, network: bool) -> Option<ShellReadConflict> {
+    if policy.explicitly_denies_outside_reads() {
+        return Some(ShellReadConflict::Outside);
+    }
+    RUNTIME_DIRS
+        .iter()
+        .map(|&path| (path, true))
+        .chain([("/dev", true), ("/proc", true), (LOADER_CACHE, false)])
+        .chain(NETWORK_MOUNTS.iter().copied().filter(|_| network))
+        .filter_map(|(mount, tree)| {
+            let index = policy.restricted_read_rule(mount, tree).or_else(|| {
+                let source = std::fs::canonicalize(mount).ok()?;
+                policy.restricted_read_rule(source.to_str()?, tree)
+            })?;
+            Some(ShellReadConflict::Rule { index, mount })
+        })
+        .min_by_key(|conflict| match conflict {
+            ShellReadConflict::Rule { index, .. } => *index,
+            ShellReadConflict::Outside => unreachable!(),
+        })
+}
+
+pub fn shell_network_allowed(policies: &[Policy]) -> bool {
+    !policies.is_empty()
+        && policies
+            .iter()
+            .all(|policy| policy.blanket_allows(Action::Network, Zone::Workspace))
 }
 
 pub fn preflight() -> Result<(), String> {
@@ -64,6 +129,14 @@ impl Registry {
             .map(|policy| policy.parsed_shell_effect(&parsed))
             .max()
             .unwrap_or(Effect::Deny);
+        let network = shell_network_allowed(&self.policy);
+        if effect != Effect::Deny {
+            for policy in &self.policy {
+                if let Some(conflict) = shell_read_conflict(policy, network) {
+                    return Err(conflict.to_string());
+                }
+            }
+        }
         self.authorize(
             effect,
             &call,
@@ -81,10 +154,6 @@ impl Registry {
                 .policy
                 .iter()
                 .all(|policy| policy.blanket_allows(Action::Write, Zone::Workspace));
-        let network = self
-            .policy
-            .iter()
-            .all(|policy| policy.blanket_allows(Action::Network, Zone::Workspace));
         let registry = self.clone();
         let guard = tokio::select! {
             biased;

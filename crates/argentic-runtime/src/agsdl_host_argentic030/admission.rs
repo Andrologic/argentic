@@ -10,6 +10,7 @@ use crate::{
 use argentic_harness::policy::{
     Action as NativeAction, Effect as NativeEffect, Policy, Preset as NativePreset, Rule, Zone,
 };
+use argentic_harness::tools::{shell_network_allowed, shell_read_conflict, ShellReadConflict};
 use serde_json::Value;
 
 pub(super) fn unsupported(pointer: &str, feature: &str) -> crate::persistence::dto::EngineFailure {
@@ -64,6 +65,49 @@ pub(super) fn qualify(agent: &Value, pointer: &str) -> Result<()> {
         }
     }
     if shell_requested(&permissions) {
+        #[cfg(target_os = "linux")]
+        if let RequestedPermissions::Object(object) = &permissions {
+            if object.outside == Some(Outside::Deny) {
+                return Err(read_conflict(
+                    &format!("{at}/outside"),
+                    ShellReadConflict::Outside,
+                ));
+            }
+            for (index, rule) in object.rules.iter().enumerate() {
+                if rule.action != Action::Read
+                    || rule.effect == Effect::Allow
+                    || rule
+                        .pattern
+                        .as_deref()
+                        .is_some_and(|pattern| !pattern.starts_with('/'))
+                {
+                    continue;
+                }
+                let policy = Policy::compile_rules(
+                    std::path::Path::new("/"),
+                    None,
+                    None,
+                    None,
+                    &[Rule {
+                        action: NativeAction::Read,
+                        effect: NativeEffect::Deny,
+                        pattern: rule.pattern.clone(),
+                    }],
+                )
+                .map_err(|error| failure("PERMISSION", &format!("{at}/rules/{index}"), &error))?;
+                if let Some(conflict) = shell_read_conflict(&policy, false) {
+                    let field = if rule.pattern.is_some() {
+                        "match"
+                    } else {
+                        "effect"
+                    };
+                    return Err(read_conflict(
+                        &format!("{at}/rules/{index}/{field}"),
+                        conflict,
+                    ));
+                }
+            }
+        }
         argentic_harness::tools::shell_preflight()
             .map_err(|diagnostic| failure("HARNESS_CAPABILITY", &at, &diagnostic))?;
     }
@@ -101,19 +145,38 @@ pub(super) fn shell_requested(permissions: &RequestedPermissions) -> bool {
                 let global = rule.pattern.as_ref().is_none_or(|pattern| {
                     !pattern.is_empty() && pattern.bytes().all(|byte| byte == b'*')
                 });
-                if global
-                    && (rule.effect == Effect::Deny
-                        || rule.effect == Effect::Ask
-                            && permissions.reviewer != Some(Reviewer::Person))
-                {
+                if global && rule.effect == Effect::Deny {
                     return false;
                 }
-                allowed |= rule.effect == Effect::Allow
-                    || rule.effect == Effect::Ask && permissions.reviewer == Some(Reviewer::Person);
+                allowed |= rule.effect != Effect::Deny;
             }
             allowed
         }
     }
+}
+
+fn read_conflict(
+    pointer: &str,
+    conflict: ShellReadConflict,
+) -> crate::persistence::dto::EngineFailure {
+    failure("HARNESS_UNSUPPORTED", pointer, &conflict.to_string())
+}
+
+pub(super) fn admit_shell(policies: &[Policy], person: bool, pointer: &str) -> Result<bool> {
+    if !policies.iter().all(|policy| policy.may_run_shell(person)) {
+        return Ok(false);
+    }
+    let network = shell_network_allowed(policies);
+    for policy in policies {
+        if let Some(conflict) = shell_read_conflict(policy, network) {
+            let at = match conflict {
+                ShellReadConflict::Outside => format!("{pointer}/permissions/outside"),
+                ShellReadConflict::Rule { .. } => format!("{pointer}/permissions/rules"),
+            };
+            return Err(read_conflict(&at, conflict));
+        }
+    }
+    Ok(true)
 }
 
 pub(super) fn compile_policy(policy: &EffectivePolicy) -> Result<Vec<Policy>> {
@@ -169,7 +232,13 @@ pub(super) fn compile_policy(policy: &EffectivePolicy) -> Result<Vec<Policy>> {
                 &paths.workspace,
                 Some(&paths.home),
                 preset,
-                Some(layer.outside() == Outside::Read),
+                if layer.explicitly_denies_outside_reads() {
+                    Some(false)
+                } else if layer.outside() == Outside::Read {
+                    Some(true)
+                } else {
+                    None
+                },
                 &rules,
             )
             .map(|policy| {

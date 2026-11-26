@@ -4,6 +4,7 @@ mod mutation;
 mod patch;
 mod shell;
 pub use shell::preflight as shell_preflight;
+pub use shell::{shell_network_allowed, shell_read_conflict, ShellReadConflict};
 
 mod confined;
 mod output;

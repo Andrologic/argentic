@@ -170,6 +170,8 @@ pub struct NormalizedPolicy {
     preset: Option<Preset>,
     directories: Vec<DirectoryGrant>,
     outside: Outside,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    explicit_outside_deny: bool,
     rules: Vec<NormalizedRule>,
     reviewer: Option<Reviewer>,
 }
@@ -186,6 +188,9 @@ impl NormalizedPolicy {
     }
     pub fn outside(&self) -> Outside {
         self.outside
+    }
+    pub(crate) fn explicitly_denies_outside_reads(&self) -> bool {
+        self.explicit_outside_deny
     }
     pub fn rules(&self) -> &[NormalizedRule] {
         &self.rules
@@ -230,6 +235,7 @@ pub fn normalize_requested(
             } else {
                 Outside::Deny
             }),
+        explicit_outside_deny: object.outside == Some(Outside::Deny),
         rules,
         reviewer: object.reviewer,
     })
@@ -305,6 +311,8 @@ struct StoredPolicy {
     preset: Option<Preset>,
     directories: Vec<DirectoryGrant>,
     outside: Outside,
+    #[serde(default)]
+    explicit_outside_deny: bool,
     rules: Vec<NormalizedRule>,
     reviewer: Option<Reviewer>,
 }
@@ -315,6 +323,7 @@ impl StoredPolicy {
             preset: self.preset,
             directories: self.directories,
             outside: self.outside,
+            explicit_outside_deny: self.explicit_outside_deny,
             rules: self.rules,
             reviewer: self.reviewer,
         }

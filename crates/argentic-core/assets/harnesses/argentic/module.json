@@ -53,7 +53,7 @@
       "ask": "sandbox",
       "deny": "sandbox",
       "outside": "sandbox",
-      "note": "Direct file tools enforce the compiled policy. Linux shell uses a confined workspace snapshot and a fixed system runtime. Denied paths and paths requiring approval are omitted from the snapshot."
+      "note": "Direct file tools enforce the compiled policy. The Linux sandbox exposes a filtered workspace snapshot and the system files needed to run programs. Qualification refuses shell with an explicit outside denial or a deny or ask rule that overlaps a required runtime mount."
     },
     "write": {
       "allow": "harness",
