@@ -110,6 +110,10 @@
       "maxTurnBytes": {
         "type": "integer"
       },
+      "forceSubmissionOnCorrection": {
+        "type": "boolean",
+        "description": "Force the result tool after a missing required submission. Defaults to true. If the provider rejects tool choice, omit it for the rest of the work attempt. Anthropic Messages uses automatic tool selection with manual extended thinking."
+      },
       "compaction": {
         "type": "object",
         "description": "Summarize older conversation turns before reaching the configured provider context window.",

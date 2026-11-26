@@ -9,9 +9,9 @@ use argentic_harness::{
     config::Settings,
     policy::{Preset, ReadPolicy},
     providers::{
-        reasoning_capability, AnthropicMessages, Chunk, DeliveryProgress, DeliveryStatus, Finish,
-        Message, OpenAiResponses, Provider, ProviderError, Request, ToolDefinition, TurnLimits,
-        Usage,
+        reasoning_capability, AnthropicMessages, ChatCompletions, Chunk, DeliveryProgress,
+        DeliveryStatus, Finish, Message, OpenAiResponses, Provider, ProviderError, Request,
+        ToolDefinition, TurnLimits, Usage,
     },
     r#loop::{Failure, Harness, Work},
     tools::Registry,
@@ -221,6 +221,27 @@ impl Drop for Mock {
 
 impl Mock {
     async fn start(protocol: Protocol, replies: Vec<Response>) -> Self {
+        Self::start_at(protocol.path(), replies, |url| match protocol {
+            Protocol::Messages => Arc::new(
+                AnthropicMessages::new("fixture", url, Some("fixture-key"))
+                    .unwrap()
+                    .with_prompt_caching(true)
+                    .with_attempt_effort_fallback(),
+            ),
+            Protocol::Responses => Arc::new(
+                OpenAiResponses::new("fixture", url, Some("fixture-key"))
+                    .unwrap()
+                    .with_attempt_effort_fallback(),
+            ),
+        })
+        .await
+    }
+
+    async fn start_at(
+        path: &str,
+        replies: Vec<Response>,
+        provider: impl FnOnce(reqwest::Url) -> Arc<dyn Provider>,
+    ) -> Self {
         async fn send(
             State((requests, replies)): State<(Requests, Script)>,
             headers: HeaderMap,
@@ -238,33 +259,16 @@ impl Mock {
         }
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!(
-            "http://{}{}",
-            listener.local_addr().unwrap(),
-            protocol.path()
-        )
-        .parse()
-        .unwrap();
+        let url = format!("http://{}{path}", listener.local_addr().unwrap())
+            .parse()
+            .unwrap();
         let requests = Requests::default();
         let app = Router::new()
-            .route(protocol.path(), post(send))
+            .route(path, post(send))
             .with_state((requests.clone(), Arc::new(Mutex::new(replies.into()))));
         let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let provider: Arc<dyn Provider> = match protocol {
-            Protocol::Messages => Arc::new(
-                AnthropicMessages::new("fixture", url, Some("fixture-key"))
-                    .unwrap()
-                    .with_prompt_caching(true)
-                    .with_attempt_effort_fallback(),
-            ),
-            Protocol::Responses => Arc::new(
-                OpenAiResponses::new("fixture", url, Some("fixture-key"))
-                    .unwrap()
-                    .with_attempt_effort_fallback(),
-            ),
-        };
         Self {
-            provider,
+            provider: provider(url),
             requests,
             task,
         }
@@ -283,6 +287,8 @@ async fn run(
                 model: &protocol.model().parse().unwrap(),
                 messages,
                 tools,
+                tool_choice: Default::default(),
+                tool_choice_rejected: None,
                 max_output_tokens: 4096,
                 reasoning_effort: Some("medium"),
                 delivery: DeliveryProgress::default(),
@@ -446,6 +452,119 @@ fn http_error(status: u16, retry_after: Option<&str>, body: &'static str) -> Res
     response
 }
 
+fn correction_replies(stop: impl Fn() -> Response, rejection: &'static str) -> Vec<Response> {
+    vec![stop(), http_error(400, None, rejection), stop(), stop()]
+}
+
+async fn correction_turns(mock: &Mock, model: &str, effort: Option<&str>) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let policy = ReadPolicy::compile(&root, None, Some(Preset::ReadOnly), None, &[]).unwrap();
+    let registry = Registry::new(&[root], policy, json!({"type":"object"})).unwrap();
+    let harness = Harness::new(
+        mock.provider.clone(),
+        Arc::new(registry),
+        Settings::default(),
+    );
+    let (_, steer) = tokio::sync::mpsc::channel(1);
+    let report = harness
+        .run(
+            Work {
+                model: model.parse().unwrap(),
+                reasoning_effort: effort.map(str::to_owned),
+                messages: vec![Message::User("Submit a result".into())],
+                submission_required: true,
+                max_corrections: 2,
+            },
+            &(),
+            steer,
+            CancellationToken::new(),
+        )
+        .await;
+    assert!(matches!(report.outcome, Err(Failure::OutputInvalid(_))));
+}
+
+fn assert_choice_fallback(mock: &Mock, forced: Value) {
+    let requests = mock.requests.lock().unwrap();
+    assert_eq!(requests.len(), 4);
+    assert!(requests[0].1.get("tool_choice").is_none());
+    assert_eq!(requests[1].1["tool_choice"], forced);
+    let mut retry = requests[1].1.clone();
+    retry.as_object_mut().unwrap().remove("tool_choice");
+    assert_eq!(requests[2].1, retry);
+    assert!(requests[3].1.get("tool_choice").is_none());
+    assert!(requests[3].1.to_string().contains("SUBMISSION_REQUIRED"));
+}
+
+#[tokio::test]
+async fn chat_completions_forces_submission_and_falls_back() {
+    let stop = || {
+        sse(concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"text only\"},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n"
+    ).into())
+    };
+    let mock = Mock::start_at(
+        "/v1/chat/completions",
+        correction_replies(stop, r#"{"error":"Invalid tool_choice type: 'object'. Supported string values: none, auto, required"}"#),
+        |url| Arc::new(ChatCompletions::new("fixture", url, None).unwrap()),
+    )
+    .await;
+    correction_turns(&mock, "fixture/gpt-5.4", None).await;
+    assert_choice_fallback(
+        &mock,
+        json!({"type":"function","function":{"name":"agsdl_submit_result"}}),
+    );
+}
+
+#[tokio::test]
+async fn responses_forces_submission_and_falls_back() {
+    let protocol = Protocol::Responses;
+    let mock = Mock::start(
+        protocol,
+        correction_replies(
+            || protocol.success(),
+            r#"{"error":{"message":"Unsupported value","param":"tool_choice"}}"#,
+        ),
+    )
+    .await;
+    correction_turns(&mock, protocol.model(), Some("medium")).await;
+    assert_choice_fallback(
+        &mock,
+        json!({"type":"function","name":"agsdl_submit_result"}),
+    );
+}
+
+#[tokio::test]
+async fn messages_forces_submission_and_falls_back() {
+    let protocol = Protocol::Messages;
+    let mut replies = correction_replies(
+        || protocol.success(),
+        r#"{"type":"error","error":{"type":"invalid_request_error","message":"tool_choice: type \"tool\" and \"any\" are not supported for this model."}}"#,
+    );
+    replies.insert(0, http_error(400, None, "Unsupported thinking parameter"));
+    let mock = Mock::start(protocol, replies).await;
+    correction_turns(&mock, protocol.model(), Some("medium")).await;
+    let (_, first, _) = mock.requests.lock().unwrap().remove(0);
+    assert_eq!(first["thinking"]["type"], "enabled");
+    assert!(first.get("tool_choice").is_none());
+    assert_choice_fallback(&mock, json!({"type":"tool","name":"agsdl_submit_result"}));
+}
+
+#[tokio::test]
+async fn messages_correction_keeps_automatic_tool_selection_with_manual_thinking() {
+    let protocol = Protocol::Messages;
+    let mock = Mock::start(protocol, (0..3).map(|_| protocol.success()).collect()).await;
+    correction_turns(&mock, protocol.model(), Some("medium")).await;
+    let requests = mock.requests.lock().unwrap();
+    assert_eq!(requests.len(), 3);
+    for (_, body, _) in requests.iter() {
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert!(body.get("tool_choice").is_none());
+    }
+    assert!(requests[1].1.to_string().contains("SUBMISSION_REQUIRED"));
+}
+
 async fn retries(protocol: Protocol) {
     let busy = http_error(529, Some("0"), "private-overload");
     let throttle = http_error(429, Some("1"), "private-rate-limit");
@@ -524,6 +643,8 @@ async fn bounds_and_errors(protocol: Protocol) {
         model: &model,
         messages: &[],
         tools: &[],
+        tool_choice: Default::default(),
+        tool_choice_rejected: None,
         max_output_tokens: 4096,
         reasoning_effort: None,
         delivery: delivery.clone(),

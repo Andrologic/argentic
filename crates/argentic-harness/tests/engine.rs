@@ -8,7 +8,7 @@ use argentic_harness::{
     policy::{Preset, ReadPolicy},
     providers::{
         Chunk, Finish, Message, Provider, ProviderError, ProviderStream, Request, ScriptedProvider,
-        ToolCall, Usage,
+        ToolCall, ToolChoice, Usage,
     },
     r#loop::{Event, Failure, Harness, Hook, Steer, Work, WorkPort},
     tools::Registry,
@@ -785,6 +785,69 @@ async fn missing_and_refused_submissions_share_the_correction_budget() {
         .run(work(true), &(), steer, CancellationToken::new())
         .await;
     assert!(matches!(report.outcome, Err(Failure::OutputInvalid(_))));
+}
+
+#[tokio::test]
+async fn text_only_submission_gets_a_tool_call_correction() {
+    struct CorrectionScript {
+        provider: ScriptedProvider,
+        expected: ToolChoice<'static>,
+    }
+
+    #[async_trait]
+    impl Provider for CorrectionScript {
+        async fn stream(
+            &self,
+            request: Request<'_>,
+            cancel: CancellationToken,
+        ) -> Result<ProviderStream, ProviderError> {
+            let Some(Message::User(last)) = request.messages.last() else {
+                panic!("expected a user message");
+            };
+            if request.messages.len() == 1 {
+                assert_eq!(request.tool_choice, ToolChoice::Auto);
+            } else {
+                assert_eq!(request.tool_choice, self.expected);
+                let (instruction, details) = last.split_once("\n\n").unwrap();
+                assert!(instruction
+                    .starts_with("Your previous reply did not call the agsdl_submit_result tool."));
+                assert!(instruction.contains("argument schema"));
+                assert!(instruction.contains("leave the assistant text empty."));
+                assert!(instruction.contains(r#"required keys in results are ["answer"]"#));
+                let details: Value = serde_json::from_str(details).unwrap();
+                assert_eq!(details["diagnostics"][0]["rule"], "SUBMISSION_REQUIRED");
+            }
+            self.provider.stream(request, cancel).await
+        }
+    }
+
+    for (project, expected) in [
+        (json!({}), ToolChoice::Named("agsdl_submit_result")),
+        (
+            json!({"forceSubmissionOnCorrection":false}),
+            ToolChoice::Auto,
+        ),
+    ] {
+        let provider = CorrectionScript {
+            provider: scripted(vec![
+                vec![
+                    Chunk::Text(r#"agsdl_submit_result({"results":{"answer":42}})"#.into()),
+                    end(Finish::Stop),
+                ],
+                vec![submit("s1", json!({"answer":42})), end(Finish::ToolCalls)],
+            ]),
+            expected,
+        };
+        let (_dir, harness) = fixture_with_provider(Arc::new(provider), project);
+        let (_, steer) = mpsc::channel(1);
+        let report = harness
+            .run(work(true), &(), steer, CancellationToken::new())
+            .await;
+        assert_eq!(
+            report.outcome.unwrap().submission,
+            Some(json!({"results":{"answer":42}}))
+        );
+    }
 }
 
 #[tokio::test]

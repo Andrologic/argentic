@@ -80,6 +80,12 @@ impl HttpStream {
         self.effort_rejected = Some(AtomicBool::new(false));
     }
 
+    pub(super) fn attempt_effort_rejected(&self) -> bool {
+        self.effort_rejected
+            .as_ref()
+            .is_some_and(|rejected| rejected.load(Ordering::Relaxed))
+    }
+
     fn drop_effort(&self, body: &mut Value, field: &str) -> bool {
         if body
             .as_object_mut()
@@ -102,12 +108,14 @@ impl HttpStream {
         effort_field: &str,
     ) -> Result<ProviderStream, ProviderError> {
         let budget = TurnBudget::new(request.limits);
-        if self
-            .effort_rejected
-            .as_ref()
-            .is_some_and(|rejected| rejected.load(Ordering::Relaxed))
-        {
-            if let Some(fields) = body.as_object_mut() {
+        if let Some(fields) = body.as_object_mut() {
+            if request
+                .tool_choice_rejected
+                .is_some_and(|rejected| rejected.load(Ordering::Relaxed))
+            {
+                fields.remove("tool_choice");
+            }
+            if self.attempt_effort_rejected() {
                 fields.remove(effort_field);
             }
         }
@@ -166,11 +174,21 @@ impl HttpStream {
 
             delivery.report(DeliveryStatus::NotDelivered);
             let message = error_body(&mut response, &cancel, &budget).await?;
-            if matches!(status.as_u16(), 400 | 422)
-                && rejects_effort(&message)
-                && self.drop_effort(&mut body, effort_field)
-            {
-                continue;
+            if matches!(status.as_u16(), 400 | 422) {
+                if rejects_tool_choice(&message)
+                    && body
+                        .as_object_mut()
+                        .and_then(|fields| fields.remove("tool_choice"))
+                        .is_some()
+                {
+                    if let Some(rejected) = request.tool_choice_rejected {
+                        rejected.store(true, Ordering::Relaxed);
+                    }
+                    continue;
+                }
+                if rejects_effort(&message) && self.drop_effort(&mut body, effort_field) {
+                    continue;
+                }
             }
             if let Some(delay) =
                 delay.filter(|_| status.as_u16() == 429 || status.is_server_error())
@@ -325,6 +343,29 @@ pub(super) fn rejects_effort(message: &str) -> bool {
             "allowed values",
             "supported values",
             "must be one of",
+        ]
+        .iter()
+        .any(|reason| message.contains(reason))
+}
+
+fn rejects_tool_choice(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    ["tool_choice", "tool choice"]
+        .iter()
+        .any(|field| message.contains(field))
+        && [
+            "unsupported",
+            "not supported",
+            "does not support",
+            "unknown parameter",
+            "unrecognized",
+            "invalid value",
+            "invalid enum",
+            "invalid tool_choice type",
+            "must be one of",
+            "must be a string",
+            "only supports",
+            "only supported",
         ]
         .iter()
         .any(|reason| message.contains(reason))

@@ -14,6 +14,7 @@ pub enum Layer {
 pub struct Settings {
     limits: BTreeMap<&'static str, (u32, Layer)>,
     pub(crate) compaction: Compaction,
+    pub(crate) force_submission_on_correction: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -56,6 +57,7 @@ impl Default for Settings {
                 .map(|(key, value)| (key, (value, Layer::Default)))
                 .collect(),
             compaction: Compaction::default(),
+            force_submission_on_correction: true,
         }
     }
 }
@@ -74,6 +76,9 @@ impl Settings {
             schema
                 .validate(data)
                 .map_err(|e| format!("{layer:?}: {e}"))?;
+            if let Some(force) = data["forceSubmissionOnCorrection"].as_bool() {
+                settings.force_submission_on_correction = force;
+            }
             if let Some(compaction) = data.get("compaction") {
                 if let Some(enabled) = compaction["enabled"].as_bool() {
                     settings.compaction.enabled = enabled;

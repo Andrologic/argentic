@@ -149,11 +149,22 @@ impl Replay {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ToolChoice<'a> {
+    #[default]
+    Auto,
+    Required,
+    Named(&'a str),
+}
+
 pub struct Request<'a> {
     pub model: &'a ModelName,
     pub reasoning_effort: Option<&'a str>,
     pub messages: &'a [Message],
     pub tools: &'a [ToolDefinition],
+    pub tool_choice: ToolChoice<'a>,
+    /// Optional rejection flag shared by requests in one work attempt.
+    pub tool_choice_rejected: Option<&'a std::sync::atomic::AtomicBool>,
     pub max_output_tokens: u32,
     pub limits: TurnLimits,
     pub delivery: DeliveryProgress,

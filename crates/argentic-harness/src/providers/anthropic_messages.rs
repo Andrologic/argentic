@@ -9,8 +9,8 @@ use super::{
     emit_items,
     http::{rejects_effort, secret, DecodeError, Events, HttpStream},
     invalid, reasoning_capability, wire_index, wire_str, Chunk, Finish, Message, ModelName,
-    Provider, ProviderError, ProviderStream, ReasoningCapability, Replay, Request, ToolCall, Usage,
-    WireFormat,
+    Provider, ProviderError, ProviderStream, ReasoningCapability, Replay, Request, ToolCall,
+    ToolChoice, Usage, WireFormat,
 };
 
 pub struct AnthropicMessages {
@@ -154,7 +154,10 @@ impl Provider for AnthropicMessages {
         if !tools.is_empty() {
             body["tools"] = json!(tools);
         }
-        if let Some(effort) = request.reasoning_effort {
+        if let Some(effort) = request
+            .reasoning_effort
+            .filter(|_| !self.http.attempt_effort_rejected())
+        {
             let budget = capability
                 .filter(|c| c.efforts.iter().any(|supported| supported == effort))
                 .and_then(|c| c.thinking_budgets.get(effort))
@@ -166,6 +169,16 @@ impl Provider for AnthropicMessages {
                 let budget = budget.min(request.max_output_tokens.saturating_sub(1));
                 if budget >= 1024 {
                     body["thinking"] = json!({"type":"enabled","budget_tokens":budget});
+                }
+            }
+        }
+        // Manual extended thinking requires automatic tool selection here.
+        if body["thinking"]["type"] != "enabled" {
+            match request.tool_choice {
+                ToolChoice::Auto => {}
+                ToolChoice::Required => body["tool_choice"] = json!({"type":"any"}),
+                ToolChoice::Named(name) => {
+                    body["tool_choice"] = json!({"type":"tool","name":name});
                 }
             }
         }

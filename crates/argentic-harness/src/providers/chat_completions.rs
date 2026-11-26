@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 use super::{
     http::{bearer, rejects_effort, DecodeError, Events, HttpStream, MAX_EVENT_BYTES},
     Chunk, Finish, Message, ModelName, Provider, ProviderError, ProviderStream, Request, ToolCall,
-    Usage,
+    ToolChoice, Usage,
 };
 
 pub struct ChatCompletions {
@@ -64,6 +64,13 @@ impl Provider for ChatCompletions {
                 "type": "function",
                 "function": { "name": tool.name, "description": tool.description, "parameters": tool.parameters }
             })).collect::<Vec<_>>());
+        }
+        match request.tool_choice {
+            ToolChoice::Auto => {}
+            ToolChoice::Required => body["tool_choice"] = json!("required"),
+            ToolChoice::Named(name) => {
+                body["tool_choice"] = json!({"type":"function","function":{"name":name}});
+            }
         }
         self.http
             .open::<Accumulator>(body, cancel, request, "reasoning_effort")
