@@ -11,7 +11,7 @@
     },
     "model.name": {
       "support": "approximate",
-      "note": "The standalone Chat Completions loop accepts a configured name. The engine does not resolve or observe the model."
+      "note": "The standalone loop accepts a configured provider and model name. The engine does not resolve or observe the model."
     },
     "model.effort": {
       "support": "approximate",

@@ -1,6 +1,6 @@
 // Adapted from Macro's reasoning_catalog.rs and reasoningCatalog.json.
 
-use std::sync::LazyLock;
+use std::{collections::BTreeMap, sync::LazyLock};
 
 use regex::RegexSet;
 use serde::Deserialize;
@@ -16,12 +16,15 @@ struct Entry {
     model_patterns: Vec<String>,
     supported_efforts: Vec<String>,
     default_effort: String,
+    #[serde(default)]
+    thinking_budgets: BTreeMap<String, u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReasoningCapability {
     pub efforts: Vec<String>,
     pub default_effort: String,
+    pub(super) thinking_budgets: BTreeMap<String, u32>,
 }
 
 type CatalogEntry = (Vec<String>, RegexSet, ReasoningCapability);
@@ -37,6 +40,7 @@ static CATALOG: LazyLock<Result<Vec<CatalogEntry>, String>> = LazyLock::new(|| {
             let capability = ReasoningCapability {
                 efforts: entry.supported_efforts,
                 default_effort: entry.default_effort,
+                thinking_budgets: entry.thinking_budgets,
             };
             Ok((entry.provider_types, patterns, capability))
         })

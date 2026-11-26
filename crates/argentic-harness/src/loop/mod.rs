@@ -365,6 +365,7 @@ impl Instance<'_> {
             work.messages.push(Message::Assistant {
                 text: response.text,
                 reasoning: response.reasoning,
+                replay: response.replay,
                 calls: calls.clone(),
             });
 
@@ -526,6 +527,7 @@ impl Instance<'_> {
         let mut stream = opened?;
         let mut text = String::new();
         let mut reasoning = String::new();
+        let mut replay = None;
         let mut calls = Vec::new();
         let mut ids = HashSet::new();
         let mut bytes = 0usize;
@@ -564,6 +566,7 @@ impl Instance<'_> {
                     }
                     calls.push(call);
                 }
+                Chunk::Replay(state) => replay = Some(state),
                 Chunk::End { finish, usage } => {
                     self.port
                         .assistant_message(turn, &text, self.cancel)
@@ -581,6 +584,7 @@ impl Instance<'_> {
                             return Ok(Response {
                                 text,
                                 reasoning,
+                                replay,
                                 calls,
                                 finish,
                                 usage,
@@ -764,6 +768,7 @@ impl Instance<'_> {
 }
 
 struct Response {
+    replay: Option<crate::providers::Replay>,
     text: String,
     reasoning: String,
     calls: Vec<ToolCall>,

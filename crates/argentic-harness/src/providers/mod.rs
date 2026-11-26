@@ -1,8 +1,13 @@
 //! Provider-independent conversation and streaming response types.
 
+mod anthropic_messages;
 mod chat_completions;
+mod http;
+mod openai_responses;
 mod reasoning;
+pub use anthropic_messages::AnthropicMessages;
 pub use chat_completions::ChatCompletions;
+pub use openai_responses::OpenAiResponses;
 pub use reasoning::{reasoning_capability, ReasoningCapability};
 
 use std::{collections::VecDeque, str::FromStr, sync::Mutex};
@@ -82,11 +87,61 @@ pub enum Message {
         text: String,
         reasoning: String,
         calls: Vec<ToolCall>,
+        replay: Option<Replay>,
     },
     Tool {
         call_id: String,
         content: String,
     },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WireFormat {
+    Anthropic,
+    Responses,
+}
+
+/// Provider-native assistant items reserved for replay with the same model.
+/// Kept out of visible events and redacted in diagnostic output.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Replay {
+    format: WireFormat,
+    model: ModelName,
+    items: Vec<Value>,
+}
+
+impl std::fmt::Debug for Replay {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Replay([redacted])")
+    }
+}
+
+impl Replay {
+    fn items(
+        &self,
+        format: WireFormat,
+        model: &ModelName,
+        calls: &[ToolCall],
+    ) -> Option<Vec<Value>> {
+        if self.format != format || &self.model != model {
+            return None;
+        }
+        Some(
+            self.items
+                .iter()
+                .filter(|item| {
+                    let call_id = match item["type"].as_str() {
+                        Some("tool_use") => item["id"].as_str(),
+                        Some("function_call") => item["call_id"].as_str(),
+                        _ => return true,
+                    };
+                    // The loop may record a successful submission and skip later calls.
+                    calls.iter().any(|call| Some(call.id.as_str()) == call_id)
+                })
+                .cloned()
+                .collect(),
+        )
+    }
 }
 
 pub struct Request<'a> {
@@ -161,6 +216,12 @@ impl From<&crate::config::Settings> for TurnLimits {
 pub struct Usage {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
+    /// A subset of prompt_tokens.
+    #[serde(default)]
+    pub cache_read_tokens: u64,
+    /// A subset of prompt_tokens.
+    #[serde(default)]
+    pub cache_creation_tokens: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -176,6 +237,7 @@ pub enum Chunk {
     Text(String),
     Reasoning(String),
     ToolCall(ToolCall),
+    Replay(Replay),
     End {
         finish: Finish,
         usage: Option<Usage>,
@@ -242,4 +304,52 @@ impl Provider for ScriptedProvider {
         request.delivery.report(DeliveryStatus::Accepted);
         Ok(Box::pin(stream::iter(turn)))
     }
+}
+
+fn invalid(message: &'static str) -> ProviderError {
+    ProviderError::Invalid(message.into())
+}
+
+fn wire_str<'a>(value: &'a Value, field: &str) -> Result<&'a str, ProviderError> {
+    value[field]
+        .as_str()
+        .ok_or_else(|| invalid("Invalid provider event field"))
+}
+
+fn wire_index(value: &Value, field: &str) -> Result<u64, ProviderError> {
+    value[field]
+        .as_u64()
+        .ok_or_else(|| invalid("Invalid provider event index"))
+}
+
+fn emit_items(
+    output: &mut VecDeque<Chunk>,
+    finish: Finish,
+    usage: Option<Usage>,
+    calls: Vec<ToolCall>,
+    replay: Replay,
+) -> Result<(), ProviderError> {
+    if !matches!(finish, Finish::Length | Finish::Filtered) {
+        let mut ids = std::collections::HashSet::new();
+        if calls.len() > 128
+            || calls
+                .iter()
+                .any(|call| call.id.is_empty() || call.name.is_empty() || !ids.insert(&call.id))
+        {
+            return Err(invalid("Invalid tool call batch"));
+        }
+        let call_bytes = calls.iter().fold(0usize, |total, call| {
+            total
+                .saturating_add(call.id.len())
+                .saturating_add(call.name.len())
+                .saturating_add(call.arguments.len())
+        });
+        if call_bytes > http::MAX_EVENT_BYTES {
+            return Err(invalid("Tool call batch exceeds 1 MiB"));
+        }
+        output.extend(calls.into_iter().map(Chunk::ToolCall));
+        output.push_back(Chunk::Replay(replay));
+    }
+    output.push_back(Chunk::End { finish, usage });
+    Ok(())
 }

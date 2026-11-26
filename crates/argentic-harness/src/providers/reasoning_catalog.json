@@ -2,6 +2,14 @@
   "version": 2,
   "entries": [
     {
+      "id": "anthropic-manual-thinking",
+      "provider_types": ["anthropic"],
+      "model_patterns": ["^claude-(?:3-7-sonnet|(?:sonnet|opus|haiku)-4(?:-[0-6])?)(?:-latest|-[0-9]{8})?$"],
+      "supported_efforts": ["none", "low", "medium", "high"],
+      "default_effort": "medium",
+      "thinking_budgets": {"low": 1024, "medium": 2048, "high": 8192}
+    },
+    {
       "id": "macro-ai",
       "provider_types": ["openai"],
       "model_patterns": ["^macro-ai(?:-deep)?$"],
