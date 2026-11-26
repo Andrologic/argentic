@@ -130,7 +130,7 @@ pub(crate) mod registration;
 use crate::agsdl_host_action_approval030::CommandApprovals030;
 use crate::agsdl_host_content030 as content;
 use admission::codex_read_only030;
-pub(crate) mod mcp;
+pub(crate) use crate::agsdl_host_agent_mcp030 as mcp;
 type AdapterSink030 = Arc<
     dyn Fn(
             Value,

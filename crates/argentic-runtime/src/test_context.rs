@@ -117,6 +117,26 @@ pub(crate) mod mcp {
 
     pub const FIRST: &str = "argentic-fixture-mcp-first-secret";
     pub const SECOND: &str = "argentic-fixture-mcp-second-secret";
+    pub const STDIO_TOOL_SCRIPT: &str = r#"
+IFS= read -r frame || exit 1
+printf '%s\n' '{"jsonrpc":"2.0","id":"1","result":{"protocolVersion":"2025-06-18"}}'
+IFS= read -r frame || exit 1
+IFS= read -r frame || exit 0
+id=2
+case "$frame" in
+    *'"method":"tools/list"'*)
+        printf '%s\n' '{"jsonrpc":"2.0","id":"2","result":{"tools":[{"name":"check","inputSchema":{"type":"object"}}]}}'
+        IFS= read -r frame || exit 0
+        id=3
+        ;;
+esac
+case "$frame" in
+    *'"method":"tools/call"'*) printf sent > "$1" ;;
+    *) exit 1 ;;
+esac
+while [ ! -f "$2" ]; do /bin/sleep .01; done
+printf '{"jsonrpc":"2.0","id":"%s","result":{"content":[]}}\n' "$id"
+"#;
     pub const REQUIREMENTS: &str = r#"{"first":["FIRST_TOKEN"],"second":["SECOND_TOKEN"]}"#;
     type Calls = Arc<Mutex<Vec<(String, String)>>>;
 

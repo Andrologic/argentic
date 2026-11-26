@@ -62,18 +62,7 @@ impl Peer {
 
     fn stdio(&self) -> raw_mcp::ServerTransport {
         let workspace = self.sent.parent().unwrap();
-        let script = r#"
-IFS= read -r frame || exit 1
-printf '%s\n' '{"jsonrpc":"2.0","id":"1","result":{"protocolVersion":"2025-06-18"}}'
-IFS= read -r frame || exit 1
-IFS= read -r frame || exit 0
-case "$frame" in
-    *'"method":"tools/call"'*) printf sent > "$1" ;;
-    *) exit 1 ;;
-esac
-while [ ! -f "$2" ]; do /bin/sleep .01; done
-printf '%s\n' '{"jsonrpc":"2.0","id":"2","result":{"content":[]}}'
-"#;
+
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         let grant = crate::agsdl_host_calls::tests::grant(workspace);
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
@@ -91,7 +80,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":"2","result":{"content":[]}}'
             program: "/bin/sh".into(),
             arguments: vec![
                 "-c".into(),
-                script.into(),
+                crate::test_context::mcp::STDIO_TOOL_SCRIPT.into(),
                 "mcp-fixture".into(),
                 self.sent.to_str().unwrap().into(),
                 self.reply.to_str().unwrap().into(),
