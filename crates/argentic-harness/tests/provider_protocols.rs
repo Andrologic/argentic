@@ -62,14 +62,10 @@ impl Protocol {
 
     fn text(self) -> Vec<Value> {
         match self {
-            Self::Messages => vec![
-                json!({"type":"message_start","message":{"id":"msg_1","content":[],"usage":{
-                    "input_tokens":11,"output_tokens":1,"cache_creation_input_tokens":3,"cache_read_input_tokens":5}}}),
-                json!({"type":"ping"}),
-                json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
-                json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"café"}}),
-                json!({"type":"content_block_stop","index":0}),
-            ],
+            Self::Messages => Self::messages_start()
+                .into_iter()
+                .chain(Self::messages_text(0))
+                .collect(),
             Self::Responses => vec![
                 json!({"type":"response.created","response":{"id":"resp_1","status":"in_progress","output":[]}}),
                 json!({"type":"response.output_item.added","output_index":0,
@@ -80,6 +76,22 @@ impl Protocol {
                         "content":[{"type":"output_text","text":"café","annotations":[]}]}}),
             ],
         }
+    }
+
+    fn messages_start() -> [Value; 2] {
+        [
+            json!({"type":"message_start","message":{"id":"msg_1","content":[],"usage":{
+                "input_tokens":11,"output_tokens":1,"cache_creation_input_tokens":3,"cache_read_input_tokens":5}}}),
+            json!({"type":"ping"}),
+        ]
+    }
+
+    fn messages_text(index: u64) -> [Value; 3] {
+        [
+            json!({"type":"content_block_start","index":index,"content_block":{"type":"text","text":""}}),
+            json!({"type":"content_block_delta","index":index,"delta":{"type":"text_delta","text":"café"}}),
+            json!({"type":"content_block_stop","index":index}),
+        ]
     }
 
     fn end(self, tools: bool) -> Vec<Value> {
@@ -112,7 +124,7 @@ impl Protocol {
     fn reasoning(self) -> Value {
         match self {
             Self::Messages => {
-                json!({"type":"thinking","thinking":"plan","signature":"private-signature"})
+                json!({"type":"thinking","thinking":"plan","signature":"c2lnbmVkLys="})
             }
             Self::Responses => json!({"type":"reasoning","id":"rs_1",
                 "summary":[{"type":"summary_text","text":"plan"}],"encrypted_content":"private-encrypted"}),
@@ -120,22 +132,37 @@ impl Protocol {
     }
 
     fn tool_turn(self) -> Response {
-        let mut events = match self {
-            Self::Messages => vec![
-                json!({"type":"content_block_start","index":1,"content_block":{"type":"thinking","thinking":"","signature":""}}),
-                json!({"type":"content_block_delta","index":1,"delta":{"type":"thinking_delta","thinking":"plan"}}),
-                json!({"type":"content_block_delta","index":1,"delta":{"type":"signature_delta","signature":"private-signature"}}),
-                json!({"type":"content_block_stop","index":1}),
-            ],
-            Self::Responses => vec![
-                json!({"type":"response.output_item.added","output_index":1,
-                    "item":{"type":"reasoning","id":"rs_1","summary":[],"encrypted_content":null}}),
-                json!({"type":"response.reasoning_summary_text.delta","output_index":1,
-                    "item_id":"rs_1","summary_index":0,"delta":"plan"}),
-                json!({"type":"response.output_item.done","output_index":1,"item":self.reasoning()}),
-            ],
+        let (mut events, first_tool_index) = match self {
+            Self::Messages => {
+                let mut events = Vec::from(Self::messages_start());
+                events.extend([
+                    json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}),
+                    json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"plan"}}),
+                    json!({"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"c2lnbmVk"}}),
+                    json!({"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"Lys="}}),
+                    json!({"type":"content_block_stop","index":0}),
+                    json!({"type":"content_block_start","index":1,"content_block":{"type":"redacted_thinking","data":"AAE+/w=="}}),
+                    json!({"type":"content_block_stop","index":1}),
+                ]);
+                events.extend(Self::messages_text(2));
+                (events, 3)
+            }
+            Self::Responses => {
+                let mut events = self.text();
+                events.extend([
+                    json!({"type":"response.output_item.added","output_index":1,
+                        "item":{"type":"reasoning","id":"rs_1","summary":[],"encrypted_content":null}}),
+                    json!({"type":"response.reasoning_summary_text.delta","output_index":1,
+                        "item_id":"rs_1","summary_index":0,"delta":"plan"}),
+                    json!({"type":"response.output_item.done","output_index":1,"item":self.reasoning()}),
+                ]);
+                (events, 2)
+            }
         };
-        for (index, id) in [(2, "call_1"), (3, "call_2")] {
+        for (index, id) in [
+            (first_tool_index, "call_1"),
+            (first_tool_index + 1, "call_2"),
+        ] {
             events.extend(match self {
                 Self::Messages => vec![
                     json!({"type":"content_block_start","index":index,"content_block":{"type":"tool_use","id":id,"name":"read","input":{}}}),
@@ -154,7 +181,7 @@ impl Protocol {
                 ],
             });
         }
-        sse(self.events(self.text().into_iter().chain(events).chain(self.end(true))))
+        sse(self.events(events.into_iter().chain(self.end(true))))
     }
 }
 
@@ -281,8 +308,13 @@ async fn round_trip(protocol: Protocol) {
         parameters: json!({"type":"object","properties":{"path":{"type":"string"}}}),
     }];
     let chunks = run(&mock, protocol, &history, &tools).await;
-    assert_eq!(chunks[0], Chunk::Text("café".into()));
-    assert_eq!(chunks[1], Chunk::Reasoning("plan".into()));
+    let text = Chunk::Text("café".into());
+    let reasoning = Chunk::Reasoning("plan".into());
+    let first_chunks = match protocol {
+        Protocol::Messages => [reasoning, text],
+        Protocol::Responses => [text, reasoning],
+    };
+    assert_eq!(chunks[..2], first_chunks);
     let calls = chunks[2..4]
         .iter()
         .map(|chunk| {
@@ -349,10 +381,15 @@ async fn round_trip(protocol: Protocol) {
             );
             assert_eq!(first["system"], next["system"]);
             assert_eq!(first["tools"][0]["input_schema"], tools[0].parameters);
-            assert_eq!(next["messages"][1]["content"][1], protocol.reasoning());
             assert_eq!(
-                next["messages"][1]["content"][2]["input"],
-                json!({"path":"memo.txt"})
+                next["messages"][1]["content"],
+                json!([
+                    protocol.reasoning(),
+                    {"type":"redacted_thinking","data":"AAE+/w=="},
+                    {"type":"text","text":"café"},
+                    {"type":"tool_use","id":"call_1","name":"read","input":{"path":"memo.txt"}},
+                    {"type":"tool_use","id":"call_2","name":"read","input":{"path":"memo.txt"}}
+                ])
             );
             assert_eq!(
                 next["messages"][2]["content"],
