@@ -56,6 +56,10 @@ struct Server {
 
 impl Server {
     async fn start() -> Self {
+        Self::start_at("/v1/chat/completions").await
+    }
+
+    async fn start_at(path: &str) -> Self {
         async fn respond(
             State(send): State<mpsc::Sender<Request>>,
             headers: HeaderMap,
@@ -74,9 +78,7 @@ impl Server {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
         let (send, requests) = mpsc::channel(4);
-        let app = Router::new()
-            .route("/v1/chat/completions", post(respond))
-            .with_state(send);
+        let app = Router::new().route(path, post(respond)).with_state(send);
         let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         Self {
             base_url,
@@ -227,6 +229,151 @@ async fn reads_and_submits_schema_valid_result() {
         );
         close(&host).await;
     }
+}
+
+#[derive(Clone, Copy)]
+enum NativeProvider {
+    Messages,
+    Responses,
+}
+
+impl NativeProvider {
+    fn tool(self, request: Request, tool: &str, arguments: Value) {
+        let reasoning = self.reasoning();
+        let events = match self {
+            Self::Messages => vec![
+                json!({"type":"message_start","message":{"content":[],"usage":{"input_tokens":8,"output_tokens":1}}}),
+                json!({"type":"content_block_start","index":0,"content_block":reasoning}),
+                json!({"type":"content_block_stop","index":0}),
+                json!({"type":"content_block_start","index":1,"content_block":{
+                    "type":"tool_use","id":"toolu_fixture","name":tool,"input":{}}}),
+                json!({"type":"content_block_delta","index":1,"delta":{
+                    "type":"input_json_delta","partial_json":arguments.to_string()}}),
+                json!({"type":"content_block_stop","index":1}),
+                json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":4}}),
+                json!({"type":"message_stop"}),
+            ],
+            Self::Responses => vec![
+                json!({"type":"response.created","response":{"id":"resp_fixture","status":"in_progress"}}),
+                json!({"type":"response.output_item.done","output_index":0,"item":reasoning}),
+                json!({"type":"response.output_item.done","output_index":1,"item":{
+                    "type":"function_call","id":"fc_fixture","call_id":"call_fixture","name":tool,
+                    "arguments":arguments.to_string(),"status":"completed"}}),
+                json!({"type":"response.completed","response":{"status":"completed",
+                    "usage":{"input_tokens":8,"output_tokens":4}}}),
+            ],
+        };
+        let body: String = events
+            .into_iter()
+            .map(|event| {
+                format!(
+                    "event: {}\ndata: {event}\n\n",
+                    event["type"].as_str().unwrap()
+                )
+            })
+            .collect();
+        request.send(StatusCode::OK, body, "text/event-stream");
+    }
+
+    fn reasoning(self) -> Value {
+        match self {
+            Self::Messages => {
+                json!({"type":"thinking","thinking":"Read the memo","signature":"signed-fixture"})
+            }
+            Self::Responses => {
+                json!({"type":"reasoning","id":"rs_fixture","summary":[],"encrypted_content":"encrypted-fixture"})
+            }
+        }
+    }
+}
+
+async fn native_provider_reads_and_submits(provider: NativeProvider) {
+    let (path, protocol, model) = match provider {
+        NativeProvider::Messages => ("/v1/messages", "anthropic-messages", "claude-sonnet-4-6"),
+        NativeProvider::Responses => ("/v1/responses", "openai-responses", "gpt-5.4"),
+    };
+    let mut server = Server::start_at(path).await;
+    let base_url = match provider {
+        NativeProvider::Messages => server.base_url.strip_suffix("/v1").unwrap(),
+        NativeProvider::Responses => &server.base_url,
+    };
+    let mut doc = document();
+    doc["agents"]["worker"]["model"]["name"] = json!(format!("local/{model}#fixture"));
+    doc["agents"]["worker"]["harnessSettings"]["maxOutputTokens"] = json!(4096);
+    let mut config = json!({"providers":{"local":{"protocol":protocol,"baseUrl":base_url,
+        "models":[format!("{model}#fixture")]}}});
+    if matches!(provider, NativeProvider::Messages) {
+        config["providers"]["local"]["promptCaching"] = json!(true);
+    }
+    let f = Fixture::new(&doc.to_string());
+    std::fs::write(f.workspace.join("memo.txt"), "Native provider memo").unwrap();
+    let host = open(&f, false)
+        .await
+        .with_argentic(serde_json::from_value(config).unwrap())
+        .unwrap();
+    let run = start(&host).await;
+    let first = server.next().await;
+    assert_eq!(first.body["model"], model);
+    let history_field = match provider {
+        NativeProvider::Messages => {
+            assert_eq!(first.headers["anthropic-version"], "2023-06-01");
+            assert_eq!(first.body["thinking"]["budget_tokens"], 4095);
+            let system = first.body["system"].as_array().unwrap();
+            assert_eq!(system.last().unwrap()["cache_control"]["type"], "ephemeral");
+            "messages"
+        }
+        NativeProvider::Responses => {
+            assert_eq!(first.body["store"], false);
+            assert_eq!(first.body["reasoning"]["effort"], "high");
+            "input"
+        }
+    };
+    assert!(first.body[history_field]
+        .to_string()
+        .contains("Read memo.txt"));
+    provider.tool(first, "read", json!({"path":"memo.txt"}));
+    let next = server.next().await;
+    let history = next.body[history_field].as_array().unwrap();
+    match provider {
+        NativeProvider::Messages => {
+            let assistant = history.iter().find(|m| m["role"] == "assistant").unwrap();
+            assert_eq!(assistant["content"][0], provider.reasoning());
+            assert_eq!(
+                history.last().unwrap()["content"][0]["tool_use_id"],
+                "toolu_fixture"
+            );
+        }
+        NativeProvider::Responses => {
+            assert!(history.contains(&provider.reasoning()));
+            assert_eq!(history.last().unwrap()["call_id"], "call_fixture");
+        }
+    }
+    assert!(history
+        .last()
+        .unwrap()
+        .to_string()
+        .contains("Native provider memo"));
+    provider.tool(
+        next,
+        "agsdl_submit_result",
+        json!({"results":{"report":{"body":"Native provider memo"}}}),
+    );
+    let output = completed(&finish(&host, &run).await);
+    assert!(
+        output.to_string().contains("Native provider memo"),
+        "{output}"
+    );
+    close(&host).await;
+}
+
+#[tokio::test]
+async fn anthropic_messages_reads_file_and_submits() {
+    native_provider_reads_and_submits(NativeProvider::Messages).await;
+}
+
+#[tokio::test]
+async fn openai_responses_reads_file_and_submits() {
+    native_provider_reads_and_submits(NativeProvider::Responses).await;
 }
 
 #[tokio::test]

@@ -34,6 +34,8 @@ fn end(finish: Finish) -> Chunk {
     Chunk::End {
         finish,
         usage: Some(Usage {
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
             prompt_tokens: 10,
             completion_tokens: 5,
         }),

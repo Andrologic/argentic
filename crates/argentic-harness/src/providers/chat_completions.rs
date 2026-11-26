@@ -1,36 +1,20 @@
-use std::{
-    collections::{BTreeMap, VecDeque},
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
-    },
-    time::{Duration, SystemTime},
-};
+use std::collections::{BTreeMap, VecDeque};
 
 use async_trait::async_trait;
-use futures::{stream, StreamExt};
-use reqwest::{
-    header::{HeaderValue, AUTHORIZATION, RETRY_AFTER},
-    Client, Response, Url,
-};
+use reqwest::{header::AUTHORIZATION, Url};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    Chunk, DeliveryProgress, DeliveryStatus, Finish, Message, Provider, ProviderError,
-    ProviderStream, Request, ToolCall, TurnLimits, Usage,
+    http::{bearer, rejects_effort, DecodeError, Events, HttpStream, MAX_EVENT_BYTES},
+    Chunk, Finish, Message, ModelName, Provider, ProviderError, ProviderStream, Request, ToolCall,
+    Usage,
 };
 
-const MAX_EVENT_BYTES: usize = 1024 * 1024;
-const MAX_RETRIES: u32 = 3;
-
 pub struct ChatCompletions {
-    client: Client,
-    endpoint: Url,
+    http: HttpStream,
     provider: String,
-    authorization: Option<HeaderValue>,
-    effort_rejected: Option<std::sync::atomic::AtomicBool>,
 }
 
 impl ChatCompletions {
@@ -40,124 +24,16 @@ impl ChatCompletions {
         endpoint: Url,
         api_key: Option<&str>,
     ) -> Result<Self, ProviderError> {
-        if !matches!(endpoint.scheme(), "http" | "https")
-            || endpoint.host().is_none()
-            || !endpoint.username().is_empty()
-            || endpoint.password().is_some()
-            || endpoint.fragment().is_some()
-        {
-            return Err(ProviderError::Invalid(
-                "Invalid Chat Completions endpoint".into(),
-            ));
-        }
-        let authorization = api_key
-            .map(|key| {
-                let mut value = HeaderValue::from_str(&format!("Bearer {key}"))
-                    .map_err(|_| ProviderError::Invalid("Invalid provider credential".into()))?;
-                value.set_sensitive(true);
-                Ok(value)
-            })
-            .transpose()?;
-        let client = Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(Duration::from_secs(10))
-            .read_timeout(Duration::from_secs(120))
-            .build()
-            .map_err(transport)?;
         Ok(Self {
-            client,
-            endpoint,
+            http: HttpStream::new(endpoint, bearer(api_key)?, AUTHORIZATION)?,
             provider: provider.into(),
-            authorization,
-            effort_rejected: None,
         })
     }
 
     /// The host creates a fresh provider for every work attempt.
     pub fn with_attempt_effort_fallback(mut self) -> Self {
-        self.effort_rejected = Some(std::sync::atomic::AtomicBool::new(false));
+        self.http.enable_attempt_effort_fallback();
         self
-    }
-
-    fn drop_effort(&self, body: &mut Value) -> bool {
-        if !remove_effort(body) {
-            return false;
-        }
-        if let Some(rejected) = &self.effort_rejected {
-            rejected.store(true, std::sync::atomic::Ordering::Relaxed);
-        }
-        true
-    }
-
-    async fn open(
-        &self,
-        mut body: Value,
-        cancel: CancellationToken,
-        limits: TurnLimits,
-        delivery: DeliveryProgress,
-    ) -> Result<ProviderStream, ProviderError> {
-        let budget = TurnBudget::new(limits);
-        let mut retries = 0;
-        loop {
-            let mut request = self.client.post(self.endpoint.clone()).json(&body);
-            if let Some(value) = &self.authorization {
-                request = request.header(AUTHORIZATION, value.clone());
-            }
-            let request = request.build().map_err(transport)?;
-            budget.check(&cancel)?;
-            delivery.report(DeliveryStatus::Uncertain);
-            let mut response = budget
-                .wait(&cancel, self.client.execute(request))
-                .await?
-                .map_err(|error| {
-                    if error.is_connect() {
-                        delivery.report(DeliveryStatus::NotDelivered);
-                    }
-                    transport(error)
-                })?;
-            let status = response.status();
-            if status.is_success() {
-                delivery.report(DeliveryStatus::Accepted);
-                let mut output = Box::pin(decode(response, cancel.clone(), budget.clone()));
-                let first = output.next().await;
-                if matches!(
-                    &first,
-                    Some(Err(DecodeError::Remote {
-                        rejects_effort: true
-                    }))
-                ) && self.drop_effort(&mut body)
-                {
-                    continue;
-                }
-                return Ok(Box::pin(stream::iter(first).chain(output).map(
-                    move |result| result.map_err(|error| error.public(status.as_u16())),
-                )));
-            }
-
-            delivery.report(DeliveryStatus::NotDelivered);
-            let retry_after = response.headers().get(RETRY_AFTER).and_then(retry_delay);
-            let message = error_body(&mut response, &cancel, &budget).await?;
-            if matches!(status.as_u16(), 400 | 422)
-                && rejects_effort(&message)
-                && self.drop_effort(&mut body)
-            {
-                continue;
-            }
-            if (status.as_u16() == 429 || status.is_server_error()) && retries < MAX_RETRIES {
-                let backoff = Duration::from_millis(250 * (1 << retries));
-                let delay = retry_after.map_or(backoff, |delay| delay.max(backoff));
-                if delay <= Duration::from_secs(60) {
-                    drop(response);
-                    budget.wait(&cancel, tokio::time::sleep(delay)).await?;
-                    retries += 1;
-                    continue;
-                }
-            }
-            return Err(ProviderError::Http {
-                status: status.as_u16(),
-                message: "Provider refused the request".into(),
-            });
-        }
     }
 }
 
@@ -180,11 +56,7 @@ impl Provider for ChatCompletions {
             "stream": true,
             "stream_options": { "include_usage": true }
         });
-        if let Some(effort) = request.reasoning_effort.filter(|_| {
-            self.effort_rejected
-                .as_ref()
-                .is_none_or(|rejected| !rejected.load(std::sync::atomic::Ordering::Relaxed))
-        }) {
+        if let Some(effort) = request.reasoning_effort {
             body["reasoning_effort"] = json!(effort);
         }
         if !request.tools.is_empty() {
@@ -193,7 +65,8 @@ impl Provider for ChatCompletions {
                 "function": { "name": tool.name, "description": tool.description, "parameters": tool.parameters }
             })).collect::<Vec<_>>());
         }
-        self.open(body, cancel, request.limits, request.delivery)
+        self.http
+            .open::<Accumulator>(body, cancel, request, "reasoning_effort")
             .await
     }
 }
@@ -205,11 +78,7 @@ fn message_json(message: &Message) -> Value {
         Message::Tool { call_id, content } => {
             json!({"role":"tool","tool_call_id":call_id,"content":content})
         }
-        Message::Assistant {
-            text,
-            reasoning: _,
-            calls,
-        } => {
+        Message::Assistant { text, calls, .. } => {
             let mut message = json!({"role":"assistant","content":text});
             if !calls.is_empty() {
                 message["tool_calls"] = json!(calls.iter().map(|call| json!({
@@ -218,197 +87,6 @@ fn message_json(message: &Message) -> Value {
             }
             message
         }
-    }
-}
-
-#[derive(Clone)]
-struct TurnBudget {
-    deadline: tokio::time::Instant,
-    bytes_left: Arc<AtomicUsize>,
-}
-
-impl TurnBudget {
-    fn new(limits: TurnLimits) -> Self {
-        Self {
-            deadline: tokio::time::Instant::now() + limits.timeout,
-            bytes_left: Arc::new(AtomicUsize::new(limits.response_bytes)),
-        }
-    }
-
-    fn check(&self, cancel: &CancellationToken) -> Result<(), ProviderError> {
-        if cancel.is_cancelled() {
-            return Err(ProviderError::Cancelled);
-        }
-        if tokio::time::Instant::now() >= self.deadline {
-            return Err(ProviderError::TurnTimeout);
-        }
-        Ok(())
-    }
-
-    async fn wait<T>(
-        &self,
-        cancel: &CancellationToken,
-        future: impl std::future::Future<Output = T>,
-    ) -> Result<T, ProviderError> {
-        self.check(cancel)?;
-        tokio::select! {
-            biased;
-            _ = cancel.cancelled() => Err(ProviderError::Cancelled),
-            _ = tokio::time::sleep_until(self.deadline) => Err(ProviderError::TurnTimeout),
-            value = future => Ok(value),
-        }
-    }
-
-    async fn chunk(
-        &self,
-        cancel: &CancellationToken,
-        response: &mut Response,
-    ) -> Result<Option<impl AsRef<[u8]>>, ProviderError> {
-        let chunk = self
-            .wait(cancel, response.chunk())
-            .await?
-            .map_err(transport)?;
-        if let Some(bytes) = &chunk {
-            self.bytes_left
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
-                    left.checked_sub(bytes.len())
-                })
-                .map_err(|_| ProviderError::ResponseTooLarge)?;
-        }
-        Ok(chunk)
-    }
-}
-
-fn transport(error: reqwest::Error) -> ProviderError {
-    ProviderError::Transport(
-        if error.is_timeout() {
-            "Network request timed out"
-        } else if error.is_connect() {
-            "Could not connect to provider"
-        } else {
-            "Network request failed"
-        }
-        .into(),
-    )
-}
-
-fn retry_delay(value: &HeaderValue) -> Option<Duration> {
-    let value = value.to_str().ok()?;
-    if let Ok(seconds) = value.parse() {
-        return Some(Duration::from_secs(seconds));
-    }
-    Some(
-        httpdate::parse_http_date(value)
-            .ok()?
-            .duration_since(SystemTime::now())
-            .unwrap_or_default(),
-    )
-}
-
-async fn error_body(
-    response: &mut Response,
-    cancel: &CancellationToken,
-    budget: &TurnBudget,
-) -> Result<String, ProviderError> {
-    let mut bytes = Vec::new();
-    while let Some(chunk) = budget.chunk(cancel, response).await? {
-        let chunk = chunk.as_ref();
-        let take = chunk.len().min(8192 - bytes.len());
-        bytes.extend_from_slice(&chunk[..take]);
-        if bytes.len() == 8192 {
-            break;
-        }
-    }
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
-}
-
-fn remove_effort(body: &mut Value) -> bool {
-    body.as_object_mut()
-        .and_then(|fields| fields.remove("reasoning_effort"))
-        .is_some()
-}
-
-// Matches Macro's parameter/value fallback, scoped to this request.
-fn rejects_effort(message: &str) -> bool {
-    let message = message.to_ascii_lowercase();
-    ["reasoning", "thinking"]
-        .iter()
-        .any(|name| message.contains(name))
-        && [
-            "unsupported",
-            "not supported",
-            "does not support",
-            "unknown parameter",
-            "unrecognized",
-            "invalid value",
-            "invalid enum",
-            "allowed values",
-            "supported values",
-            "must be one of",
-        ]
-        .iter()
-        .any(|reason| message.contains(reason))
-}
-
-// Based on Macro's SSE parser. Buffer bytes until a complete line arrives so
-// network chunks can split CRLF and UTF-8 code points.
-#[derive(Default)]
-struct Sse {
-    line: Vec<u8>,
-    data: String,
-    after_cr: bool,
-    first_line_seen: bool,
-    has_data: bool,
-}
-
-impl Sse {
-    fn push(&mut self, bytes: &[u8]) -> Result<Vec<String>, ProviderError> {
-        let mut events = Vec::new();
-        for &byte in bytes {
-            if std::mem::take(&mut self.after_cr) && byte == b'\n' {
-                continue;
-            }
-            if matches!(byte, b'\r' | b'\n') {
-                self.after_cr = byte == b'\r';
-                self.line_end(&mut events)?;
-            } else {
-                self.line.push(byte);
-                if self.line.len() + self.data.len() > MAX_EVENT_BYTES {
-                    return Err(ProviderError::Invalid("SSE event exceeds 1 MiB".into()));
-                }
-            }
-        }
-        Ok(events)
-    }
-
-    fn line_end(&mut self, events: &mut Vec<String>) -> Result<(), ProviderError> {
-        let line = std::str::from_utf8(&self.line)
-            .map_err(|_| ProviderError::Invalid("SSE line is not UTF-8".into()))?;
-        let line = if !std::mem::replace(&mut self.first_line_seen, true) {
-            line.trim_start_matches('\u{feff}')
-        } else {
-            line
-        };
-        if line.is_empty() && std::mem::take(&mut self.has_data) {
-            events.push(std::mem::take(&mut self.data));
-        } else if let Some(data) = line
-            .strip_prefix("data:")
-            .or_else(|| (line == "data").then_some(""))
-        {
-            if std::mem::replace(&mut self.has_data, true) {
-                self.data.push('\n');
-            }
-            self.data.push_str(data.strip_prefix(' ').unwrap_or(data));
-        }
-        self.line.clear();
-        Ok(())
-    }
-
-    fn finish(&mut self) -> Result<Vec<String>, ProviderError> {
-        let mut events = Vec::new();
-        self.line_end(&mut events)?;
-        self.line_end(&mut events)?;
-        Ok(events)
     }
 }
 
@@ -453,29 +131,6 @@ struct FunctionDelta {
     arguments: Option<String>,
 }
 
-enum DecodeError {
-    Public(ProviderError),
-    Remote { rejects_effort: bool },
-}
-
-impl From<ProviderError> for DecodeError {
-    fn from(error: ProviderError) -> Self {
-        Self::Public(error)
-    }
-}
-
-impl DecodeError {
-    fn public(self, status: u16) -> ProviderError {
-        match self {
-            Self::Public(error) => error,
-            Self::Remote { .. } => ProviderError::Stream {
-                status,
-                message: "Provider reported an error in the response stream",
-            },
-        }
-    }
-}
-
 #[derive(Default)]
 struct Accumulator {
     calls: BTreeMap<u32, (String, String, String)>,
@@ -484,7 +139,7 @@ struct Accumulator {
     call_bytes: usize,
 }
 
-impl Accumulator {
+impl Events for Accumulator {
     fn frame(&mut self, data: &str, output: &mut VecDeque<Chunk>) -> Result<bool, DecodeError> {
         if data == "[DONE]" {
             return Ok(true);
@@ -494,6 +149,7 @@ impl Accumulator {
         if let Some(error) = frame.error {
             return Err(DecodeError::Remote {
                 rejects_effort: rejects_effort(&error.to_string()),
+                retryable: false,
             });
         }
         if let Some(usage) = frame.usage {
@@ -551,7 +207,12 @@ impl Accumulator {
         Ok(frame.done)
     }
 
-    fn end(&mut self, output: &mut VecDeque<Chunk>) -> Result<(), ProviderError> {
+    fn end(
+        &mut self,
+        output: &mut VecDeque<Chunk>,
+        _: bool,
+        _: &ModelName,
+    ) -> Result<(), ProviderError> {
         let finish = self
             .finish
             .ok_or_else(|| ProviderError::Invalid("Stream ended without a finish reason".into()))?;
@@ -577,63 +238,4 @@ impl Accumulator {
         });
         Ok(())
     }
-}
-
-#[derive(Default)]
-struct Decoder {
-    sse: Sse,
-    assembled: Accumulator,
-    output: VecDeque<Chunk>,
-    ended: bool,
-    error: Option<DecodeError>,
-}
-
-fn decode(
-    response: Response,
-    cancel: CancellationToken,
-    budget: TurnBudget,
-) -> impl futures::Stream<Item = Result<Chunk, DecodeError>> + Send {
-    stream::try_unfold(
-        (response, cancel, budget, Decoder::default()),
-        |(mut response, cancel, budget, mut state)| async move {
-            loop {
-                budget.check(&cancel)?;
-                if let Some(chunk) = state.output.pop_front() {
-                    return Ok(Some((chunk, (response, cancel, budget, state))));
-                }
-                if let Some(error) = state.error.take() {
-                    return Err(error);
-                }
-                if state.ended {
-                    return Ok(None);
-                }
-
-                let next = budget.chunk(&cancel, &mut response).await?;
-                let eof = next.is_none();
-                let frames = match next {
-                    Some(bytes) => state.sse.push(bytes.as_ref())?,
-                    None => state.sse.finish()?,
-                };
-                for frame in frames {
-                    match state.assembled.frame(&frame, &mut state.output) {
-                        Ok(true) => {
-                            state.ended = true;
-                            break;
-                        }
-                        Ok(false) => {}
-                        Err(error) => {
-                            // Deliver any earlier text before the error, even if
-                            // the server batched both frames in one network chunk.
-                            state.error = Some(error);
-                            break;
-                        }
-                    }
-                }
-                if state.error.is_none() && (eof || state.ended) {
-                    state.assembled.end(&mut state.output)?;
-                    state.ended = true;
-                }
-            }
-        },
-    )
 }

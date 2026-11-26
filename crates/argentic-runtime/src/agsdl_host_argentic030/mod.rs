@@ -41,6 +41,80 @@ const MODULE: &str = include_str!("../../../argentic-core/assets/harnesses/argen
 
 pub struct ArgenticAdapter030(Arc<ArgenticConfig030>);
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn responses_config() -> Value {
+        json!({"providers":{"local":{"protocol":"openai-responses",
+            "baseUrl":"https://example.test/v1","models":["gpt-5.4"]}},
+            "defaultModel":"local/gpt-5.4"})
+    }
+
+    #[test]
+    fn responses_rejects_host_token_limits_below_the_protocol_minimum() {
+        for limit in ["maxOutputTokens", "maxTotalTokens"] {
+            let mut config = responses_config();
+            config["settings"] = json!({limit: 15});
+            let error = ArgenticAdapter030::new(serde_json::from_value(config).unwrap())
+                .err()
+                .expect("the host should reject a Responses limit below 16");
+            assert_eq!(error.code, "HARNESS_SETTINGS");
+            assert_eq!(error.pointer, format!("/settings/{limit}"));
+        }
+    }
+
+    #[test]
+    fn responses_qualification_checks_project_token_limits_for_the_selected_protocol() {
+        let mut config = responses_config();
+        config["providers"]["chat"] = json!({"protocol":"chat-completions",
+            "baseUrl":"https://example.test/v1","models":["gpt-5.4"]});
+        let adapter = ArgenticAdapter030::new(serde_json::from_value(config).unwrap()).unwrap();
+        for limit in ["maxOutputTokens", "maxTotalTokens"] {
+            let mut agent = json!({"permissions":"read-only","harnessSettings":{limit:15}});
+            let error = adapter.qualify_agent(&agent, "/agents/worker").unwrap_err();
+            assert_eq!(error.code, "HARNESS_SETTINGS");
+            assert_eq!(
+                error.pointer,
+                format!("/agents/worker/harnessSettings/{limit}")
+            );
+            agent["harnessSettings"][limit] = json!(16);
+            adapter.qualify_agent(&agent, "/agents/worker").unwrap();
+            agent["harnessSettings"][limit] = json!(15);
+            agent["model"] = json!({"name":"chat/gpt-5.4"});
+            adapter.qualify_agent(&agent, "/agents/worker").unwrap();
+        }
+    }
+
+    #[test]
+    fn anthropic_messages_rejects_catalogues_without_native_thinking_mapping() {
+        let mut config = json!({"providers":{"local":{"protocol":"anthropic-messages",
+            "baseUrl":"https://example.test","models":["claude-sonnet-4-6"],
+            "reasoningCatalog":"openrouter"}}});
+        let error = ArgenticAdapter030::new(serde_json::from_value(config.clone()).unwrap())
+            .err()
+            .expect("the host should reject OpenRouter reasoning for Messages");
+        assert_eq!(error.pointer, "/providers/local/reasoningCatalog");
+        config["providers"]["local"]["reasoningCatalog"] = json!("Anthropic");
+        let adapter = ArgenticAdapter030::new(serde_json::from_value(config).unwrap()).unwrap();
+        assert_eq!(
+            adapter.0.catalogue().unwrap()[0]["efforts"],
+            json!(["none", "low", "medium", "high"])
+        );
+        let mut agent = json!({"permissions":"read-only",
+            "model":{"name":"local/claude-sonnet-4-6","effort":"high"}});
+        adapter.qualify_agent(&agent, "/agents/worker").unwrap();
+        agent["model"]["effort"] = json!("max");
+        assert_eq!(
+            adapter
+                .qualify_agent(&agent, "/agents/worker")
+                .unwrap_err()
+                .pointer,
+            "/agents/worker/model/effort"
+        );
+    }
+}
+
 impl ArgenticAdapter030 {
     pub fn new(config: ArgenticConfig030) -> Result<Self> {
         config.validate()?;
@@ -85,8 +159,14 @@ impl HarnessAdapter030 for ArgenticAdapter030 {
                 ));
             }
         }
-        self.0
-            .settings(&settings(agent), &format!("{pointer}/harnessSettings"))?;
+        let model: ModelName = name
+            .parse()
+            .map_err(|_| config::invalid_model(&format!("{pointer}/model/name")))?;
+        self.0.settings_for_model(
+            &model,
+            &settings(agent),
+            &format!("{pointer}/harnessSettings"),
+        )?;
         Ok(())
     }
 
@@ -231,9 +311,9 @@ impl Executor {
             .map_err(|_| config::invalid_model("model"))?;
         let (provider, credential) = self.config.provider(&model)?;
         let mut definition = document["agents"][agent].clone();
-        let settings = self
-            .config
-            .settings(&settings(&definition), "harnessSettings")?;
+        let settings =
+            self.config
+                .settings_for_model(&model, &settings(&definition), "harnessSettings")?;
         let FlowEffectKind030::Start {
             work: reference,
             step,
@@ -373,7 +453,7 @@ impl Executor {
         messages.push(Message::User(mission));
         let port = port::Port::new(events, work, sources, credential);
         let (_send, steer) = tokio::sync::mpsc::channel(1);
-        let report = Harness::new(Arc::new(provider), Arc::new(registry), settings)
+        let report = Harness::new(provider, Arc::new(registry), settings)
             .with_hook(Arc::new(port.clone()))
             .run(
                 Work {
