@@ -1,5 +1,6 @@
 //! Direct, read-only tools. All model paths resolve beneath an admitted root.
 
+mod confined;
 mod output;
 mod submission;
 pub use output::Page;
@@ -10,7 +11,6 @@ use std::{
     sync::Arc,
 };
 
-use cap_fs_ext::{DirExt, FollowSymlinks, MetadataExt, OpenOptionsFollowExt};
 use cap_std::{
     ambient_authority,
     fs::{Dir, File, OpenOptions},
@@ -191,7 +191,9 @@ impl Registry {
             return Err("Read permission denied".into());
         }
         let text = match call.name.as_str() {
-            "read" if args.path.is_some() => self.read_one(root, &path, cancel),
+            "read" if args.path.is_some() => self
+                .read_one(root, &path, cancel)
+                .map(|text| text.replace("\r\n", "\n")),
             "list" => self.scan(root, &path, Search::List, cancel),
             "glob" => {
                 let pattern = args.pattern.as_deref().ok_or("glob requires pattern")?;
@@ -216,11 +218,34 @@ impl Registry {
             .map_err(|e| e.to_string())
     }
 
+    fn verify_location(&self, root: &Root, relative: &Path, actual: PathBuf) -> io::Result<()> {
+        let expected = if relative.as_os_str().is_empty() {
+            root.path.clone()
+        } else {
+            root.path.join(relative)
+        };
+        if actual.as_os_str() != expected.as_os_str() || !self.allows(&actual, true) {
+            return Err(denied());
+        }
+        Ok(())
+    }
+
     fn read_one(&self, root: &Root, path: &Path, cancel: &CancellationToken) -> io::Result<String> {
-        let parent = path.parent().ok_or_else(denied)?;
-        let name = path.file_name().ok_or_else(denied)?;
-        let dir = open_directory(&root.directory, parent)?;
-        file_text(&dir, Path::new(name), cancel).map(|text| text.replace("\r\n", "\n"))
+        let file = confined::file(&root.directory, path)?;
+        self.read_open_file(root, path, file, cancel)
+    }
+
+    fn read_open_file(
+        &self,
+        root: &Root,
+        path: &Path,
+        mut file: File,
+        cancel: &CancellationToken,
+    ) -> io::Result<String> {
+        self.verify_location(root, path, confined::location(&file)?)?;
+        let text = file_text(&mut file, cancel)?;
+        self.verify_location(root, path, confined::location(&file)?)?;
+        Ok(text)
     }
 
     fn scan(
@@ -230,7 +255,8 @@ impl Registry {
         search: Search,
         cancel: &CancellationToken,
     ) -> io::Result<String> {
-        let directory = open_directory(&root.directory, path)?;
+        let directory = confined::directory(&root.directory, path)?;
+        self.verify_location(root, path, confined::location(&directory)?)?;
         let mut stack = vec![(path.to_path_buf(), directory.entries()?, directory)];
         let mut records = Vec::new();
         let mut entries = 0;
@@ -242,7 +268,9 @@ impl Registry {
                 break;
             };
             check_cancel(cancel)?;
-            let Some(entry) = iter.next() else {
+            let entry = iter.next();
+            self.verify_location(root, parent, confined::location(directory)?)?;
+            let Some(entry) = entry else {
                 stack.pop();
                 continue;
             };
@@ -262,6 +290,7 @@ impl Registry {
                 continue;
             }
             let kind = entry.file_type()?;
+            self.verify_location(root, parent, confined::location(directory)?)?;
             if !kind.is_file() && !kind.is_dir() {
                 continue;
             }
@@ -279,7 +308,7 @@ impl Registry {
                     records.push((display, 0, String::new()))
                 }
                 Search::Grep(pattern) if kind.is_file() => {
-                    let Ok(content) = file_text(directory, &name, cancel) else {
+                    let Ok(content) = self.read_one(root, &child, cancel) else {
                         continue;
                     };
                     bytes_read += content.len();
@@ -307,7 +336,8 @@ impl Registry {
                 if depth > MAX_DEPTH {
                     return Err(io::Error::other("Search depth budget exceeded"));
                 }
-                if let Ok(dir) = directory.open_dir_nofollow(&name) {
+                if let Ok(dir) = confined::directory(&root.directory, &child) {
+                    self.verify_location(root, &child, confined::location(&dir)?)?;
                     stack.push((child, dir.entries()?, dir));
                 }
             }
@@ -372,51 +402,6 @@ fn relative_path(raw: &str) -> io::Result<PathBuf> {
     Ok(path)
 }
 
-fn open_directory(root: &Dir, path: &Path) -> io::Result<Dir> {
-    let mut dir = root.try_clone()?;
-    for part in path {
-        let part = Path::new(part);
-        check_spelling(&dir, part)?;
-        dir = dir.open_dir_nofollow(part)?;
-    }
-    Ok(dir)
-}
-
-// Case folding and short-name aliases could reach a path covered by a
-// different rule. On platforms with these aliases require the stored name.
-fn check_spelling(dir: &Dir, name: &Path) -> io::Result<()> {
-    if cfg!(any(windows, target_os = "macos")) {
-        for entry in dir.entries()? {
-            if entry?.file_name() == name.as_os_str() {
-                return Ok(());
-            }
-        }
-        return Err(denied());
-    }
-    Ok(())
-}
-
-fn regular_file(dir: &Dir, name: &Path) -> io::Result<File> {
-    check_spelling(dir, name)?;
-    let entry = dir.symlink_metadata(name)?;
-    if !entry.is_file() {
-        return Err(denied());
-    }
-    let mut options = OpenOptions::new();
-    options.read(true).follow(FollowSymlinks::No);
-    #[cfg(unix)]
-    {
-        use cap_std::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NONBLOCK);
-    }
-    let file = dir.open_with(name, &options)?;
-    let metadata = file.metadata()?;
-    if !metadata.is_file() || metadata.nlink() != 1 {
-        return Err(denied());
-    }
-    Ok(file)
-}
-
 fn check_cancel(cancel: &CancellationToken) -> io::Result<()> {
     if cancel.is_cancelled() {
         return Err(io::Error::other("Read cancelled"));
@@ -424,8 +409,7 @@ fn check_cancel(cancel: &CancellationToken) -> io::Result<()> {
     Ok(())
 }
 
-fn file_text(dir: &Dir, name: &Path, cancel: &CancellationToken) -> io::Result<String> {
-    let mut file = regular_file(dir, name)?;
+fn file_text(file: &mut File, cancel: &CancellationToken) -> io::Result<String> {
     let mut bytes = Vec::new();
     let mut chunk = [0; 16 * 1024];
     loop {
@@ -440,4 +424,31 @@ fn file_text(dir: &Dir, name: &Path, cancel: &CancellationToken) -> io::Result<S
         bytes.extend_from_slice(&chunk[..len]);
     }
     String::from_utf8(bytes).map_err(io::Error::other)
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos", windows)))]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use crate::policy::Preset;
+
+    #[test]
+    fn refuses_an_open_file_moved_after_open() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let relative = Path::new("allowed/memo.txt");
+        std::fs::create_dir_all(workspace.join("allowed")).unwrap();
+        std::fs::write(workspace.join(relative), "memo").unwrap();
+        let workspace = workspace.canonicalize().unwrap();
+        let policy =
+            ReadPolicy::compile(&workspace, None, Some(Preset::ReadOnly), None, &[]).unwrap();
+        let registry = Registry::new(std::slice::from_ref(&workspace), policy, json!({})).unwrap();
+        let root = &registry.roots[0];
+        let file = confined::file(&root.directory, relative).unwrap();
+        std::fs::rename(workspace.join("allowed"), temp.path().join("moved")).unwrap();
+        let error = registry
+            .read_open_file(root, relative, file, &CancellationToken::new())
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    }
 }
