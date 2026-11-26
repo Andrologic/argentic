@@ -207,9 +207,12 @@ impl ActionPolicySource for Policies {
                 guard.policy.permissions.clone(),
                 PathContext {
                     workspace: guard.workspace.clone(),
-                    home: std::env::var_os("HOME").map(PathBuf::from).ok_or_else(|| {
-                        failure("PERMISSION", "approval", "Native home is absent")
-                    })?,
+                    home: std::env::var_os("HOME")
+                        .or_else(|| std::env::var_os("USERPROFILE"))
+                        .map(PathBuf::from)
+                        .ok_or_else(|| {
+                            failure("PERMISSION", "approval", "Native home is absent")
+                        })?,
                 },
             )
             .map_err(|_| {
