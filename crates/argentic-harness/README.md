@@ -38,6 +38,55 @@ token. Set `reasoningCatalog` when the provider ID differs from the catalogue
 name. Preflight checks the host-configured catalogue. The first provider
 request happens when the work starts.
 
+For Claude Messages and OpenAI Responses, a single host can configure both
+protocols.
+
+```json
+{
+  "providers": {
+    "claude": {
+      "protocol": "anthropic-messages",
+      "baseUrl": "https://api.anthropic.com",
+      "apiKeyEnv": "ANTHROPIC_API_KEY",
+      "models": ["claude-sonnet-4-6#work"],
+      "promptCaching": true
+    },
+    "openai": {
+      "protocol": "openai-responses",
+      "baseUrl": "https://api.openai.com/v1",
+      "apiKeyEnv": "OPENAI_API_KEY",
+      "models": ["gpt-5.4"]
+    }
+  },
+  "defaultModel": "claude/claude-sonnet-4-6#work"
+}
+```
+
+- `anthropic-messages` appends `/v1/messages` and uses the key as `x-api-key`.
+  Set `promptCaching: true` to mark the end of the tools and system prefix
+  for Anthropic's ephemeral cache. It defaults to `false`. Prompt usage
+  includes uncached input, cache reads and cache creation.
+- `openai-responses` appends `/responses` and uses the key as a bearer token.
+  Requests use `store: false` and ask for encrypted reasoning. The harness
+  replays encrypted reasoning items and completed output items with each
+  subsequent request. Cached tokens, if reported, are already included in
+  the input total.
+
+The new protocols default to the `anthropic` and `openai` reasoning catalogues
+respectively, even when configured under aliases. Responses sends the selected
+effort as `reasoning.effort`. For Claude models listed in the manual-thinking
+catalogue, `low`, `medium` and `high` request 1,024, 2,048 and 8,192 thinking
+tokens respectively. The harness caps this budget below `maxOutputTokens` and
+omits it if fewer than 1,024 tokens fit. `none` omits the thinking configuration.
+Claude models outside the manual-thinking catalogue use their server defaults.
+The harness keeps Claude's signed thinking blocks in history
+for follow-up requests. [Anthropic extended thinking](https://platform.claude.com/docs/en/build-with-claude/extended-thinking)
+
+HTTP 429 and 5xx responses can be retried within the turn's time and byte
+limits. A transient error event can also be retried before any output has
+been emitted. After output, the error ends the turn. The Host remembers a
+provider's explicit effort rejection for the rest of the work attempt.
+
 Save this document as `read.json`.
 
 ```json
@@ -119,8 +168,9 @@ response data per provider turn, including error bodies and SSE comments.
    ceiling. Open a `Registry` with the host-admitted roots and the current
    step's submission envelope schema. Use that schema to describe named
    results, media types, allowed choices, and route instruction requirements.
-3. Construct `Harness::new(provider, registry, settings)`. For Chat Completions,
-   configure a provider ID and endpoint on `ChatCompletions`. A name such as
+3. Construct `Harness::new(provider, registry, settings)`. Configure a provider
+   ID and the full endpoint on `ChatCompletions`, `AnthropicMessages` or
+   `OpenAiResponses`. A name such as
    `openrouter/vendor/model#fast` selects the provider, keeps `vendor/model`
    as the wire model ID, and exposes `fast` to the host for configuration.
 4. Run `Harness::run(work, port, steer_receiver, parent_cancel)`. Each run
@@ -264,8 +314,7 @@ opt-in. Shared and named instances keep their conversation in memory for the
 run. Route and delivery metadata travels as untrusted message data. The
 module leaves authored resources unsupported because the adapter has no
 separate resource channel. Additional authored directories, model reviewers,
-conversation compaction, completion checks, skills, MCP and other provider
-protocols remain unsupported.
+conversation compaction, completion checks, skills and MCP remain unsupported.
 
 ## Source notes
 

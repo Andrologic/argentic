@@ -373,7 +373,7 @@ impl Executor {
         messages.push(Message::User(mission));
         let port = port::Port::new(events, work, sources, credential);
         let (_send, steer) = tokio::sync::mpsc::channel(1);
-        let report = Harness::new(Arc::new(provider), Arc::new(registry), settings)
+        let report = Harness::new(provider, Arc::new(registry), settings)
             .with_hook(Arc::new(port.clone()))
             .run(
                 Work {

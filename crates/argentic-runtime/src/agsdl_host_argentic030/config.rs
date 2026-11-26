@@ -1,12 +1,15 @@
 use crate::persistence::{failure, Result};
 use argentic_harness::{
     config::Settings,
-    providers::{reasoning_capability, ChatCompletions, ModelName},
+    providers::{
+        reasoning_capability, AnthropicMessages, ChatCompletions, ModelName, OpenAiResponses,
+        Provider,
+    },
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 use url::Url;
 
 #[derive(Deserialize)]
@@ -27,12 +30,17 @@ struct ProviderConfig {
     api_key_env: Option<String>,
     reasoning_catalog: Option<String>,
     models: Vec<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    prompt_caching: bool,
 }
 
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 enum Protocol {
     ChatCompletions,
+    AnthropicMessages,
+    #[serde(rename = "openai-responses")]
+    OpenAiResponses,
 }
 
 fn empty_settings() -> Value {
@@ -52,6 +60,16 @@ pub(super) fn invalid_model(pointer: &str) -> crate::persistence::dto::EngineFai
 }
 
 impl ProviderConfig {
+    fn catalog<'a>(&'a self, provider_id: &'a str) -> &'a str {
+        self.reasoning_catalog
+            .as_deref()
+            .unwrap_or(match self.protocol {
+                Protocol::ChatCompletions => provider_id,
+                Protocol::AnthropicMessages => "anthropic",
+                Protocol::OpenAiResponses => "openai",
+            })
+    }
+
     fn endpoint(&self) -> Result<Url> {
         let mut endpoint =
             Url::parse(&self.base_url).map_err(|_| config_error("Invalid provider base URL"))?;
@@ -66,12 +84,16 @@ impl ProviderConfig {
                 "Expected an HTTP(S) base URL without credentials, query or fragment",
             ));
         }
-        endpoint
+        let mut path = endpoint
             .path_segments_mut()
-            .map_err(|_| config_error("Invalid provider base URL"))?
-            .pop_if_empty()
-            .push("chat")
-            .push("completions");
+            .map_err(|_| config_error("Invalid provider base URL"))?;
+        path.pop_if_empty();
+        match self.protocol {
+            Protocol::ChatCompletions => path.extend(["chat", "completions"]),
+            Protocol::AnthropicMessages => path.extend(["v1", "messages"]),
+            Protocol::OpenAiResponses => path.push("responses"),
+        };
+        drop(path);
         Ok(endpoint)
     }
 }
@@ -83,6 +105,10 @@ impl ArgenticConfig030 {
         }
         for (id, provider) in &self.providers {
             provider.endpoint()?;
+            if provider.prompt_caching && !matches!(provider.protocol, Protocol::AnthropicMessages)
+            {
+                return Err(config_error("promptCaching requires anthropic-messages"));
+            }
             if provider.models.is_empty()
                 || provider
                     .api_key_env
@@ -134,11 +160,8 @@ impl ArgenticConfig030 {
                 let model: ModelName = full
                     .parse()
                     .map_err(|_| config_error("Invalid configured model name"))?;
-                let capability = reasoning_capability(
-                    provider.reasoning_catalog.as_deref().unwrap_or(id),
-                    model.model(),
-                )
-                .map_err(|_| config_error("Argentic reasoning catalogue is unavailable"))?;
+                let capability = reasoning_capability(provider.catalog(id), model.model())
+                    .map_err(|_| config_error("Argentic reasoning catalogue is unavailable"))?;
                 models.push(json!({"name":full,"efforts":capability.map(|c| c.efforts.as_slice()).unwrap_or_default(),
                     "defaultEffort":capability.map(|c| &c.default_effort)}));
             }
@@ -166,7 +189,10 @@ impl ArgenticConfig030 {
         })
     }
 
-    pub(super) fn provider(&self, model: &ModelName) -> Result<(ChatCompletions, Option<String>)> {
+    pub(super) fn provider(
+        &self,
+        model: &ModelName,
+    ) -> Result<(Arc<dyn Provider>, Option<String>)> {
         let provider = self
             .providers
             .get(model.provider())
@@ -183,9 +209,29 @@ impl ArgenticConfig030 {
                     })
             })
             .transpose()?;
-        let client = ChatCompletions::new(model.provider(), provider.endpoint()?, key.as_deref())
-            .map_err(|_| config_error("Cannot initialize the configured provider or credential"))?
-            .with_attempt_effort_fallback();
+        let endpoint = provider.endpoint()?;
+        let id = model.provider();
+        let credential = key.as_deref();
+        let map_error = |_| config_error("Cannot initialize the configured provider or credential");
+        let client: Arc<dyn Provider> = match provider.protocol {
+            Protocol::ChatCompletions => Arc::new(
+                ChatCompletions::new(id, endpoint, credential)
+                    .map_err(map_error)?
+                    .with_attempt_effort_fallback(),
+            ),
+            Protocol::AnthropicMessages => Arc::new(
+                AnthropicMessages::new(id, endpoint, credential)
+                    .map_err(map_error)?
+                    .with_reasoning_catalog(provider.catalog(id))
+                    .with_prompt_caching(provider.prompt_caching)
+                    .with_attempt_effort_fallback(),
+            ),
+            Protocol::OpenAiResponses => Arc::new(
+                OpenAiResponses::new(id, endpoint, credential)
+                    .map_err(map_error)?
+                    .with_attempt_effort_fallback(),
+            ),
+        };
         Ok((client, key))
     }
 }

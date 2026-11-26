@@ -14,7 +14,7 @@
     },
     "model.effort": {
       "support": "approximate",
-      "note": "Argentic sends catalogue-listed effort values. If the provider rejects the effort parameter, Argentic retries without it and omits it for the remainder of the work attempt."
+      "note": "Argentic sends catalogue-listed effort values or maps them to a Claude thinking budget when supported. If the provider rejects the effort configuration, Argentic retries without it and omits it for the remainder of the work attempt."
     },
     "skills": {
       "support": "absent"
