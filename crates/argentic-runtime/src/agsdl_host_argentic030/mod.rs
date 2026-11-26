@@ -341,6 +341,9 @@ impl Executor {
         }
         if shell {
             registry = registry.with_shell();
+            if let Some(directory) = &self.config.shell_staging_directory {
+                registry = registry.with_shell_staging_directory(directory.clone());
+            }
         }
         if person {
             registry = registry.with_authorizer(Arc::new(approval::Human {

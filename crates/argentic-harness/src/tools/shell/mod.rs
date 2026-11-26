@@ -189,9 +189,12 @@ fn run(
     ))]
     {
         let root = &registry.roots[0];
-        let workspace = workspace::Snapshot::new(root, cancel, |path| {
-            registry.path_effect(root, Action::Read, &root.path.join(path)) == Effect::Allow
-        })
+        let workspace = workspace::Snapshot::new(
+            root,
+            registry.shell_staging_directory.as_deref(),
+            cancel,
+            |path| registry.path_effect(root, Action::Read, &root.path.join(path)) == Effect::Allow,
+        )
         .map_err(|e| e.to_string())?;
         let outcome = linux::run(
             &args.command,

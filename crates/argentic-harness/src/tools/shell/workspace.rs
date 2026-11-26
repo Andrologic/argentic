@@ -4,7 +4,7 @@ use super::super::{
     check_cancel, confined, denied, mutation::Target, relative_path, Root, MAX_DEPTH, MAX_ENTRIES,
     MAX_FILE_BYTES, MAX_SCAN_BYTES,
 };
-use cap_fs_ext::{FollowSymlinks, MetadataExt, OpenOptionsFollowExt};
+use cap_fs_ext::{DirExt, FollowSymlinks, MetadataExt, OpenOptionsFollowExt};
 use cap_std::{
     ambient_authority,
     fs::{Dir, Metadata, OpenOptions, OpenOptionsExt, PermissionsExt as _},
@@ -15,6 +15,7 @@ use std::{
     io::{self, Read, Write},
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
+    time::Instant,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -28,10 +29,21 @@ pub(super) struct Snapshot {
 impl Snapshot {
     pub(super) fn new(
         root: &Root,
+        staging_parent: Option<&Path>,
         cancel: &CancellationToken,
         readable: impl FnMut(&Path) -> bool,
     ) -> io::Result<Self> {
-        let staging = tempfile::tempdir()?;
+        let staging = if let Some(parent) = staging_parent {
+            let parent = parent.canonicalize()?;
+            if parent.starts_with(&root.path) {
+                return Err(io::Error::other(
+                    "Shell staging directory must be outside the workspace",
+                ));
+            }
+            tempfile::tempdir_in(parent)?
+        } else {
+            tempfile::tempdir()?
+        };
         let mut original = BTreeMap::new();
         walk(root, cancel, readable, false, |path, entry| {
             match entry {
@@ -149,6 +161,76 @@ impl Snapshot {
                     "Published {index} of {total} file changes: {error}"
                 ))
             })?;
+        }
+        Ok(())
+    }
+}
+
+/// Sample linked entries through directory handles without following symlinks.
+pub(super) struct Budget {
+    root: Dir,
+    entries: usize,
+    bytes: u64,
+}
+
+impl Budget {
+    pub(super) fn open(path: &Path) -> io::Result<Self> {
+        Ok(Self {
+            root: Dir::open_ambient_dir(path, ambient_authority())?,
+            entries: 0,
+            bytes: 0,
+        })
+    }
+
+    pub(super) fn check(
+        &mut self,
+        cancel: &CancellationToken,
+        deadline: Instant,
+    ) -> io::Result<()> {
+        self.entries = 0;
+        self.bytes = 0;
+        self.scan(&self.root.try_clone()?, 0, cancel, deadline)
+    }
+
+    fn scan(
+        &mut self,
+        dir: &Dir,
+        depth: usize,
+        cancel: &CancellationToken,
+        deadline: Instant,
+    ) -> io::Result<()> {
+        for entry in dir.entries()? {
+            check_cancel(cancel)?;
+            if Instant::now() >= deadline {
+                return Err(io::Error::other("Shell command timed out"));
+            }
+            self.entries += 1;
+            if self.entries > MAX_ENTRIES || depth > MAX_DEPTH {
+                return Err(io::Error::other(
+                    "Shell workspace entry or depth budget exceeded during execution",
+                ));
+            }
+            let name = entry?.file_name();
+            let meta = match dir.symlink_metadata(&name) {
+                Ok(meta) => meta,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
+            let allocated = cap_std::fs::MetadataExt::blocks(&meta).saturating_mul(512);
+            let logical = if meta.is_file() { meta.len() } else { 0 };
+            self.bytes = self.bytes.saturating_add(allocated.max(logical));
+            if self.bytes > MAX_SCAN_BYTES as u64 {
+                return Err(io::Error::other(
+                    "Shell workspace byte budget exceeded during execution",
+                ));
+            }
+            if meta.is_dir() {
+                match dir.open_dir_nofollow(&name) {
+                    Ok(child) => self.scan(&child, depth + 1, cancel, deadline)?,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                }
+            }
         }
         Ok(())
     }

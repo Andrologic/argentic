@@ -208,12 +208,26 @@ files and files with multiple hard links. Any ceiling that restricts workspace
 reads or writes makes the entire copy read-only. The direct file tools can
 still change individual paths according to the policy.
 
+For a writable shell, the launcher checks the staging tree before starting
+Bash, approximately every 50 ms during execution, and after all sandbox
+processes exit. A sample exceeding 64 MiB, 20,000 directory entries, or the
+depth budget aborts the call without publishing. It counts the greater of
+logical size and allocated blocks per regular file, and allocated blocks
+for other entries. The kernel also limits each file to 16 MiB and open file
+descriptors to 256 per process. The process limit is 512, subject to Linux's
+real-UID accounting and exemptions. Lower inherited limits still apply.
+
+Sampling can miss transient growth and storage held by open, unlinked files.
+For a hard disk budget, set the host's top-level `shellStagingDirectory` to an
+existing absolute directory outside the workspace on a volume with byte and
+inode quotas. The default is the host's temporary directory.
+
 After a writable run, the host compares the staged bytes and modes with the
 originals and checks read and write permission for every changed path before
 applying any change. Only regular files and deletions are published, and their
 parent directories must already exist in the workspace. Publication uses the
-same atomic file replacement as the mutation tools. On timeout or Stop the
-host kills PID 1 through a pidfd and waits for it and the Bubblewrap supervisor
+same atomic file replacement as the mutation tools. On timeout, Stop, or a
+staging budget error the host kills PID 1 through a pidfd and waits for it and the Bubblewrap supervisor
 before returning. The kernel terminates all processes remaining in that PID
 namespace.
 

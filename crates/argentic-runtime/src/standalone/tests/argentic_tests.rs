@@ -920,6 +920,10 @@ async fn shell_executes_and_stop_reaps_the_namespace_before_physical_end() {
     let mut doc = document();
     doc["agents"]["worker"]["permissions"] = json!("full");
     let mut f = Fixture::new(&doc.to_string());
+    let staging = f.workspace.parent().unwrap().join("staging");
+    std::fs::create_dir(&staging).unwrap();
+    let mut config = config(&server.base_url, None);
+    config["shellStagingDirectory"] = json!(staging);
     let mut policy: Value = serde_json::from_slice(&std::fs::read(&f.policy).unwrap()).unwrap();
     policy["permissions"] = json!("full");
     let bytes = serde_json::to_vec(&policy).unwrap();
@@ -929,7 +933,7 @@ async fn shell_executes_and_stop_reaps_the_namespace_before_physical_end() {
         .open()
         .await
         .unwrap()
-        .with_argentic(server.config(None))
+        .with_argentic(serde_json::from_value(config).unwrap())
         .unwrap();
     let run = start(&host).await;
     server
@@ -957,6 +961,7 @@ async fn shell_executes_and_stop_reaps_the_namespace_before_physical_end() {
         .await
         .unwrap()
         .unwrap();
+    assert_eq!(std::fs::read_dir(&staging).unwrap().count(), 1);
     host.stop(EngineStopRequest {
         request_id: "stop-shell".into(),
         system_start_id: run.receipt.identity.system_start_id.clone(),
@@ -971,6 +976,7 @@ async fn shell_executes_and_stop_reaps_the_namespace_before_physical_end() {
         .unwrap()
         .unwrap();
     assert_eq!(stream.try_read(&mut [0]).unwrap(), 0);
+    assert_eq!(std::fs::read_dir(&staging).unwrap().count(), 0);
     let physical: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM engine_flow030_events WHERE
             json_extract(event_json,'$.kind.PhysicalEnded.evidence.descendants_joined')=1

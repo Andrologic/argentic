@@ -462,6 +462,36 @@ async fn shell_publishes_regular_files_and_times_out_with_background_processes()
     any(target_arch = "aarch64", target_arch = "x86_64")
 ))]
 #[tokio::test]
+async fn shell_stops_on_staging_budget_during_execution() {
+    if !sandbox_present() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let registry = Arc::new(registry(dir.path(), Some(Preset::Workspace), &[]).with_shell());
+    for (command, expected) in [
+        (
+            "for i in 1 2 3 4 5; do truncate -s 14M part-$i; done; sleep 15",
+            "byte budget",
+        ),
+        ("touch item-{1..20001}; sleep 15", "entry or depth budget"),
+    ] {
+        let error = call(
+            &registry,
+            "shell",
+            json!({"command":command,"timeout_ms":5000}),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains(expected), "{error}");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+}
+
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "aarch64", target_arch = "x86_64")
+))]
+#[tokio::test]
 async fn shell_refuses_private_publication_before_applying_other_changes() {
     if !sandbox_present() {
         return;

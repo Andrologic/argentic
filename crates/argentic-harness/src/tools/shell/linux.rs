@@ -14,6 +14,7 @@ mod seccomp;
 
 const OUTPUT_LIMIT: usize = 256 * 1024;
 const SETUP_LIMIT: Duration = Duration::from_secs(5);
+const STAGING_CHECK_INTERVAL: Duration = Duration::from_millis(50);
 
 fn binary() -> Result<&'static Path, String> {
     ["/usr/bin/bwrap", "/bin/bwrap", "/usr/local/bin/bwrap"]
@@ -200,6 +201,9 @@ fn run_inner(
     cancel: &CancellationToken,
 ) -> io::Result<String> {
     super::super::check_cancel(cancel)?;
+    let mut budget = write
+        .then(|| super::workspace::Budget::open(workspace))
+        .transpose()?;
     let mut filter = tempfile::tempfile()?;
     seccomp::write_filter(&mut filter, network)?;
     let (mut info, info_writer) = io::pipe()?;
@@ -283,12 +287,23 @@ fn run_inner(
             for fd in fds {
                 inheritable(fd)?;
             }
-            let limit = libc::rlimit {
-                rlim_cur: 16 * 1024 * 1024,
-                rlim_max: 16 * 1024 * 1024,
-            };
-            if libc::setrlimit(libc::RLIMIT_FSIZE, &limit) == -1 {
-                return Err(io::Error::last_os_error());
+            for (resource, ceiling) in [
+                (libc::RLIMIT_FSIZE, 16 * 1024 * 1024),
+                (libc::RLIMIT_NPROC, 512),
+                (libc::RLIMIT_NOFILE, 256),
+            ] {
+                let mut limit = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
+                if libc::getrlimit(resource, &mut limit) == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                limit.rlim_max = limit.rlim_max.min(ceiling);
+                limit.rlim_cur = limit.rlim_cur.min(limit.rlim_max);
+                if libc::setrlimit(resource, &limit) == -1 {
+                    return Err(io::Error::last_os_error());
+                }
             }
             Ok(())
         });
@@ -356,8 +371,12 @@ fn run_inner(
     if start.elapsed() >= deadline {
         return Err(io::Error::other("Shell command timed out"));
     }
+    if let Some(budget) = &mut budget {
+        budget.check(cancel, start + deadline)?;
+    }
     gate.write_all(b"1")?;
     drop(gate);
+    let mut next_budget_check = Instant::now() + STAGING_CHECK_INTERVAL;
     let status = loop {
         out.pump(&mut stdout)?;
         err.pump(&mut stderr)?;
@@ -374,8 +393,19 @@ fn run_inner(
         if start.elapsed() >= deadline {
             return Err(io::Error::other("Shell command timed out"));
         }
+        if let Some(budget) = &mut budget {
+            if Instant::now() >= next_budget_check {
+                // An error returns through Sandbox::drop, which kills PID 1
+                // via its pidfd and waits before the staging copy is removed.
+                budget.check(cancel, start + deadline)?;
+                next_budget_check = Instant::now() + STAGING_CHECK_INTERVAL;
+            }
+        }
         thread::sleep(Duration::from_millis(5));
     };
+    if let Some(budget) = &mut budget {
+        budget.check(cancel, start + deadline)?;
+    }
     out.pump(&mut stdout)?;
     err.pump(&mut stderr)?;
     let status = status

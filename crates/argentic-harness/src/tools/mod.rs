@@ -68,6 +68,7 @@ pub struct Registry {
     authorizer: Option<Arc<dyn Authorizer>>,
     writes: bool,
     shell: bool,
+    shell_staging_directory: Option<PathBuf>,
     workspace_gate: Arc<tokio::sync::RwLock<()>>,
 }
 
@@ -179,6 +180,7 @@ impl Registry {
             authorizer: None,
             writes: false,
             shell: false,
+            shell_staging_directory: None,
             workspace_gate,
         })
     }
@@ -209,6 +211,12 @@ impl Registry {
             parameters: json!({"type":"object","required":["command"],"additionalProperties":false,
                 "properties":{"command":{"type":"string"},"timeout_ms":{"type":"integer","minimum":1,"maximum":300000}}}),
         });
+        self
+    }
+
+    /// Use a host-owned staging directory, typically on a quota-limited volume.
+    pub fn with_shell_staging_directory(mut self, directory: PathBuf) -> Self {
+        self.shell_staging_directory = Some(directory);
         self
     }
 
