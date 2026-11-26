@@ -14,6 +14,10 @@ use std::{
     sync::OnceLock,
 };
 
+/// Allocation charged before listing one skill directory. On Windows,
+/// cap-std resolves the directory path first through a zeroed buffer of
+/// 32,767 UTF-16 units (64 KiB) in `winx::file::get_file_path`.
+const DIRECTORY_STREAM_BYTES: usize = if cfg!(windows) { 72 * 1024 } else { 4096 };
 const MODE_SIDECAR: &str = ".agsdl-executables";
 const MODE_HEADER: &[u8] = b"AgSDL executable paths v1\n";
 
@@ -766,7 +770,7 @@ impl<'a> Reader<'a> {
                 // the pinned path also allocates component names and handles.
                 reserve(
                     &self.budget,
-                    4096 + path_len * 2 + path.components().count() * 128,
+                    DIRECTORY_STREAM_BYTES + path_len * 2 + path.components().count() * 128,
                 )?;
                 let mut children =
                     member::with_directory(dir, &path, Dir::entries).map_err(|e| io(&path, e))?;
