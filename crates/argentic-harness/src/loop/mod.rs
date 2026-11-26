@@ -292,6 +292,7 @@ impl Harness {
             correction_start: None,
             response_text_start: None,
             pending_steer: VecDeque::new(),
+            host_steer_pending: false,
             accepted_steer: Vec::new(),
             delivery: DeliveryProgress::default(),
         };
@@ -351,6 +352,7 @@ struct Instance<'a> {
     correction_start: Option<usize>,
     response_text_start: Option<usize>,
     pending_steer: VecDeque<Steer>,
+    host_steer_pending: bool,
     accepted_steer: Vec<Message>,
     delivery: DeliveryProgress,
 }
@@ -775,8 +777,12 @@ impl Instance<'_> {
                 self.pending_steer.push_back(steer);
             }
         }
-        if let Some(steer) = self.port.take_steer(self.cancel).await? {
-            self.pending_steer.push_back(steer);
+        // The host owns one outstanding offer until it is settled.
+        if !self.host_steer_pending {
+            if let Some(steer) = self.port.take_steer(self.cancel).await? {
+                self.pending_steer.push_back(steer);
+                self.host_steer_pending = true;
+            }
         }
         Ok(!self.pending_steer.is_empty())
     }
@@ -795,6 +801,7 @@ impl Instance<'_> {
                 }
             }
         }
+        self.host_steer_pending = false;
         Ok(())
     }
 

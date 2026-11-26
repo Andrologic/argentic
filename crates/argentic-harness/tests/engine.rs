@@ -358,6 +358,83 @@ async fn compaction_leaves_pending_submission_feedback_in_the_next_request() {
 }
 
 #[tokio::test]
+async fn steer_arriving_during_summary_reaches_the_next_agent_request() {
+    struct SteerDuringSummary {
+        recording: RecordingProvider,
+        send: mpsc::Sender<Steer>,
+        late: Mutex<Option<Steer>>,
+    }
+
+    #[async_trait]
+    impl Provider for SteerDuringSummary {
+        async fn stream(
+            &self,
+            request: Request<'_>,
+            cancel: CancellationToken,
+        ) -> Result<ProviderStream, ProviderError> {
+            if request.tools.is_empty() {
+                self.send
+                    .try_send(self.late.lock().unwrap().take().unwrap())
+                    .unwrap();
+            }
+            self.recording.stream(request, cancel).await
+        }
+    }
+
+    let (send, steer) = mpsc::channel(2);
+    let (early, early_receipt) = oneshot::channel();
+    let (late, late_receipt) = oneshot::channel();
+    send.try_send(Steer {
+        id: "early".into(),
+        message: "Earlier steer".into(),
+        consumed: early,
+    })
+    .unwrap();
+    let requests = Arc::new(Requests::default());
+    let provider = Arc::new(SteerDuringSummary {
+        recording: RecordingProvider {
+            requests: requests.clone(),
+            provider: scripted(vec![
+                vec![
+                    Chunk::Text("recent ".repeat(1800)),
+                    call("read", "list", json!({})),
+                    end(Finish::ToolCalls),
+                ],
+                vec![Chunk::Text("Earlier evidence".into()), end(Finish::Stop)],
+                vec![submit("done", json!({"answer":42})), end(Finish::ToolCalls)],
+            ]),
+        },
+        send,
+        late: Mutex::new(Some(Steer {
+            id: "late".into(),
+            message: "Steer during summary".into(),
+            consumed: late,
+        })),
+    });
+    let (_dir, harness) = fixture_with_provider(
+        provider,
+        json!({"maxOutputTokens":256,"compaction":{"threshold":0.60,"keepRecentTurns":1}}),
+    );
+    let mut work = work(true);
+    let mut older = recorded_tool_turn("old", "earlier evidence".into());
+    if let Message::Assistant { text, .. } = &mut older[0] {
+        *text = "old ".repeat(3000);
+    }
+    work.messages.extend(older);
+    let report = harness
+        .with_context_window(Some(8192))
+        .run(work, &(), steer, CancellationToken::new())
+        .await;
+    assert!(report.outcome.is_ok(), "{:?}", report.outcome);
+    assert!(requests.0.lock().unwrap()[2].ends_with(&[
+        Message::User("Earlier steer".into()),
+        Message::User("Steer during summary".into()),
+    ]));
+    early_receipt.await.unwrap();
+    late_receipt.await.unwrap();
+}
+
+#[tokio::test]
 async fn compaction_leaves_history_intact_when_the_summary_finishes_at_its_limit() {
     let (_dir, harness) = fixture(
         vec![

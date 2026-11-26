@@ -115,6 +115,9 @@ impl Instance<'_> {
                 )
                 .await?;
         }
+        // The summary request cannot deliver steering. Collect arrivals from
+        // compaction for admission with the next agent request.
+        self.collect_steer().await?;
         Ok(charged)
     }
 
