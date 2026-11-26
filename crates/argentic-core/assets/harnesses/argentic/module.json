@@ -109,6 +109,16 @@
       },
       "maxTurnBytes": {
         "type": "integer"
+      },
+      "compaction": {
+        "type": "object",
+        "description": "Summarize older conversation turns before reaching the configured provider context window.",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": { "type": "boolean", "description": "Defaults to true when the provider context window is configured." },
+          "threshold": { "type": "number", "description": "Fraction of the window, strictly between zero and one. Defaults to 0.8." },
+          "keepRecentTurns": { "type": "integer", "description": "Positive count of recent assistant turns to retain verbatim. Defaults to four." }
+        }
       }
     }
   }

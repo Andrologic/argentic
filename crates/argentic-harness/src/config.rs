@@ -13,6 +13,24 @@ pub enum Layer {
 #[derive(Clone, Debug)]
 pub struct Settings {
     limits: BTreeMap<&'static str, (u32, Layer)>,
+    pub(crate) compaction: Compaction,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Compaction {
+    pub enabled: bool,
+    pub threshold: f64,
+    pub keep_recent_turns: usize,
+}
+
+impl Default for Compaction {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            threshold: 0.8,
+            keep_recent_turns: 4,
+        }
+    }
 }
 
 const DEFAULTS: [(&str, u32); 7] = [
@@ -37,6 +55,7 @@ impl Default for Settings {
                 .into_iter()
                 .map(|(key, value)| (key, (value, Layer::Default)))
                 .collect(),
+            compaction: Compaction::default(),
         }
     }
 }
@@ -55,6 +74,26 @@ impl Settings {
             schema
                 .validate(data)
                 .map_err(|e| format!("{layer:?}: {e}"))?;
+            if let Some(compaction) = data.get("compaction") {
+                if let Some(enabled) = compaction["enabled"].as_bool() {
+                    settings.compaction.enabled = enabled;
+                }
+                if let Some(threshold) = compaction.get("threshold") {
+                    settings.compaction.threshold = threshold
+                        .as_f64()
+                        .filter(|&value| value > 0.0 && value < 1.0)
+                        .ok_or_else(|| {
+                            format!("{layer:?}: compaction threshold must be between 0 and 1")
+                        })?;
+                }
+                if let Some(turns) = compaction.get("keepRecentTurns") {
+                    settings.compaction.keep_recent_turns = turns
+                        .as_f64()
+                        .filter(|value| (1.0..=f64::from(u32::MAX)).contains(value))
+                        .ok_or_else(|| format!("{layer:?}: keepRecentTurns must be a positive unsigned 32-bit integer"))?
+                        as usize;
+                }
+            }
             for (key, default) in DEFAULTS {
                 if let Some(value) = data.get(key) {
                     // Integer-valued decimals are permitted by AgSDL.

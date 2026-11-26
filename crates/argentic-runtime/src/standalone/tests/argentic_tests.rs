@@ -831,6 +831,74 @@ async fn a_host_restart_interrupts_argentic_runs_and_new_runs_start_fresh() {
 }
 
 #[tokio::test]
+async fn compaction_summarizes_old_turns_and_preserves_the_active_wire_prefix() {
+    let mut server = Server::start().await;
+    let mut doc = document();
+    doc["agents"]["worker"]["instructions"] = json!("Stable rules for this run.");
+    doc["agents"]["worker"]["harnessSettings"]["compaction"] =
+        json!({"threshold":0.60,"keepRecentTurns":1});
+    let mut provider = config(&server.base_url, None);
+    provider["providers"]["local"]["contextWindowTokens"] = json!(8192);
+    let f = Fixture::new(&doc.to_string());
+    let host = open(&f, false)
+        .await
+        .with_argentic(serde_json::from_value(provider).unwrap())
+        .unwrap();
+    let run = start(&host).await;
+
+    let first = server.next().await;
+    let prefix = first.body["messages"].clone();
+    let tools = first.body["tools"].clone();
+    let long_tool_turn = |request: Request, marker: &str, padding: char| {
+        let content = format!("{marker} {}", padding.to_string().repeat(12_000));
+        let chunk = json!({"choices":[{"index":0,"delta":{"content":content}}]});
+        let tool = Request::tool_response("list", json!({}));
+        request.send(
+            StatusCode::OK,
+            format!("data: {chunk}\n\n{tool}"),
+            "text/event-stream",
+        );
+    };
+    long_tool_turn(first, "Old turn marker", 'a');
+    long_tool_turn(server.next().await, "Recent turn marker", 'b');
+    let summary = server.next().await;
+    assert!(summary.body.get("tools").is_none(), "{}", summary.body);
+    let transcript = summary.body["messages"].to_string();
+    assert!(transcript.contains("Summarize this older conversation"));
+    assert!(transcript.contains("Old turn marker"));
+    assert!(!transcript.contains("Recent turn marker"));
+    let output = json!({"choices":[{"index":0,"delta":{"content":"Remember the old directory listing."},"finish_reason":"stop"}]});
+    summary.send(
+        StatusCode::OK,
+        format!("data: {output}\n\ndata: [DONE]\n\n"),
+        "text/event-stream",
+    );
+    let compacted = server.next().await;
+    let messages = compacted.body["messages"].as_array().unwrap();
+    assert_eq!(&messages[..2], prefix.as_array().unwrap());
+    assert_eq!(compacted.body["tools"], tools);
+    assert!(messages[2]["content"]
+        .as_str()
+        .unwrap()
+        .contains("Remember the old directory listing."));
+    assert!(messages[3]["content"]
+        .as_str()
+        .unwrap()
+        .contains("Recent turn marker"));
+    assert_eq!(
+        messages[3]["tool_calls"][0]["id"],
+        messages[4]["tool_call_id"]
+    );
+    assert_eq!(messages.len(), 5);
+    compacted.tool(
+        "agsdl_submit_result",
+        json!({"results":{"report":{"body":"compacted work"}}}),
+    );
+    assert_eq!(finish(&host, &run).await["verdict"], "succeeded");
+    close(&host).await;
+}
+
+#[tokio::test]
 async fn provider_failure_does_not_persist_the_echoed_credential() {
     // Cargo supplies this fixture value to the test process without mutating
     // the environment of concurrently running tests.

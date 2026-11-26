@@ -12,7 +12,7 @@ use crate::{
 };
 use argentic_harness::{
     providers::{DeliveryStatus, ToolCall},
-    r#loop::{Decision, Failure, Hook, Proposal, Steer, SteerAdmission, WorkPort},
+    r#loop::{Decision, Event, Failure, Hook, Proposal, Steer, SteerAdmission, WorkPort},
 };
 use serde_json::{json, Value};
 use std::sync::{
@@ -88,6 +88,38 @@ impl Hook for Port {
 impl WorkPort for Port {
     fn validates_submission(&self) -> bool {
         true
+    }
+
+    async fn event(
+        &self,
+        event: Event<'_>,
+        _: &CancellationToken,
+    ) -> std::result::Result<(), Failure> {
+        if let Event::Compaction {
+            turn,
+            before_tokens,
+            after_tokens,
+            truncated_tool_results,
+            summarized_messages,
+        } = event
+        {
+            use std::io::Write;
+            let _ = writeln!(
+                std::io::stderr().lock(),
+                "{}",
+                json!({
+                    "kind": "argentic.contextCompaction",
+                    "identity": self.0.attempt.identity(),
+                    "activationId": self.0.attempt.work().activation_id,
+                    "turn": turn,
+                    "beforeTokens": before_tokens,
+                    "afterTokens": after_tokens,
+                    "truncatedToolResults": truncated_tool_results,
+                    "summarizedMessages": summarized_messages,
+                })
+            );
+        }
+        Ok(())
     }
 
     async fn assistant_message(
