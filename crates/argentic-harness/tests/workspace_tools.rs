@@ -227,6 +227,22 @@ async fn mutation_tools_apply_exact_edits_and_patches() {
 }
 
 #[tokio::test]
+async fn patches_use_normalized_context_and_preserve_line_endings() {
+    let dir = tempfile::tempdir().unwrap();
+    let registry = Arc::new(registry(dir.path(), Some(Preset::Workspace), &[]));
+    let path = dir.path().join("memo");
+    fs::write(&path, "first\r\ncontext\nold\r\nlast").unwrap();
+    let patch = "*** Begin Patch\n*** Update File: memo\n@@\n first\n context\n-old\n+new\n last\n*** End Patch";
+    call(&registry, "apply_patch", json!({"patch_text":patch}))
+        .await
+        .unwrap();
+    assert_eq!(
+        fs::read_to_string(path).unwrap(),
+        "first\r\ncontext\nnew\r\nlast"
+    );
+}
+
+#[tokio::test]
 async fn refused_or_unreviewed_patch_has_no_effects() {
     let dir = tempfile::tempdir().unwrap();
     let registry = Arc::new(registry(

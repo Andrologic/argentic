@@ -155,16 +155,19 @@ pub(crate) fn parse_apply_patch(patch_text: &str) -> Result<Vec<ParsedPatchOpera
     Ok(operations)
 }
 
-fn split_text_lines(content: &str) -> (Vec<String>, bool) {
-    let trailing_newline = content.ends_with('\n');
-    let mut lines = content
-        .split('\n')
-        .map(|line| line.to_string())
-        .collect::<Vec<_>>();
-    if trailing_newline {
-        let _ = lines.pop();
-    }
-    (lines, trailing_newline)
+fn split_text_lines(content: &str) -> Vec<(&str, &str)> {
+    content
+        .split_inclusive('\n')
+        .map(|line| {
+            if let Some(text) = line.strip_suffix("\r\n") {
+                (text, "\r\n")
+            } else if let Some(text) = line.strip_suffix('\n') {
+                (text, "\n")
+            } else {
+                (line, "")
+            }
+        })
+        .collect()
 }
 
 pub(crate) fn join_text_lines(lines: &[String], trailing_newline: bool) -> String {
@@ -176,8 +179,8 @@ pub(crate) fn join_text_lines(lines: &[String], trailing_newline: bool) -> Strin
 }
 
 fn find_line_sequence(
-    lines: &[String],
-    needle: &[String],
+    lines: &[(&str, &str)],
+    needle: &[&str],
     start_index: usize,
     cancel: &CancellationToken,
 ) -> Result<Option<usize>, String> {
@@ -190,7 +193,11 @@ fn find_line_sequence(
 
     for candidate_start in start_index..=lines.len().saturating_sub(needle.len()) {
         super::check_cancel(cancel).map_err(|error| error.to_string())?;
-        if lines[candidate_start..candidate_start + needle.len()] == *needle {
+        if lines[candidate_start..candidate_start + needle.len()]
+            .iter()
+            .map(|(text, _)| *text)
+            .eq(needle.iter().copied())
+        {
             return Ok(Some(candidate_start));
         }
     }
@@ -203,7 +210,12 @@ pub(crate) fn apply_patch_hunks_to_content(
     hunks: &[PatchHunk],
     cancel: &CancellationToken,
 ) -> Result<String, String> {
-    let (mut lines, trailing_newline) = split_text_lines(current_content);
+    let mut lines = split_text_lines(current_content);
+    let newline = lines
+        .iter()
+        .map(|(_, ending)| *ending)
+        .find(|ending| !ending.is_empty())
+        .unwrap_or("\n");
     let mut search_start = 0usize;
 
     for hunk in hunks {
@@ -211,21 +223,33 @@ pub(crate) fn apply_patch_hunks_to_content(
             .lines
             .iter()
             .filter(|line| line.kind != '+')
-            .map(|line| line.content.clone())
-            .collect::<Vec<_>>();
-        let replacement_lines = hunk
-            .lines
-            .iter()
-            .filter(|line| line.kind != '-')
-            .map(|line| line.content.clone())
+            .map(|line| line.content.as_str())
             .collect::<Vec<_>>();
 
         let replace_at = find_line_sequence(&lines, &old_lines, search_start, cancel)?
             .ok_or_else(|| format!("Patch hunk could not be applied cleanly to {}.", path))?;
         let replace_end = replace_at + old_lines.len();
-        lines.splice(replace_at..replace_end, replacement_lines.iter().cloned());
-        search_start = replace_at + replacement_lines.len();
+        let mut old = lines[replace_at..replace_end].iter().copied();
+        let mut replacement = Vec::new();
+        for line in &hunk.lines {
+            match line.kind {
+                '+' => replacement.push((line.content.as_str(), newline)),
+                '-' => {
+                    old.next();
+                }
+                _ => replacement.extend(old.next()),
+            }
+        }
+        search_start = replace_at + replacement.len();
+        lines.splice(replace_at..replace_end, replacement);
     }
 
-    Ok(join_text_lines(&lines, trailing_newline))
+    let mut output = String::new();
+    for (index, (text, ending)) in lines.iter().enumerate() {
+        output.push_str(text);
+        if index + 1 < lines.len() || current_content.ends_with('\n') {
+            output.push_str(if ending.is_empty() { newline } else { ending });
+        }
+    }
+    Ok(output)
 }
