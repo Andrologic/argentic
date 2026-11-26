@@ -41,7 +41,7 @@ Ses défauts expliquent pourquoi on le refait plutôt que de le restaurer :
 
 | Domaine | Cible du module `argentic` |
 | --- | --- |
-| `read`, `write`, `network`, `outside` | `sandbox` pour allow, ask et deny. L’OS couvre tout ce que l’agent exécute. Un `ask` bloque le shell, et seul l’outil qui demande atteint la ressource. |
+| `read`, `write`, `network`, `outside` | `sandbox` pour allow, ask et deny. L’OS interdit l’accès direct. Le proxy réseau peut demander une approbation au moment où le shell vise un hôte soumis à `ask`. |
 | `shell` | `harness`, comparaison du texte complet de chaque sous-commande. |
 | `mcp`, `delegate` | `harness`. |
 | Toutes les propriétés | `native`, y compris `resources` (canal d’information distinct des instructions), `planFirst.ask` (verrou appliqué comme une permission), `reviewer.model` et `delivery.steer` (preuve de réception liée au work). |
@@ -226,3 +226,27 @@ filtrées. Il publie leurs modifications lorsque chaque politique effective
 accorde la lecture et l’écriture sans restriction sur le répertoire concerné.
 L’admission refuse les racines qui se recouvrent pour le shell ou recouvrent
 les données privées du Host.
+
+### Lot 4b
+
+Le shell Linux conserve le namespace réseau privé et seccomp. Un relais TCP
+sur le loopback du namespace transmet les requêtes à un socket Unix du Host.
+Sur macOS ARM64, Seatbelt interdit le réseau direct et autorise uniquement
+le port TCP local du proxy. Les clients qui prennent en charge les variables
+de proxy peuvent utiliser HTTP et HTTPS. Pour HTTPS, le proxy vérifie la
+destination de CONNECT, puis transmet les octets du tunnel.
+
+Le proxy applique chaque politique effective à l’hôte demandé. Un refus
+renvoie une erreur HTTP 403. Une demande `ask` passe par le port partagé
+d’approbation humaine et est refusée en l’absence de relecteur. Chaque requête
+issue d’une redirection repasse par les contrôles. Le proxy résout lui-même
+le nom, contrôle les adresses obtenues et se connecte à l’adresse vérifiée.
+Une adresse privée, de loopback ou de lien local exige une règle IP exacte.
+Les budgets bornent les connexions, les octets échangés et leur durée.
+
+Le shell Seatbelt réutilise la préparation et la publication des copies
+filtrées. Son répertoire courant est la copie du workspace. Les autres
+racines sont exposées sous `ARGENTIC_DIRECTORY_<indice>`. Le profil limite
+l’exécution à Bash et à une liste d’utilitaires système, et le lanceur vérifie
+que les processus de la session dédiée sont terminés avant de publier.
+Windows refuse le shell à la qualification.
