@@ -40,6 +40,9 @@ pub mod permissions;
 pub mod persistence;
 pub mod sqlite;
 
+#[path = "agsdl_host_registry030.rs"]
+pub mod harness;
+
 pub mod host;
 
 /// Native capture preparation shared with desktop and standalone hosts.
@@ -76,6 +79,8 @@ mod agsdl_host_codex030;
 mod agsdl_host_compiler;
 mod agsdl_host_completion030;
 mod agsdl_host_confinement;
+mod agsdl_host_content030;
+mod agsdl_host_diagnostics030;
 mod agsdl_host_dispatch030;
 mod agsdl_host_evaluation030;
 mod agsdl_host_flow030;

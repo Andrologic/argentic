@@ -97,6 +97,7 @@ pub struct HostContext {
     policy: Arc<dyn PolicySource>,
     network: Arc<dyn crate::content_network::ContentNetwork>,
     codex_auth_file: Option<PathBuf>,
+    harnesses: crate::harness::HarnessRegistry030,
     mcp_secrets: Option<Arc<McpSecretProvider>>,
     mcp_http: Option<Arc<McpHttpAuthorizer>>,
     remote_mcp_tool_budget_ms: NonZeroU64,
@@ -111,10 +112,18 @@ impl HostContext {
             policy,
             network: Arc::new(crate::content_network::UnavailableNetwork),
             codex_auth_file: None,
+            harnesses: crate::harness::HarnessRegistry030::with_codex(),
             mcp_secrets: None,
             mcp_http: None,
             remote_mcp_tool_budget_ms: Self::DEFAULT_REMOTE_MCP_TOOL_BUDGET_MS,
         }
+    }
+    pub fn with_harnesses(mut self, harnesses: crate::harness::HarnessRegistry030) -> Self {
+        self.harnesses = harnesses;
+        self
+    }
+    pub fn harnesses(&self) -> &crate::harness::HarnessRegistry030 {
+        &self.harnesses
     }
     pub fn with_network(
         mut self,

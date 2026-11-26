@@ -304,7 +304,7 @@ async fn native_steer_claim_consumes_before_absorption_makes_its_quorum_missed()
             &attempt,
             async move {
                 let delivery = inbox.receive().await.unwrap();
-                delivery.acknowledge(&owned, &target).unwrap();
+                delivery.acknowledge(&owned, &target).await.unwrap();
                 let _ = hold.await;
             },
         )

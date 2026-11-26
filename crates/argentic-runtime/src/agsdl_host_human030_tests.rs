@@ -6,7 +6,7 @@ use tokio::io::AsyncWriteExt;
 
 #[tokio::test]
 async fn diagnostic_action_broker_keeps_attach_admit_open_and_pump_failures_distinct() {
-    use crate::agsdl_host_codex030::approvals::CommandApprovals030;
+    use crate::agsdl_host_action_approval030::CommandApprovals030;
     struct UnusedPolicy;
     impl crate::host::ActionPolicySource for UnusedPolicy {
         fn lock_current<'a>(

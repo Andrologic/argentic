@@ -114,9 +114,7 @@ use crate::{
     },
     agsdl_host_runtime030::{AgentExecutor030, AgentWork030, WorkEventSink030},
     agsdl_host_work::{captured_work_contract030, CapturedWorkPlan030},
-    agsdl_host_work_admission030::{
-        codex_read_only030, AttestedWorkPolicy030, PreparedEffectiveAgentWork030,
-    },
+    agsdl_host_work_admission030::{AttestedWorkPolicy030, PreparedEffectiveAgentWork030},
     host::HostContext,
     persistence::{
         failure,
@@ -126,8 +124,12 @@ use crate::{
     process::ContainedBackgroundProcess,
 };
 use futures::future::BoxFuture;
+pub(crate) mod admission;
 pub(crate) mod approvals;
-pub(crate) mod content;
+pub(crate) mod registration;
+use crate::agsdl_host_action_approval030::CommandApprovals030;
+use crate::agsdl_host_content030 as content;
+use admission::codex_read_only030;
 pub(crate) mod mcp;
 type AdapterSink030 = Arc<
     dyn Fn(
@@ -138,7 +140,7 @@ type AdapterSink030 = Arc<
         + Send
         + Sync,
 >;
-use crate::agsdl_host_codex::diagnostics::{self, Stage};
+use crate::agsdl_host_diagnostics030::{self as diagnostics, Stage};
 use std::{path::Path, sync::Arc};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -149,7 +151,7 @@ use tokio_util::sync::CancellationToken;
 pub(crate) struct CodexExecutor030 {
     config: HostContext,
     threads: Arc<Mutex<BTreeMap<(String, String), String>>>,
-    approvals: Option<Arc<dyn approvals::CommandApprovals030>>,
+    approvals: Option<Arc<dyn CommandApprovals030>>,
     has_mcp_equipment: bool,
     #[cfg(test)]
     pub(crate) test_profile: Option<profile::Profile>,
@@ -165,20 +167,20 @@ impl CodexExecutor030 {
             test_profile: None,
         }
     }
-    pub(crate) fn with_approvals(
-        mut self,
-        approvals: Arc<dyn approvals::CommandApprovals030>,
-    ) -> Self {
+    pub(crate) fn with_approvals(mut self, approvals: Arc<dyn CommandApprovals030>) -> Self {
         self.approvals = Some(approvals);
         self
     }
     pub(crate) fn with_mcp_equipment(mut self, document: &Value) -> Self {
         self.has_mcp_equipment = document["agents"].as_object().is_some_and(|agents| {
-            agents.values().any(|agent| {
-                agent["mcpServers"]
-                    .as_array()
-                    .is_some_and(|servers| !servers.is_empty())
-            })
+            agents
+                .values()
+                .filter(|agent| agent["harness"] == "codex")
+                .any(|agent| {
+                    agent["mcpServers"]
+                        .as_array()
+                        .is_some_and(|servers| !servers.is_empty())
+                })
         });
         self
     }
@@ -202,7 +204,7 @@ impl AgentExecutor030 for CodexExecutor030 {
                 "Native action approvals require the human request port",
             ));
         }
-        AttestedWorkPolicy030::from_codex(work)
+        admission::prepare(work)
     }
     fn run(
         &self,
@@ -213,6 +215,50 @@ impl AgentExecutor030 for CodexExecutor030 {
         let this = self.clone();
         Box::pin(async move { this.execute(work, events, cancel).await })
     }
+}
+
+fn skill_tool030() -> Value {
+    json!({"type":"function","name":"agsdl_load_skill","description":"Load a skill selected for the current AgSDL work. Unselected skills are unavailable. Skills grant no permissions.","inputSchema":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"],"additionalProperties":false},"deferLoading":false})
+}
+
+/// Native tool replies use only the recipient's captured bytes. There is no
+/// path argument, filesystem read, or grant derived from the model's request.
+fn skill_reply030(
+    params: &Value,
+    thread: &str,
+    turn: &str,
+    skills: &[crate::content::SkillDescriptor],
+    cancel: &CancellationToken,
+) -> HostResult<Value> {
+    if required(params, "threadId")? != thread || required(params, "turnId")? != turn {
+        return Err(missing("skillOwner"));
+    }
+    if cancel.is_cancelled() {
+        return Err(failure(
+            "STOP_PENDING",
+            "skills",
+            "Skill loading was cancelled",
+        ));
+    }
+    let args = &params["arguments"];
+    let selected = (params["tool"] == "agsdl_load_skill"
+        && params["namespace"].is_null()
+        && args.as_object().is_some_and(|args| args.len() == 1))
+    .then(|| {
+        args["name"]
+            .as_str()
+            .and_then(|name| skills.iter().find(|skill| skill.key == name))
+    })
+    .flatten();
+    let Some(skill) = selected else {
+        return Ok(
+            json!({"success":false,"contentItems":[{"type":"inputText","text":"SKILL_NOT_SELECTED: only a skill selected for the current work can be loaded by name."}]}),
+        );
+    };
+    let crate::content::ContentPayload::Text { text } = &skill.source.payload else {
+        return Err(missing("skillText"));
+    };
+    Ok(json!({"success":true,"contentItems":[{"type":"inputText","text":text}]}))
 }
 
 fn missing(field: &str) -> crate::persistence::dto::EngineFailure {
@@ -287,7 +333,7 @@ struct SteerContext030 {
     tasks: crate::tasks::StreamTasks,
     attempt: crate::agsdl_host_flow030::FlowWorkAttempt030,
     document: Value,
-    approvals: Option<Arc<dyn approvals::CommandApprovals030>>,
+    approvals: Option<Arc<dyn CommandApprovals030>>,
     policy: crate::permissions::EffectivePolicy,
     root: String,
     auto_plan: bool,
@@ -322,22 +368,13 @@ impl PendingSteer030 {
     }
     async fn settle_observed(&mut self, context: &SteerContext030) -> HostResult<()> {
         if self.receipt_observed {
-            let deadline = self.delivery.as_ref().and_then(|offer| offer.deadline());
-            let settle = crate::agsdl_host_steer030::SteerDelivery030::acknowledge_from_provider(
+            crate::agsdl_host_steer030::SteerDelivery030::acknowledge_from_provider(
                 &mut self.delivery,
                 &context.tasks,
                 &context.attempt,
                 self.turn_ended_while_counted,
-            );
-            if let Some(deadline) = deadline {
-                if let Ok(result) = tokio::time::timeout_at(deadline, settle).await {
-                    result?;
-                } else {
-                    self.delivery = None;
-                }
-            } else {
-                settle.await?;
-            }
+            )
+            .await?;
             self.receipt_observed = false;
         }
         Ok(())
@@ -434,9 +471,9 @@ impl PendingSteer030 {
         turn: &str,
         steer: &mut Option<&mut SteerContext030>,
     ) -> HostResult<bool> {
-        let asynchronous = steer
-            .as_ref()
-            .is_some_and(|context| context.document["contract"] == argentic_core::AGSDL_040);
+        let asynchronous = steer.as_ref().is_some_and(|context| {
+            crate::agsdl_host_steer030::asynchronous_contract(&context.document["contract"])
+        });
         if self.request_id.is_some()
             && event.get("method").is_none()
             && event.get("id").and_then(Value::as_u64) == self.request_id
@@ -644,9 +681,9 @@ async fn between_turn_event030(
     steer: &mut Option<&mut SteerContext030>,
 ) -> HostResult<crate::persistence::work_dto030::ProtocolDecision030> {
     let event = events(body, cancel.clone());
-    let asynchronous = steer
-        .as_ref()
-        .is_some_and(|context| context.document["contract"] == argentic_core::AGSDL_040);
+    let asynchronous = steer.as_ref().is_some_and(|context| {
+        crate::agsdl_host_steer030::asynchronous_contract(&context.document["contract"])
+    });
     tokio::pin!(event);
     loop {
         tokio::select! {
@@ -948,9 +985,9 @@ impl CodexExecutor030 {
             _ = cancel.cancelled() => Ok(()),
             result = self.session(&mut client, profile, root, read_only, model, frozen, key, instructions, mission, resources, sink, cancel, &mut current_thread, &mut current_turn, &mut pending_steer, steer.as_mut()) => result,
         };
-        let current_steer = steer
-            .as_ref()
-            .is_some_and(|context| context.document["contract"] == argentic_core::AGSDL_040);
+        let current_steer = steer.as_ref().is_some_and(|context| {
+            crate::agsdl_host_steer030::asynchronous_contract(&context.document["contract"])
+        });
         if let Some(context) = steer.as_mut().filter(|_| current_steer) {
             // After dropping the session future, no other code can send these
             // offers. Acknowledge definite non-receipt before closing stdio.
@@ -1018,9 +1055,9 @@ impl CodexExecutor030 {
         pending_steer: &mut PendingSteer030,
         mut steer: Option<&mut SteerContext030>,
     ) -> HostResult<()> {
-        let current_steer = steer
-            .as_ref()
-            .is_some_and(|context| context.document["contract"] == argentic_core::AGSDL_040);
+        let current_steer = steer.as_ref().is_some_and(|context| {
+            crate::agsdl_host_steer030::asynchronous_contract(&context.document["contract"])
+        });
         if current_steer {
             client.enable_asynchronous_steer();
         }
@@ -1050,7 +1087,7 @@ impl CodexExecutor030 {
             params["ephemeral"] = json!(false);
             // Register on every fresh thread. A later work may select skills on
             // that same instance; resume restores the native tool definition.
-            params["dynamicTools"] = json!([content::skill_tool030()]);
+            params["dynamicTools"] = json!([skill_tool030()]);
         }
         let response = client.request(method, params).await?;
         let thread = required(&response["thread"], "id")?;
@@ -1268,7 +1305,7 @@ impl CodexExecutor030 {
                         if let Some(sources) = &context.sources {
                             sources.check_ceiling().await?;
                         }
-                        let result = content::skill_reply030(
+                        let result = skill_reply030(
                             &event["params"],
                             &thread,
                             &turn,
@@ -1379,7 +1416,7 @@ impl CodexExecutor030 {
                     if params["threadId"] != thread || params["turnId"] != turn {
                         return Err(missing("errorOwner"));
                     }
-                    native_failure = Some(crate::agsdl_host_codex::diagnostics::turn_error(
+                    native_failure = Some(crate::agsdl_host_diagnostics030::turn_error(
                         &params["error"],
                     ));
                     // Retry notifications are not a terminal result. Keep only
@@ -1434,9 +1471,8 @@ impl CodexExecutor030 {
                         }
                     }
                     if params["turn"]["status"] != "completed" {
-                        let direct = crate::agsdl_host_codex::diagnostics::turn_error(
-                            &params["turn"]["error"],
-                        );
+                        let direct =
+                            crate::agsdl_host_diagnostics030::turn_error(&params["turn"]["error"]);
                         let code = if params["turn"]["status"] == "interrupted" {
                             "CODEX_TURN_INTERRUPTED"
                         } else if direct != "CODEX_TURN_FAILED" {
@@ -2231,13 +2267,13 @@ for line in sys.stdin:
         consumed: Option<Arc<tokio::sync::Notify>>,
         wait_auth: Option<std::path::PathBuf>,
     }
-    impl approvals::CommandApprovals030 for TestCommandApprovals {
+    impl CommandApprovals030 for TestCommandApprovals {
         fn answer<'a>(
             &'a self,
             attempt: &'a crate::agsdl_host_flow030::FlowWorkAttempt030,
             _: Value,
             _: &'a CancellationToken,
-            respond: approvals::Respond030<'a>,
+            respond: crate::agsdl_host_action_approval030::Respond030<'a>,
         ) -> BoxFuture<'a, HostResult<()>> {
             Box::pin(async move {
                 if let Some(path) = &self.wait_auth {

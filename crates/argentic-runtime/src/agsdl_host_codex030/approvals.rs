@@ -1,21 +1,8 @@
 //! One native command, one bounded filesystem overlay, one human answer.
 use super::*;
-use crate::{agsdl_host_flow030::FlowWorkAttempt030, permissions::*};
+use crate::permissions::*;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
-
-pub(crate) type Respond030<'a> = Box<dyn FnOnce(bool) -> BoxFuture<'a, HostResult<()>> + Send + 'a>;
-
-/// The existing human broker owns identity, deadlines and the final send gate.
-pub(crate) trait CommandApprovals030: Send + Sync {
-    fn answer<'a>(
-        &'a self,
-        work: &'a FlowWorkAttempt030,
-        payload: Value,
-        cancel: &'a CancellationToken,
-        respond: Respond030<'a>,
-    ) -> BoxFuture<'a, HostResult<()>>;
-}
 
 /// The upstream module describes generic patch approvals. This adapter instead
 /// denies writes in the native sandbox until a bounded command overlay is granted.
@@ -152,7 +139,7 @@ mod tests {
         );
         let host = normalize(json!("workspace"));
         let policy = EffectivePolicy::new(requested.clone(), host.clone(), host);
-        assert!(crate::agsdl_host_work_admission030::codex_read_only030(&policy).unwrap());
+        assert!(crate::agsdl_host_codex030::admission::codex_read_only030(&policy).unwrap());
         let native = json!({"method":"item/commandExecution/requestApproval","id":0,"params":{
             "threadId":"thread","turnId":"turn","kind":"command","environmentId":"local","itemId":"item","command":"synthetic command","cwd":root,
             "additionalPermissions":{"network":null,"fileSystem":{"read":null,"write":[file],"entries":[{"path":{"type":"path","path":file},"access":"write"}]}}}});

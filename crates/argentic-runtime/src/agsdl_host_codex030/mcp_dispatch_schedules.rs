@@ -369,13 +369,13 @@ async fn budget_before_handoff(transport: Transport) {
 
 struct AcknowledgeAfterExpiry;
 
-impl crate::agsdl_host_codex030::approvals::CommandApprovals030 for AcknowledgeAfterExpiry {
+impl crate::agsdl_host_action_approval030::CommandApprovals030 for AcknowledgeAfterExpiry {
     fn answer<'a>(
         &'a self,
         _: &'a crate::agsdl_host_flow030::FlowWorkAttempt030,
         _: Value,
         cancel: &'a CancellationToken,
-        respond: crate::agsdl_host_codex030::approvals::Respond030<'a>,
+        respond: crate::agsdl_host_action_approval030::Respond030<'a>,
     ) -> BoxFuture<'a, HostResult<()>> {
         Box::pin(async move {
             respond(true).await?;

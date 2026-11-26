@@ -1,7 +1,10 @@
 //! Full dispatch, native admission, Codex adapter and production controller.
 //! Only the observed installation and JSON-RPC peer are synthetic.
 use super::*;
-use crate::agsdl_host_codex030::{approvals, protocol_tests::SERVER, CodexExecutor030};
+use crate::{
+    agsdl_host_action_approval030::CommandApprovals030,
+    agsdl_host_codex030::{protocol_tests::SERVER, CodexExecutor030},
+};
 use crate::persistence::Result as HostResult;
 use futures::future::BoxFuture;
 use std::{os::unix::fs::PermissionsExt, path::Path};
@@ -74,13 +77,13 @@ struct ActionAnswer {
     calls: Arc<std::sync::atomic::AtomicUsize>,
     identity: crate::persistence::flow030::FlowIdentity030,
 }
-impl approvals::CommandApprovals030 for ActionAnswer {
+impl CommandApprovals030 for ActionAnswer {
     fn answer<'a>(
         &'a self,
         attempt: &'a crate::agsdl_host_flow030::FlowWorkAttempt030,
         _: Value,
         _: &'a CancellationToken,
-        respond: approvals::Respond030<'a>,
+        respond: crate::agsdl_host_action_approval030::Respond030<'a>,
     ) -> BoxFuture<'a, HostResult<()>> {
         Box::pin(async move {
             assert_eq!(attempt.identity(), &self.identity);
@@ -361,7 +364,10 @@ async fn run_with_clock(
     .is_none());
     let tasks = crate::tasks::StreamTasks::default();
     let executors: Executors030 = Executors030 {
-        agents: executor,
+        agents: std::collections::BTreeMap::from([(
+            "codex".into(),
+            executor as Arc<dyn AgentExecutor030>,
+        )]),
         calls: None,
         humans: None,
         clock,
@@ -475,12 +481,15 @@ async fn accepted_040_result_survives_deadline_during_physical_cleanup() {
         identity: f.identity.clone(),
     });
     let executors = Executors030 {
-        agents: Arc::new(PendingCleanup {
-            host: f.host.clone(),
-            committed,
-            accepted: accepted.clone(),
-            finish: finish.clone(),
-        }),
+        agents: std::collections::BTreeMap::from([(
+            "codex".into(),
+            Arc::new(PendingCleanup {
+                host: f.host.clone(),
+                committed,
+                accepted: accepted.clone(),
+                finish: finish.clone(),
+            }) as Arc<dyn AgentExecutor030>,
+        )]),
         humans: None,
         calls: None,
         clock: Some(runtime_clock.clone()),

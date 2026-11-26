@@ -1,6 +1,6 @@
 //! Single-process host using the production Start transaction and supervisor.
 //! Loading inputs never starts a provider. Only explicit preflight/Start may
-//! observe Codex, and both require the caller's `allow_codex` opt-in.
+//! observe a registered harness with the caller's explicit opt-in.
 use crate::{
     api::{self, HumanSubmission, StartSession, StreamTasks},
     host::{
@@ -24,6 +24,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use sqlx::{SqliteConnection, SqlitePool};
 use std::{
+    collections::BTreeSet,
     fs::File,
     io::{self, Read},
     path::{Path, PathBuf},
@@ -294,6 +295,10 @@ pub struct Host {
 }
 impl Host {
     /// Native host configuration, before preflight/Start. Never a document input.
+    pub fn with_harnesses(mut self, harnesses: crate::harness::HarnessRegistry030) -> Self {
+        self.context = self.context.with_harnesses(harnesses);
+        self
+    }
     pub fn with_codex_auth_file(mut self, path: PathBuf) -> Self {
         self.context = self.context.with_codex_auth_file(path);
         self
@@ -423,11 +428,21 @@ impl Host {
     pub async fn source(&self) -> EngineSourceRevision {
         self.policies.0.read().await.source.clone()
     }
-    async fn prepare(&self, entry: Option<&EngineEntry>, allow_codex: bool) -> Result<Prepared> {
+    async fn prepare(
+        &self,
+        entry: Option<&EngineEntry>,
+        allowed_harnesses: &BTreeSet<String>,
+    ) -> Result<Prepared> {
         let inputs = self.policies.acquire().await?;
         let doc: Value = serde_json::from_str(inputs.opened.authored_json())?;
-        let qualification = api::qualify_product(&doc, None, Some(&inputs.policy.permissions))
-            .map_err(|error| inputs.opened.locate_error(error))?;
+        let registered = self.context.harnesses();
+        let qualification = api::qualify_product_with_harnesses(
+            &doc,
+            None,
+            Some(&inputs.policy.permissions),
+            registered,
+        )
+        .map_err(|error| inputs.opened.locate_error(error))?;
         if let Some(d) = qualification.blocking_diagnostic() {
             return Err(inputs
                 .opened
@@ -443,59 +458,66 @@ impl Host {
                 "Standalone host requires AgSDL 0.3.0 or 0.4.0",
             ));
         }
-        if doc["agents"]
-            .as_object()
-            .is_some_and(|a| a.values().any(|v| v["harness"] != "codex"))
-            || api::declared_steps(&doc).any(|(_, s)| s["type"] == "call")
-        {
-            return Err(failure("UNSUPPORTED", "source", "Standalone host supports Codex and human flows; host calls and other harnesses are unavailable"));
-        }
-        let uses_codex = doc["agents"].as_object().is_some_and(|a| !a.is_empty());
-        if uses_codex && !allow_codex {
+        if api::declared_steps(&doc).any(|(_, step)| step["type"] == "call") {
             return Err(failure(
-                "CODEX_OPT_IN_REQUIRED",
+                "UNSUPPORTED",
                 "source",
-                "Explicit Codex opt-in is required for preflight or Start",
+                "Standalone host does not support host calls",
             ));
         }
-        let observed = if uses_codex {
-            crate::agsdl_host_work_admission030::validate_codex_document_at030(
-                &doc,
-                crate::capture::document_location(&inputs.scope)?.as_ref(),
-            )
-            .map_err(|e| inputs.opened.locate_error(e))?;
-            let observed =
-                api::observe_codex(&self.context, &inputs.scope, inputs.policy.read_only).await?;
-            match observed {
-                Some(observed) => Some(observed),
-                None => {
-                    let status = api::codex_status(&self.context).await;
-                    return Err(failure(&status.code,"engine","Official private Codex profile is not ready; consult the documented login procedure"));
-                }
+        let used: BTreeSet<_> = doc["agents"]
+            .as_object()
+            .into_iter()
+            .flatten()
+            .filter_map(|(_, agent)| agent["harness"].as_str())
+            .collect();
+        let mut harnesses = Vec::new();
+        let mut agents = Vec::new();
+        let mut observations = serde_json::Map::new();
+        let mut supports_approval = true;
+        for id in &used {
+            let adapter = registered.get(id).expect("harness qualified above");
+            if !allowed_harnesses.contains(*id) {
+                return Err(adapter.opt_in_error());
             }
-        } else {
-            None
-        };
-        let (harnesses, agents) = if let Some(observed) = &observed {
-            let (h, a) = crate::capture::codex_registry(
+            supports_approval &= adapter.supports_host_approval();
+        }
+        let location = crate::capture::document_location(&inputs.scope)?;
+        for id in used {
+            let adapter = registered.get(id).expect("harness qualified above");
+            adapter
+                .validate_document(&doc, location.as_ref())
+                .map_err(|error| inputs.opened.locate_error(error))?;
+            let observation = adapter
+                .observe(&self.context, &inputs.scope, inputs.policy.read_only)
+                .await?;
+            adapter
+                .validate_observation(&doc, &inputs.scope, &observation)
+                .map_err(|error| inputs.opened.locate_error(error))?;
+            let (entry, entries) = crate::capture::observed_registry(
                 &doc,
                 &inputs.source.source_sha256,
                 &inputs.scope,
-                observed,
+                id,
+                adapter.adapter_id(),
+                &observation,
             )
-            .map_err(|e| inputs.opened.locate_error(e))?;
-            (vec![h], a)
-        } else {
-            (vec![], vec![])
+            .map_err(|error| inputs.opened.locate_error(error))?;
+            harnesses.push(entry);
+            agents.extend(entries);
+            observations.insert(id.to_owned(), observation.fingerprint);
+        }
+        let observation = match observations.len() {
+            0 => Value::Null,
+            1 => observations.into_iter().next().unwrap().1,
+            _ => Value::Object(observations),
         };
-        let observation = match &observed {
-            Some(o) => {
-                json!({"profile":o.profile.identity(),"accountDigest":o.account_digest,"models":o.models,"version":o.version})
-            }
-            None => Value::Null,
-        };
-        let mut registry = json!({"format":"macro-agsdl-registry/030", "modules":[{"harness":"codex","moduleJson":api::codex_module()}],
-            "harnesses":harnesses,"agents":agents,"hostCapabilities": if !uses_codex || cfg!(all(target_os="macos",target_arch="aarch64")) {
+        let modules = registered
+            .iter()
+            .map(|adapter| json!({"harness":adapter.id(),"moduleJson":adapter.module_json()}))
+            .collect::<Vec<_>>();
+        let mut registry = json!({"format":"macro-agsdl-registry/030", "modules":modules,
+            "harnesses":harnesses,"agents":agents,"hostCapabilities": if supports_approval {
                 json!([{"name":"approval","support":"native","evidenceJson":"{\"runtime\":\"flow-human-clock\"}"}])
             } else { json!([]) }});
         registry["version"] = json!(format!(
@@ -510,10 +532,11 @@ impl Host {
         registry["startEntry"] = serde_json::to_value(entry)?;
         let compiled = self
             .engine
-            .compile_document(
+            .compile_document_with_harnesses(
                 inputs.source.clone(),
                 inputs.opened.authored_json().to_owned(),
                 registry.to_string(),
+                registered,
             )
             .await?;
         let mut result: Value = serde_json::from_str(&compiled.result_json)?;
@@ -562,7 +585,16 @@ impl Host {
     }
     /// Explicitly observes Codex when needed; does not admit or start any work.
     pub async fn preflight(&self, entry: Option<&EngineEntry>, allow_codex: bool) -> Result<Value> {
-        Ok(self.prepare(entry, allow_codex).await?.result)
+        self.preflight_with_harnesses(entry, &codex_opt_in(allow_codex))
+            .await
+    }
+
+    pub async fn preflight_with_harnesses(
+        &self,
+        entry: Option<&EngineEntry>,
+        allowed_harnesses: &BTreeSet<String>,
+    ) -> Result<Value> {
+        Ok(self.prepare(entry, allowed_harnesses).await?.result)
     }
     /// Idempotent native Start. The private adapter retains real source/policy
     /// guards and delegates ownership and commit acknowledgement to the session.
@@ -571,6 +603,16 @@ impl Host {
         request_id: String,
         entry: Option<EngineEntry>,
         allow_codex: bool,
+    ) -> Result<RetainedStart030> {
+        self.start_with_harnesses(request_id, entry, &codex_opt_in(allow_codex))
+            .await
+    }
+
+    pub async fn start_with_harnesses(
+        &self,
+        request_id: String,
+        entry: Option<EngineEntry>,
+        allowed_harnesses: &BTreeSet<String>,
     ) -> Result<RetainedStart030> {
         let session = self.engine.begin_start().await?;
         let request = EngineStartRequest {
@@ -585,7 +627,7 @@ impl Host {
             session: &session,
             prepared: Mutex::new(None),
             capture: Mutex::new(None),
-            allow_codex,
+            allowed_harnesses,
         };
         let retained = match start030::start(&self.pool, &request, &adapter).await {
             Ok(r) => r,
@@ -731,12 +773,16 @@ struct Prepared {
     permissions: Value,
     generation: String,
 }
+fn codex_opt_in(allowed: bool) -> BTreeSet<String> {
+    allowed.then(|| "codex".into()).into_iter().collect()
+}
+
 struct Start<'a> {
     host: &'a Host,
     session: &'a StartSession<'a>,
     prepared: Mutex<Option<Prepared>>,
     capture: Mutex<Option<StartCapture030>>,
-    allow_codex: bool,
+    allowed_harnesses: &'a BTreeSet<String>,
 }
 impl Authority030 for Start<'_> {
     fn owner<'a>(
@@ -785,7 +831,7 @@ impl StartAuthority030 for Start<'_> {
     async fn capture(&self, r: &EngineStartRequest) -> Result<StartCapture030> {
         let p = self
             .host
-            .prepare(r.entry.as_ref(), self.allow_codex)
+            .prepare(r.entry.as_ref(), self.allowed_harnesses)
             .await?;
         let inputs = self.host.policies.acquire().await?;
         if r.source != inputs.source || p.generation != self.session.generation() {
@@ -823,7 +869,7 @@ impl StartAuthority030 for Start<'_> {
     async fn lock_source(&self, r: &EngineStartRequest) -> Result<Self::SourceGuard> {
         let current = self
             .host
-            .prepare(r.entry.as_ref(), self.allow_codex)
+            .prepare(r.entry.as_ref(), self.allowed_harnesses)
             .await?;
         let guard = self.host.policies.acquire().await?;
         {
@@ -1051,6 +1097,189 @@ mod tests {
             host.close().await.unwrap();
         }
     }
+    #[derive(Clone)]
+    struct RoutingAdapter {
+        id: &'static str,
+        adapter_id: &'static str,
+        module: String,
+        runs: Arc<Mutex<Vec<(String, String)>>>,
+    }
+
+    impl crate::harness::HarnessAdapter030 for RoutingAdapter {
+        fn id(&self) -> &str {
+            self.id
+        }
+        fn adapter_id(&self) -> &str {
+            self.adapter_id
+        }
+        fn module_json(&self) -> &str {
+            &self.module
+        }
+
+        fn observe<'a>(
+            &'a self,
+            _: &'a HostContext,
+            _: &'a Value,
+            _: bool,
+        ) -> futures::future::BoxFuture<'a, Result<crate::harness::HarnessObservation030>> {
+            Box::pin(async move {
+                let mut observed = crate::agsdl_host_codex030::registration::observation(
+                    &api::synthetic_codex_observation(),
+                );
+                if self.id == "argentic" {
+                    observed.version = "0.1.0".into();
+                    observed.evidence = json!({"kind":"routing-test"});
+                    for capability in &mut observed.capabilities {
+                        capability["evidenceJson"] = json!(observed.evidence.to_string());
+                    }
+                }
+                Ok(observed)
+            })
+        }
+
+        fn executor(
+            &self,
+            _: crate::harness::AgentExecutorContext030<'_>,
+        ) -> Result<Arc<dyn crate::harness::AgentExecutor030>> {
+            Ok(Arc::new(self.clone()))
+        }
+    }
+
+    impl crate::harness::AgentExecutor030 for RoutingAdapter {
+        fn prepare(
+            &self,
+            work: crate::harness::PreparedEffectiveAgentWork030,
+        ) -> Result<crate::harness::AttestedWorkPolicy030> {
+            assert_eq!(work.harness(), self.id);
+            if self.id == "codex" {
+                return crate::agsdl_host_codex030::admission::prepare(work);
+            }
+            crate::harness::AttestedWorkPolicy030::new(
+                work,
+                self.adapter_id,
+                1000.try_into().unwrap(),
+                1024.try_into().unwrap(),
+                false,
+            )
+        }
+
+        fn run(
+            &self,
+            work: crate::harness::AgentWork030,
+            events: crate::harness::WorkEventSink030,
+            cancel: tokio_util::sync::CancellationToken,
+        ) -> futures::future::BoxFuture<'static, Result<()>> {
+            self.runs
+                .lock()
+                .unwrap()
+                .push((self.id.into(), work.attempt.agent().into()));
+            Box::pin(async move {
+                events
+                    .emit(
+                        json!({"kind":"submit","callId":"result","argumentsJson":"{}"}),
+                        &cancel,
+                    )
+                    .await?;
+                Ok(())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn standalone_routes_mixed_harnesses_and_requires_each_opt_in() {
+        let fixture = Fixture::new(
+            r#"{
+            "contract":"agsdl-0.4.0","id":"mixed",
+            "agents":{
+                "writer":{"harness":"argentic","permissions":"workspace"},
+                "reviewer":{"harness":"codex","permissions":"workspace"}
+            },
+            "flow":{"entry":"draft","steps":{
+                "draft":{"type":"agent","agent":"writer","next":"review"},
+                "review":{"type":"agent","agent":"reviewer","next":[]}
+            }}
+        }"#,
+        );
+        let host = fixture.open().await.unwrap();
+        let mut allowed = BTreeSet::from(["codex".into(), "argentic".into()]);
+        let error = host
+            .preflight_with_harnesses(entry().as_ref(), &allowed)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "UNSUPPORTED_030_FEATURE");
+        assert_eq!(error.pointer, "/agents/writer/harness");
+        assert!(error
+            .message
+            .contains("No executor is registered for harness argentic"));
+
+        let mut registry = crate::harness::HarnessRegistry030::default();
+        let runs = Arc::new(Mutex::new(Vec::new()));
+        for (id, adapter_id) in [("codex", api::CODEX_ADAPTER), ("argentic", "routing-test")] {
+            let module = if id == "codex" {
+                api::codex_module()
+            } else {
+                let mut module: Value =
+                    serde_json::from_str(argentic_core::harness_module(id).unwrap()).unwrap();
+                // This test executor has no external effects. Describe the
+                // restrictions it enforces locally, in its own test module.
+                module["permissions"]["write"]["deny"] = json!("harness");
+                module["permissions"]["network"]["deny"] = json!("harness");
+                module["permissions"]["read"]["outside"] = json!("harness");
+                module.to_string()
+            };
+            registry
+                .register(Arc::new(RoutingAdapter {
+                    id,
+                    adapter_id,
+                    module,
+                    runs: runs.clone(),
+                }))
+                .unwrap();
+        }
+        let host = host.with_harnesses(registry);
+        allowed.remove("argentic");
+        let error = host
+            .preflight_with_harnesses(entry().as_ref(), &allowed)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "HARNESS_OPT_IN_REQUIRED");
+        assert!(error.message.contains("argentic"));
+        assert!(runs.lock().unwrap().is_empty());
+
+        allowed.insert("argentic".into());
+        let preflight = host
+            .preflight_with_harnesses(entry().as_ref(), &allowed)
+            .await
+            .unwrap();
+        assert_eq!(
+            preflight.pointer("/productRuntimeAvailable"),
+            Some(&json!(true))
+        );
+        let started = host
+            .start_with_harnesses("mixed".into(), entry(), &allowed)
+            .await
+            .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            host.engine
+                .flow030()
+                .supervisors
+                .wait(&started.receipt.identity.system_start_id),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            *runs.lock().unwrap(),
+            [
+                ("argentic".into(), "writer".into()),
+                ("codex".into(), "reviewer".into())
+            ]
+        );
+        host.shutdown(&[]).await.unwrap();
+        host.close().await.unwrap();
+    }
+
     #[tokio::test]
     async fn standalone_real_start_human_submission_stop_and_reopen() {
         let mut document: Value = serde_json::from_str(WAIT).unwrap();

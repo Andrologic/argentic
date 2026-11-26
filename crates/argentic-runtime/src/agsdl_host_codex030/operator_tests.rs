@@ -257,7 +257,7 @@ async fn supervisor_reconciles_lost_operator_and_delivery_commit_acks_before_ret
 fn start_operator_supervisor(f: &Fixture, agents: Arc<dyn AgentExecutor030>, tasks: &StreamTasks) {
     let (pool, app, identity) = (f.pool.clone(), f.host.as_ref().clone(), f.identity.clone());
     let executors = Executors030 {
-        agents,
+        agents: BTreeMap::from([("codex".into(), agents)]),
         calls: None,
         humans: Some(Arc::new(
             crate::agsdl_host_human_executor030::HumanExecutor030 {

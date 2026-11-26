@@ -57,7 +57,9 @@ impl HostExecutor030 for CallExecutor030 {
         );
         Box::pin(async move {
             let host = app.clone();
-            let authority = NativeCallAuthority030::capture(&host, &owner).await?;
+            let authority = NativeCallAuthority030::capture(&host, &owner)
+                .await?
+                .with_harnesses(config.harnesses());
             let broker = host.start_lease().await?.call_data030()?;
             let attempt = calls::reserve_call030(&pool, &authority, &effect).await?;
             #[cfg(test)]
@@ -99,7 +101,9 @@ impl HostExecutor030 for CallExecutor030 {
                         wait_clock.await.map_err(|_| {
                             failure("INTERRUPTED", "clock", "Clock admission failed")
                         })?;
-                        let authority = NativeCallAuthority030::capture(&host, &owner).await?;
+                        let authority = NativeCallAuthority030::capture(&host, &owner)
+                            .await?
+                            .with_harnesses(config.harnesses());
                         let control = Control {
                             stop: owned_cancel,
                             machine_timeout,

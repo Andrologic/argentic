@@ -45,14 +45,17 @@ fn start_calls(
         tasks.clone(),
         f.owner.clone(),
         Executors030 {
-            agents: Arc::new(Executor {
-                whole_stop: Default::default(),
-                steer_script: Default::default(),
-                deferred: Default::default(),
-                plans: Default::default(),
-                running: Arc::new(Mutex::new(Vec::new())),
-                wake: watch::channel(0).0,
-            }),
+            agents: std::collections::BTreeMap::from([(
+                "codex".into(),
+                Arc::new(Executor {
+                    whole_stop: Default::default(),
+                    steer_script: Default::default(),
+                    deferred: Default::default(),
+                    plans: Default::default(),
+                    running: Arc::new(Mutex::new(Vec::new())),
+                    wake: watch::channel(0).0,
+                }) as Arc<dyn AgentExecutor030>,
+            )]),
             calls: Some(Arc::new(
                 crate::agsdl_host_call_executor030::CallExecutor030 {
                     config,

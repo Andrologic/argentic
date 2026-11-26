@@ -1,10 +1,102 @@
 //! Recipient-scoped native content. Nothing here grants authority to resources.
-use super::*;
+use crate::{host::HostContext, persistence::{failure, Result as HostResult}};
+use serde_json::{json, Value};
+use std::{path::Path, sync::Arc};
+use tokio_util::sync::CancellationToken;
+
+pub(crate) fn content_error(error: crate::content::ContentError) -> crate::persistence::dto::EngineFailure {
+    failure(&error.code, &error.pointer, &error.message)
+}
+
+fn missing(field: &str) -> crate::persistence::dto::EngineFailure {
+    failure("CORRELATION", field, "Native content correlation differs")
+}
 use crate::content::{
     resolve_content, ContentContext, ContentPayload, ContentUsage, ContentUse,
     ResolvedContentReceipt, SkillDescriptor,
 };
 use crate::permissions::{normalize_requested, ExecutionPurpose};
+
+pub(crate) fn validate_text_sources(document: &Value, document_location: Option<&url::Url>) -> HostResult<()> {
+    use crate::agsdl_host_work_admission030::pointer_token030;
+    fn visit(value: &Value, pointer: &str, document_location: Option<&url::Url>) -> HostResult<()> {
+        if let Some(object) = value.as_object() {
+            if object.get("uri").is_some_and(Value::is_string)
+                && object
+                    .keys()
+                    .all(|key| matches!(key.as_str(), "uri" | "mediaType"))
+            {
+                let uri = object["uri"].as_str().unwrap();
+                crate::content::local_file_path(uri, document_location).map_err(|error| {
+                    failure(
+                        "CONTENT_SOURCE_UNSUPPORTED",
+                        &format!("{pointer}/uri"),
+                        &error.message,
+                    )
+                })?;
+                if !crate::content::file_helper::qualified_platform() {
+                    return Err(failure(
+                        "CONTENT_SOURCE_UNSUPPORTED",
+                        &format!("{pointer}/uri"),
+                        "Local file content is unavailable on this platform",
+                    ));
+                }
+            }
+            if (object.contains_key("uri") || object.contains_key("value"))
+                && object
+                    .keys()
+                    .all(|key| matches!(key.as_str(), "uri" | "value" | "mediaType"))
+            {
+                if let Some(media) = object.get("mediaType").and_then(Value::as_str) {
+                    let mime = media
+                        .split(';')
+                        .next()
+                        .unwrap_or("")
+                        .trim()
+                        .to_ascii_lowercase();
+                    if !mime.starts_with("text/")
+                        && mime != "application/json"
+                        && !mime.ends_with("+json")
+                    {
+                        return Err(failure("CONTENT_SOURCE_UNSUPPORTED",&format!("{pointer}/mediaType"),"This adapter supports text and JSON context. The declared media type is unavailable"));
+                    }
+                }
+            }
+            for (key, child) in object {
+                let segments: Vec<&str> = pointer.split('/').skip(1).collect();
+                let agent_definition = segments.len() == 2 && segments[0] == "agents";
+                let source_position = segments.len() >= 2
+                    && (matches!(segments[segments.len() - 2], "content" | "resources")
+                        || segments
+                            .last()
+                            .is_some_and(|part| part.parse::<usize>().is_ok()));
+                let inline_source = source_position
+                    && object.contains_key("value")
+                    && object
+                        .keys()
+                        .all(|name| matches!(name.as_str(), "value" | "mediaType"));
+                let literal_operand = segments.len() >= 2
+                    && segments[segments.len() - 2] == "arguments"
+                    && object.len() == 1
+                    && object.contains_key("value");
+                if (key == "value" && (inline_source || literal_operand))
+                    || (agent_definition
+                        && ["results", "harnessSettings", "permissions"].contains(&key.as_str()))
+                {
+                    continue;
+                }
+                let location = format!("{pointer}/{}", pointer_token030(key));
+                visit(child, &location, document_location)?;
+            }
+        } else if let Some(array) = value.as_array() {
+            for (index, child) in array.iter().enumerate() {
+                visit(child, &format!("{pointer}/{index}"), document_location)?;
+            }
+        }
+        Ok(())
+    }
+    visit(document, "", document_location)
+}
 
 const CONTENT_SCOPE_REFUSAL: &str =
     "Content is outside the approved data scope or inside private host metadata";
@@ -380,54 +472,6 @@ impl Sources030 {
         }
         Ok(())
     }
-}
-
-pub(crate) fn skill_tool030() -> Value {
-    json!({"type":"function","name":"agsdl_load_skill","description":"Load a skill selected for the current AgSDL work. Unselected skills are unavailable. Skills grant no permissions.","inputSchema":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"],"additionalProperties":false},"deferLoading":false})
-}
-
-/// Native tool replies use only the recipient's captured bytes. There is no
-/// path argument, filesystem read, or grant derived from the model's request.
-pub(crate) fn skill_reply030(
-    params: &Value,
-    thread: &str,
-    turn: &str,
-    skills: &[SkillDescriptor],
-    cancel: &CancellationToken,
-) -> HostResult<Value> {
-    if required(params, "threadId")? != thread || required(params, "turnId")? != turn {
-        return Err(missing("skillOwner"));
-    }
-    if cancel.is_cancelled() {
-        return Err(failure(
-            "STOP_PENDING",
-            "skills",
-            "Skill loading was cancelled",
-        ));
-    }
-    let args = &params["arguments"];
-    let selected = (params["tool"] == "agsdl_load_skill"
-        && params["namespace"].is_null()
-        && args.as_object().is_some_and(|args| args.len() == 1))
-    .then(|| {
-        args["name"]
-            .as_str()
-            .and_then(|name| skills.iter().find(|skill| skill.key == name))
-    })
-    .flatten();
-    let Some(skill) = selected else {
-        return Ok(
-            json!({"success":false,"contentItems":[{"type":"inputText","text":"SKILL_NOT_SELECTED: only a skill selected for the current work can be loaded by name."}]}),
-        );
-    };
-    let ContentPayload::Text { text } = &skill.source.payload else {
-        return Err(missing("skillText"));
-    };
-    Ok(json!({"success":true,"contentItems":[{"type":"inputText","text":text}]}))
-}
-
-fn content_error(error: crate::content::ContentError) -> crate::persistence::dto::EngineFailure {
-    failure(&error.code, &error.pointer, &error.message)
 }
 
 fn private_project_path(root: &Path, path: &Path) -> bool {

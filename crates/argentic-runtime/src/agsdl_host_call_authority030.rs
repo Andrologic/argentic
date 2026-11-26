@@ -19,6 +19,7 @@ pub(crate) struct NativeCallAuthority030<'a> {
     host: &'a HostState,
     lease: HostStartLease,
     owner: EngineOwner,
+    harnesses: crate::harness::HarnessRegistry030,
 }
 impl<'a> NativeCallAuthority030<'a> {
     pub(crate) async fn capture(host: &'a HostState, owner: &EngineOwner) -> Result<Self> {
@@ -34,7 +35,12 @@ impl<'a> NativeCallAuthority030<'a> {
             host,
             lease,
             owner: owner.clone(),
+            harnesses: crate::harness::HarnessRegistry030::with_codex(),
         })
+    }
+    pub(crate) fn with_harnesses(mut self, harnesses: &crate::harness::HarnessRegistry030) -> Self {
+        self.harnesses = harnesses.clone();
+        self
     }
     fn flow_authority(&self) -> Authority<'_> {
         Authority {
@@ -105,6 +111,7 @@ impl CallAuthority030 for NativeCallAuthority030<'_> {
             if crate::agsdl_host_qualification030::product_diagnostic030(
                 &document,
                 Some(&capture.compiled_plan_json),
+                &self.harnesses,
             )
             .is_some()
                 || step["type"] != "call"

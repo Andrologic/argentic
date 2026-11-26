@@ -113,7 +113,10 @@ async fn exercise(
     .is_none());
     let tasks = crate::tasks::StreamTasks::default();
     let executors: Executors030 = Executors030 {
-        agents: executor,
+        agents: std::collections::BTreeMap::from([(
+            "codex".into(),
+            executor as Arc<dyn AgentExecutor030>,
+        )]),
         calls: None,
         humans: None,
         clock: None,

@@ -50,6 +50,7 @@ async fn example_agent_capture(
             authored.clone(),
             registry.to_string(),
             &tokio_util::sync::CancellationToken::new(),
+            argentic_core::calculation::default_available_harnesses(),
         )
         .await
         .unwrap();

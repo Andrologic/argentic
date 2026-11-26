@@ -253,7 +253,7 @@ fn operator_receipt(applied: Apply030) -> Result<FlowReceipt030> {
 /// The executor acknowledges only after the native turn has ended. The
 /// activation, attempt and agent instance continue to belong to the run.
 #[derive(Clone)]
-pub(crate) struct AgentOperator030 {
+pub struct AgentOperator030 {
     host: HostState,
     pool: SqlitePool,
     attempt: FlowWorkAttempt030,
@@ -280,7 +280,7 @@ impl AgentOperator030 {
 
     /// Serialize the provider turn write with Stop and operator transitions.
     /// The guard is released before waiting for the server's response.
-    pub(crate) async fn admit_turn(&self) -> Result<Option<OwnedMutexGuard<()>>> {
+    pub async fn admit_turn(&self) -> Result<Option<OwnedMutexGuard<()>>> {
         let lease = self.host.start_lease().await?;
         let guard = self.host.admission_lock().lock_owned().await;
         reconcile_admission030(
@@ -324,7 +324,7 @@ impl AgentOperator030 {
         self.host.flow030().operator_test_yield(point).await;
     }
 
-    pub(crate) async fn requested(&mut self) -> String {
+    pub async fn requested(&mut self) -> String {
         loop {
             if let Some(id) = self.commands.borrow_and_update().clone() {
                 return id;
@@ -335,7 +335,7 @@ impl AgentOperator030 {
         }
     }
 
-    pub(crate) async fn park(&mut self, mut hold_id: String) -> Result<()> {
+    pub async fn park(&mut self, mut hold_id: String) -> Result<()> {
         self.parked.store(true, Ordering::Release);
         loop {
             self.confirm(&hold_id).await?;

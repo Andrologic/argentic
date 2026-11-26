@@ -1,4 +1,4 @@
-//! Observed Codex registry preparation shared by native hosts.
+//! Observed harness registry preparation shared by native hosts.
 use crate::persistence::{failure, Result};
 use semver::{Version, VersionReq};
 use serde_json::{json, Value};
@@ -177,7 +177,9 @@ fn version_requirement(range: &str) -> std::result::Result<VersionReq, semver::E
 
 /// The retained project root in the same form `canonicalize` gives a skill
 /// path, including Windows' verbatim prefix. A missing snapshot is refused.
-fn captured_project_root(document_location: Option<&url::Url>) -> Result<std::path::PathBuf> {
+pub(crate) fn captured_project_root(
+    document_location: Option<&url::Url>,
+) -> Result<std::path::PathBuf> {
     document_location
         .and_then(|uri| uri.to_file_path().ok())
         .and_then(|path| path.parent().map(Path::to_owned))
@@ -199,52 +201,31 @@ pub fn codex_registry(
     scope: &Value,
     observed: &crate::api::CodexObservation,
 ) -> Result<(Value, Vec<Value>)> {
-    let document_location = document_location(scope)?;
-    crate::agsdl_host_work_admission030::validate_codex_document_at030(
+    crate::agsdl_host_codex030::registration::validate_observation(document, scope, observed)?;
+    observed_registry(
         document,
-        document_location.as_ref(),
-    )?;
-    if document["agents"].as_object().is_some_and(|agents| {
-        agents.values().any(|agent| {
-            agent["skills"]
-                .as_array()
-                .is_some_and(|skills| !skills.is_empty())
-        })
-    }) {
-        let workspace = scope["root"]
-            .as_str()
-            .ok_or_else(|| failure("CORRELATION", "skills", "Native project scope is absent"))?;
-        let snapshot_root = if scope.get("projectSnapshot").is_some() {
-            Some(captured_project_root(document_location.as_ref())?)
-        } else {
-            None
-        };
-        crate::agsdl_host_codex030::content::qualify_skill_folders(
-            document,
-            snapshot_root
-                .as_deref()
-                .unwrap_or_else(|| Path::new(workspace)),
-            document_location.as_ref(),
-        )?;
-    }
-    if !crate::api::qualified_codex_version(&observed.version) || observed.models.is_empty() {
-        return Err(failure(
-            "CODEX_VERSION_UNQUALIFIED",
-            "/agents",
-            "Codex observation is outside the qualified version or catalogue",
-        ));
-    }
-    let adapter = crate::agsdl_host_codex::ADAPTER;
-    let evidence = json!({"adapterId":adapter,"version":observed.version,"profileDigest":observed.profile.digest,"accountDigest":observed.account_digest,"kind":"native-codex"}).to_string();
-    let mut capabilities = ["result-submission", "continuity", "permission-enforcement", "contained-stop", "response-attribution", "instructions", "resources", "model.name", "model.effort", "instance.new", "delivery.queue", "delivery.steer", "answer-timeout", "reviewer.person", "planFirst.auto", "completion-check", "skills", "mcpServers", "harness-settings"]
-        .into_iter().filter(|name| match *name {
-            "completion-check" => cfg!(all(target_os = "macos", target_arch = "aarch64")),
-            "skills" => observed.version == "0.167.0" && crate::content_io::file_helper::qualified_platform(),
-            _ => true,
-        }).map(|name| json!({"name":name,"support":if matches!(name, "resources" | "planFirst.auto") {"approximate"} else {"native"},"evidenceJson":evidence})).collect::<Vec<_>>();
+        source_sha256,
+        scope,
+        "codex",
+        crate::agsdl_host_codex::ADAPTER,
+        &crate::agsdl_host_codex030::registration::observation(observed),
+    )
+}
+
+/// Build only compiler inputs. Native admission verifies the captured adapter.
+pub fn observed_registry(
+    document: &Value,
+    source_sha256: &str,
+    scope: &Value,
+    harness: &str,
+    adapter: &str,
+    observed: &crate::harness::HarnessObservation030,
+) -> Result<(Value, Vec<Value>)> {
+    let evidence = observed.evidence.to_string();
+    let mut capabilities = observed.capabilities.clone();
     let mut ranges = BTreeSet::new();
     for (name, agent) in document["agents"].as_object().into_iter().flatten() {
-        if agent["harness"] != "codex" {
+        if agent["harness"] != harness {
             continue;
         }
         let Some(range) = agent["harnessVersion"].as_str() else {
@@ -260,21 +241,21 @@ pub fn codex_registry(
         let requirement = version_requirement(range)
             .map_err(|error| failure("HARNESS_VERSION_INVALID", &pointer, &error.to_string()))?;
         let installed = Version::parse(&observed.version)
-            .map_err(|error| failure("CODEX_VERSION_UNQUALIFIED", &pointer, &error.to_string()))?;
+            .map_err(|error| failure("HARNESS_VERSION_INVALID", &pointer, &error.to_string()))?;
         if !requirement.matches(&installed) {
             return Err(failure(
                 "HARNESS_VERSION",
                 &pointer,
-                &format!("Codex {installed} does not satisfy {range}."),
+                &format!("{harness} {installed} does not satisfy {range}."),
             ));
         }
         let receipt = json!({
             "kind": "harness-version-range",
-            "harness": "codex",
+            "harness": harness,
             "version": observed.version,
             "range": range,
             "satisfied": true,
-            "receipt": observed.profile.digest,
+            "receipt": observed.version_receipt,
         });
         capabilities.push(json!({
             "name":format!("harness-version-range-{}", ranges.len()),
@@ -282,19 +263,13 @@ pub fn codex_registry(
             "evidenceJson":receipt.to_string(),
         }));
     }
-    let default = observed
-        .models
-        .iter()
-        .find(|model| model["isDefault"] == true)
-        .and_then(|model| model["name"].as_str());
-    let models = observed.models.iter().map(|model| json!({"name":model["name"],"efforts":model["efforts"],"defaultEffort":model["defaultEffort"]})).collect::<Vec<_>>();
-    let agents = document["agents"].as_object().into_iter().flatten().filter(|(_, agent)| agent["harness"] == "codex").map(|(name, agent)| {
+    let agents = document["agents"].as_object().into_iter().flatten().filter(|(_, agent)| agent["harness"] == harness).map(|(name, agent)| {
         json!({"agentName":name,"agentDeclarationJson":agent.to_string(),"settingsJson":agent.get("harnessSettings").cloned().unwrap_or_else(|| json!({})).to_string(),
             "permissionsJson":json!({"requested":agent["permissions"],"authority":"native-03-at-handoff"}).to_string(),
             "scopeJson":scope.to_string(),"evidenceJson":evidence,"provenanceJson":json!({"sourceSha256":source_sha256,"agent":name}).to_string()})
     }).collect();
     Ok((
-        json!({"harness":"codex","version":observed.version,"installation":"available","adapterId":adapter,"qualified":true,"capabilities":capabilities,"models":models,"defaultModel":default}),
+        json!({"harness":harness,"version":observed.version,"installation":"available","adapterId":adapter,"qualified":true,"capabilities":capabilities,"models":observed.models,"defaultModel":observed.default_model}),
         agents,
     ))
 }
@@ -337,12 +312,8 @@ mod tests {
         assert_eq!(root, real);
         let document = json!({"agents":{"worker":{"skills":["review"]}},
             "skills":{"review":{"uri":"skills/review/SKILL.md"}}});
-        crate::agsdl_host_codex030::content::qualify_skill_folders(
-            &document,
-            &root,
-            Some(&location),
-        )
-        .unwrap();
+        crate::agsdl_host_content030::qualify_skill_folders(&document, &root, Some(&location))
+            .unwrap();
         std::fs::remove_dir_all(&real).unwrap();
         assert_eq!(
             captured_project_root(Some(&location)).unwrap_err().code,

@@ -1,6 +1,6 @@
 //! Development-only checks through the actual private native approval actor.
 use super::*;
-use crate::agsdl_host_codex030::approvals::CommandApprovals030;
+use crate::agsdl_host_action_approval030::CommandApprovals030;
 use crate::agsdl_host_human030::fixture::*;
 use crate::host::{ActionPolicyLease, ActionPolicySource, PolicyFuture};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};

@@ -154,6 +154,7 @@ impl CompileBroker {
         authored_source: String,
         registry_json: String,
         cancelled: &tokio_util::sync::CancellationToken,
+        available: argentic_core::calculation::AvailableHarnesses,
     ) -> Result<CompileReceipt> {
         let budget = SourceBudget::default();
         let registry = validate_input(&source, &authored_source, &registry_json, &budget)?;
@@ -199,11 +200,13 @@ impl CompileBroker {
                 cancelled,
                 raw_job,
                 move || {
-                    crate::calculation::compile_with_budget(
+                    argentic_core::calculation::compile_with_harnesses(
                         &captured_authored,
                         &source_json,
                         &registry_json,
+                        crate::native_numbers::normalize,
                         &compute_budget,
+                        &available,
                     )
                     .map_err(|error| {
                         if error.code == GRAPH_LIMIT_CODE {

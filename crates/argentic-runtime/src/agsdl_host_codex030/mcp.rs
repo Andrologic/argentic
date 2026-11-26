@@ -1,6 +1,6 @@
 //! Filtered per-work MCP sessions. Codex sees a loopback server with only the
 //! admitted tools. Upstream credentials and processes belong to Argentic.
-use super::{approvals::CommandApprovals030, AgentWork030};
+use super::{AgentWork030, CommandApprovals030};
 use crate::{
     agsdl_host_call_executor030::{agent_mcp_grant, mcp_server, remote_mcp, NoHuman},
     agsdl_host_calls::{raw_mcp, CallIdentity, Control, PhysicalEvidence},

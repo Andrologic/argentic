@@ -81,6 +81,7 @@ pub(crate) async fn deliver030(
             inspection.capture.source.clone(),
             inspection.capture.authored_source.clone(),
             registry.to_string(),
+            argentic_core::calculation::default_available_harnesses(),
         )
         .await?;
     let validation: Value = serde_json::from_str(&receipt.result_json)?;

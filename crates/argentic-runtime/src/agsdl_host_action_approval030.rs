@@ -1,7 +1,7 @@
 //! Existing native approval/resolution/delivery, owned entirely by runtime.
 use crate::{
     agsdl_host::HostState,
-    agsdl_host_codex::diagnostics::{self, Stage},
+    agsdl_host_diagnostics030::{self as diagnostics, Stage},
     agsdl_host_flow030 as flow,
     host::ActionPolicySource,
     persistence::{failure, Result},
@@ -15,13 +15,26 @@ pub(crate) struct AgentActionHumans030 {
     pub pool: SqlitePool,
     pub policy: Arc<dyn ActionPolicySource>,
 }
-impl crate::agsdl_host_codex030::approvals::CommandApprovals030 for AgentActionHumans030 {
+pub type Respond030<'a> = Box<dyn FnOnce(bool) -> BoxFuture<'a, Result<()>> + Send + 'a>;
+
+/// The existing human broker owns identity, deadlines and the final send gate.
+pub trait CommandApprovals030: Send + Sync {
+    fn answer<'a>(
+        &'a self,
+        work: &'a flow::FlowWorkAttempt030,
+        payload: serde_json::Value,
+        cancel: &'a CancellationToken,
+        respond: Respond030<'a>,
+    ) -> BoxFuture<'a, Result<()>>;
+}
+
+impl CommandApprovals030 for AgentActionHumans030 {
     fn answer<'a>(
         &'a self,
         attempt: &'a crate::agsdl_host_flow030::FlowWorkAttempt030,
         mut payload: serde_json::Value,
         cancel: &'a CancellationToken,
-        respond: crate::agsdl_host_codex030::approvals::Respond030<'a>,
+        respond: Respond030<'a>,
     ) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             let host = &self.host;
@@ -33,7 +46,10 @@ impl crate::agsdl_host_codex030::approvals::CommandApprovals030 for AgentActionH
                     .broker(host, &self.pool, attempt.identity())
                     .await,
             )?;
-            payload["title"] = payload["nativeRequest"]["params"]["reason"].clone();
+            if payload.get("title").is_none() {
+                // Legacy RPC payloads carry the title in the native reason field.
+                payload["title"] = payload["nativeRequest"]["params"]["reason"].clone();
+            }
             let (work, ticket) = {
                 let _operation = broker.operation.lock().await;
                 let work = diagnostics::at(
