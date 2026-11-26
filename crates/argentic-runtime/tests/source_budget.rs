@@ -163,14 +163,25 @@ fn measure<T>(name: &str, operation: impl Fn(&SourceBudget) -> T) -> (T, Sample)
     unreachable!()
 }
 
+/// GetProcessTimes advances kernel and user time in 15.625 ms ticks, so a
+/// fast sample can read zero. Allow one tick of each on Windows only.
+const CPU_CLOCK_SLACK: Duration = if cfg!(windows) {
+    Duration::from_micros(31_250)
+} else {
+    Duration::ZERO
+};
+
 fn scales(label: &str, small: Sample, large: Sample) {
     assert!(large.work > small.work, "{label}: work did not grow");
     let charged_ratio = large.work as f64 / small.work as f64;
     let cpu_ratio = large.cpu.as_secs_f64() / small.cpu.as_secs_f64();
     eprintln!("{label}: CPU {cpu_ratio:.2}x, work {charged_ratio:.2}x");
+    let allowed = small.cpu.mul_f64(4.0 * charged_ratio) + CPU_CLOCK_SLACK;
     assert!(
-        cpu_ratio <= 4.0 * charged_ratio,
-        "{label}: CPU ratio {cpu_ratio:.2} vs work {charged_ratio:.2}"
+        large.cpu <= allowed,
+        "{label}: CPU {:?} -> {:?} ({cpu_ratio:.2}x) vs work {charged_ratio:.2}x",
+        small.cpu,
+        large.cpu
     );
 }
 
