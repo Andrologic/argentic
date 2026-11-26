@@ -1,0 +1,77 @@
+# Changelog
+
+## Unreleased
+
+- Native local stdio MCP call steps can launch verified project assets from
+  a retained snapshot. `HostContext::with_mcp_secrets` supplies each server's
+  declared environment variables at spawn.
+- Native embeddings can authorize Streamable HTTP MCP endpoints and deliver
+  per-server secrets through bearer authentication or named headers. Remote
+  calls use pinned destinations and the existing call clock and response limits.
+- Codex agents can use MCP tools granted by their effective permissions.
+  Argentic owns the upstream connections and routes tool approval requests
+  through the existing human approval path.
+- Approved Codex MCP calls keep the current policy lease and Stop admission
+  gate until the request reaches the transport. Server-wide tool denials skip
+  endpoint consent and discovery.
+- Streamable HTTP preserves IPv6 interface scopes, sends the negotiated
+  protocol version after initialization, and attempts to close stateful
+  sessions on shutdown. Remote connection and discovery have deadlines.
+  Session DELETE uses the protocol version when known.
+- `HostContext::with_remote_mcp_tool_budget_ms` configures the remote MCP
+  tool budget for direct call steps and Codex tools. It defaults to 60
+  seconds. Local stdio MCP has no default tool budget. An authored
+  `timeoutMs` replaces the default and can grant more time. On host budget
+  expiry, a direct call with confirmed termination reports `CALL_FAILED`
+  and may follow `onError`. The Codex bridge checks the deadline before
+  handing off the HTTP body. Expiry before handoff returns a tool error.
+  Unconfirmed termination closes MCP admission immediately, interrupts the
+  active Codex turn and reports `MCP_TERMINATION_UNCERTAIN` to the run.
+- Native MCP preflight reports direct call and Codex equipment usage per
+  server. Unsupported endpoints block only when a direct call or eligible
+  Codex equipment uses that server.
+- Native hosts can select a replacement model and effort per agent at Start.
+  Inspection and replay read the frozen selection with the original source
+  identity.
+- Codex 0.171.0 is qualified on macOS ARM64 and Linux ARM64 for the
+  read-only profile with private login. The adapter isolates runtime sockets
+  and checks the platform's package layout, including the macOS exec-server
+  sibling.
+
+- Project opening and compilation share work and allocation budgets across
+  parsing, expansion, validation and output. `GRAPH_LIMIT` locates refusals,
+  including when diagnostics or the retained compiled plan exceed their limits.
+  Approval prompt checks reuse results across converging routes.
+- Project readers reserve selected file and ZIP buffers before allocation and
+  reuse verified file digests. Diagnostic producers stop at the report cap,
+  including JSON escapes. The native compiler preserves `GRAPH_LIMIT` pointers
+  and reports its 4,000,000-byte input limit as `INPUT_LIMIT`.
+- Project folders pin their root before reading the manifest and members,
+  and restore executable flags from the first matching lowercase AgSDL
+  sidecar on Windows. Direct local file opens reject reparse points.
+- Archive import reports `ARCHIVE_LAYOUT` for unaccounted ZIP bytes.
+- Project errors expose a file, local JSON pointer and diagnostic kind.
+  Component I/O failures and invalid JSON retain the `PROJECT` code.
+
+- Argentic runtime exposes the selected project files with their original bytes
+  and executable flags, and maps assembled JSON pointers to component files.
+- Hosts can write a deterministic AgSDL v0.5.0 snapshot archive without Git
+  history from an opened project folder or archive.
+- Hosts can interrupt and resume an open Codex work, and pause and resume an
+  AgSDL 0.4.0 run. Inspection reports holds and pauses, including their retained
+  state after an interrupted run. Flow approval deadlines continue during pause.
+- Native admission reconciles lost commit acknowledgements for operator
+  actions and deliveries before dispatch and work finalization. Resuming a
+  paused run preserves arrival order for steer fallbacks and uses the original
+  evidence when routing deferred failures, including failed steers and approval
+  timeouts.
+- Interrupting Codex preserves the first automatic plan reported through
+  the end of the turn. The journal preserves action answers and timeouts
+  when the hold closes their delivery. Confirmations received during a hold
+  retain the steer send's admission checkpoint for replay.
+- Stop binds superseded deadlines to physical termination and keeps prior
+  results and approval decisions. The agent result and its clock retirement
+  reservation commit together. Recovery retains the exact unevaluated clock
+  ticket when it fences an interrupted run.
+- Run state now stores `lastEventId`. Builds predating `9c49a0e` cannot read
+  run state written with this field.

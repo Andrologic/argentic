@@ -164,7 +164,10 @@ pub(crate) fn codex_permissions030(value: &serde_json::Value, pointer: &str) -> 
                 && p.outside.is_none_or(|o| o == Outside::Deny)
                 && p.reviewer != Some(Reviewer::Model)
                 && p.rules.iter().all(|r| {
-                    r.action == Action::Write && r.effect == Effect::Ask && r.pattern.is_none()
+                    r.action == Action::Mcp
+                        || (r.action == Action::Write
+                            && r.effect == Effect::Ask
+                            && r.pattern.is_none())
                 })
         }
         _ => false,
@@ -201,7 +204,8 @@ pub(crate) fn codex_read_only030(policy: &crate::permissions::EffectivePolicy) -
     for ceiling in policy.policies() {
         if !matches!(ceiling.preset(), Some(Preset::ReadOnly | Preset::Workspace))
             || ceiling.rules().iter().any(|r| {
-                r.action != Action::Write || r.effect != Effect::Ask || r.pattern.is_some()
+                r.action != Action::Mcp
+                    && (r.action != Action::Write || r.effect != Effect::Ask || r.pattern.is_some())
             })
             || !ceiling.directories().is_empty()
             || ceiling.reviewer() == Some(Reviewer::Model)
@@ -213,7 +217,11 @@ pub(crate) fn codex_read_only030(policy: &crate::permissions::EffectivePolicy) -
                 "The effective Codex permission ceiling cannot be represented by this slice",
             ));
         }
-        read_only |= ceiling.preset() == Some(Preset::ReadOnly) || !ceiling.rules().is_empty();
+        read_only |= ceiling.preset() == Some(Preset::ReadOnly)
+            || ceiling
+                .rules()
+                .iter()
+                .any(|rule| rule.action == Action::Write);
     }
     Ok(read_only)
 }
@@ -272,20 +280,15 @@ pub(crate) fn validate_codex_document_at030(
                     ));
                 }
             }
-            for key in ["mcpServers", "harnessSettings"] {
-                if agent.get(key).is_some_and(|value| {
-                    value.as_array().is_some_and(|v| !v.is_empty())
-                        || value.as_object().is_some_and(|v| !v.is_empty())
-                }) {
-                    return Err(failure(
-                        "HARNESS_CAPABILITY",
-                        &format!("{pointer}/{key}"),
-                        if key == "mcpServers" {
-                            "Agent MCP equipment is not qualified for correlated human waits and physical completion in this Codex adapter. Local MCP call steps remain available."
-                        } else {
-                            "This Codex option is not connected"
-                        },
-                    ));
+            if let Some(settings) = agent["harnessSettings"].as_object() {
+                for (key, value) in settings {
+                    if key != "webSearch" || value != "disabled" {
+                        return Err(failure(
+                            "HARNESS_CAPABILITY",
+                            &format!("{pointer}/harnessSettings/{}", pointer_token030(key)),
+                            "Only the isolated profile's disabled web search setting is supported",
+                        ));
+                    }
                 }
             }
             if agent["plan"] == true {
@@ -313,7 +316,11 @@ pub(crate) fn validate_codex_document_at030(
                     )
                 })?;
                 if !crate::content::file_helper::qualified_platform() {
-                    return Err(failure("CONTENT_SOURCE_UNSUPPORTED",&format!("{pointer}/uri"),"Local file content is unavailable on this platform"));
+                    return Err(failure(
+                        "CONTENT_SOURCE_UNSUPPORTED",
+                        &format!("{pointer}/uri"),
+                        "Local file content is unavailable on this platform",
+                    ));
                 }
             }
             if (object.contains_key("uri") || object.contains_key("value"))
@@ -760,14 +767,6 @@ impl PolicyLeases030 {
     ) -> Result<PreparedAgentWork030> {
         let capture = &inspection.capture;
         let state = &inspection.flow.state;
-        if capture.identity != effect.identity
-            || state.identity != capture.identity
-            || inspection.owner.system_start_id != capture.identity.system_start_id
-            || state.stopping
-            || state.verdict.is_some()
-        {
-            return Err(failure("CORRELATION", "work", "Flow snapshot differs"));
-        }
         let FlowEffectKind030::Start {
             work,
             step,
@@ -807,23 +806,6 @@ impl PolicyLeases030 {
             || activation.agent.as_deref() != Some(agent.as_str())
         {
             return Err(failure("CORRELATION", "work", "Agent activation differs"));
-        }
-        let encoded = serde_json::to_value(effect)?;
-        let matching = inspection
-            .flow
-            .effects
-            .iter()
-            .filter(|entry| {
-                entry.get("status").and_then(serde_json::Value::as_str) == Some("pending")
-                    && entry.get("effect") == Some(&encoded)
-            })
-            .count();
-        if matching != 1 {
-            return Err(failure(
-                "CORRELATION",
-                "work",
-                "Pending agent start is not unique",
-            ));
         }
         let engine_work = EngineWork {
             system_start_id: capture.identity.system_start_id.clone(),
@@ -911,6 +893,27 @@ pub(crate) async fn prepare_effective_agent_work030(
     effect: &FlowEffect030,
 ) -> Result<PreparedEffectiveAgentWork030> {
     let capture = &inspection.capture;
+    let state = &inspection.flow.state;
+    if capture.identity != effect.identity
+        || state.identity != capture.identity
+        || inspection.owner.system_start_id != capture.identity.system_start_id
+    {
+        return Err(failure("CORRELATION", "work", "Flow snapshot differs"));
+    }
+    let encoded = serde_json::to_value(effect)?;
+    if !crate::persistence::flow_store030::eligible(state, effect)
+        || !inspection
+            .flow
+            .effects
+            .iter()
+            .any(|row| row["status"] == "pending" && row["effect"] == encoded)
+    {
+        return Err(failure(
+            "STALE_REFERENCE",
+            "work",
+            "Agent Start is no longer pending and eligible",
+        ));
+    }
     let FlowEffectKind030::Start {
         work,
         step,

@@ -357,6 +357,8 @@ async fn codex_parallel_sessions_isolate_settings_missions_and_resources() {
     let root = f._temp.path().canonicalize().unwrap();
     let trace = root.join("parallel.jsonl");
     let profile = crate::agsdl_host_codex::profile::Profile {
+        mcp: None,
+        runtime: None,
         executable: root.join("fake-codex"),
         directory: root.join("profile"),
         home: root.join("profile/home"),

@@ -78,7 +78,12 @@ pub(crate) fn captured_work_contract030(
             step.get("submissionContractJson")
         }
         None => {
-            if plan.get("entry") != Some(&Value::Null) {
+            // AgSDL 0.4.0 permits a native host delivery to release a hold on
+            // a shared or named flow instance. The reducer admits that message
+            // and owns its Start before this contract is selected.
+            if snapshot.versions.contract != argentic_core::AGSDL_040
+                && plan.get("entry") != Some(&Value::Null)
+            {
                 return Err(failure(
                     "CORRELATION",
                     "contract",

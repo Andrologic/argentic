@@ -462,6 +462,43 @@ pub(crate) fn resolve_route_message(
     item: &ItemContext,
     content: &mut CapturedContent<'_>,
 ) -> Result<ResolvedMessage> {
+    resolve_route_message_using(
+        DeliveryDocument::Encoded(document_json),
+        target,
+        source,
+        item,
+        content,
+    )
+}
+
+pub(crate) fn resolve_route_message_in_document(
+    document: &Object,
+    target: &RouteTarget,
+    source: &RouteSource,
+    item: &ItemContext,
+    content: &mut CapturedContent<'_>,
+) -> Result<ResolvedMessage> {
+    resolve_route_message_using(
+        DeliveryDocument::Parsed(document),
+        target,
+        source,
+        item,
+        content,
+    )
+}
+
+enum DeliveryDocument<'a> {
+    Encoded(&'a str),
+    Parsed(&'a Object),
+}
+
+fn resolve_route_message_using(
+    document: DeliveryDocument<'_>,
+    target: &RouteTarget,
+    source: &RouteSource,
+    item: &ItemContext,
+    content: &mut CapturedContent<'_>,
+) -> Result<ResolvedMessage> {
     let RouteTarget::Step {
         step_json,
         message_json,
@@ -480,8 +517,14 @@ pub(crate) fn resolve_route_message(
     if !["agent", "approval", "compose"].contains(&exact::text(step.get("type"), "")?) {
         return fail("ROUTES", "", "This target receives no message.");
     }
-    let document_value = exact::decode(document_json)?;
-    let document = exact::record(Some(&document_value), "")?;
+    let decoded;
+    let document = match document {
+        DeliveryDocument::Encoded(json) => {
+            decoded = exact::decode(json)?;
+            exact::record(Some(&decoded), "")?
+        }
+        DeliveryDocument::Parsed(document) => document,
+    };
     let output_value = exact::decode(&source.output_json)?;
     let output = exact::record(Some(&output_value), "")?;
     let metadata = result_metadata(document, source)?;

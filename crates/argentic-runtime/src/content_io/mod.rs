@@ -7,6 +7,8 @@ mod macos_launcher;
 pub mod macos_launcher;
 #[cfg(windows)]
 mod windows_reader;
+#[cfg(windows)]
+pub(crate) use windows_reader::open_relative;
 
 use std::sync::Arc;
 pub type ContentResourceOwner =

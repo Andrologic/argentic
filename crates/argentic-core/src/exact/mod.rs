@@ -16,11 +16,11 @@ pub(crate) use scan::parse_shared;
 pub(crate) use values::{equal, stringify};
 
 use super::error::{fail, Failure};
-use std::mem;
+use std::{collections::HashMap, mem};
 
 /// An authored JSON number lexeme. Constructed only from text matching the
 /// JSON number grammar, the same domain the TS scanners produce.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct NumberToken {
     raw: String,
 }
@@ -57,6 +57,7 @@ pub(crate) enum Value {
 #[derive(Default)]
 pub(crate) struct Object {
     entries: Vec<(String, Value)>,
+    index: Option<HashMap<String, usize>>,
 }
 
 impl Object {
@@ -77,16 +78,26 @@ impl Object {
             *previous = value;
         } else {
             self.entries.push((key, value));
-            self.entries = scan::js_object_order(mem::take(&mut self.entries));
+            *self = Self::from_unique_entries(scan::js_object_order(mem::take(&mut self.entries)));
         }
     }
 
     /// Caller guarantees unique keys.
     pub(super) fn from_unique_entries(entries: Vec<(String, Value)>) -> Self {
-        Self { entries }
+        let index = (entries.len() > 16).then(|| {
+            entries
+                .iter()
+                .enumerate()
+                .map(|(index, (key, _))| (key.clone(), index))
+                .collect()
+        });
+        Self { entries, index }
     }
 
     pub(crate) fn get(&self, key: &str) -> Option<&Value> {
+        if let Some(index) = &self.index {
+            return index.get(key).map(|&index| &self.entries[index].1);
+        }
         self.entries
             .iter()
             .find(|(name, _)| name == key)
@@ -94,7 +105,7 @@ impl Object {
     }
 
     pub(crate) fn contains_key(&self, key: &str) -> bool {
-        self.entries.iter().any(|(name, _)| name == key)
+        self.get(key).is_some()
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -165,22 +176,39 @@ impl Value {
 /// hold the unpaired surrogates that JS would escape.
 pub(crate) fn quote(text: &str) -> String {
     let mut out = String::with_capacity(text.len() + 2);
-    out.push('"');
-    for c in text.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\u{8}' => out.push_str("\\b"),
-            '\u{c}' => out.push_str("\\f"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
+    quote_to(&mut out, text).expect("writing to a String");
+    out
+}
+
+pub(crate) fn quote_to(out: &mut (impl std::fmt::Write + ?Sized), text: &str) -> std::fmt::Result {
+    out.write_char('"')?;
+    let mut start = 0;
+    for (index, byte) in text.bytes().enumerate() {
+        if matches!(byte, b'"' | b'\\' | 0..=31) {
+            out.write_str(&text[start..index])?;
+            quote_char(out, char::from(byte))?;
+            start = index + 1;
+        } else if index - start >= 512 && text.is_char_boundary(index) {
+            out.write_str(&text[start..index])?;
+            start = index;
         }
     }
-    out.push('"');
-    out
+    out.write_str(&text[start..])?;
+    out.write_char('"')
+}
+
+pub(super) fn quote_char(out: &mut (impl std::fmt::Write + ?Sized), c: char) -> std::fmt::Result {
+    match c {
+        '"' => out.write_str("\\\""),
+        '\\' => out.write_str("\\\\"),
+        '\u{8}' => out.write_str("\\b"),
+        '\u{c}' => out.write_str("\\f"),
+        '\n' => out.write_str("\\n"),
+        '\r' => out.write_str("\\r"),
+        '\t' => out.write_str("\\t"),
+        c if (c as u32) < 0x20 => write!(out, "\\u{:04x}", c as u32),
+        c => out.write_char(c),
+    }
 }
 
 const PARSE_MESSAGE: &str = "Invalid or unsupported exact JSON.";

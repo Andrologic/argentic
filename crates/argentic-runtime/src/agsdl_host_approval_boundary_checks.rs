@@ -236,7 +236,7 @@ async fn rejected_case(kind: &str) {
         .await
         .unwrap();
     native_pump(&f).await;
-    let mut decision = f.broker.take_resolution(&f.host, &request).await.unwrap();
+    let mut decision = f.broker.action_resolution(&f.host, &request).await.unwrap();
     match kind {
         "foreign-identity" => decision.identity.snapshot_id.push_str("-foreign"),
         "foreign-owner" => decision.owner.owner_epoch.push_str("-foreign"),

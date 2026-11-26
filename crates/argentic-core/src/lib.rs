@@ -22,6 +22,7 @@ pub(crate) mod integers;
 pub(crate) mod messages;
 pub(crate) mod native;
 pub(crate) mod reader;
+mod resource;
 pub(crate) mod route;
 pub(crate) mod schema;
 
@@ -43,7 +44,15 @@ mod native_json;
 pub mod durable_json;
 pub mod flow;
 
-pub use reader::validate_document_json;
+pub use graph::{
+    GRAPH_LIMIT_CODE, MAX_COMPILED_GRAPH_JSON_BYTES, MAX_COMPOSITION_DEPTH,
+    MAX_EXPANDED_GRAPH_EDGES, MAX_EXPANDED_GRAPH_NODES,
+};
+pub use reader::{
+    check_source_json, parse_source_json, source_document_tokens_equal, source_json_equal,
+    validate_document_json, validate_document_json_with_budget, validate_source,
+};
+pub use resource::{SourceBudget, MAX_SOURCE_BYTES, MAX_SOURCE_JSON_DEPTH, MAX_SOURCE_WORK};
 
 /// Exact bundled harness-module bytes. Descriptive support never grants an effect.
 pub fn harness_module(name: &str) -> Option<&'static str> {

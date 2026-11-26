@@ -28,7 +28,7 @@ use sqlx::{Connection, SqlitePool};
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
 };
@@ -36,6 +36,9 @@ use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 pub(crate) trait AgentExecutor030: Send + Sync {
+    fn supports_operator_hold(&self) -> bool {
+        false
+    }
     /// Local preparation only. No provider IO while configuration leases live.
     fn prepare(&self, work: PreparedEffectiveAgentWork030) -> Result<AttestedWorkPolicy030>;
     /// Return only after native resources have ended or have been attached to
@@ -55,6 +58,7 @@ pub(crate) struct AgentWork030 {
     pub policy: crate::permissions::EffectivePolicy,
     pub tasks: StreamTasks,
     pub steer: crate::agsdl_host_steer030::SteerInbox030,
+    pub operator: flow::operator030::AgentOperator030,
 }
 
 pub(crate) type EventWriter030 = Arc<
@@ -239,6 +243,8 @@ pub(crate) struct StartedAgent030 {
     pub attempt: FlowWorkAttempt030,
     pub cancel: CancellationToken,
     returned: watch::Receiver<Option<Result<()>>>,
+    operator: watch::Sender<Option<String>>,
+    parked: Arc<AtomicBool>,
 }
 impl StartedAgent030 {
     async fn returned(&mut self) -> Result<()> {
@@ -285,6 +291,13 @@ pub(crate) async fn start_agent_work030(
     }
     let (steer, inbox) = crate::agsdl_host_steer030::channel030();
     let (returned, receiver) = watch::channel(None);
+    let (operator, commands) = watch::channel(None);
+    let parked = Arc::new(AtomicBool::new(false));
+    let operator_parked = parked.clone();
+    let operator_host = host.clone();
+    let operator_pool = pool.clone();
+    #[cfg(test)]
+    let test_host = host.clone();
     let mut started = None;
     let work_cancel = cancel.clone();
     let timeout = CancellationToken::new();
@@ -301,6 +314,9 @@ pub(crate) async fn start_agent_work030(
                 serial: Default::default(),
             };
             let work = AgentWork030 {
+                operator: flow::operator030::AgentOperator030::new(
+                    operator_host, operator_pool, attempt.clone(), commands, operator_parked,
+                ),
                 attempt,
                 capture: inspection.capture,
                 effect,
@@ -330,6 +346,10 @@ pub(crate) async fn start_agent_work030(
                     result = &mut running => result,
                 };
                 if let Err(error) = &result {
+                    if error.code == "MCP_TERMINATION_UNCERTAIN" {
+                        returned.send_replace(Some(Err(error.clone())));
+                        return;
+                    }
                     if !work_cancel.is_cancelled() {
                         // A fixed diagnostic is independent of the work protocol's
                         // closed failure enum. No raw provider fields are emitted.
@@ -347,6 +367,8 @@ pub(crate) async fn start_agent_work030(
                             )
                             .await;
                         if let Err(error) = diagnostics::at(&events.attempt, Stage::ExecutorStop, failure) {
+                            #[cfg(test)]
+                            test_host.flow030().operator_test_yield("work.failure.rejected").await;
                             returned.send_replace(Some(Err(error)));
                             return;
                         }
@@ -363,6 +385,8 @@ pub(crate) async fn start_agent_work030(
             .ok_or_else(|| failure("INTERRUPTED", "work", "Owned attempt was not constructed"))?,
         cancel,
         returned: receiver,
+        operator,
+        parked,
     })
 }
 
@@ -384,6 +408,9 @@ pub(crate) async fn finish_agent_work030(
 pub(crate) trait EffectDriver030: Send {
     fn before_pass(&mut self) -> BoxFuture<'_, Result<()>> {
         Box::pin(async { Ok(()) })
+    }
+    fn unpark_pending(&self) -> bool {
+        false
     }
     fn owns_effect(&self, _id: &str) -> bool {
         false
@@ -457,10 +484,20 @@ pub(crate) async fn drain_effects030(
     owner: &EngineOwner,
     driver: &mut dyn EffectDriver030,
     cancel: &CancellationToken,
-) -> Result<FlowView030> {
+) -> Result<Option<FlowView030>> {
     // Yield after a bounded batch; the supervisor immediately runs another
     // batch when effects remain, allowing Stop/completions between batches.
+    let dispatcher = host
+        .flow030()
+        .supervisors
+        .dispatcher(&owner.system_start_id);
     for _ in 0..256 {
+        #[cfg(test)]
+        host.flow030().operator_test_yield("supervisor.pass").await;
+        let _dispatch = match &dispatcher {
+            Some((gate, _)) => Some(gate.lock().await),
+            None => None,
+        };
         if cancel.is_cancelled() {
             return Err(failure(
                 "INTERRUPTED",
@@ -468,28 +505,41 @@ pub(crate) async fn drain_effects030(
                 "Supervisor was cancelled",
             ));
         }
+        if !flow::reconcile_dispatch_events030(host, pool, owner).await? {
+            return Ok(None);
+        }
         driver.before_pass().await?;
         let inspection = flow::inspect_run(host.flow030(), host, pool, owner).await?;
+        if !inspection.flow.state.stopping && driver.unpark_pending() {
+            return Ok(Some(inspection.flow));
+        }
         let Some(effect) = next_effect030(&inspection, |id| driver.owns_effect(id))? else {
-            return Ok(inspection.flow);
+            return Ok(Some(inspection.flow));
         };
         match &effect.kind {
-            FlowEffectKind030::Start { agent: Some(_), .. } => {
-                if let Err(error) = driver.start_agent(effect.clone()).await {
-                    // Stop can invalidate a pending Start between selection,
-                    // local preparation and claim. It did not start a provider.
+            FlowEffectKind030::Start { agent, .. } => {
+                #[cfg(test)]
+                host.flow030()
+                    .operator_test_yield(if agent.is_some() {
+                        "supervisor.agent.selected"
+                    } else {
+                        "supervisor.host.selected"
+                    })
+                    .await;
+                let result = if agent.is_some() {
+                    driver.start_agent(effect.clone()).await
+                } else {
+                    driver.start_host(inspection, effect.clone()).await
+                };
+                if let Err(error) = result {
+                    if error.code != "STALE_REFERENCE" {
+                        return Err(error);
+                    }
                     let fresh = flow::inspect_run(host.flow030(), host, pool, owner).await?;
-                    let unclaimed =
-                        fresh.flow.effects.iter().any(|row| {
-                            row["status"] == "pending" && row["effect"]["id"] == effect.id
-                        });
-                    if !fresh.flow.state.stopping || !unclaimed {
+                    if !fresh.start_withdrawn(&effect)? {
                         return Err(error);
                     }
                 }
-            }
-            FlowEffectKind030::Start { agent: None, .. } => {
-                driver.start_host(inspection, effect).await?
             }
             FlowEffectKind030::Steer { .. } => driver.steer(effect).await?,
             FlowEffectKind030::StopWork { .. } => driver.stop(effect).await?,
@@ -532,7 +582,7 @@ pub(crate) async fn drain_effects030(
     }
     flow::inspect_run(host.flow030(), host, pool, owner)
         .await
-        .map(|value| value.flow)
+        .map(|value| Some(value.flow))
 }
 
 /// Host extensions must start their work and return promptly. They own their
@@ -565,6 +615,8 @@ struct SupervisorHandle030 {
     cancel: CancellationToken,
     task: Option<tokio::task::JoinHandle<()>>,
     outcome: Option<Result<()>>,
+    dispatch: Arc<tokio::sync::Mutex<()>>,
+    supports_operator_hold: bool,
 }
 #[derive(Default)]
 pub(crate) struct RuntimeRegistry030(Mutex<BTreeMap<String, SupervisorHandle030>>);
@@ -604,6 +656,8 @@ impl RuntimeRegistry030 {
                 cancel: CancellationToken::new(),
                 task: None,
                 outcome: None,
+                dispatch: Arc::new(tokio::sync::Mutex::new(())),
+                supports_operator_hold: false,
             },
         );
         Ok(())
@@ -623,6 +677,11 @@ impl RuntimeRegistry030 {
                 }
             }
         }
+    }
+    pub(crate) fn dispatcher(&self, system: &str) -> Option<(Arc<tokio::sync::Mutex<()>>, bool)> {
+        let handles = self.0.lock().ok()?;
+        let handle = handles.get(system)?;
+        Some((handle.dispatch.clone(), handle.supports_operator_hold))
     }
     pub(crate) fn wake(&self, system: &str) {
         if let Ok(handles) = self.0.lock() {
@@ -671,6 +730,21 @@ impl RuntimeRegistry030 {
                 .map_err(|_| failure("INTERRUPTED", "runtime", "Supervisor wake channel closed"))?;
         }
     }
+    #[cfg(test)]
+    pub(crate) async fn crash_operator_fixture(&self, system: &str) {
+        let task = self
+            .0
+            .lock()
+            .unwrap()
+            .get_mut(system)
+            .unwrap()
+            .task
+            .take()
+            .unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+    }
+
     pub(crate) fn outcome(&self, system: &str) -> Option<Result<()>> {
         self.0.lock().ok()?.get(system)?.outcome.clone()
     }
@@ -682,7 +756,14 @@ struct LiveAgent030 {
     attempt: FlowWorkAttempt030,
     cancel: CancellationToken,
     stop: Option<(String, flow::ClaimedStopWork030)>,
+    operator: watch::Sender<Option<String>>,
+    parked: Arc<AtomicBool>,
 }
+struct AgentJoin030 {
+    joined: JoinedOwnedAgent030,
+    returned: Result<()>,
+}
+
 struct NativeDriver030<'a> {
     app: Option<&'a HostState>,
     emitter: Arc<dyn Fn(String) -> EventEmitter030 + Send + Sync>,
@@ -693,7 +774,7 @@ struct NativeDriver030<'a> {
     owner: &'a EngineOwner,
     executors: &'a Executors030,
     active: BTreeMap<String, LiveAgent030>,
-    joining: FuturesUnordered<BoxFuture<'a, (String, Result<JoinedOwnedAgent030>)>>,
+    joining: FuturesUnordered<BoxFuture<'a, (String, Result<AgentJoin030>)>>,
     joined: BTreeMap<String, JoinedOwnedAgent030>,
     ready: BTreeMap<String, JoinedOwnedAgent030>,
     approvals: BTreeMap<String, String>,
@@ -715,49 +796,97 @@ struct NativeDriver030<'a> {
 impl EffectDriver030 for NativeDriver030<'_> {
     fn before_pass(&mut self) -> BoxFuture<'_, Result<()>> {
         Box::pin(async move {
-            let Some(clock) = &self.executors.clock else {
-                return Ok(());
-            };
             let view =
                 flow::inspect_run(self.host.flow030(), self.host, self.pool, self.owner).await?;
             if view.flow.state.stopping || view.flow.state.verdict.is_some() {
                 return Ok(());
             }
-            if !clock.tracks_humans() {
+            if let Some(clock) = self
+                .executors
+                .clock
+                .as_ref()
+                .filter(|clock| clock.tracks_humans())
+            {
+                clock.tick().await?;
+                #[cfg(test)]
+                self.host
+                    .flow030()
+                    .operator_test_yield("supervisor.clock.return")
+                    .await;
+                let fresh =
+                    flow::inspect_run(self.host.flow030(), self.host, self.pool, self.owner)
+                        .await?;
+                if fresh.flow.state.stopping || fresh.flow.state.verdict.is_some() {
+                    return Ok(());
+                }
+                for (work, effect) in self.approvals.clone() {
+                    if fresh
+                        .flow
+                        .state
+                        .activations
+                        .iter()
+                        .any(|a| a.id == work && !a.physical)
+                    {
+                        self.approvals.remove(&work);
+                        self.in_flight.remove(&effect);
+                    }
+                }
+                let broker = self
+                    .host
+                    .flow030()
+                    .humans
+                    .broker(self.host, self.pool, &view.capture.identity)
+                    .await?;
+                for control in broker.timeout_controls().await? {
+                    if let Some(live) = self.active.get(&control.work_id().to_owned()) {
+                        live.timeout.cancel();
+                    } else if let Some((_, _, timeout)) = self.calls.get(control.work_id()) {
+                        timeout.cancel();
+                    }
+                }
+            }
+            if self.active.is_empty() || view.capture.versions.contract != argentic_core::AGSDL_040
+            {
                 return Ok(());
             }
-            clock.tick().await?;
-            let fresh =
-                flow::inspect_run(self.host.flow030(), self.host, self.pool, self.owner).await?;
-            for (work, effect) in self.approvals.clone() {
-                if fresh
-                    .flow
-                    .state
+            let _admission = self.host.admission_lock().lock_owned().await;
+            let raw: String = sqlx::query_scalar(
+                "SELECT state_json FROM engine_flow030_runs WHERE system_id=? AND invocation_id=?",
+            )
+            .bind(&view.capture.identity.system_start_id)
+            .bind(&view.capture.identity.flow_invocation_id)
+            .fetch_one(self.pool)
+            .await?;
+            let state: crate::persistence::flow030::FlowState030 = serde_json::from_str(&raw)?;
+            if state.stopping || state.verdict.is_some() {
+                return Ok(());
+            }
+            for (id, live) in &self.active {
+                if state
                     .activations
                     .iter()
-                    .any(|a| a.id == work && !a.physical)
+                    .any(|a| a.id == *id && a.stop_effect_id.is_some())
                 {
-                    self.approvals.remove(&work);
-                    self.in_flight.remove(&effect);
+                    continue;
                 }
-            }
-            let broker = self
-                .host
-                .flow030()
-                .humans
-                .broker(self.host, self.pool, &view.capture.identity)
-                .await?;
-            for control in broker.timeout_controls().await? {
-                if let Some(live) = self.active.get(&control.work_id().to_owned()) {
-                    live.timeout.cancel();
-                } else if let Some((_, _, timeout)) = self.calls.get(control.work_id()) {
-                    timeout.cancel();
-                }
+                let hold = state.operator_holds.get(id).map(|hold| hold.id.clone());
+                live.operator.send_if_modified(|current| {
+                    if *current == hold {
+                        return false;
+                    }
+                    *current = hold;
+                    true
+                });
             }
             Ok(())
         })
     }
 
+    fn unpark_pending(&self) -> bool {
+        self.active
+            .values()
+            .any(|work| work.parked.load(Ordering::Acquire) && work.operator.borrow().is_none())
+    }
     fn owns_effect(&self, id: &str) -> bool {
         self.in_flight.contains(id)
     }
@@ -771,14 +900,14 @@ impl EffectDriver030 for NativeDriver030<'_> {
                 .clock
                 .as_ref()
                 .is_some_and(|clock| clock.tracks_humans());
-            let (release, ready) =
-                if tracks_humans && inspection.capture.versions.contract == argentic_core::AGSDL_040
-                {
-                    let (release, ready) = tokio::sync::oneshot::channel();
-                    (Some(release), Some(ready))
-                } else {
-                    (None, None)
-                };
+            let (release, ready) = if tracks_humans
+                && inspection.capture.versions.contract == argentic_core::AGSDL_040
+            {
+                let (release, ready) = tokio::sync::oneshot::channel();
+                (Some(release), Some(ready))
+            } else {
+                (None, None)
+            };
             let mut started = start_agent_work030(
                 self.host,
                 self.pool,
@@ -827,20 +956,15 @@ impl EffectDriver030 for NativeDriver030<'_> {
                     attempt: started.attempt.clone(),
                     cancel: started.cancel.clone(),
                     stop: None,
+                    operator: started.operator.clone(),
+                    parked: started.parked.clone(),
                 },
             );
             let tasks = self.tasks;
             self.joining.push(Box::pin(async move {
-                // Even executor errors do not bypass the physical join.
-                let result = started.returned().await;
+                let returned = started.returned().await;
                 let joined = dispatch::join_owned_agent030(tasks, &started.attempt).await;
-                (
-                    key,
-                    match joined {
-                        Ok(joined) => result.map(|_| joined),
-                        Err(error) => Err(error),
-                    },
-                )
+                (key, joined.map(|joined| AgentJoin030 { joined, returned }))
             }));
             Ok(())
         })
@@ -984,6 +1108,23 @@ impl EffectDriver030 for NativeDriver030<'_> {
                 return Ok(());
             }
             if self.executors.humans.is_some() && work.agent_instance_id.is_none() {
+                let lease = self.host.start_lease().await?;
+                let control = self
+                    .host
+                    .flow030()
+                    .retiring_controls(lease.generation())?
+                    .into_iter()
+                    .find(|control| control.identity() == &effect.identity)
+                    .ok_or_else(|| failure("INTERRUPTED", "approval", "Flow owner absent"))?;
+                drop(lease);
+                if !self.approvals.contains_key(&work.activation_id)
+                    && control
+                        .settle_unadmitted(self.host.flow030(), self.pool, work)
+                        .await?
+                        .is_some()
+                {
+                    return Ok(());
+                }
                 let Some(claim) = flow::claim_expected(
                     self.host.flow030(),
                     self.host,
@@ -1030,15 +1171,6 @@ impl EffectDriver030 for NativeDriver030<'_> {
                 {
                     return Err(failure("INTERRUPTED", "approval", "Approval owner absent"));
                 }
-                let lease = self.host.start_lease().await?;
-                let control = self
-                    .host
-                    .flow030()
-                    .retiring_controls(lease.generation())?
-                    .into_iter()
-                    .find(|control| control.identity() == &effect.identity)
-                    .ok_or_else(|| failure("INTERRUPTED", "approval", "Flow owner absent"))?;
-                drop(lease);
                 let view = control.read(self.pool).await?;
                 control
                     .apply(
@@ -1154,6 +1286,7 @@ pub(crate) fn spawn_supervisor030(
             "Run already has a supervisor",
         ));
     }
+    handle.supports_operator_hold = executors.agents.supports_operator_hold();
     let receiver = handle.wake.subscribe();
     let cancel = handle.cancel.clone();
     let (task_app, system, task_cancel) =
@@ -1291,7 +1424,7 @@ pub(crate) async fn supervise_with_steer_port030(
         // Subscribe/mark observed BEFORE reading state. A wake during the read
         // remains unseen and changed() returns immediately on the next select.
         wake.borrow_and_update();
-        let view = drain_effects030(
+        let Some(view) = drain_effects030(
             host,
             pool,
             tasks,
@@ -1299,7 +1432,13 @@ pub(crate) async fn supervise_with_steer_port030(
             &mut driver,
             &CancellationToken::new(),
         )
-        .await?;
+        .await? else {
+            tokio::select! {
+                _ = cancel.cancelled() => return Err(failure("INTERRUPTED", "runtime", "Supervisor was cancelled")),
+                changed = wake.changed() => changed.map_err(|_| failure("INTERRUPTED", "runtime", "Supervisor wake channel closed"))?,
+            }
+            continue;
+        };
         let mut completed = false;
         for key in driver.ready.keys().cloned().collect::<Vec<_>>() {
             let joined = driver.ready.get(&key).unwrap().clone();
@@ -1307,6 +1446,8 @@ pub(crate) async fn supervise_with_steer_port030(
             if let Some((_, stop)) = &live.stop {
                 stop.control().settle_joined_diagnostic(host.flow030(), pool, &joined, Some(stop)).await?;
             } else {
+                #[cfg(test)]
+                host.flow030().operator_test_yield("supervisor.joined").await;
                 let result = flow_work_protocol030::finish_joined_agent030(host, pool, &joined, &CancellationToken::new()).await;
                 let fresh = flow::inspect_run(host.flow030(), host, pool, owner).await?;
                 let physical = fresh.flow.state.activations.iter().any(|a| a.id == key && a.physical);
@@ -1320,6 +1461,8 @@ pub(crate) async fn supervise_with_steer_port030(
                 if physical { return Err(failure("UNCERTAIN", "work", "Joined work has no terminal controller result")); }
             }
             if executors.clock.as_ref().is_some_and(|clock| clock.tracks_humans()) && live.stop.is_none() {
+                #[cfg(test)]
+                host.flow030().operator_test_yield("supervisor.retirement").await;
                 let broker = host.flow030().humans.broker(host, pool, joined.attempt().identity()).await?;
                 let _operation = broker.operation.lock().await;
                 let fresh=flow::inspect_run(host.flow030(),host,pool,owner).await?;
@@ -1347,7 +1490,7 @@ pub(crate) async fn supervise_with_steer_port030(
                 "Supervisor was cancelled after physical cleanup",
             ));
         }
-        if view.effects.iter().any(|row| {
+        if !driver.unpark_pending() && view.effects.iter().any(|row| {
             row["status"] == "pending"
                 && serde_json::from_value::<FlowEffect030>(row["effect"].clone()).is_ok_and(
                     |effect| {
@@ -1388,8 +1531,22 @@ pub(crate) async fn supervise_with_steer_port030(
                 }
                 if let Some((_, effect, _)) = driver.calls.remove(&key) { driver.in_flight.remove(&effect); }
             },
-            Some((key, joined)) = driver.joining.next(), if !driver.joining.is_empty() => {
-                driver.ready.insert(key, joined?);
+            Some((key, result)) = driver.joining.next(), if !driver.joining.is_empty() => {
+                let AgentJoin030 { joined, returned } = result?;
+                if let Err(error) = returned {
+                    if error.code == "MCP_TERMINATION_UNCERTAIN" {
+                        return Err(error);
+                    }
+                    // An executor can lose its last work event to Stop before
+                    // it sees cancellation. Preserve the physical join for
+                    // StopWork. Acquire admission only after selection, since
+                    // the next dispatch pass also needs that gate.
+                    let fresh = flow::inspect_run(host.flow030(), host, pool, owner).await?;
+                    if !fresh.flow.state.activations.iter().any(|a| a.id == key && a.stop_effect_id.is_some()) {
+                        return Err(error);
+                    }
+                }
+                driver.ready.insert(key, joined);
             },
             _ = async { if let Some(duration) = deadline { tokio::time::sleep(duration).await; } else { std::future::pending::<()>().await; } } => {
                 // The next dispatch pass arbitrates deadlines and joins.
@@ -1424,7 +1581,7 @@ pub(crate) async fn supervise_with_steer_port030(
         }
     }
     while let Some((_, result)) = driver.joining.next().await {
-        if let Err(error) = result {
+        if let Err(error) = result.and_then(|join| join.returned) {
             cleanup_error.get_or_insert(error);
         }
     }
@@ -1453,7 +1610,7 @@ pub(crate) async fn emit_work_event030(
     let policies = PolicyLeases030::acquire(config, project_id).await?;
     let lease = host.start_lease().await?;
     let gate = host.admission_lock().lock_owned().await;
-    host.flow030().available(attempt.identity())?;
+    flow::reconcile_admission030(host.flow030(), pool, &lease, attempt.identity()).await?;
     let parent = format!(
         "flow030:{}:{}",
         attempt.identity().system_start_id,

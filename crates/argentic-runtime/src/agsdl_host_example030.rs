@@ -219,6 +219,7 @@ impl crate::agsdl_host_runtime030::AgentExecutor030 for ScriptedExecutor030 {
                         value = &mut channels.outcome => break value.map_err(|_| failure("INTERRUPTED", "work", "Scripted outcome closed"))?,
                         delivery = channels.steer.receive() => {
                             let Some(delivery) = delivery else { return Ok(()); };
+                            drop(delivery.wire_admission().await?);
                             deliveries.push(delivery.effect().clone());
                             delivery.acknowledge(&work.tasks, &work.attempt)?;
                         }
@@ -350,7 +351,8 @@ async fn quiesce_scenario030(
         &mut driver,
         cancelled,
     )
-    .await
+    .await?
+    .ok_or_else(|| failure("UNCERTAIN", "runtime", "A flow event commit is unresolved"))
 }
 
 struct ScenarioDriver030<'a> {

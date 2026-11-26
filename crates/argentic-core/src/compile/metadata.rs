@@ -1,8 +1,5 @@
 //! Runtime guards for transport metadata. Shape never authenticates a caller.
-use crate::argentic_core::{
-    exact,
-    native::{fail, o, s, Error, Text, Value},
-};
+use crate::argentic_core::native::{fail, o, s, Error, Text, Value};
 type Result<T> = std::result::Result<T, Error>;
 pub(crate) fn object<'a>(v: &'a Value, p: &str, code: &'static str) -> Result<&'a [(Text, Value)]> {
     v.object()
@@ -23,16 +20,6 @@ pub(crate) fn identity(v: &Value, p: &str, code: &'static str) -> Result<Text> {
 pub(crate) fn array<'a>(v: &'a Value, p: &str) -> Result<&'a [Value]> {
     v.array()
         .ok_or_else(|| Error::new("UNSUPPORTED", p, "Expected a metadata array."))
-}
-pub(crate) fn json(v: &Value, p: &str) -> Result<String> {
-    let raw = text(v, p, "UNSUPPORTED")?;
-    let Some(raw) = raw.utf8() else {
-        return fail("UNSUPPORTED", p, "Expected validated exact JSON metadata.");
-    };
-    if exact::decode(&raw).is_err() {
-        return fail("UNSUPPORTED", p, "Expected validated exact JSON metadata.");
-    }
-    Ok(raw)
 }
 pub(crate) fn at(p: &Text, key: &Text) -> Text {
     let mut units = p.units().to_vec();

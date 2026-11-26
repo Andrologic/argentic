@@ -79,6 +79,14 @@ impl<'de> Deserialize<'de> for Members<'de> {
     }
 }
 pub(crate) fn parse(raw: &str, number: super::calculation::NativeNumber) -> Result<Value, Error> {
+    parse_charged(raw, number, |_| Ok(()))
+}
+
+fn parse_charged(
+    raw: &str,
+    number: super::calculation::NativeNumber,
+    mut visit: impl FnMut(&str) -> Result<(), Error>,
+) -> Result<Value, Error> {
     let root: &RawValue = serde_json::from_str(raw).map_err(|e| Error(e.to_string()))?;
     enum Task<'a> {
         Visit(&'a RawValue),
@@ -91,6 +99,7 @@ pub(crate) fn parse(raw: &str, number: super::calculation::NativeNumber) -> Resu
         match task {
             Task::Visit(raw) => {
                 let json = raw.get();
+                visit(json)?;
                 match json.as_bytes()[0] {
                     b'n' => values.push(Value::Null),
                     b't' => values.push(Value::Bool(true)),
@@ -133,11 +142,7 @@ pub(crate) fn parse(raw: &str, number: super::calculation::NativeNumber) -> Resu
             }
             Task::Object(keys) => {
                 let items = values.split_off(values.len() - keys.len());
-                let mut object = Value::Object(vec![]);
-                for (k, v) in keys.into_iter().zip(items) {
-                    object.set(k, v);
-                }
-                values.push(object);
+                values.push(Value::from_entries(keys.into_iter().zip(items)));
             }
         }
     }
@@ -146,6 +151,42 @@ pub(crate) fn parse(raw: &str, number: super::calculation::NativeNumber) -> Resu
 
 /// The integrated codec implements the core's durable, pure decoding port.
 pub(crate) struct Decoder(pub(crate) super::calculation::NativeNumber);
+impl Decoder {
+    /// The compiler already holds valid UTF-8 transport bytes. Charge each
+    /// nested raw parse and pass those bytes directly to the native decoder.
+    pub(crate) fn parse_source(
+        &self,
+        raw: &str,
+        at: &str,
+        budget: &crate::SourceBudget,
+    ) -> Result<Value, super::calculation::Failure> {
+        use super::calculation::Failure;
+        let syntax_error = |message| Failure {
+            code: "NATIVE_JSON".into(),
+            pointer: String::new(),
+            message,
+        };
+        budget.bytes(raw.len() * 2, at)?;
+        syntax::validate(&Text::from(raw)).map_err(|e| syntax_error(e.message.lossy()))?;
+        let mut limit = None;
+        let parsed = parse_charged(raw, self.0, |value| {
+            // Containers are scanned again by serde for each enclosing frame.
+            let size = value.len();
+            let charge = budget.work(1 + size.div_ceil(16), at).and_then(|()| {
+                if matches!(value.as_bytes()[0], b'"' | b'-' | b'0'..=b'9') {
+                    budget.bytes(size * 8, at)?;
+                }
+                Ok(())
+            });
+            charge.map_err(|error| {
+                limit = Some(error);
+                Error(String::new())
+            })
+        });
+        parsed.map_err(|error| limit.unwrap_or_else(|| syntax_error(error.0)))
+    }
+}
+
 impl JsonDecoder for Decoder {
     fn parse(&self, raw: &Text) -> Result<Value, SyntaxError> {
         syntax::validate(raw)?;

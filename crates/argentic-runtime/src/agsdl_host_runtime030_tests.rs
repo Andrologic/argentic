@@ -140,6 +140,20 @@ impl Fixture {
         Self::with_capabilities(document, run, &[]).await
     }
     async fn with_capabilities(document: Value, run: &str, capabilities: &[&str]) -> Self {
+        Self::start_fixture(document, run, capabilities, None).await
+    }
+    #[cfg(unix)]
+    async fn from_project(project: &std::path::Path) -> Self {
+        let opened = crate::source::OpenedSource::open_path(project).unwrap();
+        let document = serde_json::from_str(opened.authored_json()).unwrap();
+        Self::start_fixture(document, "system", &[], Some(opened)).await
+    }
+    async fn start_fixture(
+        document: Value,
+        run: &str,
+        capabilities: &[&str],
+        opened: Option<crate::source::OpenedSource>,
+    ) -> Self {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         let workspace = root.join("workspace");
@@ -147,11 +161,27 @@ impl Fixture {
         std::fs::create_dir(&workspace).unwrap();
         std::fs::create_dir(&metadata).unwrap();
         let (config, policy) = crate::test_context::context_with_policy(root.join("config"));
-        let authored = document.to_string();
+        let authored = opened.as_ref().map_or_else(
+            || document.to_string(),
+            |source| source.authored_json().to_owned(),
+        );
         let source = json!({"owner":{"projectId":"project","planId":"source","branch":"develop"},"revision":"1","sourceSha256":format!("{:x}",Sha256::digest(authored.as_bytes()))});
         let scope = json!({"projectId":"project","root":workspace,"rootIdentity":crate::content_io::admitted::workspace_root_identity(&workspace).unwrap().observation_key().unwrap(),"sourceOwner":source["owner"]});
+        let scope = if let Some(opened) = opened.as_ref() {
+            let mut scope = scope;
+            opened
+                .retain(config.root())
+                .unwrap()
+                .bind_scope(&mut scope)
+                .unwrap();
+            scope
+        } else {
+            scope
+        };
         let observed = crate::agsdl_host_codex::CodexObservation030 {
             profile: crate::agsdl_host_codex::Profile {
+                mcp: None,
+                runtime: None,
                 executable: root.join("synthetic-codex"),
                 directory: root.join("profile"),
                 home: root.join("profile/home"),
@@ -164,12 +194,12 @@ impl Fixture {
             ],
             account_digest: "synthetic-account".into(),
         };
-        let (harness, agents) = crate::test_context::codex_registry030(
-            &document,
-            source["sourceSha256"].as_str().unwrap(),
-            &scope,
-            &observed,
-        )
+        let digest = source["sourceSha256"].as_str().unwrap();
+        let (harness, agents) = if opened.is_some() {
+            crate::capture::codex_registry(&document, digest, &scope, &observed.into())
+        } else {
+            crate::test_context::codex_registry030(&document, digest, &scope, &observed)
+        }
         .unwrap();
         let mut registry = json!({"format":"macro-agsdl-registry/030","version":"fixture","modules":[{"harness":"codex","moduleJson":crate::agsdl_host_codex030::approvals::module030()}],"harnesses":[harness],"agents":agents,"hostCapabilities":[{"name":"approval","support":"native","evidenceJson":"{\"runtime\":\"synthetic-human-clock\"}"}]});
         for name in capabilities {
@@ -204,7 +234,7 @@ impl Fixture {
         let pool = crate::sqlite::create_file(&root.join("run.db"))
             .await
             .unwrap();
-        let request = serde_json::from_value(json!({"source":source,"profile":"macro-agsdl-030-v1", "associations":{}, "requestId":"request", "entry":{"deliveryId":"delivery", "messageJson":"{\"prompt\":\"Start\"}"}})).unwrap();
+        let request = serde_json::from_value(json!({"source":source,"profile":"macro-agsdl-030-v1", "associations":{}, "requestId":"request", "entry":document.get("flow").map(|_| json!({"deliveryId":"delivery", "messageJson":"{\"prompt\":\"Start\"}"}))})).unwrap();
         start030::start_linked(
             &pool,
             &request,
@@ -745,7 +775,8 @@ async fn stop_before_the_first_handoff_settles_an_unadmitted_start() {
         "contract": argentic_core::AGSDL_040, "id": "unadmitted-stop",
         "agents": {"worker": {"harness": "codex", "permissions": "workspace"}},
         "flow": {"entry": "first", "steps": {"first": {"type": "agent", "agent": "worker"}}}
-    })).await;
+    }))
+    .await;
     stop_fixture(&f, "stop-before-handoff").await;
     let tasks = StreamTasks::default();
     let starts = Arc::new(AtomicUsize::new(0));
@@ -786,20 +817,29 @@ async fn stop_before_the_first_handoff_settles_an_unadmitted_start() {
         .await
         .unwrap();
     assert_eq!(view.flow.state.verdict.as_deref(), Some("cancelled"));
-    let page = f.host.runtime_projection(
-        &f.pool,
-        crate::api::RuntimeProjectionQuery030 {
-            system_start_id: f.identity.system_start_id.clone(),
-            source: view.capture.source,
-            snapshot_id: None,
-        },
-        None,
-    ).await.unwrap();
-    let statuses = page.items.iter().find_map(|item| match item {
-        crate::agsdl_host_projection030::RuntimeProjectionItem030::Activation { value } =>
-            value.message.as_ref().map(|message| &message.statuses),
-        _ => None,
-    }).unwrap();
+    let page = f
+        .host
+        .runtime_projection(
+            &f.pool,
+            crate::api::RuntimeProjectionQuery030 {
+                system_start_id: f.identity.system_start_id.clone(),
+                source: view.capture.source,
+                snapshot_id: None,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    let statuses = page
+        .items
+        .iter()
+        .find_map(|item| match item {
+            crate::agsdl_host_projection030::RuntimeProjectionItem030::Activation { value } => {
+                value.message.as_ref().map(|message| &message.statuses)
+            }
+            _ => None,
+        })
+        .unwrap();
     assert_eq!(statuses, &["sent"]);
 }
 
@@ -1008,7 +1048,7 @@ async fn shutdown_failed_stop_does_not_commit_an_interruption_marker() {
     let f = Fixture::new(false).await;
     assert!(!f.host.shutdown_started());
     let approved = f.host.shutdown_active_runs(&f.pool).await.unwrap();
-    query("CREATE TRIGGER reject_shutdown_stop BEFORE INSERT ON engine_flow030_events WHEN NEW.event_id LIKE 'retire:%' BEGIN SELECT RAISE(ABORT, 'synthetic Stop persistence failure'); END")
+    query("CREATE TRIGGER reject_shutdown_stop BEFORE INSERT ON engine_flow030_events WHEN NEW.event_id LIKE 'system-stop:retire:%' BEGIN SELECT RAISE(ABORT, 'synthetic Stop persistence failure'); END")
         .execute(&f.pool).await.unwrap();
     assert!(f
         .host

@@ -51,12 +51,28 @@ pub enum RuntimeProjectionItem030 {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
+pub enum OperatorWorkState {
+    Holding,
+    Held,
+    Interrupted { code: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RuntimeProjectionPage030 {
     pub scope: RuntimeProjectionScope030,
     pub flow_invocation_id: String,
     pub revision: String,
     pub stopping: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub paused: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub interrupted_while_paused: bool,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub operator_works: std::collections::BTreeMap<String, OperatorWorkState>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub model_overrides: std::collections::BTreeMap<String, crate::capture::ModelOverride>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub termination_uncertain: bool,
     pub verdict: Option<String>,
@@ -136,6 +152,10 @@ fn page(
         flow_invocation_id: view.flow_invocation_id,
         revision: view.revision,
         stopping: view.stopping,
+        paused: false,
+        interrupted_while_paused: false,
+        operator_works: Default::default(),
+        model_overrides: Default::default(),
         termination_uncertain: false,
         verdict: view.verdict,
         total: total.to_string(),
@@ -145,7 +165,7 @@ fn page(
 }
 
 pub(crate) async fn read(
-    _host: &HostState,
+    host: &HostState,
     pool: &SqlitePool,
     query: RuntimeProjectionQuery030,
     continuation: Option<RuntimeProjectionContinuation030>,
@@ -199,6 +219,10 @@ pub(crate) async fn read(
             )
         })?;
     let mut page = page(scope, continuation, projection)?;
+    page.model_overrides = crate::capture::verify_model_overrides(
+        &plan,
+        &serde_json::from_str(&capture.registry_json)?,
+    )?;
     if plan.versions.contract == argentic_core::AGSDL_040 {
         let interrupted: bool = row.try_get("interrupted")?;
         let revoked: bool = row.try_get("revoked")?;
@@ -207,7 +231,33 @@ pub(crate) async fn read(
             page.stopping = false;
         }
         page.stopping &= page.verdict.is_none();
-        page.termination_uncertain = (interrupted || (revoked && page.verdict.is_none()))
+        page.paused = state.paused && page.verdict.is_none();
+        page.interrupted_while_paused = state.paused && interrupted;
+        page.operator_works = state
+            .operator_holds
+            .iter()
+            .map(|(id, hold)| {
+                let status = if interrupted {
+                    OperatorWorkState::Interrupted {
+                        code: "INTERRUPTED".into(),
+                    }
+                } else if hold.ready {
+                    OperatorWorkState::Held
+                } else {
+                    OperatorWorkState::Holding
+                };
+                (id.clone(), status)
+            })
+            .collect();
+        let mcp_uncertain = host
+            .flow030()
+            .supervisor_registry()
+            .outcome(&page.scope.system_start_id)
+            .is_some_and(|outcome| {
+                outcome.is_err_and(|error| error.code == "MCP_TERMINATION_UNCERTAIN")
+            });
+        page.termination_uncertain = (interrupted
+            || ((revoked || mcp_uncertain) && page.verdict.is_none()))
             && state
                 .activations
                 .iter()

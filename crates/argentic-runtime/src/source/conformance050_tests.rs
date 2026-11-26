@@ -163,35 +163,45 @@ fn notes_beside_the_manifest_leave_the_inventory_unchanged() {
     );
 }
 
-/// The official example equips the agent with a remote MCP server. The
-/// Argentic profile refuses both before a run starts, naming the component.
+/// Preserve component locations when a packaged project requests a capability
+/// outside the MCP or Codex profile.
 #[test]
-fn argentic_profile_refuses_the_official_example_with_located_diagnostics() {
+fn profile_accepts_the_official_example_and_locates_unsupported_options() {
     for input in [
         fixture("review-project"),
         fixture("review-project-history.agsdl"),
     ] {
         let opened = OpenedSource::open_path(&input).unwrap();
-        let doc: Value = serde_json::from_str(opened.authored_json()).unwrap();
-        let slice = crate::api::product_slice(opened.authored_json(), None).unwrap();
+        assert!(crate::api::product_slice(opened.authored_json(), None).is_none());
+
+        let mut doc: Value = serde_json::from_str(opened.authored_json()).unwrap();
+        doc["mcpServers"]["issues"]["url"] = json!("http://example.invalid/issues");
+        let report = crate::api::qualify_product(&doc, None, None).unwrap();
+        assert!(report.blocking_diagnostic().is_none());
+        let issue = report.mcp_servers["issues"].diagnostic.as_ref().unwrap();
         assert_eq!(
-            (slice.code.as_str(), slice.pointer.as_str()),
-            ("UNSUPPORTED_030_FEATURE", "/mcpServers/issues/url")
+            (issue.code.as_str(), issue.pointer.as_str()),
+            ("MCP_ENDPOINT_UNSUPPORTED", "/mcpServers/issues/url")
         );
-        let located = opened.locate_error(failure(&slice.code, &slice.pointer, &slice.message));
+        let located = opened.locate_error(failure(&issue.code, &issue.pointer, &issue.message));
         assert!(
             located.message.starts_with("mcp/issues.json"),
             "{}",
             located.message
         );
+
+        doc["agents"]["reviewer"]["harnessSettings"]["webSearch"] = json!("live");
         let codex = crate::api::validate_codex_document(&doc).unwrap_err();
         assert_eq!(
             (codex.code.as_str(), codex.pointer.as_str()),
-            ("HARNESS_CAPABILITY", "/agents/reviewer/mcpServers")
+            (
+                "HARNESS_CAPABILITY",
+                "/agents/reviewer/harnessSettings/webSearch"
+            )
         );
         let located = opened.locate_error(codex);
         assert!(
-            located.message.starts_with("agents/reviewer/agent.json"),
+            located.message.starts_with("harnesses/codex/reviewer.json"),
             "{}",
             located.message
         );

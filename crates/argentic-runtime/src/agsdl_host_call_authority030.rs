@@ -102,8 +102,8 @@ impl CallAuthority030 for NativeCallAuthority030<'_> {
             }
             let step: serde_json::Value = serde_json::from_str(declaration)?;
             let document: serde_json::Value = serde_json::from_str(&capture.authored_source)?;
-            if crate::agsdl_host_qualification030::product_slice030(
-                &capture.authored_source,
+            if crate::agsdl_host_qualification030::product_diagnostic030(
+                &document,
                 Some(&capture.compiled_plan_json),
             )
             .is_some()
@@ -114,9 +114,13 @@ impl CallAuthority030 for NativeCallAuthority030<'_> {
             }
             if let Some(mcp) = step.get("mcp") {
                 let server = mcp["server"].as_str().ok_or(StoreError030::Authority)?;
-                if document["mcpServers"][server]["command"]
-                    .as_array()
-                    .is_none()
+                let declaration = &document["mcpServers"][server];
+                if (!declaration["command"].is_array() && !declaration["url"].is_string())
+                    || crate::agsdl_host_qualification030::mcp_endpoint_diagnostic(
+                        server,
+                        declaration,
+                    )
+                    .is_some()
                 {
                     return Err(StoreError030::Authority);
                 }
@@ -133,7 +137,8 @@ mod tests {
 
     #[tokio::test]
     async fn native_authority_refuses_unqualified_transport_and_foreign_generation() {
-        let f = Fixture::new(r#"{"type":"call","command":"true"}"#).await;
+        // This call names an MCP server absent from the retained capture.
+        let f = Fixture::new(r#"{"type":"call","mcp":{"server":"missing","tool":"check"}}"#).await;
         let owner = EngineOwner {
             system_start_id: f.id.system_start_id.clone(),
             owner_epoch: "owner".into(),
@@ -142,9 +147,10 @@ mod tests {
         let authority = NativeCallAuthority030::capture(&host, &owner)
             .await
             .unwrap();
-        assert!(calls::reserve_call030(&f.pool, &authority, &f.effect)
-            .await
-            .is_err());
+        let Err(error) = calls::reserve_call030(&f.pool, &authority, &f.effect).await else {
+            panic!("Native authority reserved a call with no captured server");
+        };
+        assert_eq!(error.code, "AUTHORITY");
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM engine_flow030_calls")
             .fetch_one(&f.pool)
             .await
@@ -156,7 +162,10 @@ mod tests {
             .await
             .unwrap();
         let mut tx = f.pool.begin().await.unwrap();
-        assert!(authority.owner(&mut tx, &f.id).await.is_err());
+        assert!(matches!(
+            authority.owner(&mut tx, &f.id).await,
+            Err(StoreError030::Authority)
+        ));
     }
 
     #[tokio::test]

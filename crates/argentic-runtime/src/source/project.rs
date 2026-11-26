@@ -1,21 +1,31 @@
 use super::{
-    archive, invalid, io, parse_json, read_regular, Files, MANIFEST, MAX_FILES, MAX_JSON,
-    MAX_JSON_TOTAL, MAX_TOTAL,
+    archive, bounded_read, encode_document, invalid, io, member, open_regular, parse_json,
+    project_failure, read_limit, read_regular, source_limit, Files, SourceBudget, GRAPH_LIMIT_CODE,
+    MANIFEST, MAX_FILES, MAX_JSON, MAX_JSON_TOTAL, MAX_TOTAL,
 };
-use crate::persistence::Result;
-use cap_std::{ambient_authority, fs::Dir};
+use crate::persistence::{dto::SourceErrorKind, Result};
+use cap_std::fs::Dir;
 use percent_encoding::{percent_decode_str, utf8_percent_encode, NON_ALPHANUMERIC};
 use serde_json::{Map, Value};
 use std::{
     collections::{BTreeMap, BTreeSet},
+    io::Read,
     path::{Path, PathBuf},
     sync::OnceLock,
 };
+
+/// Allocation charged before listing one skill directory. On Windows,
+/// cap-std resolves the directory path first through a zeroed buffer of
+/// 32,767 UTF-16 units (64 KiB) in `winx::file::get_file_path`.
+const DIRECTORY_STREAM_BYTES: usize = if cfg!(windows) { 72 * 1024 } else { 4096 };
+const MODE_SIDECAR: &str = ".agsdl-executables";
+const MODE_HEADER: &[u8] = b"AgSDL executable paths v1\n";
 
 const SECTIONS: &[&str] = &["agents", "compositions", "content", "skills", "mcpServers"];
 
 pub(super) struct Project {
     pub document: Value,
+    pub(super) budget: SourceBudget,
     pub secrets: BTreeMap<String, Vec<String>>,
     pub mcp_files: BTreeMap<String, Vec<String>>,
     pub files: Files,
@@ -23,12 +33,7 @@ pub(super) struct Project {
 }
 
 impl Project {
-    pub fn location(&self, pointer: &str) -> String {
-        let (file, local) = self.origin(pointer);
-        format!("{file}#{local}")
-    }
-
-    fn origin<'a>(&'a self, pointer: &'a str) -> (&'a str, &'a str) {
+    pub(super) fn origin<'a>(&'a self, pointer: &'a str) -> (&'a str, &'a str) {
         let mut prefix = pointer;
         loop {
             if let Some(file) = self.origins.get(prefix) {
@@ -55,8 +60,9 @@ fn scheme(uri: &str) -> Option<&str> {
     .then_some(prefix)
 }
 
-struct Reader {
-    dir: Option<(Dir, PathBuf)>,
+struct Reader<'a> {
+    dir: Option<&'a Dir>,
+    budget: SourceBudget,
     files: Files,
     selected: BTreeSet<String>,
     skills: BTreeSet<String>,
@@ -65,29 +71,125 @@ struct Reader {
     total: u64,
 }
 
+#[cfg(test)]
 pub(super) fn assemble_folder(
-    path: &Path,
+    dir: Dir,
     manifest: Option<super::ProjectFile>,
+    native_modes: bool,
 ) -> Result<Project> {
-    let dir = Dir::open_ambient_dir(path, ambient_authority()).map_err(|e| io(path, e))?;
-    let root = path.canonicalize().map_err(|e| io(path, e))?;
-    let mut reader = Reader::new(Some((dir, root)), Files::new());
+    assemble_folder_with_budget(dir, manifest, native_modes, SourceBudget::default())
+}
+
+pub(super) fn assemble_folder_with_budget(
+    dir: Dir,
+    manifest: Option<super::ProjectFile>,
+    native_modes: bool,
+    budget: SourceBudget,
+) -> Result<Project> {
+    let mut reader = Reader::new(Some(&dir), Files::new(), budget);
+
     if let Some(file) = manifest {
         let canonical = reader.resolve(MANIFEST, MANIFEST, "")?;
         reader.total = file.bytes.len() as u64;
         reader.files.insert(canonical, file);
     }
-    reader.assemble()
+    let mut project = reader.assemble()?;
+    if !native_modes {
+        for file in project.files.values_mut() {
+            file.executable = false;
+        }
+        restore_executable_modes(&dir, &mut project.files, &project.budget)?;
+    }
+    Ok(project)
 }
 
-pub(super) fn assemble_archive(files: Files) -> Result<Project> {
-    Reader::new(None, files).assemble()
+fn sidecar_name(name: &str) -> bool {
+    let Some((prefix, suffix)) = name.split_at_checked(MODE_SIDECAR.len()) else {
+        return false;
+    };
+    prefix == MODE_SIDECAR
+        && (suffix.is_empty()
+            || suffix.strip_prefix('.').is_some_and(|suffix| {
+                !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit())
+            }))
 }
 
-impl Reader {
-    fn new(dir: Option<(Dir, PathBuf)>, files: Files) -> Self {
+fn restore_executable_modes(dir: &Dir, files: &mut Files, budget: &SourceBudget) -> Result<()> {
+    let root = Path::new(MANIFEST);
+    // Both folder and archive assembly preserve the project's selection.
+    // Only a root file outside it can carry unpacker metadata.
+    for name in files.keys() {
+        budget
+            .work(name.len().div_ceil(8) + 1, "")
+            .and_then(|()| budget.bytes(name.len() * 3 + 64, ""))
+            .map_err(|e| source_limit(MANIFEST, e))?;
+    }
+    let selected = files
+        .keys()
+        .map(|name| archive::path_key(name))
+        .collect::<BTreeSet<_>>();
+    for entry in dir.entries().map_err(|e| io(root, e))? {
+        budget.work(16, "").map_err(|e| source_limit(MANIFEST, e))?;
+        let entry = entry.map_err(|e| io(root, e))?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str().filter(|name| sidecar_name(name)) else {
+            continue;
+        };
+        if selected.contains(&archive::path_key(name))
+            || !entry
+                .file_type()
+                .map_err(|e| io(Path::new(name), e))?
+                .is_file()
+        {
+            continue;
+        }
+        let path = Path::new(name);
+        let mut input = open_regular(dir, path).map_err(|e| io(path, e))?;
+        let mut header = [0; MODE_HEADER.len()];
+        match input.read_exact(&mut header) {
+            Ok(()) if header == MODE_HEADER => {}
+            Ok(()) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => continue,
+            Err(error) => return Err(io(path, error)),
+        }
+        let size = input
+            .metadata()
+            .map_err(|e| io(path, e))?
+            .len()
+            .saturating_sub(MODE_HEADER.len() as u64);
+        let bytes = bounded_read(input, size, archive::INDEX_LIMIT, budget).map_err(|e| {
+            if let Some(error) = read_limit(name, &e) {
+                error
+            } else if e.kind() == std::io::ErrorKind::FileTooLarge {
+                invalid(name, "", "Executable metadata exceeds the 2 MiB limit")
+            } else {
+                io(path, e)
+            }
+        })?;
+        budget
+            .work(bytes.len().div_ceil(8), "")
+            .map_err(|e| source_limit(name, e))?;
+        let paths = std::str::from_utf8(&bytes)
+            .map_err(|_| invalid(name, "", "Executable metadata must be UTF-8"))?;
+        for path in paths.split_terminator('\n') {
+            if let Some(file) = files.get_mut(path) {
+                file.executable = true;
+            }
+        }
+        return Ok(());
+    }
+    Ok(())
+}
+
+pub(super) fn assemble_archive(files: Files, budget: SourceBudget) -> Result<Project> {
+    Reader::new(None, files, budget).assemble()
+}
+
+impl<'a> Reader<'a> {
+    fn new(dir: Option<&'a Dir>, files: Files, budget: SourceBudget) -> Self {
         Self {
             dir,
+            budget,
             files,
             selected: BTreeSet::new(),
             skills: BTreeSet::new(),
@@ -99,6 +201,10 @@ impl Reader {
 
     fn select(&mut self, path: &str, limit: u64) -> Result<()> {
         // Folder and archive inputs select the same portable names.
+        self.budget
+            .work(1 + path.len().div_ceil(8), "")
+            .and_then(|()| self.budget.bytes(128 + path.len() * 4, ""))
+            .map_err(|e| source_limit(path, e))?;
         archive::portable(path)?;
         for (end, _) in path
             .match_indices('/')
@@ -111,19 +217,28 @@ impl Reader {
             return Err(invalid(path, "", "Too many selected project files"));
         }
         if !self.files.contains_key(path) {
-            let (dir, _) = self
+            let dir = self
                 .dir
                 .as_ref()
                 .ok_or_else(|| invalid(path, "", "File absent from archive inventory"))?;
             let remaining = MAX_TOTAL - self.total;
-            let file = read_regular(dir, Path::new(path), limit.min(remaining)).map_err(|e| {
-                let own_size = dir.symlink_metadata(path).map_or(0, |meta| meta.len());
-                if e.kind() == std::io::ErrorKind::FileTooLarge && own_size <= limit {
-                    invalid(path, "", "Project selection exceeds the 256 MiB total")
-                } else {
-                    invalid(path, "", &e.to_string())
-                }
-            })?;
+            let file = read_regular(dir, Path::new(path), limit.min(remaining), &self.budget)
+                .map_err(|e| {
+                    if let Some(error) = read_limit(path, &e) {
+                        return error;
+                    }
+                    let own_size =
+                        member::metadata(dir, Path::new(path)).map_or(0, |meta| meta.len());
+                    match e.kind() {
+                        std::io::ErrorKind::FileTooLarge if own_size <= limit => {
+                            invalid(path, "", "Project selection exceeds the 256 MiB total")
+                        }
+                        std::io::ErrorKind::FileTooLarge | std::io::ErrorKind::InvalidData => {
+                            invalid(path, "", &e.to_string())
+                        }
+                        _ => io(Path::new(path), e),
+                    }
+                })?;
             self.total += file.bytes.len() as u64;
             self.files.insert(path.to_owned(), file);
         }
@@ -133,6 +248,16 @@ impl Reader {
     /// Record one path's spelling. Names that differ only by case folding
     /// or Unicode normalization collide, including directory names.
     fn spell(&mut self, part: &str, path: &str) -> Result<()> {
+        self.spell_charged_to(part, path, path)
+    }
+
+    /// Like `spell`, but a budget exhaustion names `owner`, the component
+    /// whose walk is paying, while a collision still names `path`.
+    fn spell_charged_to(&mut self, part: &str, owner: &str, path: &str) -> Result<()> {
+        self.budget
+            .work(1 + part.len().div_ceil(8), "")
+            .and_then(|()| self.budget.bytes(part.len() * 3 + 64, ""))
+            .map_err(|e| source_limit(owner, e))?;
         if self
             .spellings
             .insert(archive::path_key(part), part.into())
@@ -149,7 +274,13 @@ impl Reader {
     }
 
     fn resolve(&mut self, owner: &str, name: &str, pointer: &str) -> Result<String> {
-        let error = |detail| invalid(owner, pointer, &format!("{detail}: {name:?}"));
+        self.budget
+            .work(1 + name.len().div_ceil(8), pointer)
+            .map_err(|e| source_limit(owner, e))?;
+        let error = |detail| {
+            let shown = &name[..name.floor_char_boundary(name.len().min(160))];
+            invalid(owner, pointer, &format!("{detail}: {shown:?}"))
+        };
         if name.is_empty()
             || name.starts_with('/')
             || name.contains('\\')
@@ -184,14 +315,25 @@ impl Reader {
                     parts.push(part);
                     // As the official reader does, a component used only on
                     // the way to `..` still needs a portable, consistent name.
+                    let bytes = parts.iter().map(|part| part.len() + 1).sum::<usize>();
+                    self.budget
+                        .work(1 + bytes.div_ceil(8), pointer)
+                        .map_err(|e| source_limit(owner, e))?;
+                    self.budget
+                        .bytes(128 + bytes * 5, pointer)
+                        .map_err(|e| source_limit(owner, e))?;
                     let walked = parts.join("/");
                     archive::portable(&walked).map_err(|_| error("Invalid portable path"))?;
-                    self.spell(&walked, &walked)
-                        .map_err(|_| error("Case collision or too many project paths"))?;
-                    if let Some((dir, _)) = &self.dir {
-                        if dir
-                            .symlink_metadata(parts.join("/"))
-                            .is_ok_and(|meta| meta.is_symlink())
+                    self.spell(&walked, &walked).map_err(|cause| {
+                        if cause.code == GRAPH_LIMIT_CODE {
+                            cause
+                        } else {
+                            error("Case collision or too many project paths")
+                        }
+                    })?;
+                    if let Some(dir) = &self.dir {
+                        if member::metadata(dir, Path::new(&walked))
+                            .is_ok_and(|meta| member::is_link(&meta))
                         {
                             return Err(error("Path contains a symbolic link"));
                         }
@@ -211,7 +353,7 @@ impl Reader {
 
     fn is_file(&self, path: &str) -> bool {
         match &self.dir {
-            Some((dir, _)) => dir.symlink_metadata(path).is_ok_and(|meta| meta.is_file()),
+            Some(dir) => member::metadata(dir, Path::new(path)).is_ok_and(|meta| meta.is_file()),
             None => self.files.contains_key(path),
         }
     }
@@ -229,7 +371,7 @@ impl Reader {
                 "Project JSON exceeds per-file or aggregate limit",
             ));
         }
-        parse_json(bytes, file, true)
+        parse_json(bytes, file, true, &self.budget)
     }
 
     fn component(
@@ -238,6 +380,12 @@ impl Reader {
         value: Value,
         pointer: &str,
     ) -> Result<Value> {
+        self.budget
+            .work(1, pointer)
+            .map_err(|e| source_limit(MANIFEST, e))?;
+        self.budget
+            .bytes(pointer.len() + 96, pointer)
+            .map_err(|e| source_limit(MANIFEST, e))?;
         if value
             .as_object()
             .is_some_and(|object| object.len() == 1 && object.contains_key("file"))
@@ -280,6 +428,7 @@ impl Reader {
         let secrets = manifest.remove("secrets");
         let mut project = Project {
             document: Value::Null,
+            budget: self.budget.clone(),
             secrets: BTreeMap::new(),
             mcp_files: BTreeMap::new(),
             files: Files::new(),
@@ -399,6 +548,15 @@ impl Reader {
                             &path,
                             &child(&pointer, &i.to_string()),
                             "Invalid secret name",
+                        ));
+                    }
+                    if super::mcp_secret_is_reserved(name) {
+                        return Err(project_failure(
+                            "MCP_SECRET_RESERVED",
+                            &path,
+                            &child(&pointer, &i.to_string()),
+                            SourceErrorKind::InvalidContent,
+                            "MCP secret name is reserved by the launcher",
                         ));
                     }
                 }
@@ -523,6 +681,9 @@ impl Reader {
             return Ok(());
         };
         let pointer = child(pointer, "uri");
+        self.budget
+            .work(1 + uri.len().div_ceil(8), &pointer)
+            .map_err(|e| source_limit(owner, e))?;
         if let Some(scheme) = scheme(uri) {
             return if scheme.eq_ignore_ascii_case("file") {
                 Err(invalid(
@@ -548,12 +709,24 @@ impl Reader {
             self.resolve(owner, &path, &pointer)?
         };
         self.select(&task, MAX_TOTAL).map_err(|cause| {
-            // `select` already names the selected file; keep one location.
+            if cause.code == GRAPH_LIMIT_CODE {
+                return cause;
+            }
+            // Keep the authored URI in the error and locate an I/O failure
+            // at the resource itself.
             let detail = cause
                 .message
                 .strip_prefix(&format!("{task}#: "))
                 .unwrap_or(&cause.message);
-            invalid(owner, &pointer, &format!("{task}: {detail}"))
+            let mut error = invalid(owner, &pointer, &format!("{task}: {detail}"));
+            if cause
+                .source
+                .as_ref()
+                .is_some_and(|location| location.kind == SourceErrorKind::Io)
+            {
+                error.source = cause.source;
+            }
+            error
         })?;
         const ENCODE: percent_encoding::AsciiSet = NON_ALPHANUMERIC
             .remove(b'/')
@@ -561,6 +734,9 @@ impl Reader {
             .remove(b'.')
             .remove(b'_')
             .remove(b'~');
+        self.budget
+            .bytes(task.len() * 3 + uri.len() - split, &pointer)
+            .map_err(|e| source_limit(owner, e))?;
         source["uri"] = Value::from(format!(
             "{}{}",
             utf8_percent_encode(&task, &ENCODE),
@@ -580,37 +756,62 @@ impl Reader {
     }
 
     fn skill_tree(&mut self, directory: &str) -> Result<()> {
-        if !self.skills.insert(directory.to_owned()) {
+        if self.skills.contains(directory) {
             return Ok(());
         }
-        let mut pending = vec![PathBuf::from(directory)];
-        let mut entries = 0;
-        if let Some((dir, _)) = &self.dir {
+        let reserve = |budget: &SourceBudget, bytes| {
+            budget
+                .bytes(bytes, "")
+                .map_err(|e| source_limit(directory, e))
+        };
+        reserve(&self.budget, 256 + directory.len() * 3)?;
+        self.skills.insert(directory.to_owned());
+        if let Some(dir) = self.dir {
+            let mut pending = vec![PathBuf::from(directory)];
             let mut names = Vec::new();
-            let mut directories = Vec::new();
+            let mut entries = 0;
             while let Some(path) = pending.pop() {
-                for item in dir.read_dir(&path).map_err(|e| io(&path, e))? {
+                let path_len = path.as_os_str().len();
+                // The directory stream has a buffer of its own. Reopening
+                // the pinned path also allocates component names and handles.
+                reserve(
+                    &self.budget,
+                    DIRECTORY_STREAM_BYTES + path_len * 2 + path.components().count() * 128,
+                )?;
+                let mut children =
+                    member::with_directory(dir, &path, Dir::entries).map_err(|e| io(&path, e))?;
+                loop {
+                    // Both the iterator and file_name() allocate a name.
+                    reserve(&self.budget, 2048)?;
+                    let Some(item) = children.next() else {
+                        break;
+                    };
                     let item = item.map_err(|e| io(&path, e))?;
-                    let relative = path.join(item.file_name());
+                    let basename = item.file_name();
+                    let length = path_len + basename.len() + 1;
+                    self.budget
+                        .work(1 + length.div_ceil(8), "")
+                        .map_err(|e| source_limit(directory, e))?;
+                    // Reserve the joined path, portable spelling and growth
+                    // of the vectors retaining pending paths or files.
+                    reserve(&self.budget, 128 + length * 8)?;
+                    let relative = path.join(basename);
                     entries += 1;
                     if entries > 16_384 || relative.components().count() > 64 {
                         return Err(invalid(directory, "", "Skill tree exceeds path limits"));
                     }
                     let ty = item.file_type().map_err(|e| io(&relative, e))?;
+                    let name = relative
+                        .to_str()
+                        .ok_or_else(|| invalid(directory, "", "Expected UTF-8 skill path"))?
+                        .replace(std::path::MAIN_SEPARATOR, "/");
                     if ty.is_dir() {
-                        // The official walk checks directories too, including
-                        // empty ones that select no file.
-                        let name = relative
-                            .to_str()
-                            .ok_or_else(|| invalid(directory, "", "Expected UTF-8 skill path"))?
-                            .replace(std::path::MAIN_SEPARATOR, "/");
-                        directories.push(name);
+                        // The official walk checks empty directories too.
+                        archive::portable(&name)?;
+                        self.spell_charged_to(&name, directory, &name)?;
                         pending.push(relative);
                     } else if ty.is_file() {
-                        let name = relative
-                            .to_str()
-                            .ok_or_else(|| invalid(directory, "", "Expected UTF-8 skill path"))?;
-                        names.push(name.replace(std::path::MAIN_SEPARATOR, "/"));
+                        names.push(name);
                     } else {
                         return Err(invalid(
                             directory,
@@ -620,22 +821,19 @@ impl Reader {
                     }
                 }
             }
-            for name in directories {
-                archive::portable(&name)?;
-                self.spell(&name, &name)?;
-            }
             for name in names {
                 self.select(&name, MAX_TOTAL)?;
             }
         } else {
             let prefix = format!("{directory}/");
-            let names: Vec<_> = self
-                .files
-                .range(prefix.clone()..)
-                .map(|(name, _)| name)
-                .take_while(|name| name.starts_with(&prefix))
-                .cloned()
-                .collect();
+            let mut names = Vec::new();
+            for (name, _) in self.files.range(prefix.clone()..) {
+                if !name.starts_with(&prefix) {
+                    break;
+                }
+                reserve(&self.budget, 64 + name.len())?;
+                names.push(name.clone());
+            }
             for name in names {
                 self.select(&name, MAX_TOTAL)?;
             }
@@ -645,26 +843,22 @@ impl Reader {
 }
 
 fn validate(project: &Project) -> Result<()> {
-    let authored = serde_json::to_vec(&project.document)?;
-    let report = argentic_core::validate_document_json(&authored, None)
-        .map_err(|e| invalid(MANIFEST, &e.pointer, &e.message))?;
-    let report: Value = serde_json::from_str(&report)?;
-    if !report["valid"].as_bool().unwrap_or(false) {
-        let diagnostic = report["diagnostics"]
-            .as_array()
-            .and_then(|items| items.iter().find(|d| d["severity"] == "error"));
-        if let Some(diagnostic) = diagnostic {
-            let location = diagnostic["path"].as_str().unwrap_or("");
-            let (file, pointer) = project.origin(location);
-            return Err(invalid(
-                file,
-                pointer,
-                diagnostic["message"].as_str().unwrap_or("Invalid document"),
-            ));
-        }
-        return Err(invalid(MANIFEST, "", "Invalid assembled document"));
-    }
-    Ok(())
+    let authored = encode_document(&project.document, &project.budget)?;
+    argentic_core::validate_source(authored.as_bytes(), &project.budget).map_err(|error| {
+        let (file, pointer) = project.origin(&error.pointer);
+        let code = if error.code == GRAPH_LIMIT_CODE {
+            GRAPH_LIMIT_CODE
+        } else {
+            "PROJECT"
+        };
+        project_failure(
+            code,
+            file,
+            pointer,
+            SourceErrorKind::InvalidContent,
+            &error.message,
+        )
+    })
 }
 
 fn object(value: Value, file: &str, pointer: &str) -> Result<Map<String, Value>> {

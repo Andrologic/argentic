@@ -4,6 +4,8 @@ use crate::persistence::flow030::{reduce, Activation030, Failure030, FlowIdentit
 
 pub(super) enum PathFailureOrigin030 {
     AgentWork,
+    Steer,
+    Approval,
     Call,
     Compose,
     FailedJoin,
@@ -32,13 +34,26 @@ impl PathFailureOrigin030 {
         {
             return Ok(Self::PreparedFailure);
         }
+        if let Some(steer) = event.pointer("/kind/SteerFailed") {
+            let code = string(steer, "code")?;
+            require(
+                activation.start_effect_id.is_none()
+                    && steer["delivery_activation_id"] == activation.id
+                    && matches!(
+                        code,
+                        "STEER_UNCERTAIN" | "CONTENT_UNAVAILABLE" | "HARNESS_REFUSED"
+                    )
+                    && error == &Failure030::new(code),
+            )?;
+            return Ok(Self::Steer);
+        }
         let plan: crate::persistence::flow030::FlowPlan030 =
             serde_json::from_str(state.plan_json.as_deref().ok_or(StoreError030::Authority)?)?;
-        if plan
+        let step = plan
             .steps
             .iter()
-            .any(|s| Some(&s.address) == activation.step.as_ref() && s.r#type == "compose")
-        {
+            .find(|s| Some(&s.address) == activation.step.as_ref());
+        if step.is_some_and(|s| s.r#type == "compose") {
             return Ok(Self::Compose);
         }
         require(
@@ -48,11 +63,12 @@ impl PathFailureOrigin030 {
                 == Some(activation.id.as_str())
                 && activation.start_effect_id.is_some(),
         )?;
-        Ok(if activation.agent.is_none() {
-            Self::Call
-        } else {
-            Self::AgentWork
-        })
+        match step.map(|s| s.r#type.as_str()) {
+            Some("call") => Ok(Self::Call),
+            Some("approval") => Ok(Self::Approval),
+            _ if activation.agent.is_some() => Ok(Self::AgentWork),
+            _ => Err(StoreError030::Authority),
+        }
     }
 }
 
@@ -91,6 +107,51 @@ pub(super) async fn verify_preparation_origin_tx(
             _ => return Err(StoreError030::Authority),
         };
         require(value_equal(&expected, &prepared["result"])?)?;
+        return Ok(());
+    }
+    if let Some(steer) = event.pointer("/kind/SteerFailed") {
+        let effect_id = string(steer, "effect_id")?;
+        let event_id = string(event, "eventId")?;
+        let code = string(steer, "code")?;
+        let status = match code {
+            "not-received" => "fallback",
+            "STEER_UNCERTAIN" | "CONTENT_UNAVAILABLE" | "HARNESS_REFUSED" => "failed",
+            _ => return Err(StoreError030::Authority),
+        };
+        let delivery = state
+            .steer_deliveries
+            .iter()
+            .find(|d| d.effect_id == effect_id)
+            .ok_or(StoreError030::Authority)?;
+        require(
+            delivery.delivery_activation_id == string(steer, "delivery_activation_id")?
+                && serde_json::to_value(&delivery.work)? == steer["work"]
+                && delivery.status == status
+                && delivery.resolved_event_id.as_deref() == Some(event_id)
+                && delivery.reason.as_deref() == Some(code)
+                && event_id == format!("steer030:resolved:{}", sha(effect_id.as_bytes())),
+        )?;
+        let row = sqlx::query("SELECT effect_json,settlement_json FROM engine_flow030_outbox WHERE system_id=? AND invocation_id=? AND effect_id=? AND owner_epoch=? AND status='settled'")
+            .bind(&id.system_start_id).bind(&id.flow_invocation_id).bind(effect_id).bind(&owner.owner_epoch)
+            .fetch_optional(&mut *db).await?.ok_or(StoreError030::Authority)?;
+        let effect: FlowEffect030 = serde_json::from_str(row.get("effect_json"))?;
+        let activation = state
+            .activations
+            .iter()
+            .find(|a| a.id == delivery.delivery_activation_id)
+            .ok_or(StoreError030::Authority)?;
+        require(
+            effect.identity == *id
+                && effect.id == effect_id
+                && matches!(&effect.kind, FlowEffectKind030::Steer {work, delivery_activation_id, message_json, occurrence, sender}
+                    if work == &delivery.work && delivery_activation_id == &activation.id
+                        && message_json == activation.message_json.as_deref().unwrap_or("{}")
+                        && occurrence == &activation.occurrence && sender == &activation.producer)
+                && serde_json::from_str::<Value>(row.get("settlement_json"))?
+                    == json!({"kind":"nativeSteerSuperseded030", "effectId":effect_id,
+                        "deliveryActivationId":delivery.delivery_activation_id, "work":delivery.work,
+                        "eventId":event_id, "resolution":status, "reason":code}),
+        )?;
         return Ok(());
     }
     // A completed work can admit the next queued delivery. Its SQL decision,
@@ -282,6 +343,15 @@ fn journal_event(raw: &str) -> Verified<FlowEvent030> {
             } else {
                 Some(physical(&x["physical"])?)
             },
+        }
+    } else if kind.contains_key("Operator") {
+        FlowEventKind030::Operator(field(&v["kind"], "Operator")?)
+    } else if let Some(x) = kind.get("SteerFailed") {
+        FlowEventKind030::SteerFailed {
+            effect_id: field(x, "effect_id")?,
+            work: field(x, "work")?,
+            delivery_activation_id: field(x, "delivery_activation_id")?,
+            code: field(x, "code")?,
         }
     } else if let Some(x) = kind.get("SteerConsumed") {
         FlowEventKind030::SteerConsumed {

@@ -12,6 +12,21 @@ pub mod calculation {
             super::native_numbers::normalize,
         )
     }
+    /// Compile as part of a source operation with a shared budget.
+    pub fn compile_with_budget(
+        authored: &str,
+        source: &str,
+        registry: &str,
+        budget: &argentic_core::SourceBudget,
+    ) -> Result<String, Failure> {
+        argentic_core::calculation::compile_with_budget(
+            authored,
+            source,
+            registry,
+            super::native_numbers::normalize,
+            budget,
+        )
+    }
     pub fn work(input: &str) -> Result<String, Failure> {
         argentic_core::calculation::work(input, super::native_numbers::normalize)
     }
@@ -68,6 +83,7 @@ mod agsdl_host_harness030;
 mod agsdl_host_human030;
 mod agsdl_host_human_executor030;
 mod agsdl_host_human_projection030;
+mod agsdl_host_mcp_http;
 mod agsdl_host_projection030;
 mod agsdl_host_qualification030;
 mod agsdl_host_route030;

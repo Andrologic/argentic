@@ -216,7 +216,7 @@ impl Client {
             self.next().await
         }
     }
-    async fn response(&mut self, id: u64) -> Result<Value> {
+    pub(crate) async fn response(&mut self, id: u64) -> Result<Value> {
         loop {
             let value = self.next().await?;
             if self.handle_auth_request(&value).await? {

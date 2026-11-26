@@ -81,6 +81,8 @@ impl Fixture {
             std::fs::create_dir(root.join(name)).unwrap();
         }
         let profile = Profile {
+            mcp: None,
+            runtime: None,
             executable: root.join("bin/codex"),
             directory: root.join("profile"),
             home: root.join("profile/home"),

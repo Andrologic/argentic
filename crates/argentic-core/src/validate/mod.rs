@@ -5,34 +5,42 @@
 //! bd9f8a5b16923476fd20ac2650bd1729ee151917). Provenance and license:
 //! `src/vendor/agsdl/NOTICE.md`, `src/vendor/agsdl/v0.3/LICENSE`.
 //!
-//! Diagnostics keep the JS order, deduplication, pointers and messages. The JS
-//! helpers that recurse on author-controlled depth (`brings_prompt`,
-//! `received_resources`, `selection_problem`) run here on explicit stacks with
-//! the same visiting order, so a deep document cannot exhaust the native stack.
+//! Diagnostics keep the JS order, deduplication and pointers. Large authored
+//! values in messages are excerpted. Approval prompt propagation is iterative,
+//! as are selection and resource walks over author-controlled depth.
 //! [`Internal`] stands for an exception other than `ModuleError` in the JS
 //! code; none is reachable from a shape-valid document and pinned schemas.
 pub(crate) mod permissions;
 
 use super::{
     exact::{
-        quote,
+        quote, quote_to,
         scan::array_index,
-        stringify,
-        values::{compare_numbers, is_integer_number, Num},
+        values::{compare_decimals, decimal_v030, is_integer_number, Num},
         Object, Value,
     },
     graph::{
         address_parts, analyse_joins, empty_object, is_route_map, key, open_body_forks,
         ordered::{OrderedMap, OrderedSet},
-        route_items, route_targets, sort_utf16, sorted_addresses, step_routes, Edge, Graph,
-        InBranch, Node, RouteKind, TargetKind, Unshaped,
+        route_items, route_len, route_targets, sort_utf16, sorted_addresses, step_routes, Edge,
+        ExpansionBudget, Graph, InBranch, Node, RouteKind, TargetKind, Unshaped, GRAPH_LIMIT_CODE,
     },
     schema::{self, truthy, SchemaError},
     valueschema::{self, path_pointer, Descent, OutsideShape, PointerPart},
 };
+use crate::{
+    calculation::Failure,
+    resource::{
+        encode_string, excerpt, number_excerpt, quoted_bytes, value_excerpt,
+        DIAGNOSTIC_LIMIT_MESSAGE, MAX_DIAGNOSTICS, MAX_DIAGNOSTIC_BYTES,
+    },
+    SourceBudget,
+};
 use std::{
     cmp::Ordering,
-    collections::{HashMap, HashSet},
+    collections::{hash_map::RandomState, HashMap, HashSet, VecDeque},
+    hash::BuildHasher,
+    rc::Rc,
 };
 
 pub(crate) const CONTRACT: &str = "agsdl-0.3.0";
@@ -47,12 +55,32 @@ pub(crate) struct ModuleError {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Internal {
     pub(crate) message: String,
+    pub(crate) limit_pointer: Option<String>,
+}
+
+impl Internal {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            limit_pointer: None,
+        }
+    }
 }
 
 impl From<SchemaError> for Internal {
     fn from(error: SchemaError) -> Self {
         Self {
             message: error.message,
+            limit_pointer: error.limit_pointer,
+        }
+    }
+}
+
+impl From<Failure> for Internal {
+    fn from(error: Failure) -> Self {
+        Self {
+            message: error.message,
+            limit_pointer: Some(error.pointer),
         }
     }
 }
@@ -61,17 +89,19 @@ impl From<Unshaped> for Internal {
     fn from(error: Unshaped) -> Self {
         Self {
             message: error.message,
+            limit_pointer: error.limit_pointer,
         }
     }
 }
 
 impl From<OutsideShape> for Internal {
     fn from(error: OutsideShape) -> Self {
-        Self {
-            message: format!(
+        match error.limit {
+            Some(limit) => limit.into(),
+            None => Self::new(format!(
                 "value schema outside the published shape at {}",
                 error.pointer
-            ),
+            )),
         }
     }
 }
@@ -102,9 +132,7 @@ impl From<ModuleError> for ReadError {
 }
 
 fn internal<T>(message: impl Into<String>) -> Result<T, Internal> {
-    Err(Internal {
-        message: message.into(),
-    })
+    Err(Internal::new(message))
 }
 
 /// Harness modules by name with the semantics of a JS `Map`: `set` on a known
@@ -151,21 +179,33 @@ pub(crate) struct ReportJoin {
     pub(crate) branches: Vec<String>,
 }
 
-type BaseKey = (&'static str, &'static str, String, String);
-
+const MAX_MESSAGE_BYTES: usize = 2048;
+// Keep room for the report envelope and the final limit diagnostic.
+const REPORT_RESERVE: usize = 4608;
+const DIAGNOSTIC_OVERHEAD: usize = 64;
 /// The JS `Report`.
 #[derive(Default)]
 pub(crate) struct Report {
     current_edition: bool,
+    budget: SourceBudget,
     pub(crate) diagnostics: Vec<Diagnostic>,
     pub(crate) joins: OrderedMap<String, ReportJoin>,
-    seen: HashSet<(BaseKey, Vec<String>)>,
-    seen_base: HashSet<BaseKey>,
+    seen: HashMap<u64, Vec<usize>>,
+    hash: RandomState,
+    diagnostic_bytes: usize,
+    limited: bool,
 }
 
 impl Report {
     pub(crate) fn new() -> Self {
         Self::default()
+    }
+
+    fn with_budget(budget: &SourceBudget) -> Self {
+        Self {
+            budget: budget.clone(),
+            ..Self::default()
+        }
     }
 
     /// `report.add(severity, code, where, message, step)`.
@@ -174,22 +214,91 @@ impl Report {
         severity: &'static str,
         code: &'static str,
         path: String,
-        message: String,
+        mut message: String,
         step: Option<Vec<String>>,
     ) {
-        let base: BaseKey = (severity, code, path.clone(), message.clone());
-        let full = (base.clone(), step.clone().unwrap_or_default());
-        if self.seen.contains(&full) || (step.is_none() && self.seen_base.contains(&base)) {
+        if self.limited {
             return;
         }
-        self.seen.insert(full);
-        self.seen_base.insert(base);
+        if code == GRAPH_LIMIT_CODE {
+            self.limit(path, message);
+            return;
+        }
+        if message.len() > MAX_MESSAGE_BYTES {
+            let end = message.floor_char_boundary(MAX_MESSAGE_BYTES - '…'.len_utf8());
+            message.truncate(end);
+            message.push('…');
+        }
+        let text_bytes =
+            path.len() + message.len() + step.iter().flatten().map(String::len).sum::<usize>();
+        if let Err(error) = self.budget.work(text_bytes.div_ceil(8) + 1, &path) {
+            self.limit(path, error.message);
+            return;
+        }
+        let key = self.hash.hash_one((severity, code, &path, &message));
+        if self.seen.get(&key).is_some_and(|indices| {
+            indices.iter().any(|&index| {
+                let item = &self.diagnostics[index];
+                item.severity == severity
+                    && item.code == code
+                    && item.path == path
+                    && item.message == message
+                    && (step.is_none()
+                        || item.step.as_deref().unwrap_or(&[]) == step.as_deref().unwrap_or(&[]))
+            })
+        }) {
+            return;
+        }
+        let encoded = DIAGNOSTIC_OVERHEAD
+            + code.len()
+            + severity.len()
+            + quoted_bytes(&path)
+            + quoted_bytes(&message)
+            + step
+                .iter()
+                .flatten()
+                .map(|item| quoted_bytes(item) + 1)
+                .sum::<usize>();
+        if self.diagnostics.len() >= MAX_DIAGNOSTICS
+            || encoded > MAX_DIAGNOSTIC_BYTES - REPORT_RESERVE - self.diagnostic_bytes
+        {
+            self.limit(path, DIAGNOSTIC_LIMIT_MESSAGE.into());
+            return;
+        }
+        if let Err(error) = self.budget.bytes(text_bytes + encoded * 2 + 160, &path) {
+            self.limit(path, error.message);
+            return;
+        }
+        self.diagnostic_bytes += encoded;
+        self.seen
+            .entry(key)
+            .or_default()
+            .push(self.diagnostics.len());
         self.diagnostics.push(Diagnostic {
             severity,
             code,
             path,
             message,
             step,
+        });
+    }
+
+    fn limit(&mut self, mut path: String, message: String) {
+        if self.limited {
+            return;
+        }
+        self.limited = true;
+        // Keep an ancestor pointer if a path alone would exceed the reserve.
+        if quoted_bytes(&path) > 4096 {
+            let end = path.floor_char_boundary(680);
+            path.truncate(path[..end].rfind('/').unwrap_or(0));
+        }
+        self.diagnostics.push(Diagnostic {
+            severity: "error",
+            code: GRAPH_LIMIT_CODE,
+            path,
+            message,
+            step: None,
         });
     }
 
@@ -221,6 +330,36 @@ impl Report {
         self.add("error", code, path.to_owned(), message, None);
     }
 
+    fn value_problem(
+        &mut self,
+        code: &'static str,
+        at: &str,
+        make: &dyn Fn() -> String,
+    ) -> Result<(), OutsideShape> {
+        if !self.limited {
+            let minimum = DIAGNOSTIC_OVERHEAD + quoted_bytes(at);
+            if self.diagnostics.len() >= MAX_DIAGNOSTICS
+                || minimum > MAX_DIAGNOSTIC_BYTES - REPORT_RESERVE - self.diagnostic_bytes
+            {
+                self.limit(at.into(), DIAGNOSTIC_LIMIT_MESSAGE.into());
+            } else if let Err(error) = self.budget.bytes(at.len() + 2048, at) {
+                self.limit(at.into(), error.message);
+            } else {
+                self.error_at(code, at, make());
+            }
+        }
+        if self.limited {
+            let diagnostic = self.diagnostics.last().expect("limit diagnostic");
+            return Err(Failure {
+                code: GRAPH_LIMIT_CODE.into(),
+                pointer: diagnostic.path.clone(),
+                message: diagnostic.message.clone(),
+            }
+            .into());
+        }
+        Ok(())
+    }
+
     /// `report.valid`.
     pub(crate) fn valid(&self) -> bool {
         !self.diagnostics.iter().any(|item| item.severity == "error")
@@ -228,64 +367,90 @@ impl Report {
 
     /// `JSON.stringify(report.as_json())`. `joins` is an ordinary JS object:
     /// array-index names first, ascending, then insertion order.
+    #[cfg(test)]
     pub(crate) fn to_json(&self) -> String {
-        let mut out = format!(
-            "{{\"contract\":{},\"valid\":{},\"diagnostics\":[",
-            quote(if self.current_edition {
-                crate::argentic_core::AGSDL_040
-            } else {
-                CONTRACT
-            }),
-            self.valid()
-        );
-        for (index, item) in self.diagnostics.iter().enumerate() {
-            if index > 0 {
-                out.push(',');
-            }
-            out.push_str(&format!(
-                "{{\"severity\":{},\"code\":{},\"path\":{},\"message\":{}",
-                quote(item.severity),
-                quote(item.code),
-                quote(&item.path),
-                quote(&item.message)
-            ));
-            if let Some(step) = &item.step {
-                out.push_str(",\"step\":");
-                out.push_str(&string_array(step));
-            }
-            out.push('}');
-        }
-        out.push_str("],\"joins\":{");
-        let mut names: Vec<&String> = self.joins.keys().collect();
-        let (mut indexed, named): (Vec<&String>, Vec<&String>) = names
-            .drain(..)
+        self.to_json_with_budget(&SourceBudget::default())
+            .expect("test report within budget")
+    }
+
+    pub(crate) fn to_json_with_budget(&self, budget: &SourceBudget) -> Result<String, Failure> {
+        budget.work(self.joins.len() * 16, "/flow")?;
+        budget.bytes(self.joins.len() * 40, "/flow")?;
+        let (mut indexed, named): (Vec<_>, Vec<_>) = self
+            .joins
+            .keys()
             .partition(|name| array_index(name).is_some());
         indexed.sort_by_key(|name| array_index(name));
-        for (index, name) in indexed.into_iter().chain(named).enumerate() {
-            if index > 0 {
-                out.push(',');
+        Ok(encode_string(budget, usize::MAX, "", |out| {
+            write!(
+                out,
+                "{{\"contract\":\"{}\",\"valid\":{},\"diagnostics\":[",
+                if self.current_edition {
+                    crate::argentic_core::AGSDL_040
+                } else {
+                    CONTRACT
+                },
+                self.valid()
+            )?;
+            for (index, item) in self.diagnostics.iter().enumerate() {
+                if index > 0 {
+                    out.write_char(',')?;
+                }
+                write!(
+                    out,
+                    "{{\"severity\":\"{}\",\"code\":\"{}\",\"path\":",
+                    item.severity, item.code
+                )?;
+                quote_to(out, &item.path)?;
+                out.write_str(",\"message\":")?;
+                quote_to(out, &item.message)?;
+                if let Some(step) = &item.step {
+                    out.write_str(",\"step\":")?;
+                    write_string_array(out, step)?;
+                }
+                out.write_char('}')?;
             }
-            let join = self.joins.get(name).expect("join name");
-            out.push_str(&format!(
-                "{}:{{\"origin\":{},\"branches\":{}}}",
-                quote(name),
-                quote(&join.origin),
-                string_array(&join.branches)
-            ));
-        }
-        out.push_str("}}");
-        out
+            out.write_str("],\"joins\":{")?;
+            for (index, name) in indexed.iter().chain(&named).enumerate() {
+                if index > 0 {
+                    out.write_char(',')?;
+                }
+                let join = self.joins.get(*name).expect("join name");
+                quote_to(out, name)?;
+                out.write_str(":{\"origin\":")?;
+                quote_to(out, &join.origin)?;
+                out.write_str(",\"branches\":")?;
+                write_string_array(out, &join.branches)?;
+                out.write_char('}')?;
+            }
+            out.write_str("}}")
+        })?
+        .expect("unlimited report writer"))
     }
 }
 
-fn string_array(values: &[String]) -> String {
-    let items: Vec<String> = values.iter().map(|value| quote(value)).collect();
-    format!("[{}]", items.join(","))
+fn write_string_array(out: &mut dyn std::fmt::Write, values: &[String]) -> std::fmt::Result {
+    out.write_char('[')?;
+    for (i, value) in values.iter().enumerate() {
+        if i > 0 {
+            out.write_char(',')?;
+        }
+        quote_to(out, value)?;
+    }
+    out.write_char(']')
 }
 
 /// `check_module(module)`: the module itself, or the first problem.
+#[cfg(test)]
 pub(crate) fn check_module(module: Value) -> Result<Value, ReadError> {
-    let problems = schema::edition_schema(&module, true)?.check(&module)?;
+    check_module_with_budget(module, &SourceBudget::default())
+}
+
+pub(crate) fn check_module_with_budget(
+    module: Value,
+    budget: &SourceBudget,
+) -> Result<Value, ReadError> {
+    let problems = schema::edition_schema(&module, true)?.check_with_budget(&module, budget)?;
     if let Some((at, message)) = problems.first() {
         let at = if at.is_empty() { "/" } else { at.as_str() };
         return Err(ModuleError {
@@ -294,9 +459,10 @@ pub(crate) fn check_module(module: Value) -> Result<Value, ReadError> {
         .into());
     }
     if let Some(settings) = module.as_object().and_then(|object| object.get("settings")) {
-        let shape = schema::value_schema_shape()?.check(settings)?;
+        let shape = schema::value_schema_shape()?.check_with_budget(settings, budget)?;
         let consistency = if shape.is_empty() {
-            valueschema::consistency(settings, &[key("settings")]).map_err(Internal::from)?
+            valueschema::consistency_with_budget(settings, &[key("settings")], budget)
+                .map_err(Internal::from)?
         } else {
             Vec::new()
         };
@@ -315,34 +481,61 @@ pub(crate) fn check_module(module: Value) -> Result<Value, ReadError> {
     Ok(module)
 }
 
-/// `validate_document(document, modules)`.
-pub(crate) fn validate_document(document: &Value, modules: &ModuleMap) -> Result<Report, Internal> {
-    let mut report = Report::new();
+pub(crate) fn validate_document_with_budget(
+    document: &Value,
+    modules: &ModuleMap,
+    budget: &SourceBudget,
+) -> Result<Report, Internal> {
+    let mut report = Report::with_budget(budget);
+    if let Err(error) = validate_into(document, modules, &mut report) {
+        if let Some(pointer) = error.limit_pointer {
+            report.error_at(GRAPH_LIMIT_CODE, &pointer, error.message);
+        } else {
+            return Err(error);
+        }
+    }
+    Ok(report)
+}
+
+fn validate_into(
+    document: &Value,
+    modules: &ModuleMap,
+    report: &mut Report,
+) -> Result<(), Internal> {
     report.current_edition = matches!(member(Some(document), "contract"),
         Some(Value::String(contract)) if contract == crate::argentic_core::AGSDL_040);
-    let problems = schema::edition_schema(document, false)?.check(document)?;
+    let problems =
+        schema::edition_schema(document, false)?.check_with_budget(document, &report.budget)?;
     if !problems.is_empty() {
         for (at, message) in problems {
             report.error_at("SHAPE", &at, message);
+            if report.limited {
+                break;
+            }
         }
-        return Ok(report);
+        return Ok(());
     }
     let Value::Object(document) = document else {
         return internal("a shape-valid document is an object");
     };
-    Checker::new(document, modules, &mut report)?.run()?;
-    Ok(report)
+    Checker::new(document, modules, report)?.run()
 }
 
 /// `validate_bytes(bytes, modules)`.
 pub(crate) fn validate_bytes(bytes: &[u8], modules: &ModuleMap) -> Result<Report, Internal> {
+    let budget = SourceBudget::default();
+    if let Err(error) = budget.json_input(bytes, "") {
+        let mut report = Report::with_budget(&budget);
+        report.error_at(GRAPH_LIMIT_CODE, &error.pointer, error.message);
+        return Ok(report);
+    }
     match super::exact::scan::parse_v030(bytes) {
         Err(error) => {
             let mut report = Report::new();
             report.error_at("PARSE", "", error.message());
             Ok(report)
         }
-        Ok(parsed) => validate_document(&parsed.tree, modules),
+        Ok(parsed) => validate_document_with_budget(&parsed.tree, modules, &budget),
     }
 }
 
@@ -367,7 +560,7 @@ fn article(word: &str) -> String {
 
 /// `repr` of a string: Python-like single quotes.
 fn repr_str(text: &str) -> String {
-    let escaped = text
+    let escaped = excerpt(text)
         .replace('\\', "\\\\")
         .replace('\'', "\\'")
         .replace('\n', "\\n")
@@ -379,7 +572,8 @@ fn repr_str(text: &str) -> String {
 fn repr_value(value: &Value) -> String {
     match value {
         Value::String(text) => repr_str(text),
-        other => stringify(other),
+        Value::Number(token) => number_excerpt(token.raw()),
+        other => value_excerpt(other),
     }
 }
 
@@ -387,7 +581,7 @@ fn repr_part(part: &PointerPart) -> String {
     match part {
         PointerPart::Key(name) => repr_str(name),
         PointerPart::Index(index) => index.to_string(),
-        PointerPart::Number(token) => token.raw().to_owned(),
+        PointerPart::Number(token) => number_excerpt(token.raw()),
     }
 }
 
@@ -413,21 +607,24 @@ fn expanded(addr: &str) -> Option<Vec<String>> {
 }
 
 /// `scope_member(addr, prefix)`.
-fn scope_member(addr: &str, prefix: &str) -> Option<String> {
-    let parts = address_parts(addr);
-    let scope = address_parts(prefix);
-    if parts.len() > scope.len() && scope.iter().zip(&parts).all(|(a, b)| a == b) {
-        Some(parts[scope.len()].to_owned())
+fn scope_member<'a>(addr: &'a str, prefix: &str) -> Option<&'a str> {
+    let suffix = if prefix.is_empty() {
+        addr
     } else {
-        None
-    }
+        addr.strip_prefix(prefix)?.strip_prefix('/')?
+    };
+    (!suffix.is_empty()).then(|| suffix.split('/').next().expect("first address segment"))
 }
 
 fn first_part(addr: &str) -> Result<String, Internal> {
-    match address_parts(addr).first() {
-        Some(part) => Ok((*part).to_owned()),
-        None => internal("empty graph address"),
+    if addr.is_empty() {
+        return internal("empty graph address");
     }
+    Ok(addr
+        .split('/')
+        .next()
+        .expect("first address segment")
+        .to_owned())
 }
 
 fn object<'a>(value: &'a Value, what: &str) -> Result<&'a Object, Internal> {
@@ -489,10 +686,23 @@ fn is_single_path(value: &Value, name: &str) -> bool {
     matches!(value, Value::Array(items) if items.len() == 1 && matches!(&items[0], Value::String(text) if text == name))
 }
 
-fn path_parts(value: &Value) -> Result<Vec<PointerPart>, Internal> {
+fn path_parts(value: &Value, graph: &Graph<'_>) -> Result<Vec<PointerPart>, Internal> {
     let Value::Array(items) = value else {
         return internal("a path is not an array");
     };
+    graph.work(items.len())?;
+    graph.bytes(
+        items
+            .iter()
+            .map(|part| {
+                32 + match part {
+                    Value::String(text) => text.len(),
+                    Value::Number(token) => token.raw().len(),
+                    _ => 0,
+                }
+            })
+            .sum(),
+    )?;
     items
         .iter()
         .map(|item| match item {
@@ -627,11 +837,17 @@ impl<'a, 'r> Checker<'a, 'r> {
         }
         self.check_compositions()?;
         for (container, at, composition) in scopes {
+            if self.report.limited {
+                return Ok(());
+            }
             self.check_scope(container, &at, composition)?;
         }
         self.check_agents()?;
-        if !self.cycle {
+        if !self.cycle && !self.report.limited {
             self.check_graphs()?;
+        }
+        if self.report.limited {
+            return Ok(());
         }
         self.check_completion_choices()?;
         self.check_harnesses()
@@ -642,6 +858,13 @@ impl<'a, 'r> Checker<'a, 'r> {
         uses: &'a Value,
         parts: &[PointerPart],
     ) -> Result<(), Internal> {
+        let size = match uses {
+            Value::Array(items) => items.len(),
+            Value::Object(items) => items.len(),
+            _ => 0,
+        };
+        self.report.budget.work(size, &path_pointer(parts))?;
+        self.report.budget.bytes(size * 64, &path_pointer(parts))?;
         let items: Vec<(PointerPart, &'a Value)> = match uses {
             Value::String(_) => return Ok(()),
             Value::Array(items) => items
@@ -687,6 +910,10 @@ impl<'a, 'r> Checker<'a, 'r> {
         for (name, composition) in compositions.iter() {
             let composition = object(composition, "composition")?;
             let steps = object(required(composition, "steps")?, "steps")?;
+            self.report.budget.work(steps.len() + 1, "/compositions")?;
+            self.report
+                .budget
+                .bytes(steps.len() * 192, "/compositions")?;
             let mut dependencies = Vec::new();
             for (step_name, step) in steps.iter() {
                 let step = object(step, "step")?;
@@ -748,6 +975,7 @@ impl<'a, 'r> Checker<'a, 'r> {
             state.insert(name.clone(), State::Active);
             let mut stack: Vec<(String, usize)> = vec![(name.clone(), 0)];
             while let Some(frame) = stack.last_mut() {
+                self.report.budget.work(1, "/compositions")?;
                 let dependencies = uses.get(&frame.0).expect("composition dependencies");
                 if frame.1 == dependencies.len() {
                     state.insert(frame.0.clone(), State::Done);
@@ -791,6 +1019,7 @@ impl<'a, 'r> Checker<'a, 'r> {
         composition: Option<&'a str>,
     ) -> Result<(), Internal> {
         let steps = object(required(container, "steps")?, "steps")?;
+        self.report.budget.work(steps.len(), &path_pointer(at))?;
         let mut parameters: HashSet<&'a str> = HashSet::new();
         let mut outputs: HashSet<&'a str> = HashSet::new();
         if let Some(name) = composition {
@@ -821,6 +1050,9 @@ impl<'a, 'r> Checker<'a, 'r> {
             }
         }
         for (name, step) in steps.iter() {
+            if self.report.limited {
+                break;
+            }
             self.check_step(
                 object(step, "step")?,
                 &with(at, [key("steps"), key(name)]),
@@ -953,11 +1185,24 @@ impl<'a, 'r> Checker<'a, 'r> {
             return Ok(());
         }
         let declared = self.composition(target)?;
-        let mut expected: OrderedSet<String> = OrderedSet::new();
-        for parameter in list_or_empty(declared.get("parameters"), "parameters")? {
-            expected.insert(text(parameter, "parameter")?.to_owned());
-        }
+        let parameters_at_target = list_or_empty(declared.get("parameters"), "parameters")?;
         let given = object_or_empty(step.get("agents"), "agents")?;
+        let pointer = path_pointer(parts);
+        self.report
+            .budget
+            .work(parameters_at_target.len() + given.len(), &pointer)?;
+        self.report
+            .budget
+            .bytes((parameters_at_target.len() + given.len()) * 96, &pointer)?;
+        let mut expected: OrderedSet<String> = OrderedSet::new();
+        for parameter in parameters_at_target {
+            let parameter = text(parameter, "parameter")?;
+            self.report
+                .budget
+                .work(parameter.len().div_ceil(8), &pointer)?;
+            self.report.budget.bytes(parameter.len() * 4, &pointer)?;
+            expected.insert(parameter.to_owned());
+        }
         let mut missing: Vec<String> = expected
             .iter()
             .filter(|name| !given.contains_key(name))
@@ -1119,6 +1364,12 @@ impl<'a, 'r> Checker<'a, 'r> {
         outputs: &HashSet<&'a str>,
         composition: Option<&'a str>,
     ) -> Result<(), Internal> {
+        let pointer = path_pointer(at);
+        let count = route_len(route);
+        self.report.budget.work(count * 2, &pointer)?;
+        self.report
+            .budget
+            .bytes(count.saturating_mul(path_allocation(at) + 112), &pointer)?;
         let (items, listed): (Vec<&Value>, bool) = match route {
             Value::Array(items) => (items.iter().collect(), true),
             single => (vec![single], false),
@@ -1212,29 +1463,37 @@ impl<'a, 'r> Checker<'a, 'r> {
 
     fn check_reachability(
         &mut self,
-        entry: &str,
+        entry: &'a str,
         steps: &'a Object,
         parts: &[PointerPart],
         roots: &[&'a str],
     ) -> Result<(), Internal> {
-        let mut seen: OrderedSet<String> = OrderedSet::new();
-        seen.insert(entry.to_owned());
-        for root in roots {
+        let pointer = path_pointer(parts);
+        self.report
+            .budget
+            .work(steps.len() + roots.len(), &pointer)?;
+        self.report.budget.bytes(steps.len() * 72, &pointer)?;
+        let mut seen = OrderedSet::new();
+        seen.insert(entry);
+        for &root in roots {
             if steps.contains_key(root) {
-                seen.insert((*root).to_owned());
+                seen.insert(root);
             }
         }
-        let mut queue: Vec<String> = seen.iter().cloned().collect();
+        let mut queue: Vec<_> = seen.iter().copied().collect();
         let mut index = 0;
         while index < queue.len() {
-            let step = object(required(steps, &queue[index])?, "step")?;
+            let step = object(required(steps, queue[index])?, "step")?;
             for route in step_routes(step, &[]) {
+                let count = route_len(route.route);
+                self.report.budget.work(count, &pointer)?;
+                self.report.budget.bytes(count * 88, &pointer)?;
                 for item in route_targets(route.route, &[])? {
                     if item.kind == TargetKind::Step
                         && steps.contains_key(item.name)
-                        && seen.insert(item.name.to_owned())
+                        && seen.insert(item.name)
                     {
-                        queue.push(item.name.to_owned());
+                        queue.push(item.name);
                     }
                 }
             }
@@ -1262,6 +1521,9 @@ impl<'a, 'r> Checker<'a, 'r> {
         let servers = object_or_empty(self.doc.get("mcpServers"), "mcpServers")?;
         let agents: &'a Object = self.agents;
         for (name, agent) in agents.iter() {
+            if self.report.limited {
+                break;
+            }
             let parts = vec![key("agents"), key(name)];
             let agent = object(agent, "agent")?;
             if let Some(instructions) = agent.get("instructions") {
@@ -1318,11 +1580,13 @@ impl<'a, 'r> Checker<'a, 'r> {
                             format!("a schema needs a JSON media type, not {media}"),
                         );
                     }
-                    for (pointer, message) in
-                        valueschema::consistency(schema, &with(&at, [key("schema")]))?
-                    {
-                        self.report.error_at("SCHEMA", &pointer, message);
-                    }
+                    let budget = self.report.budget.clone();
+                    valueschema::check_consistency(
+                        schema,
+                        &with(&at, [key("schema")]),
+                        &budget,
+                        &mut |at, make| self.report.value_problem("SCHEMA", at, make),
+                    )?;
                 }
             }
             let permissions = agent.get("permissions");
@@ -1347,10 +1611,18 @@ impl<'a, 'r> Checker<'a, 'r> {
                     required(object(check, "completionCheck")?, "command")?,
                     "command",
                 )?;
-                if permissions::effect_for(permissions, "shell", command)? == "deny" {
+                let at = with(&parts, [key("completionCheck"), key("command")]);
+                if permissions::effect_for(
+                    permissions,
+                    "shell",
+                    command,
+                    &self.report.budget,
+                    &path_pointer(&at),
+                )? == "deny"
+                {
                     self.report.error(
                         "PERMISSIONS",
-                        &with(&parts, [key("completionCheck"), key("command")]),
+                        &at,
                         "the agent's own permissions deny this command".to_owned(),
                     );
                 }
@@ -1401,12 +1673,15 @@ impl<'a, 'r> Checker<'a, 'r> {
         let doc: &'a Object = self.doc;
         let compositions: &'a Object = self.compositions;
         let mut scopes: Vec<(Option<String>, Graph<'a>)> = Vec::new();
+        let mut local_budget = ExpansionBudget::new(&self.report.budget);
         let mut covered: OrderedSet<String> = OrderedSet::new();
         if let Some(flow) = doc.get("flow") {
             let flow = object(flow, "flow")?;
             let steps = object(required(flow, "steps")?, "steps")?;
             if steps.contains_key(text(required(flow, "entry")?, "entry")?) {
-                let (infos, _) = analyse_joins(&Graph::for_scope(doc, None, None)?)?;
+                let mut initial_budget = ExpansionBudget::new(&self.report.budget);
+                let initial = Graph::for_scope(doc, None, None, &mut initial_budget)?;
+                let (infos, _) = analyse_joins(&initial, &mut initial_budget)?;
                 let mut members = OrderedSet::new();
                 for info in infos.values() {
                     for found in info.branches.values() {
@@ -1415,8 +1690,11 @@ impl<'a, 'r> Checker<'a, 'r> {
                         }
                     }
                 }
-                covered = Graph::flow_error_covered(doc, &members)?;
-                scopes.push((None, Graph::for_scope(doc, None, Some(covered.clone()))?));
+                covered = Graph::flow_error_covered(doc, &members, &initial_budget)?;
+                scopes.push((
+                    None,
+                    Graph::for_scope(doc, None, Some(covered.clone()), &mut local_budget)?,
+                ));
             }
         }
         for (name, composition) in compositions.iter() {
@@ -1425,14 +1703,14 @@ impl<'a, 'r> Checker<'a, 'r> {
             if steps.contains_key(text(required(composition, "entry")?, "entry")?) {
                 scopes.push((
                     Some(name.to_owned()),
-                    Graph::for_scope(doc, Some(name), None)?,
+                    Graph::for_scope(doc, Some(name), None, &mut local_budget)?,
                 ));
             }
         }
         let mut joins: OrderedMap<Option<String>, OrderedMap<String, LocalJoin>> =
             OrderedMap::new();
         for (scope_key, graph) in &scopes {
-            let (infos, problems) = analyse_joins(graph)?;
+            let (infos, problems) = analyse_joins(graph, &mut local_budget)?;
             for problem in problems {
                 self.report.error("JOIN", &problem.pointer, problem.message);
             }
@@ -1497,24 +1775,37 @@ impl<'a, 'r> Checker<'a, 'r> {
             }
             in_branch.set(scope_key.clone(), members);
         }
+        let in_branch = Rc::new(in_branch);
         let has_flow = scopes.iter().any(|(scope_key, _)| scope_key.is_none());
         let mut graphs: Vec<Graph<'a>> = Vec::new();
+        let mut budget = ExpansionBudget::new(&self.report.budget);
         if has_flow {
             graphs.push(Graph::for_flow(
                 doc,
                 Some(in_branch.clone()),
                 Some(covered.clone()),
+                &mut budget,
             )?);
         }
         for (name, _) in compositions.iter() {
+            budget.work(scopes.len(), Some(name))?;
             if scopes
                 .iter()
                 .any(|(scope_key, _)| scope_key.as_deref() == Some(name))
             {
-                graphs.push(Graph::for_composition(doc, name, Some(in_branch.clone()))?);
+                graphs.push(Graph::for_composition(
+                    doc,
+                    name,
+                    Some(in_branch.clone()),
+                    &mut budget,
+                )?);
             }
         }
         for (index, graph) in graphs.iter().enumerate() {
+            if self.report.limited {
+                break;
+            }
+            graph.work(graph.nodes.len() * 4 + graph.edges.len() * 3)?;
             if index == 0 && has_flow {
                 for use_addr in sorted_addresses(graph.composes.keys()) {
                     let compose = graph.composes.get(&use_addr).expect("compose");
@@ -1524,6 +1815,7 @@ impl<'a, 'r> Checker<'a, 'r> {
                     let target = text(required(compose.decl, "composition")?, "composition")?;
                     if let Some(found) = joins.get(&Some(target.to_owned())) {
                         for (name, info) in found.iter() {
+                            budget.join_analysis(info.branches.len(), Some(target))?;
                             self.report.joins.set(
                                 format!("{use_addr}/{name}"),
                                 ReportJoin {
@@ -1545,6 +1837,13 @@ impl<'a, 'r> Checker<'a, 'r> {
                     .get(&scope.composition)
                     .and_then(|local| local.get(&node.name))
                 {
+                    budget.join_analysis(
+                        info.branches
+                            .values()
+                            .map(|members| members.len() + 1)
+                            .sum(),
+                        scope.composition.as_deref(),
+                    )?;
                     let mut info = info.clone();
                     info.prefix = scope.prefix.clone();
                     infos.set(addr.clone(), info);
@@ -1555,8 +1854,11 @@ impl<'a, 'r> Checker<'a, 'r> {
             }
             self.record_choices(graph);
             self.check_selections(graph, &infos)?;
+            if self.report.limited {
+                break;
+            }
             self.check_missions(graph)?;
-            self.check_shared_instances(graph, &infos)?;
+            self.check_shared_instances(graph, &infos, &mut budget)?;
         }
         Ok(())
     }
@@ -1603,13 +1905,11 @@ impl<'a, 'r> Checker<'a, 'r> {
         node.kind == "agent" && member(self.agent_of(node), "instructs").is_some_and(truthy)
     }
 
-    /// One edge of `brings_prompt`: a result, or an approval to expand.
-    fn prompt_leaf(
+    fn prompt_leaf<'g>(
         &self,
-        graph: &Graph<'a>,
-        edge: &Edge<'a>,
-        seen: &[String],
-    ) -> Result<Result<Option<bool>, String>, Internal> {
+        graph: &'g Graph<'a>,
+        edge: &'g Edge<'a>,
+    ) -> Result<Result<Option<bool>, &'g str>, Internal> {
         if let Some(message) = edge.message {
             return Ok(Ok(Some(member(Some(message), "prompt").is_some())));
         }
@@ -1620,83 +1920,91 @@ impl<'a, 'r> Checker<'a, 'r> {
         if node.kind == "agent" && node.agent.is_none() {
             return Ok(Ok(None));
         }
-        if self.instructs(node) {
-            return Ok(Ok(Some(true)));
+        if node.kind == "approval" {
+            return Ok(Err(&node.addr));
         }
-        if node.kind == "approval" && !seen.contains(&node.addr) {
-            return Ok(Err(node.addr.clone()));
-        }
-        Ok(Ok(Some(false)))
+        Ok(Ok(Some(self.instructs(node))))
     }
 
-    /// `brings_prompt(graph, edge, incoming, new Set())`, on a heap stack.
-    fn brings_prompt(
+    fn approval_prompts<'g>(
         &self,
-        graph: &Graph<'a>,
-        edge: usize,
-        incoming: &OrderedMap<String, Vec<usize>>,
-    ) -> Result<Option<bool>, Internal> {
-        struct Frame {
-            arriving: Vec<usize>,
-            next: usize,
-            any_null: bool,
-            all_true: bool,
-        }
-        let frame = |addr: String| Frame {
-            arriving: incoming.get(&addr).cloned().unwrap_or_default(),
-            next: 0,
-            any_null: false,
-            all_true: true,
-        };
-        let mut stack: Vec<Frame> = Vec::new();
-        let mut seen: Vec<String> = Vec::new();
-        match self.prompt_leaf(graph, &graph.edges[edge], &seen)? {
-            Ok(result) => return Ok(result),
-            Err(addr) => {
-                seen.push(addr.clone());
-                stack.push(frame(addr));
-            }
-        }
-        loop {
-            let top = stack.last_mut().expect("frame");
-            if top.next < top.arriving.len() {
-                let item = top.arriving[top.next];
-                top.next += 1;
-                match self.prompt_leaf(graph, &graph.edges[item], &seen)? {
-                    Ok(None) => stack.last_mut().expect("frame").any_null = true,
-                    Ok(Some(found)) => stack.last_mut().expect("frame").all_true &= found,
-                    Err(addr) => {
-                        seen.push(addr.clone());
-                        stack.push(frame(addr));
-                    }
-                }
+        graph: &'g Graph<'a>,
+        leaves: &[Result<Option<bool>, &'g str>],
+    ) -> Result<HashMap<&'g str, Option<bool>>, Internal> {
+        // Unknown leaves propagate through every dependent approval. A prompt
+        // exists on all paths only when all dependencies have proved true.
+        // Defaults for unresolved dependencies also cover approval cycles.
+        graph.work(graph.nodes.len() + graph.edges.len() * 3)?;
+        graph.bytes(graph.nodes.len() * 144 + graph.edges.len() * 48)?;
+        let mut results = HashMap::new();
+        let mut pending = HashMap::new();
+        let mut dependents: HashMap<&str, Vec<&str>> = HashMap::new();
+        let mut queue = VecDeque::new();
+        for (addr, node) in graph.nodes.iter() {
+            if node.kind != "approval" {
                 continue;
             }
-            let done = stack.pop().expect("frame");
-            seen.pop();
-            let result = if done.any_null {
-                None
+            let addr = addr.as_str();
+            let incoming = graph.incoming(addr)?;
+            let mut waits = 0;
+            let mut possible = !incoming.is_empty();
+            let mut unknown = false;
+            for &edge in incoming {
+                match leaves[edge] {
+                    Ok(None) => unknown = true,
+                    Ok(Some(has_prompt)) => possible &= has_prompt,
+                    Err(source) => {
+                        dependents.entry(source).or_default().push(addr);
+                        waits += 1;
+                    }
+                }
+            }
+            if unknown {
+                results.insert(addr, None);
+                queue.push_back(addr);
+            } else if possible && waits == 0 {
+                results.insert(addr, Some(true));
+                queue.push_back(addr);
             } else {
-                Some(!done.arriving.is_empty() && done.all_true)
-            };
-            match stack.last_mut() {
-                None => return Ok(result),
-                Some(parent) => match result {
-                    None => parent.any_null = true,
-                    Some(found) => parent.all_true &= found,
-                },
+                results.insert(addr, Some(false));
+                if possible {
+                    pending.insert(addr, waits);
+                }
             }
         }
+        while let Some(addr) = queue.pop_front() {
+            for &dependent in dependents.get(addr).into_iter().flatten() {
+                if results[dependent].is_none() {
+                    continue;
+                }
+                if results[addr].is_none() {
+                    results.insert(dependent, None);
+                    queue.push_back(dependent);
+                } else if let Some(waits) = pending.get_mut(dependent) {
+                    *waits -= 1;
+                    if *waits == 0 {
+                        results.insert(dependent, Some(true));
+                        queue.push_back(dependent);
+                    }
+                }
+            }
+        }
+        Ok(results)
     }
 
     fn check_missions(&mut self, graph: &Graph<'a>) -> Result<(), Internal> {
+        graph.work(graph.nodes.len() + graph.edges.len() * 2)?;
+        graph.bytes(graph.nodes.len() * 96 + graph.edges.len() * 48)?;
         let mut incoming: OrderedMap<String, Vec<usize>> = OrderedMap::new();
+        let mut leaves = Vec::with_capacity(graph.edges.len());
         for (index, edge) in graph.edges.iter().enumerate() {
+            leaves.push(self.prompt_leaf(graph, edge)?);
             match incoming.get_mut(&edge.dst) {
                 Some(list) => list.push(index),
                 None => incoming.set(edge.dst.clone(), vec![index]),
             }
         }
+        let approvals = self.approval_prompts(graph, &leaves)?;
         for (addr, edges) in incoming.iter() {
             let node = graph.node_at(addr)?;
             if node.kind != "agent" || node.decl.is_some_and(|decl| decl.contains_key("prompt")) {
@@ -1704,7 +2012,7 @@ impl<'a, 'r> Checker<'a, 'r> {
             }
             let mut brings = Vec::with_capacity(edges.len());
             for &edge in edges {
-                brings.push(self.brings_prompt(graph, edge, &incoming)?);
+                brings.push(leaves[edge].unwrap_or_else(|addr| approvals[addr]));
             }
             if brings.contains(&None) {
                 continue;
@@ -1716,13 +2024,11 @@ impl<'a, 'r> Checker<'a, 'r> {
                 .map(|(edge, _)| *edge)
                 .collect();
             if !missing.is_empty() && missing.len() < edges.len() {
-                let mut sources: Vec<String> = Vec::new();
+                let mut sources = HashSet::new();
                 for &edge in &missing {
-                    let name = graph.node_at(&graph.edges[edge].src)?.name.clone();
-                    if !sources.contains(&name) {
-                        sources.push(name);
-                    }
+                    sources.insert(graph.node_at(&graph.edges[edge].src)?.name.clone());
                 }
+                let mut sources: Vec<_> = sources.into_iter().collect();
                 sort_utf16(&mut sources);
                 self.report.error_step(
                     "PROMPT",
@@ -1748,17 +2054,26 @@ impl<'a, 'r> Checker<'a, 'r> {
         let mut reported: HashSet<(String, String)> = HashSet::new();
         for (index, edge) in graph.edges.iter().enumerate() {
             let target = graph.node_at(&edge.dst)?;
+            if self.report.limited {
+                return Ok(());
+            }
             if target.kind == "call" {
                 let arguments = object_or_empty(
                     target.decl.and_then(|decl| decl.get("arguments")),
                     "arguments",
                 )?;
+                graph.work(arguments.len())?;
                 for (name, operand) in arguments.iter() {
                     let Some(path) = member(Some(operand), "path") else {
                         continue;
                     };
-                    let reason =
-                        self.selection_problem(graph, infos, index, path_parts(path)?, false)?;
+                    let reason = self.selection_problem(
+                        graph,
+                        infos,
+                        index,
+                        path_parts(path, graph)?,
+                        false,
+                    )?;
                     let at = with(&target.pointer, [key("arguments"), key(name), key("path")]);
                     if let Some(reason) = reason {
                         let identity = (parts_identity(&at), reason.clone());
@@ -1775,9 +2090,9 @@ impl<'a, 'r> Checker<'a, 'r> {
             }
             if let Some(each) = edge.each {
                 let mut reason =
-                    self.selection_problem(graph, infos, index, path_parts(each)?, false)?;
+                    self.selection_problem(graph, infos, index, path_parts(each, graph)?, false)?;
                 if reason.is_none() {
-                    reason = self.fanout_problem(graph, edge, infos)?;
+                    reason = self.fanout_problem(graph, index, infos)?;
                 }
                 if let Some(reason) = reason {
                     self.report.error_step(
@@ -1795,7 +2110,7 @@ impl<'a, 'r> Checker<'a, 'r> {
                 if let Some(path) = prompt.get("from") {
                     let at = with(&edge.pointer, [key("message"), key("prompt"), key("from")]);
                     let source = graph.node_at(&edge.src)?;
-                    let parts = path_parts(path)?;
+                    let parts = path_parts(path, graph)?;
                     let allowed = (source.kind == "agent" && parts_are(&parts, &["instructions"]))
                         || (source.kind == "join"
                             && parts.len() == 3
@@ -1821,12 +2136,13 @@ impl<'a, 'r> Checker<'a, 'r> {
                 }
             }
             let resources = object_or_empty(member(Some(message), "resources"), "resources")?;
+            graph.work(resources.len())?;
             for (name, used) in resources.iter() {
                 let Some(path) = member(Some(used), "from") else {
                     continue;
                 };
                 if let Some(reason) =
-                    self.selection_problem(graph, infos, index, path_parts(path)?, true)?
+                    self.selection_problem(graph, infos, index, path_parts(path, graph)?, true)?
                 {
                     self.report.error_step(
                         "MESSAGE_PATH",
@@ -1854,12 +2170,21 @@ impl<'a, 'r> Checker<'a, 'r> {
         path: Vec<PointerPart>,
         in_message: bool,
     ) -> Result<Option<String>, Internal> {
+        let mut visited = HashSet::new();
         let mut stack: Vec<Scan> = Vec::new();
         let mut call = Some((edge, path, in_message));
         let mut returned: Option<Option<String>> = None;
         loop {
             if let Some((edge, path, in_message)) = call.take() {
-                match self.selection_step(graph, infos, edge, &path, in_message)? {
+                graph.work(path.len() + 1)?;
+                graph.bytes(96 + path_allocation(&path))?;
+                let first_visit = visited.insert((edge, path.clone(), in_message));
+                let step = if first_visit {
+                    self.selection_step(graph, infos, edge, &path, in_message)?
+                } else {
+                    SelectionStep::Done(None)
+                };
+                match step {
                     SelectionStep::Done(result) => returned = Some(result),
                     SelectionStep::Tail(edge, path, in_message) => {
                         call = Some((edge, path, in_message));
@@ -1875,7 +2200,7 @@ impl<'a, 'r> Checker<'a, 'r> {
                 return Ok(returned.expect("selection result"));
             };
             if let Some(Some(reason)) = returned.take() {
-                let wrapped = format!("{}{reason}", top.prefix);
+                let wrapped = format!("{}{}", top.prefix, excerpt(&reason));
                 stack.pop();
                 returned = Some(Some(wrapped));
                 continue;
@@ -1883,6 +2208,7 @@ impl<'a, 'r> Checker<'a, 'r> {
             if top.next < top.candidates.len() {
                 let candidate = top.candidates[top.next];
                 top.next += 1;
+                graph.bytes(path_allocation(&top.rest))?;
                 call = Some((candidate, top.rest.clone(), true));
             } else {
                 stack.pop();
@@ -1917,7 +2243,7 @@ impl<'a, 'r> Checker<'a, 'r> {
                     say("'item' is an instruction, a string".to_owned())
                 };
             }
-            let mut next = path_parts(each)?;
+            let mut next = path_parts(each, graph)?;
             next.push(PointerPart::Index(0));
             next.extend(path[1..].iter().cloned());
             return Ok(Tail(index, next, false));
@@ -1999,7 +2325,9 @@ impl<'a, 'r> Checker<'a, 'r> {
                     ));
                 }
                 if let Some(schema) = member(Some(result), "schema") {
-                    if let Descent::Refused(reason) = valueschema::descend(schema, rest)? {
+                    if let Descent::Refused(reason) =
+                        valueschema::descend_checked(schema, rest, &self.report.budget, "/flow")?
+                    {
                         return say(reason);
                     }
                 }
@@ -2080,7 +2408,12 @@ impl<'a, 'r> Checker<'a, 'r> {
                 }
                 if self.report.current_edition && part_is(path.get(1), "comments") {
                     return Ok(Done(
-                        match valueschema::descend(approval_comments(), &path[2..])? {
+                        match valueschema::descend_checked(
+                            approval_comments(),
+                            &path[2..],
+                            &self.report.budget,
+                            "/flow",
+                        )? {
                             Descent::Refused(reason) => Some(reason),
                             _ => None,
                         },
@@ -2133,16 +2466,17 @@ impl<'a, 'r> Checker<'a, 'r> {
                     }
                     rest = &rest[1..];
                     if part_is(rest.first(), "item") {
+                        graph.work(graph.edges.len())?;
+                        graph.bytes(graph.edges.len() * 8 + path_allocation(rest))?;
                         let candidates = graph
                             .edges
                             .iter()
                             .enumerate()
                             .filter(|(_, edge)| {
                                 edge.each.is_some()
-                                    && scope_member(&edge.src, &info.prefix).as_deref()
+                                    && scope_member(&edge.src, &info.prefix)
                                         == Some(info.origin.as_str())
-                                    && scope_member(&edge.dst, &info.prefix).as_deref()
-                                        == Some(branch)
+                                    && scope_member(&edge.dst, &info.prefix) == Some(branch)
                             })
                             .map(|(index, _)| index)
                             .collect();
@@ -2171,7 +2505,9 @@ impl<'a, 'r> Checker<'a, 'r> {
                     return Ok(Done(error_path_problem(rest)));
                 }
                 if !rest.is_empty() {
-                    let candidates = Self::branch_producers(graph, &node.addr, info, branch)
+                    let incoming = graph.incoming(&node.addr)?;
+                    graph.bytes(incoming.len() * 8 + path_allocation(rest))?;
+                    let candidates = Self::branch_producers(graph, incoming, info, branch)?
                         .map(|(index, _)| index)
                         .collect();
                     return Ok(Pending(Scan {
@@ -2194,140 +2530,130 @@ impl<'a, 'r> Checker<'a, 'r> {
         addr: &str,
         infos: &OrderedMap<String, LocalJoin>,
     ) -> Result<Option<OrderedSet<String>>, Internal> {
-        struct Frame {
-            addr: String,
-            edges: Vec<usize>,
-            next: usize,
-            names: OrderedSet<String>,
-        }
-        let frame = |addr: &str| Frame {
-            addr: addr.to_owned(),
-            edges: graph
-                .edges
-                .iter()
-                .enumerate()
-                .filter(|(_, edge)| edge.dst == addr)
-                .map(|(index, _)| index)
-                .collect(),
-            next: 0,
-            names: OrderedSet::new(),
-        };
         if graph.root.as_deref() == Some(addr) {
             return Ok(None);
         }
-        let mut stack = vec![frame(addr)];
-        enum Step {
-            Add(Vec<String>),
-            Push(String),
-            Null,
-        }
-        loop {
-            let depth = stack.len();
-            let next = {
-                let top = stack.last_mut().expect("frame");
-                if top.next == top.edges.len() {
-                    None
-                } else {
-                    top.next += 1;
-                    Some(top.edges[top.next - 1])
-                }
-            };
-            let Some(index) = next else {
-                let done = stack.pop().expect("frame");
-                match stack.last_mut() {
-                    None => return Ok(Some(done.names)),
-                    Some(parent) => {
-                        for name in &done.names {
-                            parent.names.insert(name.clone());
-                        }
-                    }
-                }
+        graph.bytes(192)?;
+        let mut active = HashSet::from([addr]);
+        let mut visited = HashSet::new();
+        let mut stack = vec![(addr, graph.incoming(addr)?.iter())];
+        let mut names = OrderedSet::new();
+        while let Some((addr, incoming)) = stack.last_mut() {
+            graph.work(1)?;
+            let Some(&index) = incoming.next() else {
+                active.remove(*addr);
+                visited.insert(*addr);
+                stack.pop();
                 continue;
             };
             let edge = &graph.edges[index];
-            let step = if let Some(message) = edge.message {
+            if let Some(message) = edge.message {
                 let resources = object_or_empty(member(Some(message), "resources"), "resources")?;
-                Step::Add(resources.iter().map(|(name, _)| name.to_owned()).collect())
-            } else if edge.kind == RouteKind::Error {
-                Step::Add(vec!["error".to_owned()])
-            } else {
-                let node = graph.node_at(&edge.src)?;
-                match node.kind {
-                    "agent" => match self.agent_of(node) {
-                        None => Step::Null,
-                        Some(agent) => {
-                            let mut names = vec!["text".to_owned()];
-                            for (name, _) in
-                                object_or_empty(member(Some(agent), "results"), "results")?.iter()
-                            {
-                                names.push(name.to_owned());
-                            }
-                            Step::Add(names)
-                        }
-                    },
-                    "call" => Step::Add(vec!["result".to_owned()]),
-                    "join" if infos.contains_key(&node.addr) => Step::Add(
-                        infos
-                            .get(&node.addr)
-                            .expect("join")
-                            .branches
-                            .keys()
-                            .cloned()
-                            .collect(),
-                    ),
-                    "approval"
-                        if !stack[..depth - 1]
-                            .iter()
-                            .any(|frame| frame.addr == node.addr) =>
-                    {
-                        Step::Push(node.addr.clone())
-                    }
-                    _ => Step::Null,
+                graph.work(resources.len())?;
+                for (name, _) in resources.iter() {
+                    graph.bytes(96 + name.len() * 2)?;
+                    names.insert(name.to_owned());
                 }
-            };
-            match step {
-                Step::Null => return Ok(None),
-                Step::Add(names) => {
-                    let top = stack.last_mut().expect("frame");
-                    for name in names {
-                        top.names.insert(name);
+                continue;
+            }
+            if edge.kind == RouteKind::Error {
+                names.insert("error".to_owned());
+                continue;
+            }
+            let node = graph.node_at(&edge.src)?;
+            match node.kind {
+                "agent" => {
+                    let Some(agent) = self.agent_of(node) else {
+                        return Ok(None);
+                    };
+                    names.insert("text".to_owned());
+                    let results = object_or_empty(member(Some(agent), "results"), "results")?;
+                    graph.work(results.len())?;
+                    for (name, _) in results.iter() {
+                        graph.bytes(96 + name.len() * 2)?;
+                        names.insert(name.to_owned());
                     }
                 }
-                Step::Push(child) => {
-                    if graph.root.as_deref() == Some(child.as_str()) {
+                "call" => {
+                    names.insert("result".to_owned());
+                }
+                "join" => {
+                    let Some(info) = infos.get(&node.addr) else {
+                        return Ok(None);
+                    };
+                    graph.work(info.branches.len())?;
+                    for name in info.branches.keys() {
+                        graph.bytes(96 + name.len() * 2)?;
+                        names.insert(name.clone());
+                    }
+                }
+                "approval" => {
+                    let source = node.addr.as_str();
+                    if graph.root.as_deref() == Some(source) || active.contains(source) {
                         return Ok(None);
                     }
-                    stack.push(frame(&child));
+                    if !visited.contains(source) {
+                        graph.bytes(128)?;
+                        active.insert(source);
+                        stack.push((source, graph.incoming(source)?.iter()));
+                    }
                 }
+                _ => return Ok(None),
             }
         }
+        Ok(Some(names))
     }
 
     fn branch_producers<'b>(
         graph: &'b Graph<'a>,
-        address: &'b str,
+        incoming: &'b [usize],
         info: &'b LocalJoin,
         branch: &'b str,
-    ) -> impl Iterator<Item = (usize, &'b Edge<'a>)> + 'b {
-        graph.edges.iter().enumerate().filter(move |(_, edge)| {
-            edge.dst == address
-                && edge.kind == RouteKind::Normal
-                && scope_member(&edge.src, &info.prefix).is_some_and(|local| {
-                    info.branches
-                        .get(branch)
-                        .expect("branch members")
-                        .contains(&local)
-                        || (local == info.origin && local == branch)
-                })
-        })
+    ) -> Result<impl Iterator<Item = (usize, &'b Edge<'a>)> + 'b, Internal> {
+        graph.work(incoming.len())?;
+        Ok(incoming
+            .iter()
+            .map(|&i| (i, &graph.edges[i]))
+            .filter(move |(_, edge)| {
+                edge.kind == RouteKind::Normal
+                    && scope_member(&edge.src, &info.prefix).is_some_and(|local| {
+                        info.branches
+                            .get(branch)
+                            .expect("branch members")
+                            .contains(local)
+                            || (local == info.origin && local == branch)
+                    })
+            }))
     }
 
     fn declared_kind(
         &self,
         graph: &Graph<'a>,
+        index: usize,
+        path: &[PointerPart],
+        infos: &OrderedMap<String, LocalJoin>,
+        memo: &mut HashMap<(usize, usize), Option<String>>,
+    ) -> Result<Option<String>, Internal> {
+        graph.work(path.len() + 1)?;
+        // Recursive calls only visit suffixes of the same path. The suffix
+        // length identifies the selection independently of the branch taken.
+        let key = (index, path.len());
+        if let Some(kind) = memo.get(&key) {
+            return Ok(kind.clone());
+        }
+        graph.bytes(96)?;
+        let kind = self.compute_declared_kind(graph, &graph.edges[index], path, infos, memo)?;
+        memo.insert(key, kind.clone());
+        Ok(kind)
+    }
+
+    fn compute_declared_kind(
+        &self,
+        graph: &Graph<'a>,
         edge: &Edge<'a>,
         path: &[PointerPart],
         infos: &OrderedMap<String, LocalJoin>,
+        memo: &mut HashMap<(usize, usize), Option<String>>,
     ) -> Result<Option<String>, Internal> {
         let kind = |name: &str| Ok(Some(name.to_owned()));
         let Some(head) = path.first() else {
@@ -2364,7 +2690,12 @@ impl<'a, 'r> Checker<'a, 'r> {
                     return kind("string");
                 }
                 match member(Some(result), "schema") {
-                    Some(schema) => Ok(valueschema::kind_at(schema, &path[2..])?),
+                    Some(schema) => Ok(valueschema::kind_at_checked(
+                        schema,
+                        &path[2..],
+                        &self.report.budget,
+                        "/flow",
+                    )?),
                     None => Ok(None),
                 }
             }
@@ -2403,7 +2734,12 @@ impl<'a, 'r> Checker<'a, 'r> {
                             Ok(None)
                         };
                     }
-                    return Ok(valueschema::kind_at(approval_comments(), &path[2..])?);
+                    return Ok(valueschema::kind_at_checked(
+                        approval_comments(),
+                        &path[2..],
+                        &self.report.budget,
+                        "/flow",
+                    )?);
                 }
                 Ok(None)
             }
@@ -2453,13 +2789,14 @@ impl<'a, 'r> Checker<'a, 'r> {
                     Some("error") => return Ok(None),
                     _ => {}
                 }
-                let mut producers = Self::branch_producers(graph, &node.addr, info, branch);
-                let Some((_, first)) = producers.next() else {
+                let mut producers =
+                    Self::branch_producers(graph, graph.incoming(&node.addr)?, info, branch)?;
+                let Some((first, _)) = producers.next() else {
                     return Ok(None);
                 };
-                let first = self.declared_kind(graph, first, rest, infos)?;
-                for (_, edge) in producers {
-                    if self.declared_kind(graph, edge, rest, infos)? != first {
+                let first = self.declared_kind(graph, first, rest, infos, memo)?;
+                for (index, _) in producers {
+                    if self.declared_kind(graph, index, rest, infos, memo)? != first {
                         return Ok(None);
                     }
                 }
@@ -2472,17 +2809,28 @@ impl<'a, 'r> Checker<'a, 'r> {
     fn fanout_problem(
         &self,
         graph: &Graph<'a>,
-        edge: &Edge<'a>,
+        index: usize,
         infos: &OrderedMap<String, LocalJoin>,
     ) -> Result<Option<String>, Internal> {
-        let Some(each) = edge.each else {
+        let Some(each) = graph.edges[index].each else {
             return Ok(None);
         };
         if is_single_path(each, "instructions") {
             return Ok(None);
         }
+        let path = path_parts(each, graph)?;
+        const MAX_SELECTION_PARTS: usize = 128;
+        if path.len() > MAX_SELECTION_PARTS {
+            let edge = &graph.edges[index];
+            return Err(crate::resource::limit(
+                &path_pointer(&edge.pointer),
+                "fan-out selection path parts",
+                MAX_SELECTION_PARTS,
+            )
+            .into());
+        }
         Ok(
-            match self.declared_kind(graph, edge, &path_parts(each)?, infos)? {
+            match self.declared_kind(graph, index, &path, infos, &mut HashMap::new())? {
                 Some(kind) if kind != "array" => Some(format!(
                     "a fan-out reads a list, and this value is declared as {}",
                     article(&kind)
@@ -2551,6 +2899,7 @@ impl<'a, 'r> Checker<'a, 'r> {
         &mut self,
         graph: &Graph<'a>,
         infos: &OrderedMap<String, LocalJoin>,
+        budget: &mut ExpansionBudget,
     ) -> Result<(), Internal> {
         let sorted = sorted_addresses(graph.nodes.keys());
         for (addr, info) in infos.iter() {
@@ -2559,7 +2908,7 @@ impl<'a, 'r> Checker<'a, 'r> {
             for (start, members) in info.branches.iter() {
                 for member_addr in &sorted {
                     if !scope_member(member_addr, &info.prefix)
-                        .is_some_and(|local| members.contains(&local))
+                        .is_some_and(|local| members.contains(local))
                     {
                         continue;
                     }
@@ -2603,7 +2952,7 @@ impl<'a, 'r> Checker<'a, 'r> {
             }
             let join = graph.node_at(addr)?;
             if is_text(join.decl.and_then(|decl| decl.get("remaining")), "finish") {
-                self.check_after_finish(graph, addr, &finishing)?;
+                self.check_after_finish(graph, addr, &finishing, budget)?;
             }
         }
         self.check_fanout_instances(graph, infos)?;
@@ -2707,31 +3056,47 @@ impl<'a, 'r> Checker<'a, 'r> {
             if edge.each.is_none() {
                 continue;
             }
+            graph.work(infos.len())?;
             let closing: OrderedSet<String> = infos
                 .iter()
                 .filter(|(_, info)| {
-                    scope_member(&edge.src, &info.prefix).as_deref() == Some(info.origin.as_str())
+                    scope_member(&edge.src, &info.prefix) == Some(info.origin.as_str())
                         && scope_member(&edge.dst, &info.prefix)
-                            .is_some_and(|local| info.fanout.contains(&local))
+                            .is_some_and(|local| info.fanout.contains(local))
                 })
                 .map(|(addr, _)| addr.clone())
                 .collect();
             let limit = non_null(edge.fanout.and_then(|fanout| fanout.get("max")));
+            graph.work(limit.map_or(0, numeric_size).div_ceil(8))?;
+            let decimal_limit = limit
+                .and_then(Value::as_number)
+                .map(|number| decimal_v030(Num::Token(number)));
             let source = graph.node_at(&edge.src)?;
             for member_addr in sorted_addresses(&graph.reachable(&edge.dst, &closing)?) {
                 let node = graph.node_at(&member_addr)?;
                 let visits = non_null(node.decl.and_then(|decl| decl.get("maxVisits")));
                 if let Some(visits) = visits.filter(|_| !bounded.contains(&member_addr)) {
-                    let below = match limit {
+                    let below = match &decimal_limit {
                         None => true,
-                        Some(limit) => compare_values(visits, limit)? == Ordering::Less,
+                        Some(max) => {
+                            let visits = visits
+                                .as_number()
+                                .ok_or_else(|| Internal::new("maxVisits is not a number"))?;
+                            graph.work(visits.raw().len().div_ceil(8))?;
+                            compare_decimals(&decimal_v030(Num::Token(visits)), max)
+                                == Ordering::Less
+                        }
                     };
                     if below {
                         bounded.insert(member_addr.clone());
                         let reason = match limit {
-                            Some(limit) => {
-                                format!("below the fan-out's max of {}", stringify(limit))
+                            Some(Value::Number(limit)) => {
+                                format!(
+                                    "below the fan-out's max of {}",
+                                    number_excerpt(limit.raw())
+                                )
                             }
+                            Some(_) => return internal("fan-out max is not a number"),
                             None => "while the fan-out has no max".to_owned(),
                         };
                         self.report.warning_step(
@@ -2780,6 +3145,7 @@ impl<'a, 'r> Checker<'a, 'r> {
         graph: &Graph<'a>,
         join: &str,
         finishing: &HashMap<(String, Option<&'a str>), String>,
+        budget: &mut ExpansionBudget,
     ) -> Result<(), Internal> {
         let join_node = graph.node_at(join)?;
         for later in sorted_addresses(&graph.reachable(join, &OrderedSet::new())?) {
@@ -2799,6 +3165,7 @@ impl<'a, 'r> Checker<'a, 'r> {
             let Some(branch) = finishing.get(&(agent.clone(), instance)) else {
                 continue;
             };
+            budget.join_analysis(1, graph.scopes[join_node.scope].composition.as_deref())?;
             self.report.warning_step(
                 "SHARED_INSTANCE_PARALLEL",
                 &node.pointer,
@@ -2819,6 +3186,9 @@ impl<'a, 'r> Checker<'a, 'r> {
     fn check_harnesses(&mut self) -> Result<(), Internal> {
         let agents: &'a Object = self.agents;
         for (name, agent) in agents.iter() {
+            if self.report.limited {
+                break;
+            }
             let parts = vec![key("agents"), key(name)];
             let agent = object(agent, "agent")?;
             let harness_name = text(required(agent, "harness")?, "harness")?;
@@ -2892,6 +3262,9 @@ impl<'a, 'r> Checker<'a, 'r> {
                 used.push(("delivery.steer".to_owned(), parts.clone()));
             }
             for (property, at) in &used {
+                if self.report.limited {
+                    return Ok(());
+                }
                 self.check_property(module, harness, property, at, agent)?;
             }
             self.check_permissions(module, harness, agent, &parts)?;
@@ -2904,11 +3277,14 @@ impl<'a, 'r> Checker<'a, 'r> {
                         format!("module '{harness}' declares no settings"),
                     ),
                     Some(settings) => {
-                        for (pointer, message) in
-                            valueschema::validate(settings_value, settings, &at)?
-                        {
-                            self.report.error_at("HARNESS_SETTINGS", &pointer, message);
-                        }
+                        let budget = self.report.budget.clone();
+                        valueschema::check_value(
+                            settings_value,
+                            settings,
+                            &at,
+                            &budget,
+                            &mut |at, make| self.report.value_problem("HARNESS_SETTINGS", at, make),
+                        )?;
                     }
                 }
             }
@@ -2934,8 +3310,16 @@ impl<'a, 'r> Checker<'a, 'r> {
             )?,
         };
         let note = match member(entry, "note") {
-            Some(note) if truthy(note) => format!(" {}", text(note, "note")?),
-            _ => String::new(),
+            Some(note) if truthy(note) => text(note, "note")?,
+            _ => "",
+        };
+        // Retain the same truncated message prefix without cloning the full
+        // module note on every agent that uses this property.
+        let note = if note.is_empty() {
+            String::new()
+        } else {
+            let end = note.floor_char_boundary(note.len().min(MAX_MESSAGE_BYTES));
+            format!(" {}", &note[..end])
         };
         let label = property.replace('.', " ");
         if support == "absent" {
@@ -2960,10 +3344,10 @@ impl<'a, 'r> Checker<'a, 'r> {
                 "warning",
                 "HARNESS_VERSION",
                 path_pointer(at),
-                format!(
-                    "{harness} supports {label} only for versions {}.",
-                    text(versions, "versions")?
-                ),
+                format!("{harness} supports {label} only for versions {}.", {
+                    let versions = text(versions, "versions")?;
+                    &versions[..versions.floor_char_boundary(versions.len().min(MAX_MESSAGE_BYTES))]
+                }),
                 None,
             );
         }
@@ -2973,22 +3357,43 @@ impl<'a, 'r> Checker<'a, 'r> {
                     return internal("support values are not an array");
                 };
                 let effort = required(object(required(agent, "model")?, "model")?, "effort")?;
+                let at_ptr = path_pointer(at);
+                let effort_bytes = effort.as_str().map_or(0, str::len);
+                self.report.budget.work(
+                    values
+                        .iter()
+                        .map(|value| {
+                            1 + value
+                                .as_str()
+                                .map_or(0, str::len)
+                                .min(effort_bytes)
+                                .div_ceil(8)
+                        })
+                        .sum(),
+                    &at_ptr,
+                )?;
                 let accepted = values
                     .iter()
                     .any(|value| matches!((value, effort), (Value::String(a), Value::String(b)) if a == b));
                 if !accepted {
-                    let mut shown = Vec::with_capacity(values.len());
+                    let mut shown = String::new();
                     for value in values {
-                        shown.push(text(value, "support value")?.to_owned());
+                        if !shown.is_empty() {
+                            shown.push_str(", ");
+                        }
+                        let value = text(value, "support value")?;
+                        let remaining = MAX_MESSAGE_BYTES.saturating_sub(shown.len());
+                        shown.push_str(
+                            &value[..value.floor_char_boundary(value.len().min(remaining))],
+                        );
+                        if shown.len() + 4 >= MAX_MESSAGE_BYTES {
+                            break;
+                        }
                     }
                     self.report.error(
                         "HARNESS_VALUE",
                         at,
-                        format!(
-                            "{harness} accepts {}; got {}",
-                            shown.join(", "),
-                            repr_value(effort)
-                        ),
+                        format!("{harness} accepts {}; got {}", shown, repr_value(effort)),
                     );
                 }
             }
@@ -3096,10 +3501,22 @@ fn same_keys(value: &Object, expected: &OrderedSet<String>) -> bool {
 }
 
 /// `compareNumbers(a, b)` over two authored numbers.
-fn compare_values(left: &Value, right: &Value) -> Result<Ordering, Internal> {
-    match (left, right) {
-        (Value::Number(a), Value::Number(b)) => Ok(compare_numbers(Num::Token(a), Num::Token(b))),
-        _ => internal("Expected a finite JSON number"),
+fn path_allocation(path: &[PointerPart]) -> usize {
+    path.iter()
+        .map(|part| {
+            32 + match part {
+                PointerPart::Key(key) => key.len(),
+                PointerPart::Index(_) => 0,
+                PointerPart::Number(number) => number.raw().len(),
+            }
+        })
+        .sum()
+}
+
+fn numeric_size(value: &Value) -> usize {
+    match value {
+        Value::Number(number) => number.raw().len(),
+        _ => 0,
     }
 }
 
@@ -3160,6 +3577,42 @@ mod tests {
             ]
         );
         assert!(!report.valid());
+    }
+
+    #[test]
+    fn approval_resource_analysis_unions_paths_and_leaves_cycles_unknown() {
+        for cyclic in [false, true] {
+            let steps = serde_json::json!({
+                "prepare":{"type":"agent","agent":"a","next":[
+                    "left",{"step":"right","message":{"resources":{"extra":{"from":["text"]}}}}
+                ]},
+                "left":{"type":"approval","next":{"yes":"check","no":[]}},
+                "right":{"type":"approval","next":{"yes":"check","no":[]}},
+                "check":{"type":"approval","next":{"yes":if cyclic {serde_json::json!("left")} else {serde_json::json!([])},"no":[]}}
+            });
+            let source = serde_json::json!({
+                "agents":{"a":{"results":{"notes":{}}}},
+                "flow":{"entry":"prepare","steps":steps}
+            });
+            let parsed = parse_v030(source.to_string().as_bytes()).unwrap();
+            let doc = parsed.tree.as_object().unwrap();
+            let graph = Graph::for_scope(doc, None, None, &mut ExpansionBudget::default()).unwrap();
+            let modules = ModuleMap::new();
+            let mut report = Report::new();
+            let checker = Checker::new(doc, &modules, &mut report).unwrap();
+            let names = checker
+                .received_resources(&graph, "check", &OrderedMap::new())
+                .unwrap();
+            if cyclic {
+                assert!(names.is_none());
+            } else {
+                let names = names.unwrap();
+                assert_eq!(
+                    names.iter().map(String::as_str).collect::<Vec<_>>(),
+                    ["text", "notes", "extra"]
+                );
+            }
+        }
     }
 
     #[test]

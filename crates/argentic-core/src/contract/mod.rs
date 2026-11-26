@@ -65,6 +65,10 @@ fn number_field(agent: &Object, key: &str, fallback: Value, positive: bool) -> R
 pub(crate) fn create(input: &Value) -> Result<Value> {
     let agent_value = decode_input(input.get("agentJson"))?;
     let agent = exact::record(Some(&agent_value), "")?;
+    create_with_agent(input, agent, input.get("agentJson").clone())
+}
+
+pub(crate) fn create_with_agent(input: &Value, agent: &Object, agent_json: Value) -> Result<Value> {
     let choices = if input.get("choices").is_nullish() {
         Value::Null
     } else {
@@ -162,7 +166,7 @@ pub(crate) fn create(input: &Value) -> Result<Value> {
     let answer = number_field(agent, "answerTimeoutMs", Value::Null, true)?;
     Ok(o([
         ("version", s("macro-agsdl-agent-work/030")),
-        ("agentJson", input.get("agentJson").clone()),
+        ("agentJson", agent_json),
         ("choices", choices),
         ("instructionsByChoice", routes),
         ("defaultInstructions", default),

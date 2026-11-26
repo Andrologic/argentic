@@ -1,4 +1,6 @@
-use super::{archive::hex, file_url, invalid, read_regular, sha256, Files, MAX_JSON_TOTAL};
+use super::{
+    archive::hex, file_url, invalid, read_regular, sha256, Files, SourceBudget, MAX_JSON_TOTAL,
+};
 use crate::persistence::{failure, Result};
 use cap_std::{ambient_authority, fs::Dir};
 use serde::{Deserialize, Serialize};
@@ -6,7 +8,7 @@ use serde_json::Value;
 use std::{
     collections::BTreeMap,
     fs,
-    io::Write,
+    io::{Read, Write},
     path::{Path, PathBuf},
 };
 
@@ -20,6 +22,14 @@ const PROJECT: &str = "project";
 pub struct RetainedSource {
     pub(super) location: PathBuf,
     pub(super) id: Option<String>,
+    pub(super) mcp: McpDeclarations,
+}
+
+#[derive(Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct McpDeclarations {
+    pub files: BTreeMap<String, Vec<String>>,
+    pub secrets: BTreeMap<String, Vec<String>>,
 }
 
 impl RetainedSource {
@@ -43,8 +53,10 @@ impl RetainedSource {
         );
         if let Some(id) = &self.id {
             object.insert("projectSnapshot".into(), Value::from(id.as_str()));
+            object.insert("projectMcp".into(), serde_json::to_value(&self.mcp)?);
         } else {
             object.remove("projectSnapshot");
+            object.remove("projectMcp");
         }
         Ok(())
     }
@@ -107,7 +119,7 @@ pub(super) fn retain(
                     name.clone(),
                     Entry {
                         size: file.bytes.len() as u64,
-                        sha256: sha256(&file.bytes),
+                        sha256: file.digest.clone(),
                         executable: file.executable,
                     },
                 )
@@ -163,6 +175,8 @@ pub(super) fn retain(
             .write_all(&bytes)
             .and_then(|()| output.sync_all())
             .map_err(|e| storage(&index, e))?;
+        // Windows requires the staging directory's files to be closed before renaming it.
+        drop(output);
         #[cfg(unix)]
         for directory in directories.iter().rev() {
             sync_directory(directory)?;
@@ -184,16 +198,18 @@ pub(super) fn retain(
     let root =
         Dir::open_ambient_dir(&snapshot.root, ambient_authority()).map_err(|_| unavailable())?;
     for (name, entry) in &snapshot.manifest.files {
-        let file = read_regular(&root, Path::new(name), entry.size).map_err(|_| unavailable())?;
+        let file = read_regular(&root, Path::new(name), entry.size, &SourceBudget::default())
+            .map_err(|_| unavailable())?;
         // The index records the executable flag. The disk mode depends on the
         // umask and on filesystems with fixed modes, so only bytes are checked.
-        if sha256(&file.bytes) != entry.sha256 {
+        if file.digest != entry.sha256 {
             return Err(unavailable());
         }
     }
     Ok(RetainedSource {
         location: snapshot.root.join(super::MANIFEST),
         id: Some(id),
+        mcp: McpDeclarations::default(),
     })
 }
 
@@ -222,9 +238,14 @@ impl Snapshot {
         }
         let dir =
             Dir::open_ambient_dir(&directory, ambient_authority()).map_err(|_| unavailable())?;
-        let index =
-            read_regular(&dir, Path::new(INDEX), MAX_JSON_TOTAL).map_err(|_| unavailable())?;
-        if sha256(&index.bytes) != id {
+        let index = read_regular(
+            &dir,
+            Path::new(INDEX),
+            MAX_JSON_TOTAL,
+            &SourceBudget::default(),
+        )
+        .map_err(|_| unavailable())?;
+        if index.digest != id {
             return Err(unavailable());
         }
         let manifest: Manifest = serde_json::from_slice(&index.bytes).map_err(|_| unavailable())?;
@@ -270,6 +291,47 @@ impl Snapshot {
             return Err(unavailable());
         }
         Ok(Some(snapshot))
+    }
+
+    /// Verify a member before exposing its path to a confined process. The
+    /// host protects the directory against renames and writes through spawn.
+    pub(crate) fn verify_member(&self, name: &str) -> Result<()> {
+        use sha2::Digest;
+        let entry = self.manifest.files.get(name).ok_or_else(unavailable)?;
+        let dir =
+            Dir::open_ambient_dir(&self.root, ambient_authority()).map_err(|_| unavailable())?;
+        let file = super::open_regular(&dir, Path::new(name)).map_err(|_| unavailable())?;
+        let mut hash = sha2::Sha256::new();
+        let size =
+            std::io::copy(&mut file.take(entry.size + 1), &mut hash).map_err(|_| unavailable())?;
+        if size != entry.size || format!("{:x}", hash.finalize()) != entry.sha256 {
+            return Err(unavailable());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn executable(&self, path: &Path) -> bool {
+        path.strip_prefix(&self.root)
+            .ok()
+            .and_then(Path::to_str)
+            .and_then(|name| self.manifest.files.get(name))
+            .is_some_and(|entry| entry.executable)
+    }
+
+    /// Read the interpreter prefix of a verified member. The host keeps the
+    /// retained directory unchanged between verification and launch.
+    pub(crate) fn allows_shebang(&self, path: &Path) -> Result<bool> {
+        let name = path.strip_prefix(&self.root).map_err(|_| unavailable())?;
+        let dir =
+            Dir::open_ambient_dir(&self.root, ambient_authority()).map_err(|_| unavailable())?;
+        let file = super::open_regular(&dir, name).map_err(|_| unavailable())?;
+        let mut prefix = Vec::with_capacity(256);
+        file.take(256)
+            .read_to_end(&mut prefix)
+            .map_err(|_| unavailable())?;
+        Ok(prefix.strip_prefix(b"#!").is_none_or(|line| {
+            line.iter().find(|&&byte| !matches!(byte, b' ' | b'\t')) == Some(&b'/')
+        }))
     }
 
     /// Whether a path names a location inside the retained project.

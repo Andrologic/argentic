@@ -187,6 +187,7 @@ enum KindRead {
         work: WorkRef030,
         delivery_activation_id: String,
     },
+    Operator(crate::persistence::flow030::OperatorEvent030),
     SteerFailed {
         effect_id: String,
         work: WorkRef030,
@@ -224,6 +225,8 @@ struct CaptureRead {
     identity: FlowIdentity030,
     source: Value,
     compiled_plan_json: String,
+    // Historical replay fixtures predate native registry retention.
+    registry_json: Option<String>,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -409,6 +412,19 @@ async fn verify(db: &mut SqliteConnection, system: &str, invocation: &str) -> Re
         &plan,
         &parse("start.plan", &capture.compiled_plan_json)?,
     )?;
+    let registry = capture
+        .registry_json
+        .as_deref()
+        .map(|raw| parse("start.registry", raw))
+        .transpose()?
+        .unwrap_or(Value::Null);
+    crate::capture::verify_model_overrides(&plan, &registry).map_err(|_| {
+        mismatch(
+            "start.modelOverrides",
+            "frozen choices match the retained registry",
+            "model selections differ",
+        )
+    })?;
     equal(
         "start.entry",
         &plan.entry.is_some(),
@@ -432,7 +448,10 @@ async fn verify(db: &mut SqliteConnection, system: &str, invocation: &str) -> Re
         };
         let receipt: Value = parse("outbox.settlement", &raw)?;
         if receipt["kind"] == "nativeSteerConsumed030" {
-            if let Some(head) = receipt["consumedAfterEventId"].as_str() {
+            let checkpoint = receipt
+                .get("wireAdmissionEventId")
+                .unwrap_or(&receipt["consumedAfterEventId"]);
+            if let Some(head) = checkpoint.as_str() {
                 let effect = parse(
                     "outbox.effect",
                     row.try_get("effect_json").map_err(storage)?,
@@ -594,8 +613,8 @@ async fn verify(db: &mut SqliteConnection, system: &str, invocation: &str) -> Re
                 produced.push(effect.clone());
             }
             state = transition.state;
-            // Validate consumption at the actual reduce() prefix, rather than
-            // inferring liveness from the final state or another scheduler.
+            // The send and its later settlement can straddle a hold. Verify
+            // dispatch eligibility at the prefix where the wire was admitted.
             if let Some(deliveries) = steer_checkpoints.get(&event_id) {
                 for (effect, receipt) in deliveries {
                     let FlowEffectKind030::Steer {
@@ -605,7 +624,12 @@ async fn verify(db: &mut SqliteConnection, system: &str, invocation: &str) -> Re
                     else {
                         return Err(mismatch("steer.effect", "Steer effect", &effect.kind));
                     };
-                    if !steer_effect_eligible030(&state, effect)
+                    let eligible = if receipt.get("wireAdmissionEventId").is_some() {
+                        crate::agsdl_host_steer030::wire_eligible030(&state, effect)
+                    } else {
+                        steer_effect_eligible030(&state, effect)
+                    };
+                    if !eligible
                         || !state
                             .activations
                             .iter()
@@ -630,6 +654,10 @@ async fn verify(db: &mut SqliteConnection, system: &str, invocation: &str) -> Re
         return Err(mismatch("start.enter", "accepted Enter event", Value::Null));
     }
     equal("outbox.count", &produced.len(), &outbox.len())?;
+    // Older run rows did not store the journal head.
+    if stored.last_event_id.is_none() {
+        state.last_event_id = None;
+    }
     equal("run.state", &state, &stored)?;
     for (effect, row) in produced.iter().zip(&outbox) {
         let event_id: String = row.try_get("event_id").map_err(storage)?;
@@ -674,7 +702,8 @@ async fn verify_physical_end(
     let handoff: i64 = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM engine_flow030_handoffs WHERE system_id=? AND invocation_id=? AND effect_id=?)")
         .bind(&id.system_start_id).bind(&id.flow_invocation_id).bind(&work.start_effect_id).fetch_one(&mut *db).await.map_err(storage)?;
     if handoff == 0 {
-        equal("physicalEnded.noAdmission.stopping", &true, &stopping)?;
+        // Replay already matched the physical end against the exact
+        // outstanding StopWork in its prefix, including for group stops.
         equal(
             "physicalEnded.noAdmission.eventId",
             &format!("no-admission:{}", work.start_effect_id),
@@ -683,7 +712,7 @@ async fn verify_physical_end(
         if stop_effect_id.is_none() {
             return Err(mismatch(
                 "physicalEnded.noAdmission.stopEffectId",
-                "StopWork from the native Stop",
+                "StopWork for the unadmitted Start",
                 Value::Null,
             ));
         }
@@ -801,13 +830,18 @@ async fn verify_physical_end(
             )
             .bind(&id.system_start_id)
             .bind(&id.flow_invocation_id)
-            .fetch_one(&mut *db).await.map_err(storage)?;
+            .fetch_one(&mut *db)
+            .await
+            .map_err(storage)?;
             equal("reopenedApproval.revokedStopped", &true, &revoked_stopped)?;
         }
         if matches!(
             receipt["kind"].as_str(),
-            Some("nativeJoinedGroupStop030" | "nativeJoinedDiagnosticStop030"
-                | "nativeReopenedApprovalStop030")
+            Some(
+                "nativeJoinedGroupStop030"
+                    | "nativeJoinedDiagnosticStop030"
+                    | "nativeReopenedApprovalStop030"
+            )
         ) {
             equal(
                 "physicalEnded.stop.eventId",
@@ -899,6 +933,21 @@ fn verify_steer_settlement(
             &event.expected_revision,
             &checkpoint.unwrap().receipt.revision,
         )?;
+        if let Some(wire) = receipt.get("wireAdmissionEventId") {
+            let admission_revision = wire
+                .as_str()
+                .and_then(|id| state.events.get(id))
+                .map(|event| event.receipt.revision.as_str());
+            if !admission_revision.is_some_and(|revision| {
+                argentic_core::flow::number::cmp(revision, &event.expected_revision).is_le()
+            }) {
+                return Err(mismatch(
+                    "steer.wireAdmissionEventId",
+                    "admission at or before the settlement checkpoint",
+                    wire,
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -1154,8 +1203,11 @@ async fn verify_settlement(
         }
     } else if matches!(
         receipt["kind"].as_str(),
-        Some("nativeJoinedGroupStop030" | "nativeJoinedDiagnosticStop030"
-            | "nativeReopenedApprovalStop030")
+        Some(
+            "nativeJoinedGroupStop030"
+                | "nativeJoinedDiagnosticStop030"
+                | "nativeReopenedApprovalStop030"
+        )
     ) {
         // Retained R6 group stops settled directly with the joined event and
         // the original Start handoff, without creating a second handoff row.

@@ -17,13 +17,18 @@ use super::{
         values::{compare_numbers, Num},
         Object, Value,
     },
-    valueschema::PointerPart,
+    resource::{
+        number_excerpt, SourceBudget, MAX_DIAGNOSTICS, MAX_DIAGNOSTIC_BYTES, MAX_SOURCE_BYTES,
+        MAX_SOURCE_WORK,
+    },
+    valueschema::{path_pointer, PointerPart},
 };
 use ordered::{OrderedMap, OrderedSet};
 use std::{
     cell::OnceCell,
     cmp::Ordering,
     collections::{HashMap, HashSet},
+    rc::Rc,
     sync::OnceLock,
 };
 
@@ -31,6 +36,7 @@ use std::{
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Unshaped {
     pub(crate) message: String,
+    pub(crate) limit_pointer: Option<String>,
 }
 
 pub(crate) type GraphResult<T> = Result<T, Unshaped>;
@@ -38,7 +44,196 @@ pub(crate) type GraphResult<T> = Result<T, Unshaped>;
 fn unshaped<T>(message: impl Into<String>) -> GraphResult<T> {
     Err(Unshaped {
         message: message.into(),
+        limit_pointer: None,
     })
+}
+
+/// Step instances (including compose calls and synthetic exits) in expanded graphs.
+pub const MAX_EXPANDED_GRAPH_NODES: usize = 8192;
+/// Route targets processed during expansion, including intermediate outputs.
+pub const MAX_EXPANDED_GRAPH_EDGES: usize = 32_768;
+/// Composition bodies on one expansion path. The enclosing flow has depth zero.
+pub const MAX_COMPOSITION_DEPTH: usize = 32;
+/// Serialized step, route, message and submission contract data materialized during compilation.
+pub const MAX_COMPILED_GRAPH_JSON_BYTES: usize = 32 * 1024 * 1024;
+/// Stable diagnostic code for an expansion budget refusal.
+pub const GRAPH_LIMIT_CODE: &str = "GRAPH_LIMIT";
+
+const MAX_JOIN_ANALYSIS_ITEMS: usize = 131_072;
+
+#[derive(Default)]
+pub(crate) struct ExpansionBudget {
+    source: SourceBudget,
+    nodes: usize,
+    edges: usize,
+    json_bytes: usize,
+    join_items: usize,
+    diagnostic_bytes: usize,
+    diagnostics: usize,
+}
+
+impl ExpansionBudget {
+    pub(crate) fn new(source: &SourceBudget) -> Self {
+        Self {
+            source: source.clone(),
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn work(&self, count: usize, composition: Option<&str>) -> GraphResult<()> {
+        graph_work(&self.source, count, composition)
+    }
+
+    pub(crate) fn bytes(&self, count: usize, composition: Option<&str>) -> GraphResult<()> {
+        graph_bytes(&self.source, count, composition)
+    }
+
+    pub(crate) fn scope(
+        &mut self,
+        count: usize,
+        depth: usize,
+        composition: Option<&str>,
+    ) -> GraphResult<()> {
+        if depth > MAX_COMPOSITION_DEPTH {
+            return Err(expansion_limit(
+                composition,
+                "composition depth",
+                MAX_COMPOSITION_DEPTH,
+            ));
+        }
+        self.nodes(count, composition)
+    }
+
+    fn nodes(&mut self, count: usize, composition: Option<&str>) -> GraphResult<()> {
+        self.work(count, composition)?;
+        self.bytes(count.saturating_mul(288), composition)?;
+        spend(
+            &mut self.nodes,
+            count,
+            MAX_EXPANDED_GRAPH_NODES,
+            composition,
+            "expanded graph nodes",
+        )
+    }
+
+    pub(crate) fn edges(&mut self, count: usize, composition: Option<&str>) -> GraphResult<()> {
+        self.work(count, composition)?;
+        self.bytes(count.saturating_mul(152), composition)?;
+        spend(
+            &mut self.edges,
+            count,
+            MAX_EXPANDED_GRAPH_EDGES,
+            composition,
+            "expanded graph route targets",
+        )
+    }
+
+    pub(crate) fn json(&mut self, bytes: usize, composition: Option<&str>) -> GraphResult<()> {
+        self.bytes(bytes.saturating_mul(2), composition)?;
+        spend(
+            &mut self.json_bytes,
+            bytes,
+            MAX_COMPILED_GRAPH_JSON_BYTES,
+            composition,
+            "compiled graph JSON bytes",
+        )
+    }
+
+    pub(crate) fn remaining_json(&self) -> usize {
+        MAX_COMPILED_GRAPH_JSON_BYTES - self.json_bytes
+    }
+
+    pub(crate) fn json_limit(&self, composition: Option<&str>) -> Unshaped {
+        expansion_limit(
+            composition,
+            "compiled graph JSON bytes",
+            MAX_COMPILED_GRAPH_JSON_BYTES,
+        )
+    }
+
+    pub(crate) fn join_analysis(
+        &mut self,
+        count: usize,
+        composition: Option<&str>,
+    ) -> GraphResult<()> {
+        // Branch names, memberships and diagnostics can outnumber nodes and
+        // edges, even though each individual reachability scan is linear space.
+        self.work(count, composition)?;
+        self.bytes(count.saturating_mul(128), composition)?;
+        spend(
+            &mut self.join_items,
+            count,
+            MAX_JOIN_ANALYSIS_ITEMS,
+            composition,
+            "join analysis items",
+        )
+    }
+
+    fn diagnostic(&mut self, problem: &GraphProblem, composition: Option<&str>) -> GraphResult<()> {
+        let pointer = path_pointer(&problem.pointer);
+        let bytes = pointer.len() + problem.addr.len() + problem.message.len() + 128;
+        if self.diagnostics >= MAX_DIAGNOSTICS
+            || bytes > MAX_DIAGNOSTIC_BYTES - self.diagnostic_bytes
+        {
+            return Err(Unshaped {
+                message: "Maximum join diagnostic count or bytes exceeded.".into(),
+                limit_pointer: Some(pointer),
+            });
+        }
+        self.bytes(bytes, composition)?;
+        self.diagnostics += 1;
+        self.diagnostic_bytes += bytes;
+        Ok(())
+    }
+
+    pub(crate) fn route(&mut self, route: &Value, composition: Option<&str>) -> GraphResult<()> {
+        self.edges(route_len(route), composition)
+    }
+}
+
+pub(crate) fn route_len(route: &Value) -> usize {
+    match route {
+        Value::Array(items) => items.len().max(1),
+        _ => 1,
+    }
+}
+
+fn graph_work(budget: &SourceBudget, count: usize, composition: Option<&str>) -> GraphResult<()> {
+    budget
+        .charge_work(count)
+        .then_some(())
+        .ok_or_else(|| expansion_limit(composition, "source work units", MAX_SOURCE_WORK))
+}
+
+fn graph_bytes(budget: &SourceBudget, count: usize, composition: Option<&str>) -> GraphResult<()> {
+    budget
+        .charge_bytes(count)
+        .then_some(())
+        .ok_or_else(|| expansion_limit(composition, "source allocation bytes", MAX_SOURCE_BYTES))
+}
+
+fn spend(
+    used: &mut usize,
+    count: usize,
+    limit: usize,
+    composition: Option<&str>,
+    label: &str,
+) -> GraphResult<()> {
+    if count > limit - *used {
+        return Err(expansion_limit(composition, label, limit));
+    }
+    *used += count;
+    Ok(())
+}
+
+fn expansion_limit(composition: Option<&str>, label: &str, limit: usize) -> Unshaped {
+    Unshaped {
+        message: format!("Maximum {label} exceeded ({limit})."),
+        limit_pointer: Some(composition.map_or_else(
+            || "/flow".to_owned(),
+            |name| super::exact::at("/compositions", name),
+        )),
+    }
 }
 
 pub(crate) fn empty_object() -> &'static Object {
@@ -105,13 +300,18 @@ pub(crate) fn last(addr: &str) -> Option<&str> {
 
 /// `compare_addresses(left, right)`: by segment, shorter first.
 pub(crate) fn compare_addresses(left: &str, right: &str) -> Ordering {
-    let (a, b) = (address_parts(left), address_parts(right));
-    for (x, y) in a.iter().zip(&b) {
-        if x != y {
-            return compare_utf16(x, y);
+    if left.is_empty() || right.is_empty() {
+        return right.is_empty().cmp(&left.is_empty());
+    }
+    let mut a = left.split('/');
+    let mut b = right.split('/');
+    loop {
+        match (a.next(), b.next()) {
+            (Some(a), Some(b)) if a != b => return compare_utf16(a, b),
+            (Some(_), Some(_)) => {}
+            (a, b) => return a.is_some().cmp(&b.is_some()),
         }
     }
-    a.len().cmp(&b.len())
 }
 
 pub(crate) fn sorted_addresses<'s>(values: impl IntoIterator<Item = &'s String>) -> Vec<String> {
@@ -362,7 +562,7 @@ pub(crate) type Adjacency = HashMap<String, Vec<usize>>;
 
 pub(crate) struct Graph<'a> {
     pub(crate) document: &'a Object,
-    pub(crate) in_branch: InBranch,
+    in_branch: Option<Rc<InBranch>>,
     pub(crate) covered: OrderedSet<String>,
     pub(crate) compositions: &'a Object,
     pub(crate) scopes: Vec<Scope<'a>>,
@@ -370,6 +570,7 @@ pub(crate) struct Graph<'a> {
     pub(crate) composes: OrderedMap<String, Compose<'a>>,
     pub(crate) edges: Vec<Edge<'a>>,
     pub(crate) root: Option<String>,
+    source: SourceBudget,
     successors: OnceCell<Adjacency>,
     predecessors: OnceCell<Adjacency>,
 }
@@ -384,12 +585,13 @@ fn compositions_of(document: &Object) -> GraphResult<&Object> {
 impl<'a> Graph<'a> {
     fn new(
         document: &'a Object,
-        in_branch: Option<InBranch>,
+        in_branch: Option<Rc<InBranch>>,
         covered: Option<OrderedSet<String>>,
+        budget: &ExpansionBudget,
     ) -> GraphResult<Self> {
         Ok(Self {
             document,
-            in_branch: in_branch.unwrap_or_default(),
+            in_branch,
             covered: covered.unwrap_or_default(),
             compositions: compositions_of(document)?,
             scopes: Vec::new(),
@@ -397,6 +599,7 @@ impl<'a> Graph<'a> {
             composes: OrderedMap::new(),
             edges: Vec::new(),
             root: None,
+            source: budget.source.clone(),
             successors: OnceCell::new(),
             predecessors: OnceCell::new(),
         })
@@ -466,13 +669,16 @@ impl<'a> Graph<'a> {
     /// `Graph.for_flow(document, in_branch, covered)`.
     pub(crate) fn for_flow(
         document: &'a Object,
-        in_branch: Option<InBranch>,
+        in_branch: Option<Rc<InBranch>>,
         covered: Option<OrderedSet<String>>,
+        budget: &mut ExpansionBudget,
     ) -> GraphResult<Self> {
-        let mut graph = Graph::new(document, in_branch, covered)?;
+        let mut graph = Graph::new(document, in_branch, covered, budget)?;
         let flow = Self::flow(document)?;
+        let steps = object_of(member(flow, "steps", "flow")?, "steps")?;
+        budget.scope(steps.len(), 0, None)?;
         let scope = graph.add_scope_record(Scope {
-            steps: object_of(member(flow, "steps", "flow")?, "steps")?,
+            steps,
             pointer: vec![key("flow"), key("steps")],
             prefix: String::new(),
             composition: None,
@@ -481,8 +687,8 @@ impl<'a> Graph<'a> {
             parent: None,
             compose_name: None,
         });
-        graph.add_scope(scope, &[])?;
-        graph.connect()?;
+        graph.add_scope(scope, &[], budget)?;
+        graph.connect(budget)?;
         let entry = string_of(member(flow, "entry", "flow")?, "entry")?;
         graph.root = graph.resolve(scope, entry)?;
         Ok(graph)
@@ -492,6 +698,7 @@ impl<'a> Graph<'a> {
     pub(crate) fn flow_error_covered(
         document: &'a Object,
         branch_members: &OrderedSet<String>,
+        budget: &ExpansionBudget,
     ) -> GraphResult<OrderedSet<String>> {
         let flow = Self::flow(document)?;
         let steps = object_of(member(flow, "steps", "flow")?, "steps")?;
@@ -502,6 +709,8 @@ impl<'a> Graph<'a> {
         if !steps.contains_key(entry) {
             return Ok(OrderedSet::new());
         }
+        budget.work(route_len(on_error), None)?;
+        budget.bytes(route_len(on_error) * 88, None)?;
         let targets: HashSet<&str> = route_targets(on_error, &[])?
             .into_iter()
             .filter(|item| item.kind == TargetKind::Step)
@@ -512,8 +721,11 @@ impl<'a> Graph<'a> {
         let mut queue = vec![entry.to_owned()];
         let mut i = 0;
         while i < queue.len() {
+            budget.work(1, None)?;
             let decl = object_of(member(steps, &queue[i], "steps")?, "step")?;
             for route in step_routes(decl, &[]) {
+                budget.work(route_len(route.route), None)?;
+                budget.bytes(route_len(route.route) * 88, None)?;
                 for item in route_targets(route.route, &[])? {
                     if item.kind == TargetKind::Step
                         && steps.contains_key(item.name)
@@ -543,11 +755,13 @@ impl<'a> Graph<'a> {
         document: &'a Object,
         composition: Option<&str>,
         covered: Option<OrderedSet<String>>,
+        budget: &mut ExpansionBudget,
     ) -> GraphResult<Self> {
         let mut graph = Graph::new(
             document,
             None,
             if composition.is_none() { covered } else { None },
+            budget,
         )?;
         let (container, pointer) = match composition {
             None => (Self::flow(document)?, vec![key("flow"), key("steps")]),
@@ -557,6 +771,7 @@ impl<'a> Graph<'a> {
             ),
         };
         let steps = object_of(member(container, "steps", "container")?, "steps")?;
+        budget.scope(steps.len(), usize::from(composition.is_some()), composition)?;
         let scope = graph.add_scope_record(Scope {
             steps,
             pointer,
@@ -568,6 +783,7 @@ impl<'a> Graph<'a> {
             compose_name: None,
         });
         for (name, decl) in steps.iter() {
+            budget.bytes(name.len() * 8, composition)?;
             let node = graph.node(name, Some(object_of(decl, "step")?), scope, name)?;
             graph.nodes.set(name.to_owned(), node);
         }
@@ -578,8 +794,9 @@ impl<'a> Graph<'a> {
                 (node.decl.expect("step node"), node.pointer.clone())
             };
             for route in step_routes(decl, &pointer) {
+                budget.route(route.route, composition)?;
                 for item in route_items(route.route, &route.pointer)? {
-                    if let Some(dst) = graph.local_target(scope, item.kind, item.name)? {
+                    if let Some(dst) = graph.local_target(scope, item.kind, item.name, budget)? {
                         graph.edges.push(Edge::new(
                             addr.clone(),
                             dst,
@@ -597,8 +814,9 @@ impl<'a> Graph<'a> {
         sort_utf16(&mut covered);
         for name in covered {
             let on_error = member(container, "onError", "flow")?;
+            budget.route(on_error, composition)?;
             for item in route_items(on_error, &[key("flow"), key("onError")])? {
-                if let Some(dst) = graph.local_target(scope, item.kind, item.name)? {
+                if let Some(dst) = graph.local_target(scope, item.kind, item.name, budget)? {
                     graph.edges.push(Edge::new(
                         name.clone(),
                         dst,
@@ -616,9 +834,15 @@ impl<'a> Graph<'a> {
         Ok(graph)
     }
 
-    fn exit_node(&mut self, scope: usize, name: &str) -> GraphResult<String> {
+    fn exit_node(
+        &mut self,
+        scope: usize,
+        name: &str,
+        budget: &mut ExpansionBudget,
+    ) -> GraphResult<String> {
         let addr = format!("#exit/{name}");
         if !self.nodes.contains_key(&addr) {
+            budget.nodes(1, self.scopes[scope].composition.as_deref())?;
             let node = self.node(&addr, None, scope, name)?;
             self.nodes.set(addr.clone(), node);
         }
@@ -630,6 +854,7 @@ impl<'a> Graph<'a> {
         scope: usize,
         kind: TargetKind,
         name: &str,
+        budget: &mut ExpansionBudget,
     ) -> GraphResult<Option<String>> {
         if kind == TargetKind::Step {
             return Ok(self.nodes.contains_key(name).then(|| name.to_owned()));
@@ -637,19 +862,22 @@ impl<'a> Graph<'a> {
         if self.scopes[scope].composition.is_none() {
             return Ok(None);
         }
-        self.exit_node(scope, name).map(Some)
+        self.exit_node(scope, name, budget).map(Some)
     }
 
     /// `Graph.for_composition(document, name, in_branch)`.
     pub(crate) fn for_composition(
         document: &'a Object,
         name: &str,
-        in_branch: Option<InBranch>,
+        in_branch: Option<Rc<InBranch>>,
+        budget: &mut ExpansionBudget,
     ) -> GraphResult<Self> {
-        let mut graph = Graph::new(document, in_branch, None)?;
+        let mut graph = Graph::new(document, in_branch, None, budget)?;
         let composition = graph.composition(name)?;
+        let steps = object_of(member(composition, "steps", "composition")?, "steps")?;
+        budget.scope(steps.len(), 1, Some(name))?;
         let scope = graph.add_scope_record(Scope {
-            steps: object_of(member(composition, "steps", "composition")?, "steps")?,
+            steps,
             pointer: vec![key("compositions"), key(name), key("steps")],
             prefix: format!("#{name}"),
             composition: Some(name.to_owned()),
@@ -658,14 +886,19 @@ impl<'a> Graph<'a> {
             parent: None,
             compose_name: None,
         });
-        graph.add_scope(scope, &[name.to_owned()])?;
-        graph.connect()?;
+        graph.add_scope(scope, &[name.to_owned()], budget)?;
+        graph.connect(budget)?;
         let entry = string_of(member(composition, "entry", "composition")?, "entry")?;
         graph.root = graph.resolve(scope, entry)?;
         Ok(graph)
     }
 
-    fn add_scope(&mut self, scope: usize, stack: &[String]) -> GraphResult<()> {
+    fn add_scope(
+        &mut self,
+        scope: usize,
+        stack: &[String],
+        budget: &mut ExpansionBudget,
+    ) -> GraphResult<()> {
         struct Frame<'a> {
             scope: usize,
             entries: Vec<(&'a str, &'a Value)>,
@@ -692,7 +925,12 @@ impl<'a> Graph<'a> {
             let (name, decl) = frame.entries[frame.index];
             frame.index += 1;
             let decl = object_of(decl, "step")?;
-            let addr = address(&self.scopes[scope].prefix, name);
+            let scope_record = &self.scopes[scope];
+            budget.bytes(
+                8 * (scope_record.prefix.len() + name.len() + 1),
+                scope_record.composition.as_deref(),
+            )?;
+            let addr = address(&scope_record.prefix, name);
             if string_of(member(decl, "type", "step")?, "step type")? != "compose" {
                 let node = self.node(&addr, Some(decl), scope, name)?;
                 self.nodes.set(addr, node);
@@ -714,12 +952,17 @@ impl<'a> Graph<'a> {
                 );
                 continue;
             };
+            let child_steps = object_of(member(composition, "steps", "composition")?, "steps")?;
+            budget.scope(child_steps.len(), active.len() + 1, Some(target))?;
             let mut bindings = OrderedMap::new();
             let agents = match decl.get("agents") {
                 None | Some(Value::Null) => empty_object(),
                 Some(value) => object_of(value, "compose agents")?,
             };
+            budget.work(agents.len(), Some(target))?;
+            budget.bytes(agents.len() * 96, Some(target))?;
             for (parameter, value) in agents.iter() {
+                budget.bytes(parameter.len() * 2, Some(target))?;
                 let bound = match value {
                     Value::String(name) => Some(name.clone()),
                     Value::Object(reference) => {
@@ -737,7 +980,7 @@ impl<'a> Graph<'a> {
             let compose_name = (!name.is_empty() || !prefix.is_empty())
                 .then(|| name.rsplit('/').next().unwrap_or(name).to_owned());
             let child = self.add_scope_record(Scope {
-                steps: object_of(member(composition, "steps", "composition")?, "steps")?,
+                steps: child_steps,
                 pointer: vec![key("compositions"), key(target), key("steps")],
                 prefix: addr.clone(),
                 composition: Some(target.to_owned()),
@@ -755,7 +998,6 @@ impl<'a> Graph<'a> {
                 },
             );
             active.insert(target.to_owned());
-            let child_steps: &'a Object = self.scopes[child].steps;
             frames.push(Frame {
                 scope: child,
                 entries: child_steps.iter().collect(),
@@ -794,6 +1036,8 @@ impl<'a> Graph<'a> {
         &mut self,
         scope: usize,
         item: RouteItem<'a>,
+        budget: &mut ExpansionBudget,
+        source_composition: Option<&str>,
     ) -> GraphResult<
         Vec<(
             String,
@@ -815,7 +1059,7 @@ impl<'a> Graph<'a> {
                 if self.scopes[scope].composition.is_none() {
                     continue;
                 }
-                let addr = self.exit_node(scope, item.name)?;
+                let addr = self.exit_node(scope, item.name, budget)?;
                 found.push((addr, item.message, item.pointer, item.fanout));
                 continue;
             };
@@ -836,6 +1080,7 @@ impl<'a> Graph<'a> {
                 &self.scopes[parent].pointer,
                 [key(&segment), key("next"), key(item.name)],
             );
+            budget.route(route, source_composition)?;
             let items = route_items(route, &outer)?;
             for item in items.into_iter().rev() {
                 pending.push((parent, item));
@@ -856,7 +1101,8 @@ impl<'a> Graph<'a> {
             let composition = self.scopes[scope].composition.clone();
             if self
                 .in_branch
-                .get(&composition)
+                .as_ref()
+                .and_then(|members| members.get(&composition))
                 .is_some_and(|members| members.contains(&name))
             {
                 return Ok(None);
@@ -884,7 +1130,7 @@ impl<'a> Graph<'a> {
         Ok(None)
     }
 
-    fn connect(&mut self) -> GraphResult<()> {
+    fn connect(&mut self, budget: &mut ExpansionBudget) -> GraphResult<()> {
         let snapshot: Vec<String> = self.nodes.keys().cloned().collect();
         for addr in snapshot {
             let (decl, pointer, scope, name) = {
@@ -909,9 +1155,13 @@ impl<'a> Graph<'a> {
                     ));
                 }
             }
+            let composition = self.scopes[scope].composition.clone();
             for (route, scope) in routes {
+                budget.route(route.route, composition.as_deref())?;
                 for item in route_items(route.route, &route.pointer)? {
-                    for (dst, carried, at, fanout) in self.targets(scope, item)? {
+                    for (dst, carried, at, fanout) in
+                        self.targets(scope, item, budget, composition.as_deref())?
+                    {
                         self.edges.push(Edge::new(
                             addr.clone(),
                             dst,
@@ -928,7 +1178,23 @@ impl<'a> Graph<'a> {
         Ok(())
     }
 
+    fn composition_name(&self) -> Option<&str> {
+        self.scopes
+            .first()
+            .and_then(|scope| scope.composition.as_deref())
+    }
+
+    pub(crate) fn work(&self, units: usize) -> GraphResult<()> {
+        graph_work(&self.source, units, self.composition_name())
+    }
+
+    pub(crate) fn bytes(&self, bytes: usize) -> GraphResult<()> {
+        graph_bytes(&self.source, bytes, self.composition_name())
+    }
+
     fn adjacency(&self, source: bool) -> GraphResult<Adjacency> {
+        self.work(self.nodes.len() + self.edges.len())?;
+        self.bytes(self.nodes.len() * 96 + self.edges.len() * 16)?;
         let mut result: Adjacency = self
             .nodes
             .keys()
@@ -983,16 +1249,20 @@ impl<'a> Graph<'a> {
         start: &str,
         blocked: &OrderedSet<String>,
     ) -> GraphResult<OrderedSet<String>> {
+        self.bytes(96 + start.len() * 3)?;
         let mut seen = OrderedSet::new();
         seen.insert(start.to_owned());
         let mut queue = vec![start.to_owned()];
         let mut i = 0;
         while i < queue.len() {
-            for &edge in self.outgoing(&queue[i])? {
+            let outgoing = self.outgoing(&queue[i])?;
+            self.work(1 + outgoing.len())?;
+            for &edge in outgoing {
                 let dst = &self.edges[edge].dst;
                 if blocked.contains(dst) || seen.contains(dst) {
                     continue;
                 }
+                self.bytes(96 + dst.len() * 3)?;
                 seen.insert(dst.clone());
                 queue.push(dst.clone());
             }
@@ -1007,15 +1277,19 @@ impl<'a> Graph<'a> {
         target: &str,
         blocked: &OrderedSet<String>,
     ) -> GraphResult<OrderedSet<String>> {
+        self.bytes(96 + target.len())?;
         let mut seen = OrderedSet::new();
         let mut queue = vec![target.to_owned()];
         let mut i = 0;
         while i < queue.len() {
-            for &edge in self.incoming(&queue[i])? {
+            let incoming = self.incoming(&queue[i])?;
+            self.work(1 + incoming.len())?;
+            for &edge in incoming {
                 let src = &self.edges[edge].src;
                 if blocked.contains(src) || seen.contains(src) || src == target {
                     continue;
                 }
+                self.bytes(96 + src.len() * 3)?;
                 seen.insert(src.clone());
                 queue.push(src.clone());
             }
@@ -1024,69 +1298,69 @@ impl<'a> Graph<'a> {
         Ok(seen)
     }
 
-    /// `graph.dominators()`.
-    pub(crate) fn dominators(&self) -> GraphResult<OrderedMap<String, OrderedSet<String>>> {
-        let mut dom = OrderedMap::new();
-        let Some(root) = self.root.clone() else {
-            return Ok(dom);
+    /// Compute immediate dominators in reverse postorder using the
+    /// Cooper–Harvey–Kennedy algorithm. Only one parent per node is stored.
+    fn immediate_dominators(&self) -> GraphResult<HashMap<&str, &str>> {
+        let Some(root) = self.root.as_deref() else {
+            return Ok(HashMap::new());
         };
-        let reach = self.reachable(&root, &OrderedSet::new())?;
-        for n in &reach {
-            dom.set(n.clone(), reach.clone());
-        }
-        dom.set(root.clone(), [root.clone()].into_iter().collect());
-        let mut changed = true;
-        while changed {
-            changed = false;
-            for n in &reach {
-                if *n == root {
-                    continue;
+        self.work(self.nodes.len() + self.edges.len())?;
+        self.bytes(self.nodes.len() * 128)?;
+        let mut seen = HashSet::from([root]);
+        let mut order = Vec::new();
+        let mut stack = vec![(root, self.outgoing(root)?.iter())];
+        while let Some((addr, outgoing)) = stack.last_mut() {
+            if let Some(&edge) = outgoing.next() {
+                let dst = self.edges[edge].dst.as_str();
+                if seen.insert(dst) {
+                    stack.push((dst, self.outgoing(dst)?.iter()));
                 }
-                let incoming: Vec<&String> = self
-                    .incoming(n)?
+            } else {
+                order.push(*addr);
+                stack.pop();
+            }
+        }
+        order.reverse();
+        let positions: HashMap<_, _> = order
+            .iter()
+            .enumerate()
+            .map(|(i, &addr)| (addr, i))
+            .collect();
+        let mut parents = vec![None; order.len()];
+        parents[0] = Some(0);
+        loop {
+            let mut changed = false;
+            for (index, addr) in order.iter().enumerate().skip(1) {
+                let incoming = self.incoming(addr)?;
+                self.work(1 + incoming.len())?;
+                let mut incoming = incoming
                     .iter()
-                    .map(|&edge| &self.edges[edge].src)
-                    .filter(|src| reach.contains(*src))
-                    .collect();
-                let mut next = match incoming.split_first() {
-                    None => OrderedSet::new(),
-                    Some((first, rest)) => {
-                        let mut acc: OrderedSet<String> =
-                            dom.get(*first).expect("dominator set").clone();
-                        for src in rest {
-                            acc = acc.intersection(dom.get(*src).expect("dominator set"));
+                    .filter_map(|&edge| positions.get(self.edges[edge].src.as_str()).copied())
+                    .filter(|&i| parents[i].is_some());
+                let first = incoming.next().expect("reachable DFS predecessor");
+                let parent = incoming.try_fold(first, |mut a, mut b| {
+                    while a != b {
+                        self.work(1)?;
+                        if a > b {
+                            a = parents[a].expect("known parent");
+                        } else {
+                            b = parents[b].expect("known parent");
                         }
-                        acc
                     }
-                };
-                next.insert(n.clone());
-                if !next.same_set(dom.get(n).expect("dominator set")) {
-                    dom.set(n.clone(), next);
-                    changed = true;
-                }
+                    Ok(a)
+                })?;
+                changed |= parents[index].replace(parent) != Some(parent);
+            }
+            if !changed {
+                break;
             }
         }
-        Ok(dom)
-    }
-
-    /// `graph.immediate_dominators()`.
-    pub(crate) fn immediate_dominators(&self) -> GraphResult<OrderedMap<String, String>> {
-        let dom = self.dominators()?;
-        let mut idom = OrderedMap::new();
-        for (n, ds) in dom.iter() {
-            let strict: Vec<&String> = ds.iter().filter(|d| *d != n).collect();
-            if let Some((first, rest)) = strict.split_first() {
-                let size = |d: &String| dom.get(d).expect("dominator set").len();
-                let mut best = *first;
-                for d in rest {
-                    if size(d) > size(best) {
-                        best = d;
-                    }
-                }
-                idom.set(n.clone(), best.clone());
-            }
-        }
-        Ok(idom)
+        Ok(order
+            .iter()
+            .zip(parents)
+            .skip(1)
+            .map(|(&addr, parent)| (addr, order[parent.expect("reachable node")]))
+            .collect())
     }
 
     pub(crate) fn node_at(&self, addr: &str) -> GraphResult<&Node<'a>> {
@@ -1102,8 +1376,11 @@ pub(crate) fn route_groups(
     graph: &Graph<'_>,
     addr: &str,
 ) -> GraphResult<OrderedMap<(RouteKind, Option<String>), Vec<String>>> {
+    let outgoing = graph.outgoing(addr)?;
+    graph.work(1 + outgoing.len())?;
+    graph.bytes(outgoing.len() * 96)?;
     let mut groups: OrderedMap<(RouteKind, Option<String>), Vec<String>> = OrderedMap::new();
-    for &edge in graph.outgoing(addr)? {
+    for &edge in outgoing {
         let edge = &graph.edges[edge];
         match groups.get_mut(&edge.group()) {
             Some(list) => list.push(edge.dst.clone()),
@@ -1146,6 +1423,8 @@ pub(crate) fn open_body_forks(
             continue;
         }
         for (group, dsts) in route_groups(graph, &addr)?.iter() {
+            graph
+                .work(graph.outgoing(&addr)?.len() + infos.len().saturating_mul(dsts.len() + 1))?;
             let targets: OrderedSet<String> = dsts.iter().cloned().collect();
             let fans = graph.outgoing(&addr)?.iter().any(|&edge| {
                 let edge = &graph.edges[edge];
@@ -1177,55 +1456,67 @@ pub(crate) fn open_body_forks(
 }
 
 /// `join_origin(graph, join, idom, succ)`.
-pub(crate) fn join_origin(
-    graph: &Graph<'_>,
-    join: &str,
-    idom: &OrderedMap<String, String>,
-) -> GraphResult<String> {
-    let Some(first) = idom.get(join).cloned() else {
+fn join_origin(graph: &Graph<'_>, join: &str, idom: &HashMap<&str, &str>) -> GraphResult<String> {
+    let Some(&first) = idom.get(join) else {
         return unshaped(format!("join {join} has no immediate dominator"));
     };
     let mut chain = Vec::new();
-    let mut current = Some(first.clone());
+    let mut current = Some(first);
     while let Some(step) = current {
-        current = idom.get(&step).cloned();
+        graph.work(1)?;
+        graph.bytes(64)?;
+        current = idom.get(step).copied();
         chain.push(step);
     }
-    let dominators: HashSet<&String> = chain.iter().collect();
+    let dominators: HashSet<_> = chain.iter().copied().collect();
     let fork = |step: &str, fanout_only: bool| -> GraphResult<bool> {
         let mut groups: OrderedMap<(RouteKind, Option<String>), Vec<usize>> = OrderedMap::new();
-        for &edge in graph.outgoing(step)? {
+        let outgoing = graph.outgoing(step)?;
+        graph.work(outgoing.len() * 3 + 1)?;
+        graph.bytes(outgoing.len() * 64)?;
+        for &edge in outgoing {
             let group = graph.edges[edge].group();
             match groups.get_mut(&group) {
                 Some(list) => list.push(edge),
                 None => groups.set(group, vec![edge]),
             }
         }
+        let mut reaching = None;
         for edges in groups.values() {
             if edges.iter().any(|&edge| {
                 let edge = &graph.edges[edge];
-                edge.each.is_some() && (dominators.contains(&edge.dst) || edge.dst == join)
+                edge.each.is_some() && (dominators.contains(edge.dst.as_str()) || edge.dst == join)
             }) {
                 return Ok(true);
             }
-            if !fanout_only {
-                let blocked: OrderedSet<String> = [step.to_owned()].into_iter().collect();
-                let mut reaching = OrderedSet::new();
+            if !fanout_only && edges.len() >= 2 {
+                if reaching.is_none() {
+                    reaching =
+                        Some(graph.reaching(join, &[step.to_owned()].into_iter().collect())?);
+                }
+                let reaching = reaching.as_ref().unwrap();
+                let mut first = None;
                 for &edge in edges {
                     let dst = &graph.edges[edge].dst;
-                    if dst == join || graph.reachable(dst, &blocked)?.contains(join) {
-                        reaching.insert(dst.clone());
+                    if dst == join
+                        || reaching.contains(dst)
+                        || (dst == step
+                            && graph
+                                .reachable(dst, &[step.to_owned()].into_iter().collect())?
+                                .contains(join))
+                    {
+                        if first.is_some_and(|first| first != dst) {
+                            return Ok(true);
+                        }
+                        first = Some(dst);
                     }
-                }
-                if reaching.len() >= 2 {
-                    return Ok(true);
                 }
             }
         }
         Ok(false)
     };
-    if fork(&first, false)? {
-        return Ok(first);
+    if fork(first, false)? {
+        return Ok(first.to_owned());
     }
     let mut closed = 0usize;
     for step in &chain {
@@ -1233,36 +1524,33 @@ pub(crate) fn join_origin(
             closed += 1;
         } else if fork(step, false)? {
             if closed == 0 {
-                return Ok(if fork(step, true)? {
-                    step.clone()
-                } else {
-                    first
-                });
+                return Ok(if fork(step, true)? { *step } else { first }.to_owned());
             }
             closed -= 1;
         }
     }
-    Ok(first)
+    Ok(first.to_owned())
 }
 
 /// `analyse_joins(graph)`: join information in node order, then problems.
 pub(crate) fn analyse_joins(
     graph: &Graph<'_>,
+    budget: &mut ExpansionBudget,
 ) -> GraphResult<(OrderedMap<String, JoinInfo>, Vec<GraphProblem>)> {
     let mut infos = OrderedMap::new();
     let mut problems = Vec::new();
-    let Some(root) = &graph.root else {
-        return Ok((infos, problems));
-    };
-    // Dominator sets grow quadratically and only joins use them.
+    let composition = graph
+        .scopes
+        .first()
+        .and_then(|scope| scope.composition.as_deref());
+    graph.work(graph.nodes.len())?;
     if !graph.nodes.iter().any(|(_, node)| node.kind == "join") {
         return Ok((infos, problems));
     }
     let idom = graph.immediate_dominators()?;
-    let reach = graph.reachable(root, &OrderedSet::new())?;
     let mut origins: OrderedMap<String, String> = OrderedMap::new();
     for (addr, node) in graph.nodes.iter() {
-        if node.kind == "join" && reach.contains(addr) && idom.contains_key(addr) {
+        if node.kind == "join" && idom.contains_key(addr.as_str()) {
             origins.set(addr.clone(), join_origin(graph, addr, &idom)?);
         }
     }
@@ -1270,27 +1558,36 @@ pub(crate) fn analyse_joins(
     for (addr, origin) in origins.iter() {
         let node = graph.node_at(addr)?;
         let joins_to_j = graph.reaching(addr, &one(origin))?;
-        let mut starts: Vec<String> = Vec::new();
-        for dsts in route_groups(graph, origin)?.values() {
+        let groups = route_groups(graph, origin)?;
+        let mut starts = OrderedSet::new();
+        for dsts in groups.values() {
             for dst in dsts {
                 if !starts.contains(dst) && (dst == addr || joins_to_j.contains(dst)) {
-                    starts.push(dst.clone());
+                    budget.join_analysis(1, composition)?;
+                    starts.insert(dst.clone());
                 }
             }
         }
-        let mut branches: OrderedMap<String, OrderedSet<String>> = OrderedMap::new();
+        let mut branches = OrderedMap::new();
+        let blocked = [origin.clone(), addr.clone()].into_iter().collect();
         for start in &starts {
-            let members = if start == addr {
-                OrderedSet::new()
-            } else {
-                let blocked: OrderedSet<String> =
-                    [origin.clone(), addr.clone()].into_iter().collect();
-                let mut allowed = joins_to_j.clone();
-                allowed.insert(start.clone());
-                graph.reachable(start, &blocked)?.intersection(&allowed)
-            };
+            let mut members = OrderedSet::new();
+            if start != addr {
+                for member in &graph.reachable(start, &blocked)? {
+                    if member == start || joins_to_j.contains(member) {
+                        budget.join_analysis(1, composition)?;
+                        members.insert(member.clone());
+                    }
+                }
+            }
             branches.set(start.clone(), members);
         }
+        let mut record = |problem| {
+            budget.diagnostic(&problem, composition)?;
+            budget.join_analysis(1, composition)?;
+            problems.push(problem);
+            Ok(())
+        };
         let prefix = &graph.scopes[node.scope].prefix;
         let mut names: OrderedMap<String, Option<String>> = OrderedMap::new();
         for start in &starts {
@@ -1316,7 +1613,6 @@ pub(crate) fn analyse_joins(
                 .unwrap_or_else(|| "undefined".to_owned())
         };
         let last_of = |addr: &str| last(addr).unwrap_or("undefined").to_owned();
-        let groups = route_groups(graph, origin)?;
         if fanout.is_empty()
             && !groups.values().any(|dsts| {
                 dsts.iter()
@@ -1326,19 +1622,19 @@ pub(crate) fn analyse_joins(
                     >= 2
             })
         {
-            problems.push(GraphProblem {
+            record(GraphProblem {
                 pointer: node.pointer.clone(),
                 addr: addr.clone(),
                 message: format!(
                     "no route of the origin '{}' starts two branches or more at once",
                     last_of(origin)
                 ),
-            });
+            })?;
         }
         for &edge in &started {
             let edge = &graph.edges[edge];
             if fanout.contains(&edge.dst) && edge.each.is_none() {
-                problems.push(GraphProblem {
+                record(GraphProblem {
                     pointer: edge.pointer.clone(),
                     addr: origin.clone(),
                     message: format!(
@@ -1346,35 +1642,48 @@ pub(crate) fn analyse_joins(
                         name_of(&edge.dst),
                         last_of(addr)
                     ),
-                });
+                })?;
             }
         }
-        let listed: Vec<(&String, &OrderedSet<String>)> = branches.iter().collect();
-        for i in 0..listed.len() {
-            for j in 0..i {
-                let shared = listed[i].1.intersection(listed[j].1);
-                if !shared.is_empty() {
-                    let step = sorted_addresses(&shared).remove(0);
-                    problems.push(GraphProblem {
-                        pointer: graph.node_at(&step)?.pointer.clone(),
+        let listed: Vec<_> = branches.values().collect();
+        let mut seen_members = HashSet::new();
+        for (i, members) in listed.iter().enumerate() {
+            let mut overlaps = false;
+            for member in *members {
+                overlaps |= !seen_members.insert(member);
+            }
+            if !overlaps {
+                continue;
+            }
+            for prior in &listed[..i] {
+                graph.work(members.len() + 1)?;
+                let shared = members
+                    .iter()
+                    .filter(|step| prior.contains(*step))
+                    .min_by(|a, b| compare_addresses(a, b));
+                if let Some(step) = shared {
+                    record(GraphProblem {
+                        pointer: graph.node_at(step)?.pointer.clone(),
                         addr: step.clone(),
                         message: format!(
                             "step '{}' belongs to two branches of join '{}'",
-                            last_of(&step),
+                            last_of(step),
                             last_of(addr)
                         ),
-                    });
+                    })?;
                 }
             }
         }
         for (start, members) in branches.iter() {
             for member in members {
-                for &edge in graph.incoming(member)? {
+                let incoming = graph.incoming(member)?;
+                graph.work(incoming.len() + 1)?;
+                for &edge in incoming {
                     let edge = &graph.edges[edge];
                     if members.contains(&edge.src) || (edge.src == *origin && member == start) {
                         continue;
                     }
-                    problems.push(GraphProblem {
+                    record(GraphProblem {
                         pointer: edge.pointer.clone(),
                         addr: edge.src.clone(),
                         message: format!(
@@ -1383,7 +1692,7 @@ pub(crate) fn analyse_joins(
                             name_of(start),
                             last_of(addr)
                         ),
-                    });
+                    })?;
                 }
             }
         }
@@ -1398,7 +1707,7 @@ pub(crate) fn analyse_joins(
             {
                 continue;
             }
-            problems.push(GraphProblem {
+            record(GraphProblem {
                 pointer: edge.pointer.clone(),
                 addr: edge.src.clone(),
                 message: format!(
@@ -1406,17 +1715,20 @@ pub(crate) fn analyse_joins(
                     last_of(addr),
                     last_of(&edge.src)
                 ),
-            });
+            })?;
         }
         for (start, members) in branches.iter() {
             for member in members {
                 for (group, dsts) in route_groups(graph, member)?.iter() {
+                    graph.work(
+                        dsts.len() + graph.outgoing(member)?.len().saturating_mul(dsts.len()),
+                    )?;
                     let inside: Vec<&String> = dsts
                         .iter()
                         .filter(|dst| members.contains(*dst) || *dst == addr)
                         .collect();
                     if !inside.is_empty() && inside.len() < dsts.len() {
-                        problems.push(GraphProblem {
+                        record(GraphProblem {
                             pointer: graph.node_at(member)?.pointer.clone(),
                             addr: member.clone(),
                             message: format!(
@@ -1425,7 +1737,7 @@ pub(crate) fn analyse_joins(
                                 name_of(start),
                                 last_of(addr)
                             ),
-                        });
+                        })?;
                         continue;
                     }
                     let fans = graph.outgoing(member)?.iter().any(|&edge| {
@@ -1435,6 +1747,8 @@ pub(crate) fn analyse_joins(
                     if inside.iter().collect::<HashSet<_>>().len() < 2 && !fans {
                         continue;
                     }
+                    graph.work(members.len())?;
+                    graph.bytes(members.len() * 72)?;
                     let mut blocked: OrderedSet<String> = members
                         .iter()
                         .filter(|k| origins.get(*k) == Some(member))
@@ -1449,7 +1763,7 @@ pub(crate) fn analyse_joins(
                         }
                     }
                     if open_fork {
-                        problems.push(GraphProblem {
+                        record(GraphProblem {
                             pointer: graph.node_at(member)?.pointer.clone(),
                             addr: member.clone(),
                             message: format!(
@@ -1457,7 +1771,7 @@ pub(crate) fn analyse_joins(
                                 last_of(member),
                                 last_of(addr)
                             ),
-                        });
+                        })?;
                     }
                 }
             }
@@ -1468,20 +1782,21 @@ pub(crate) fn analyse_joins(
                 let Value::Number(count) = count else {
                     return unshaped("quorum count is not a number");
                 };
+                graph.work(count.raw().len().div_ceil(8))?;
                 if compare_numbers(Num::Token(count), Num::Host(starts.len())) == Ordering::Greater
                 {
                     let mut pointer = node.pointer.clone();
                     pointer.extend([key("quorum"), key("count")]);
-                    problems.push(GraphProblem {
+                    record(GraphProblem {
                         pointer,
                         addr: addr.clone(),
                         message: format!(
                             "count {} exceeds the {} branches of join '{}'",
-                            count.raw(),
+                            number_excerpt(count.raw()),
                             starts.len(),
                             last_of(addr)
                         ),
-                    });
+                    })?;
                 }
             }
         }
@@ -1502,6 +1817,141 @@ pub(crate) fn analyse_joins(
 mod tests {
     use super::*;
     use crate::argentic_core::exact::scan::parse_v030;
+
+    #[test]
+    fn expansion_budget_checks_nodes_and_route_targets_before_allocation() {
+        let mut budget = ExpansionBudget::default();
+        budget.scope(MAX_EXPANDED_GRAPH_NODES - 1, 0, None).unwrap();
+        let source = super::super::exact::scan::parse_v030(
+            br#"{
+            "flow":{"entry":"start","steps":{"start":{"type":"compose","composition":"review"}}},
+            "compositions":{"review":{"entry":"end","steps":{"end":{"type":"agent","agent":"a","next":"end"}}}}
+        }"#,
+        )
+        .unwrap();
+        let document = source.tree.as_object().unwrap();
+        let error = Graph::for_flow(document, None, None, &mut budget)
+            .err()
+            .unwrap();
+        assert_eq!(error.limit_pointer.as_deref(), Some("/compositions/review"));
+        assert_eq!(budget.nodes, MAX_EXPANDED_GRAPH_NODES);
+        let mut budget = ExpansionBudget::default();
+        budget.edges(MAX_EXPANDED_GRAPH_EDGES, None).unwrap();
+        let error = Graph::for_flow(document, None, None, &mut budget)
+            .err()
+            .unwrap();
+        assert_eq!(error.limit_pointer.as_deref(), Some("/compositions/review"));
+        assert_eq!(budget.edges, MAX_EXPANDED_GRAPH_EDGES);
+        budget.json(MAX_COMPILED_GRAPH_JSON_BYTES, None).unwrap();
+        let error = budget.json(1, Some("review")).unwrap_err();
+        assert_eq!(error.limit_pointer.as_deref(), Some("/compositions/review"));
+    }
+
+    #[test]
+    fn join_analysis_at_expanded_node_limit() {
+        use serde_json::json;
+
+        let count = MAX_EXPANDED_GRAPH_NODES - 3;
+        let mut steps = serde_json::Map::new();
+        steps.insert(
+            "fork".into(),
+            json!({"type":"agent","agent":"a","next":["s0","short"]}),
+        );
+        steps.insert(
+            "short".into(),
+            json!({"type":"agent","agent":"a","next":"merge"}),
+        );
+        for i in 0..count {
+            let next = if i + 1 == count {
+                "merge".into()
+            } else {
+                format!("s{}", i + 1)
+            };
+            steps.insert(
+                format!("s{i}"),
+                json!({"type":"agent","agent":"a","next":next}),
+            );
+        }
+        steps.insert("merge".into(), json!({"type":"join"}));
+        let doc = json!({"flow":{"entry":"fork","steps":steps}});
+        let parsed = parse_v030(&serde_json::to_vec(&doc).unwrap()).unwrap();
+        let mut budget = ExpansionBudget::default();
+        let graph =
+            Graph::for_scope(parsed.tree.as_object().unwrap(), None, None, &mut budget).unwrap();
+        assert_eq!(graph.nodes.len(), MAX_EXPANDED_GRAPH_NODES);
+        let (joins, problems) = analyse_joins(&graph, &mut budget).unwrap();
+        assert!(problems.is_empty(), "{problems:?}");
+        let join = joins.get("merge").unwrap();
+        assert_eq!(join.origin, "fork");
+        assert_eq!(join.branches.get("s0").unwrap().len(), count);
+        assert_eq!(join.branches.get("short").unwrap().len(), 1);
+
+        let mut budget = ExpansionBudget::default();
+        budget
+            .join_analysis(MAX_JOIN_ANALYSIS_ITEMS - count, None)
+            .unwrap();
+        let error = analyse_joins(&graph, &mut budget).unwrap_err();
+        assert_eq!(error.limit_pointer.as_deref(), Some("/flow"));
+        assert!(error.message.contains("join analysis items"));
+    }
+
+    #[test]
+    fn validation_and_compiler_enforce_composition_depth() {
+        let compose = |target: String, route: serde_json::Value| {
+            serde_json::json!({
+                "type":"compose", "composition":target, "next":{"done":route},
+            })
+        };
+        let document = |depth: usize| {
+            use serde_json::json;
+            let bodies = (1..=depth)
+                .map(|index| {
+                    let output = json!({"output":"done"});
+                    let step = if index == depth {
+                        json!({"type":"agent","agent":"a","next":output})
+                    } else {
+                        compose(format!("body{}", index + 1), output)
+                    };
+                    (
+                        format!("body{index}"),
+                        json!({"entry":"step","outputs":["done"],"steps":{"step":step}}),
+                    )
+                })
+                .collect::<serde_json::Map<_, _>>();
+            json!({
+                "contract":"agsdl-0.4.0","id":"depth",
+                "agents":{"a":{"harness":"codex","permissions":"read-only"}},
+                "flow":{"entry":"step","steps":{"step":compose("body1".into(), json!([]))}},
+                "compositions":bodies,
+            })
+            .to_string()
+        };
+        let accepted = document(MAX_COMPOSITION_DEPTH);
+        let report: serde_json::Value = serde_json::from_str(
+            &crate::validate_document_json(accepted.as_bytes(), None).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(report["valid"], true, "{report}");
+        let refused = document(MAX_COMPOSITION_DEPTH + 1);
+        let pointer = format!("/compositions/body{}", MAX_COMPOSITION_DEPTH + 1);
+        let report: serde_json::Value =
+            serde_json::from_str(&crate::validate_document_json(refused.as_bytes(), None).unwrap())
+                .unwrap();
+        assert!(
+            report["diagnostics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| { entry["code"] == GRAPH_LIMIT_CODE && entry["path"] == pointer }),
+            "{report}"
+        );
+        let parsed = crate::exact::decode(&refused).unwrap();
+        let error = crate::compile::graph::compile(parsed.as_object().unwrap())
+            .err()
+            .unwrap();
+        assert_eq!(error.code, GRAPH_LIMIT_CODE);
+        assert_eq!(error.pointer.utf8().as_deref(), Some(pointer.as_str()));
+    }
 
     #[test]
     fn utf16_order_differs_from_utf8_for_astral_characters() {
@@ -1525,8 +1975,9 @@ mod tests {
             "j":{"type":"join"}}}}"#;
         let parsed = parse_v030(text.as_bytes()).unwrap();
         let document = parsed.tree.as_object().unwrap();
-        let graph = Graph::for_scope(document, None, None).unwrap();
-        let (infos, problems) = analyse_joins(&graph).unwrap();
+        let graph =
+            Graph::for_scope(document, None, None, &mut ExpansionBudget::default()).unwrap();
+        let (infos, problems) = analyse_joins(&graph, &mut ExpansionBudget::default()).unwrap();
         assert!(problems.is_empty());
         let info = infos.get("j").unwrap();
         assert_eq!(info.origin, "s");

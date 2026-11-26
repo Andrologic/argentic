@@ -19,6 +19,24 @@ use sqlx::{Row, SqliteConnection};
 use std::collections::BTreeMap;
 
 type Object = BTreeMap<String, Box<RawValue>>;
+pub(crate) fn is_remote_mcp_call(document: &Value, step: &Value) -> bool {
+    step["type"] == "call"
+        && step["mcp"]["server"]
+            .as_str()
+            .is_some_and(|server| document["mcpServers"][server]["url"].is_string())
+}
+
+fn clock_failure(attempt: &CallAttempt030) -> Result<CallResult030> {
+    let declaration: Object = serde_json::from_str(attempt.declaration_json())?;
+    Ok(CallResult030::failure(
+        if declaration.contains_key("timeoutMs") {
+            "TIMEOUT"
+        } else {
+            "CALL_FAILED"
+        },
+    ))
+}
+
 pub(crate) fn denied(detail: &str) -> EngineFailure {
     failure("CORRELATION", "call", detail)
 }
@@ -453,27 +471,45 @@ impl CallStopCause030 {
             argentic_core::durable_json::positive_integer(timeout).is_some(),
             "Clock timeout budget is not a positive exact integer",
         )?;
-        let declaration: Object = serde_json::from_str(attempt.declaration_json())?;
-        let declared = declaration
-            .get("timeoutMs")
-            .ok_or_else(|| denied("Call has no authored timeoutMs"))?;
-        require(
-            argentic_core::durable_json::equal(declared.get(), timeout)?,
-            "Clock timeout differs from captured call budget",
-        )?;
+        let declaration: Value = serde_json::from_str(attempt.declaration_json())?;
         let capture: String=sqlx::query_scalar("SELECT capture_json FROM engine_start030_requests WHERE system_id=? AND invocation_id=?")
             .bind(&attempt.identity.system_start_id).bind(&attempt.identity.flow_invocation_id).fetch_one(&mut *db).await?;
         let capture: StartCapture030 = serde_json::from_str(&capture)?;
         let plan: FlowPlan030 = serde_json::from_str(&capture.compiled_plan_json)?;
-        let budget = plan
+        let step = plan
             .steps
             .iter()
             .find(|s| s.address == attempt.address())
-            .and_then(|s| s.timeout_ms_json.as_deref())
-            .ok_or_else(|| denied("Captured call has no machine timeout budget"))?;
+            .ok_or_else(|| denied("Captured call step is absent"))?;
+        let budget = match (
+            declaration.get("timeoutMs"),
+            step.timeout_ms_json.as_deref(),
+        ) {
+            (Some(authored), Some(compiled)) => {
+                require(
+                    argentic_core::durable_json::equal(&authored.to_string(), compiled)?,
+                    "Clock budget differs from native compiled admission",
+                )?;
+                compiled.to_owned()
+            }
+            (None, None) => {
+                let document = serde_json::from_str(&plan.document_json)?;
+                require(
+                    is_remote_mcp_call(&document, &declaration)
+                        && timeout.parse::<std::num::NonZeroU64>().is_ok(),
+                    "Captured call has no host remote MCP budget",
+                )?;
+                timeout.to_owned()
+            }
+            _ => {
+                return Err(denied(
+                    "Clock budget differs from native compiled admission",
+                ))
+            }
+        };
         require(
-            argentic_core::durable_json::equal(budget, timeout)?,
-            "Clock budget differs from native compiled admission",
+            argentic_core::durable_json::equal(&budget, timeout)?,
+            "Clock timeout differs from captured call budget",
         )?;
         let receipt_id: &str = row.get("receipt_id");
         let observed: &str = row.get("observed_ms");
@@ -546,7 +582,7 @@ pub(crate) async fn record_cause_tx<A: CallAuthority030>(
     authority: &A,
     attempt: &CallAttempt030,
 ) -> Result<CallCauseReceipt030> {
-    verify_attempt_tx(db, authority, attempt, true).await?;
+    verify_attempt_tx(db, authority, attempt, AttemptCheck::Active).await?;
     let row = row_tx(db, attempt).await?;
     require(
         matches!(row.get::<&str, _>("status"), "launched" | "received"),
@@ -572,7 +608,7 @@ pub(crate) async fn record_cause_tx<A: CallAuthority030>(
 /// Settlement also checks the source decision itself: a return may win the
 /// admission lock between the clock's COMMIT and the supervisor's notification.
 /// Never attach a newly arrived cause to an already published terminal.
-async fn settlement_cause_tx<A: CallAuthority030>(
+pub(crate) async fn settlement_cause_tx<A: CallAuthority030>(
     db: &mut SqliteConnection,
     authority: &A,
     attempt: &CallAttempt030,
@@ -583,13 +619,19 @@ async fn settlement_cause_tx<A: CallAuthority030>(
     if row_tx(db, attempt).await?.get::<&str, _>("status") == "terminal" {
         return Ok(None);
     }
-    let decided: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM engine_flow030_clock_controls WHERE system_id=? AND invocation_id=? AND activation_id=? AND reason='TIMEOUT')")
-        .bind(&attempt.identity.system_start_id).bind(&attempt.identity.flow_invocation_id)
-        .bind(&attempt.work().activation_id).fetch_one(&mut *db).await?;
-    if !decided {
+    if !clock_timeout_exists_tx(db, attempt).await? {
         return Ok(None);
     }
     Ok(Some(record_cause_tx(db, authority, attempt).await?))
+}
+
+async fn clock_timeout_exists_tx(
+    db: &mut SqliteConnection,
+    attempt: &CallAttempt030,
+) -> Result<bool> {
+    Ok(sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM engine_flow030_clock_controls WHERE system_id=? AND invocation_id=? AND activation_id=? AND reason='TIMEOUT')")
+        .bind(&attempt.identity.system_start_id).bind(&attempt.identity.flow_invocation_id)
+        .bind(&attempt.work().activation_id).fetch_one(&mut *db).await?)
 }
 
 /// Retained before submitting COMMIT. Its constructor hashes exact SQL bytes
@@ -639,7 +681,7 @@ pub(crate) async fn verify_commit_marker_tx<A: CallAuthority030>(
     authority: &A,
     marker: &CallCommitMarker030,
 ) -> Result<()> {
-    verify_attempt_tx(db, authority, &marker.attempt, false).await?;
+    verify_attempt_tx(db, authority, &marker.attempt, AttemptCheck::Attribution).await?;
     require(
         commit_marker_tx(db, &marker.attempt).await? == *marker,
         "Unknown call commit does not match exact readback",
@@ -752,11 +794,17 @@ fn declaration<'a>(
     )?;
     Ok(step.declaration_json.clone())
 }
+enum AttemptCheck {
+    Attribution,
+    PendingStart,
+    Active,
+}
+
 async fn verify_attempt_tx<A: CallAuthority030>(
     db: &mut SqliteConnection,
     authority: &A,
     attempt: &CallAttempt030,
-    active: bool,
+    check: AttemptCheck,
 ) -> Result<FlowState030> {
     require(
         attempt.identity == attempt.effect.identity
@@ -782,7 +830,10 @@ async fn verify_attempt_tx<A: CallAuthority030>(
             && row.get::<&str, _>("owner_epoch") == attempt.owner_epoch,
         "Call Start differs",
     )?;
-    if active {
+    if matches!(check, AttemptCheck::PendingStart) {
+        require_pending_call_start_tx(db, authority, &state, attempt.effect()).await?;
+    }
+    if !matches!(check, AttemptCheck::Attribution) {
         require_admission_tx(db, &attempt.identity).await?;
         require(
             flow_store030::eligible(&state, &attempt.effect),
@@ -800,6 +851,26 @@ async fn verify_attempt_tx<A: CallAuthority030>(
     Ok(state)
 }
 
+async fn require_pending_call_start_tx<A: CallAuthority030>(
+    db: &mut SqliteConnection,
+    authority: &A,
+    state: &FlowState030,
+    effect: &FlowEffect030,
+) -> Result<()> {
+    let pending = flow_store030::pending_effect_tx(db, state, &effect.id, authority.owner_epoch())
+        .await
+        .map_err(|error| match error {
+            StoreError030::Missing | StoreError030::NotClaimable => failure(
+                "STALE_REFERENCE",
+                "call",
+                "Call Start is no longer pending and eligible",
+            ),
+            other => store_error(other),
+        })?;
+    require(pending == *effect, "Stored Call Start differs")?;
+    Ok(())
+}
+
 pub(crate) async fn reserve_tx<A: CallAuthority030>(
     db: &mut SqliteConnection,
     authority: &A,
@@ -807,25 +878,14 @@ pub(crate) async fn reserve_tx<A: CallAuthority030>(
 ) -> Result<CallAttempt030> {
     let capture = capture_tx(db, authority, &effect.identity).await?;
     let state = state_tx(db, &effect.identity).await?;
+    require_pending_call_start_tx(db, authority, &state, effect).await?;
     require_admission_tx(db, &effect.identity).await?;
     let declaration_json = declaration(&capture, effect, &state)?;
-    require(
-        flow_store030::eligible(&state, effect),
-        "Cannot reserve a stopped call",
-    )?;
     authority.effect(db, effect).await.map_err(store_error)?;
     authority
         .qualify_tx(db, &capture, effect, &declaration_json)
         .await
         .map_err(store_error)?;
-    let row = sqlx::query("SELECT status,effect_json,owner_epoch FROM engine_flow030_outbox WHERE system_id=? AND invocation_id=? AND effect_id=?")
-        .bind(&effect.identity.system_start_id).bind(&effect.identity.flow_invocation_id).bind(&effect.id).fetch_one(&mut *db).await?;
-    require(
-        row.get::<&str, _>("status") == "pending"
-            && row.get::<&str, _>("owner_epoch") == authority.owner_epoch()
-            && serde_json::from_str::<FlowEffect030>(row.get("effect_json"))? == *effect,
-        "Call Start already claimed or changed",
-    )?;
     let attempt = CallAttempt030 {
         identity: effect.identity.clone(),
         owner_epoch: authority.owner_epoch().into(),
@@ -874,7 +934,7 @@ pub(crate) async fn read_attempt_tx<A: CallAuthority030>(
         attempt.identity == *id && attempt.work() == work,
         "Call readback targets a different visit",
     )?;
-    verify_attempt_tx(db, authority, &attempt, false).await?;
+    verify_attempt_tx(db, authority, &attempt, AttemptCheck::Attribution).await?;
     row_tx(db, &attempt).await?;
     Ok(Some(attempt))
 }
@@ -1011,7 +1071,7 @@ pub(crate) async fn fail_preparation_tx<A: CallAuthority030>(
     {
         return Ok(CallSettlement030::Diagnostic { diagnostic });
     }
-    let state = verify_attempt_tx(db, authority, attempt, false).await?;
+    let state = verify_attempt_tx(db, authority, attempt, AttemptCheck::PendingStart).await?;
     let row = row_tx(db, attempt).await?;
     require(
         row.get::<&str, _>("status") == "reserved",
@@ -1025,15 +1085,10 @@ pub(crate) async fn fail_preparation_tx<A: CallAuthority030>(
             receipt_id: uuid::Uuid::new_v4().to_string(),
         },
     };
-    let stopped = call_stopped(&state, attempt)?;
     let receipt = CallReceipt030 {
         attempt: attempt.clone(),
         received,
-        result: if stopped {
-            CallResult030::Stopped
-        } else {
-            CallResult030::failure("OPERAND")
-        },
+        result: CallResult030::failure("OPERAND"),
         event_id: format!("call:{}:terminal", attempt.call_id),
     };
     if let Some(diagnostic) = apply_terminal_tx(db, authority, &state, &receipt).await? {
@@ -1055,7 +1110,7 @@ pub(crate) async fn prepare_tx<A: CallAuthority030>(
     attempt: &CallAttempt030,
     prepared: &PreparedCall030,
 ) -> Result<()> {
-    verify_attempt_tx(db, authority, attempt, true).await?;
+    verify_attempt_tx(db, authority, attempt, AttemptCheck::PendingStart).await?;
     let row = row_tx(db, attempt).await?;
     validate_prepared(attempt, prepared)?;
     require(
@@ -1075,7 +1130,7 @@ pub(crate) async fn launch_tx<A: CallAuthority030>(
     attempt: &CallAttempt030,
     control: &crate::agsdl_host_calls::Control,
 ) -> Result<()> {
-    verify_attempt_tx(db, authority, attempt, true).await?;
+    verify_attempt_tx(db, authority, attempt, AttemptCheck::Active).await?;
     control
         .check()
         .map_err(|e| failure(&e.code, "call", &e.detail))?;
@@ -1113,6 +1168,30 @@ pub(crate) async fn launch_tx<A: CallAuthority030>(
     .bind(&attempt.call_id)
     .execute(db)
     .await?;
+    Ok(())
+}
+
+/// Hold native admission through the HTTP body handoff. Initialization can
+/// outlive the launch transaction and a Stop can commit before cancellation.
+pub(crate) async fn admit_remote_tool_tx<A: CallAuthority030>(
+    db: &mut SqliteConnection,
+    authority: &A,
+    attempt: &CallAttempt030,
+) -> Result<()> {
+    authority.call_commits().require_clear(attempt.identity())?;
+    let state = verify_attempt_tx(db, authority, attempt, AttemptCheck::Attribution).await?;
+    if call_stopped(&state, attempt)? {
+        return Err(failure("STOPPED", "call", "Native work stopped"));
+    }
+    require_admission_tx(db, attempt.identity()).await?;
+    require(
+        state.verdict.is_none()
+            && row_tx(db, attempt).await?.get::<&str, _>("status") == "launched",
+        "Call is no longer active",
+    )?;
+    if clock_timeout_exists_tx(db, attempt).await? {
+        return Err(failure("TIMEOUT", "call", "Work machine budget expired"));
+    }
     Ok(())
 }
 
@@ -1254,12 +1333,15 @@ async fn validate_result_tx(
     received: &ReceivedCall030,
     result: &CallResult030,
 ) -> Result<()> {
-    if matches!(result,CallResult030::Failed { code } if code == "TIMEOUT") {
-        require(
-            read_cause_tx(db, attempt).await?.is_some(),
-            "TIMEOUT has no durable native cause",
-        )?;
-        return Ok(());
+    if matches!(result, CallResult030::Failed { code } if matches!(code.as_str(), "TIMEOUT" | "CALL_FAILED"))
+    {
+        // Older remote MCP receipts used TIMEOUT for the host budget.
+        if read_cause_tx(db, attempt).await?.is_some()
+            && (matches!(result, CallResult030::Failed { code } if code == "TIMEOUT")
+                || result == &clock_failure(attempt)?)
+        {
+            return Ok(());
+        }
     }
     match (result, &received.end) {
         (CallResult030::Completed { output_json }, CallEnd030::Returned { event }) => {
@@ -1308,7 +1390,7 @@ pub(crate) async fn receive_tx<A: CallAuthority030>(
     let attempt = joined.attempt();
     let received = received_from_join(joined)?;
     // A late native receipt can be retained after Stop, but cannot route success.
-    let state = verify_attempt_tx(db, authority, attempt, false).await?;
+    let state = verify_attempt_tx(db, authority, attempt, AttemptCheck::Attribution).await?;
     let row = row_tx(db, attempt).await?;
     let prepared: PreparedCall030 = serde_json::from_str(
         row.get::<Option<&str>, _>("prepared_json")
@@ -1372,10 +1454,17 @@ async fn apply_terminal_tx<A: CallAuthority030>(
     };
     let pending: i64 = sqlx::query_scalar("SELECT count(*) FROM engine_flow030_clock_controls WHERE system_id=? AND invocation_id=? AND activation_id=? AND joined=0")
         .bind(&receipt.attempt.identity.system_start_id).bind(&receipt.attempt.identity.flow_invocation_id).bind(&work.activation_id).fetch_one(&mut *db).await?;
-    if pending > 0 {
+    if pending > 0 && state.stopping {
+        crate::agsdl_host_flow030::settle_stopped_timeout_tx(
+            db,
+            &receipt.attempt.identity,
+            &work.activation_id,
+        )
+        .await?;
+    } else if pending > 0 {
         require(
-            stopped || matches!(&receipt.result, CallResult030::Failed {code} if code=="TIMEOUT"),
-            "Call deadline requires its timeout result",
+            stopped || receipt.result == clock_failure(&receipt.attempt)?,
+            "Call deadline requires its clock failure result",
         )?;
         sqlx::query("UPDATE engine_flow030_clock_controls SET joined=1 WHERE system_id=? AND invocation_id=? AND activation_id=?")
             .bind(&receipt.attempt.identity.system_start_id).bind(&receipt.attempt.identity.flow_invocation_id).bind(&work.activation_id).execute(&mut *db).await?;
@@ -1433,14 +1522,15 @@ pub(crate) async fn finish_controlled_tx<A: CallAuthority030>(
         )?;
         return Ok(Some(CallSettlement030::Diagnostic { diagnostic }));
     }
-    let state = verify_attempt_tx(db, authority, joined.attempt(), false).await?;
+    let state =
+        verify_attempt_tx(db, authority, joined.attempt(), AttemptCheck::Attribution).await?;
     let result = if call_stopped(&state, joined.attempt())? {
         CallResult030::Stopped
     } else if settlement_cause_tx(db, authority, joined.attempt())
         .await?
         .is_some()
     {
-        CallResult030::failure("TIMEOUT")
+        clock_failure(joined.attempt())?
     } else {
         return Ok(None);
     };
@@ -1469,12 +1559,12 @@ pub(crate) async fn finish_tx<A: CallAuthority030>(
     }
     let attempt = joined.attempt();
     let received = received_from_join(joined)?;
-    let state = verify_attempt_tx(db, authority, attempt, false).await?;
+    let state = verify_attempt_tx(db, authority, attempt, AttemptCheck::Attribution).await?;
     let row = row_tx(db, attempt).await?;
     if call_stopped(&state, attempt)? {
         result = CallResult030::Stopped;
     } else if settlement_cause_tx(db, authority, attempt).await?.is_some() {
-        result = CallResult030::failure("TIMEOUT");
+        result = clock_failure(attempt)?;
     }
 
     if row.get::<&str, _>("status") == "terminal" {
@@ -1536,7 +1626,7 @@ pub(crate) async fn stop_before_launch_tx<A: CallAuthority030>(
     {
         return Ok(CallSettlement030::Diagnostic { diagnostic });
     }
-    let state = verify_attempt_tx(db, authority, attempt, false).await?;
+    let state = verify_attempt_tx(db, authority, attempt, AttemptCheck::Attribution).await?;
     let row = row_tx(db, attempt).await?;
     if row.get::<&str, _>("status") == "terminal" {
         let receipt = read_receipt_tx(db, authority, attempt.identity(), attempt.work())
@@ -1875,7 +1965,7 @@ pub(crate) async fn require_live_mcp_tx<A: CallAuthority030>(
     attempt: &CallAttempt030,
     server: &str,
 ) -> Result<()> {
-    verify_attempt_tx(db, authority, attempt, true).await?;
+    verify_attempt_tx(db, authority, attempt, AttemptCheck::Active).await?;
     let row = row_tx(db, attempt).await?;
     require(
         row.get::<&str, _>("status") == "launched",

@@ -4,15 +4,15 @@ use crate::{
     agsdl_host_flow030::FlowWorkAttempt030,
     persistence::{
         failure,
-        flow030::{FlowEffect030, FlowEffectKind030},
+        flow030::{
+            accepts_steer030, steer_effect_eligible030, FlowEffect030, FlowEffectKind030,
+            FlowState030,
+        },
         Result,
     },
     tasks::StreamTasks,
 };
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
-};
+use std::sync::{Arc, OnceLock};
 use tokio::sync::{mpsc, oneshot, Mutex, OwnedMutexGuard};
 
 #[derive(Clone)]
@@ -47,12 +47,28 @@ fn matches_attempt(effect: &FlowEffect030, attempt: &FlowWorkAttempt030) -> bool
         && work.agent_instance_id == attempt.work().agent_instance_id)
 }
 
+pub(crate) fn wire_eligible030(state: &FlowState030, effect: &FlowEffect030) -> bool {
+    let FlowEffectKind030::Steer {
+        work,
+        delivery_activation_id,
+        ..
+    } = &effect.kind
+    else {
+        return false;
+    };
+    accepts_steer030(state, work)
+        && steer_effect_eligible030(state, effect)
+        && !state.activations.iter().any(|activation| {
+            activation.id == *delivery_activation_id && activation.phase == "withdrawingSteer"
+        })
+}
+
 #[derive(Clone)]
 pub(crate) struct SteerGate030 {
     pub admission: Arc<Mutex<()>>,
     pub pool: sqlx::SqlitePool,
     pub deadline: tokio::time::Instant,
-    wire_admitted: Arc<AtomicBool>,
+    wire_checkpoint: Arc<OnceLock<String>>,
 }
 
 impl SteerGate030 {
@@ -65,12 +81,16 @@ impl SteerGate030 {
             admission,
             pool,
             deadline,
-            wire_admitted: Arc::new(AtomicBool::new(false)),
+            wire_checkpoint: Arc::new(OnceLock::new()),
         }
     }
 
+    pub(crate) fn wire_checkpoint(&self) -> Option<&str> {
+        self.wire_checkpoint.get().map(String::as_str)
+    }
+
     fn lost_evidence(&self) -> crate::persistence::dto::EngineFailure {
-        if self.wire_admitted.load(Ordering::SeqCst) {
+        if self.wire_checkpoint().is_some() {
             uncertain()
         } else {
             failure(
@@ -223,14 +243,6 @@ impl SteerDelivery030 {
         let Some((guard, state)) = self.current_state().await? else {
             return Ok(None);
         };
-        let FlowEffectKind030::Steer {
-            work,
-            delivery_activation_id,
-            ..
-        } = &self.effect.kind
-        else {
-            return Err(refused());
-        };
         if self.ack.is_closed()
             || self
                 .deadline()
@@ -238,23 +250,22 @@ impl SteerDelivery030 {
         {
             return Err(uncertain());
         }
-        if !crate::persistence::flow030::accepts_steer030(&state, work)
-            || !crate::persistence::flow030::steer_effect_eligible030(&state, &self.effect)
-            || state.activations.iter().any(|activation| {
-                activation.id == *delivery_activation_id && activation.phase == "withdrawingSteer"
-            })
-        {
+        if !wire_eligible030(&state, &self.effect) {
             return Err(failure(
                 "STALE_REFERENCE",
                 "steer",
                 "The targeted work can no longer receive a steer",
             ));
         }
-        self.gate
-            .as_ref()
-            .unwrap()
-            .wire_admitted
-            .store(true, Ordering::SeqCst);
+        let gate = self.gate.as_ref().unwrap();
+        let checkpoint: String = sqlx::query_scalar(crate::persistence::flow_store030::RUN_HEAD030)
+            .bind(&self.effect.identity.system_start_id)
+            .bind(&self.effect.identity.flow_invocation_id)
+            .fetch_one(&gate.pool)
+            .await?;
+        gate.wire_checkpoint
+            .set(checkpoint)
+            .map_err(|_| refused())?;
         Ok(Some(guard))
     }
 

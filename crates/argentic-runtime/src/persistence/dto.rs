@@ -166,4 +166,26 @@ dto!(EngineSettlement {
     status: String,
     evidence_json: String
 });
-dto!(EngineFailure {code: String, pointer: String, message: String, work: Option<EngineWork>});
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SourceErrorKind {
+    Io,
+    InvalidContent,
+}
+
+dto!(SourceDiagnostic {
+    path: String,
+    pointer: String,
+    kind: SourceErrorKind,
+});
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EngineFailure {
+    pub code: String,
+    pub pointer: String,
+    pub message: String,
+    pub work: Option<EngineWork>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<Box<SourceDiagnostic>>,
+}

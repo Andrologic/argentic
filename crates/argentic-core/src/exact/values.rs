@@ -9,7 +9,7 @@
 //! strings and `BigInteger` exponents: no machine number and no expansion of an
 //! exponent into zeros. The shared and 0.3 helpers stay separate functions
 //! because they normalize zero differently.
-use super::{quote, scan::js_object_order, BigInteger, NumberToken, Object, Value};
+use super::{quote_to, scan::js_object_order, BigInteger, NumberToken, Object, Value};
 use std::cmp::Ordering;
 
 struct Lexeme<'a> {
@@ -231,51 +231,79 @@ fn same_keys<'a>(a: &'a Object, b: &'a Object, pending: &mut Vec<(&'a Value, &'a
 /// for every `Value`: the 0.3 refusals (non-JSON lexeme, unpaired surrogate,
 /// holes, cycles, non-JSON JS values) cannot occur in this type. Iterative.
 pub(crate) fn stringify(value: &Value) -> String {
+    let mut out = String::new();
+    stringify_to(&mut out, value).expect("writing to a String");
+    out
+}
+
+pub(crate) fn stringify_to(
+    out: &mut (impl std::fmt::Write + ?Sized),
+    value: &Value,
+) -> std::fmt::Result {
     enum Task<'a> {
         Value(&'a Value),
-        Text(&'static str),
-        Key(&'a str),
+        Array(std::slice::Iter<'a, Value>),
+        Object(std::slice::Iter<'a, (String, Value)>),
     }
-    let mut out = String::new();
     let mut pending = vec![Task::Value(value)];
     while let Some(task) = pending.pop() {
         match task {
-            Task::Text(text) => out.push_str(text),
-            Task::Key(key) => {
-                out.push_str(&quote(key));
-                out.push(':');
+            Task::Array(mut items) => {
+                let first = items.as_slice().len();
+                if let Some(item) = items.next() {
+                    // The opening delimiter and the first item were emitted
+                    // together when the frame was created.
+                    debug_assert!(first > 0);
+                    out.write_char(',')?;
+                    pending.push(Task::Array(items));
+                    pending.push(Task::Value(item));
+                } else {
+                    out.write_char(']')?;
+                }
+            }
+            Task::Object(mut members) => {
+                if let Some((key, value)) = members.next() {
+                    out.write_char(',')?;
+                    quote_to(out, key)?;
+                    out.write_char(':')?;
+                    pending.push(Task::Object(members));
+                    pending.push(Task::Value(value));
+                } else {
+                    out.write_char('}')?;
+                }
             }
             Task::Value(value) => match value {
-                Value::Null => out.push_str("null"),
-                Value::Bool(true) => out.push_str("true"),
-                Value::Bool(false) => out.push_str("false"),
-                Value::Number(token) => out.push_str(token.raw()),
-                Value::String(text) => out.push_str(&quote(text)),
-                Value::Array(items) => {
-                    out.push('[');
-                    pending.push(Task::Text("]"));
-                    for (index, item) in items.iter().enumerate().rev() {
-                        pending.push(Task::Value(item));
-                        if index > 0 {
-                            pending.push(Task::Text(","));
-                        }
+                Value::Null => out.write_str("null")?,
+                Value::Bool(true) => out.write_str("true")?,
+                Value::Bool(false) => out.write_str("false")?,
+                Value::Number(token) => out.write_str(token.raw())?,
+                Value::String(text) => quote_to(out, text)?,
+                Value::Array(values) => {
+                    let mut items = values.iter();
+                    if let Some(first) = items.next() {
+                        out.write_char('[')?;
+                        pending.push(Task::Array(items));
+                        pending.push(Task::Value(first));
+                    } else {
+                        out.write_str("[]")?;
                     }
                 }
                 Value::Object(object) => {
-                    out.push('{');
-                    pending.push(Task::Text("}"));
-                    for (index, (key, item)) in object.iter().enumerate().rev() {
-                        pending.push(Task::Value(item));
-                        pending.push(Task::Key(key));
-                        if index > 0 {
-                            pending.push(Task::Text(","));
-                        }
+                    let mut members = object.entries.iter();
+                    if let Some((key, first)) = members.next() {
+                        out.write_char('{')?;
+                        quote_to(out, key)?;
+                        out.write_char(':')?;
+                        pending.push(Task::Object(members));
+                        pending.push(Task::Value(first));
+                    } else {
+                        out.write_str("{}")?;
                     }
                 }
             },
         }
     }
-    out
+    Ok(())
 }
 
 /// A number operand of the 0.3 helpers: an authored token, or an internal JS
@@ -297,13 +325,14 @@ impl Num<'_> {
 }
 
 /// `{ sign, digits, power }` of the 0.3 `decimal`.
-struct V030Decimal {
+pub(crate) struct V030Decimal {
     sign: i8,
     digits: String,
     power: BigInteger,
+    order: std::cell::OnceCell<BigInteger>,
 }
 
-fn decimal_v030(number: Num<'_>) -> V030Decimal {
+pub(crate) fn decimal_v030(number: Num<'_>) -> V030Decimal {
     let text = number.text();
     let lexeme = split(&text);
     let joined = format!("{}{}", lexeme.integer, lexeme.fraction);
@@ -313,6 +342,7 @@ fn decimal_v030(number: Num<'_>) -> V030Decimal {
             sign: 0,
             digits: "0".to_owned(),
             power: BigInteger::zero(),
+            order: Default::default(),
         };
     }
     let trimmed = digits.trim_end_matches('0');
@@ -323,13 +353,16 @@ fn decimal_v030(number: Num<'_>) -> V030Decimal {
         sign: if lexeme.negative { -1 } else { 1 },
         digits: trimmed.to_owned(),
         power,
+        order: Default::default(),
     }
 }
 
 /// 0.3 `compareNumbers(left, right)`.
 pub(crate) fn compare_numbers(left: Num<'_>, right: Num<'_>) -> Ordering {
-    let a = decimal_v030(left);
-    let b = decimal_v030(right);
+    compare_decimals(&decimal_v030(left), &decimal_v030(right))
+}
+
+pub(crate) fn compare_decimals(a: &V030Decimal, b: &V030Decimal) -> Ordering {
     if a.sign != b.sign {
         return a.sign.cmp(&b.sign);
     }
@@ -337,22 +370,15 @@ pub(crate) fn compare_numbers(left: Num<'_>, right: Num<'_>) -> Ordering {
         return Ordering::Equal;
     }
     let directed = |order: Ordering| if a.sign < 0 { order.reverse() } else { order };
-    let order_a = BigInteger::from_usize(a.digits.len()).add(&a.power);
-    let order_b = BigInteger::from_usize(b.digits.len()).add(&b.power);
-    if order_a != order_b {
-        return directed(order_a.cmp(&order_b));
-    }
-    let (x, y) = (a.digits.as_bytes(), b.digits.as_bytes());
-    for i in 0..x.len().max(y.len()) {
-        let (p, q) = (
-            x.get(i).copied().unwrap_or(b'0'),
-            y.get(i).copied().unwrap_or(b'0'),
-        );
-        if p != q {
-            return directed(p.cmp(&q));
-        }
-    }
-    Ordering::Equal
+    let order_a = a
+        .order
+        .get_or_init(|| BigInteger::from_usize(a.digits.len()).add(&a.power));
+    let order_b = b
+        .order
+        .get_or_init(|| BigInteger::from_usize(b.digits.len()).add(&b.power));
+    // Both digit strings have no trailing zero. When one is a prefix of the
+    // other, its implicit zeros are smaller than the remaining digits.
+    directed(order_a.cmp(order_b).then_with(|| a.digits.cmp(&b.digits)))
 }
 
 /// 0.3 `compareNumbers` result as the JS `-1 | 0 | 1`.
@@ -390,33 +416,71 @@ pub(crate) fn json_type_matches(value: &Value, name: &str) -> bool {
 }
 
 /// 0.3 `equal(left, right)`: structural, numbers by `compareNumbers`.
+#[cfg(test)]
 pub(crate) fn equal_v030(left: &Value, right: &Value) -> bool {
+    equal_v030_with_budget(left, right, &crate::SourceBudget::default(), "").unwrap_or(false)
+}
+
+pub(crate) fn equal_v030_with_budget(
+    left: &Value,
+    right: &Value,
+    budget: &crate::SourceBudget,
+    pointer: &str,
+) -> Result<bool, crate::calculation::Failure> {
+    equal_with_budget(left, right, budget, pointer, false)
+}
+
+pub(crate) fn equal_with_budget(
+    left: &Value,
+    right: &Value,
+    budget: &crate::SourceBudget,
+    pointer: &str,
+    tokens: bool,
+) -> Result<bool, crate::calculation::Failure> {
     let mut pending = vec![(left, right)];
     while let Some((a, b)) = pending.pop() {
+        budget.work(1, pointer)?;
         match (a, b) {
             (Value::Number(a), Value::Number(b)) => {
-                if compare_numbers(Num::Token(a), Num::Token(b)) != Ordering::Equal {
-                    return false;
+                let len = a.raw().len() + b.raw().len();
+                budget.work(len.div_ceil(8), pointer)?;
+                if a.raw() != b.raw() {
+                    if tokens {
+                        return Ok(false);
+                    }
+                    budget.bytes(len * 6 + 128, pointer)?;
+                    if compare_numbers(Num::Token(a), Num::Token(b)) != Ordering::Equal {
+                        return Ok(false);
+                    }
                 }
             }
             (Value::Array(a), Value::Array(b)) => {
                 if a.len() != b.len() {
-                    return false;
+                    return Ok(false);
                 }
+                budget.work(a.len(), pointer)?;
+                budget.bytes(a.len() * 16, pointer)?;
                 pending.extend(a.iter().zip(b));
             }
             (Value::Object(a), Value::Object(b)) => {
+                budget.work(a.len(), pointer)?;
+                budget.bytes(a.len() * 16, pointer)?;
                 if !same_keys(a, b, &mut pending) {
-                    return false;
+                    return Ok(false);
                 }
             }
             (Value::Null, Value::Null) => {}
             (Value::Bool(a), Value::Bool(b)) if a == b => {}
-            (Value::String(a), Value::String(b)) if a == b => {}
-            _ => return false,
+            (Value::String(a), Value::String(b)) => {
+                budget.work(a.len().min(b.len()).div_ceil(8), pointer)?;
+                if a != b {
+                    return Ok(false);
+                }
+            }
+            _ => return Ok(false),
         }
     }
-    true
+    Ok(true)
 }
 
 #[cfg(test)]

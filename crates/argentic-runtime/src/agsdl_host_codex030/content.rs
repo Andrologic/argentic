@@ -126,8 +126,17 @@ impl Sources030 {
     ) -> HostResult<Self> {
         let scope_root = root.clone();
         let scope_private = private.clone();
-        let context = context.with_read_scope(Arc::new(move |path| {
-            if approved_data_path(&scope_root, &scope_private, path) {
+        let snapshot = context.project_root().map(Path::to_path_buf);
+        let context = context.with_read_target_scope(Arc::new(move |path, retained| {
+            // The resolver supplies a snapshot path only after it finds the
+            // member in the captured inventory. Ordinary files keep the
+            // private-root exclusion, including inside managed workspaces.
+            let retained = retained
+                .zip(snapshot.as_ref())
+                .is_some_and(|(target, root)| {
+                    target.starts_with(root) && !private_project_path(root, target)
+                });
+            if retained || approved_data_path(&scope_root, &scope_private, path) {
                 Ok(())
             } else {
                 Err(crate::content::ContentError {
@@ -500,14 +509,17 @@ mod tests {
 
     /// A run from a project keeps the message rules of an equivalent JSON
     /// document. Only paths inside the retained copy use its inventory.
-    #[test]
-    fn project_runs_keep_workspace_rules_outside_the_snapshot() {
+    fn project_read_rules(managed: bool) {
         let temp = tempfile::tempdir().unwrap();
         let base = temp.path().canonicalize().unwrap();
-        let workspace = base.join("workspace");
         let data = base.join("data");
+        let workspace = if managed {
+            data.join("managed/run")
+        } else {
+            base.join("workspace")
+        };
         std::fs::create_dir_all(workspace.join(".git")).unwrap();
-        std::fs::create_dir(&data).unwrap();
+        std::fs::create_dir_all(&data).unwrap();
         std::fs::write(workspace.join("notes.md"), "Workspace notes.\n").unwrap();
         std::fs::write(workspace.join(".git/config"), "Private.\n").unwrap();
         let opened = crate::source::OpenedSource::open_path(
@@ -562,9 +574,43 @@ mod tests {
         let sources = Sources030::from_context(context, document, workspace.clone(), data).unwrap();
         let uri = |path: &Path| json!({"uri":url::Url::from_file_path(path).unwrap().as_str()});
         sources.allowed_file(&review, "/agents/reviewer").unwrap();
-        sources
-            .allowed_file(&uri(&workspace.join("notes.md")), "/message/resources/0")
-            .unwrap();
+        let target = crate::content::local_file_path(
+            review["uri"].as_str().unwrap(),
+            sources.context.document_location(),
+        )
+        .unwrap()
+        .canonicalize()
+        .unwrap();
+        let project_root = sources.context.project_root().unwrap();
+        let logical_target = workspace.join(target.strip_prefix(project_root).unwrap());
+        let read = |path: &Path| crate::permissions::ActionRequest::Read {
+            path: crate::permissions::native_request_path(path).unwrap(),
+        };
+        assert_eq!(
+            sources
+                .context
+                .permission(&read(&logical_target), Some(&target))
+                .unwrap()
+                .effect,
+            crate::permissions::Effect::Allow
+        );
+        let notes = workspace.join("notes.md");
+        let admitted = sources.context.permission(&read(&notes), None);
+        if managed {
+            assert_eq!(admitted.unwrap_err().code, "PERMISSION");
+            assert_eq!(
+                sources
+                    .allowed_file(&uri(&notes), "/message/resources/0")
+                    .unwrap_err()
+                    .code,
+                "PERMISSION"
+            );
+        } else {
+            assert_eq!(admitted.unwrap().effect, crate::permissions::Effect::Allow);
+            sources
+                .allowed_file(&uri(&notes), "/message/resources/0")
+                .unwrap();
+        }
         assert_eq!(
             sources
                 .allowed_file(&uri(&workspace.join(".git/config")), "/message/resources/0")
@@ -592,6 +638,16 @@ mod tests {
                 private.display()
             );
         }
+    }
+
+    #[test]
+    fn project_runs_keep_workspace_rules_outside_the_snapshot() {
+        project_read_rules(false);
+    }
+
+    #[test]
+    fn managed_workspace_admits_only_captured_project_members() {
+        project_read_rules(true);
     }
 
     #[tokio::test]

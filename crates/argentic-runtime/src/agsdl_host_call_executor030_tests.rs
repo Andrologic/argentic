@@ -12,6 +12,26 @@ async fn host_fixture_with_entry(
 ) -> (Fixture, crate::tasks::StreamTasks) {
     let f =
         Fixture::new(&json!({"document":document,"entry":entry,"timeline":[]}).to_string()).await;
+    let transport = Arc::new(crate::agsdl_host_call_executor030::NativeCallTransport030 {
+        config: f.config.clone(),
+        humans: Some(Arc::new(
+            crate::agsdl_host_human_executor030::CallHumans030 {
+                app: f.host.clone(),
+                pool: f.pool.clone(),
+                identity: f.identity.clone(),
+            },
+        )),
+    });
+    let tasks = start_calls(&f, f.config.clone(), transport);
+    (f, tasks)
+}
+
+#[cfg(unix)]
+fn start_calls(
+    f: &Fixture,
+    config: crate::host::HostContext,
+    transport: Arc<dyn crate::agsdl_host_call_executor030::CallTransport030>,
+) -> crate::tasks::StreamTasks {
     let tasks = crate::tasks::StreamTasks::default();
     let host = &f.host;
     host.flow030()
@@ -21,7 +41,7 @@ async fn host_fixture_with_entry(
     spawn_supervisor030(
         f.host.clone(),
         f.pool.clone(),
-        f.config.clone(),
+        config.clone(),
         tasks.clone(),
         f.owner.clone(),
         Executors030 {
@@ -35,21 +55,11 @@ async fn host_fixture_with_entry(
             }),
             calls: Some(Arc::new(
                 crate::agsdl_host_call_executor030::CallExecutor030 {
-                    config: f.config.clone(),
+                    config,
                     pool: f.pool.clone(),
                     tasks: tasks.clone(),
                     owner: f.owner.clone(),
-                    transport: Arc::new(
-                        crate::agsdl_host_call_executor030::NativeCallTransport030 {
-                            humans: Some(Arc::new(
-                                crate::agsdl_host_human_executor030::CallHumans030 {
-                                    app: f.host.clone(),
-                                    pool: f.pool.clone(),
-                                    identity: f.identity.clone(),
-                                },
-                            )),
-                        },
-                    ),
+                    transport,
                 },
             )),
             humans: Some(Arc::new(
@@ -69,9 +79,9 @@ async fn host_fixture_with_entry(
         },
     )
     .unwrap();
-    (f, tasks)
+    tasks
 }
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(unix)]
 async fn finish(f: &Fixture) -> crate::persistence::flow_store030::FlowView030 {
     let host = &f.host;
     let result = tokio::time::timeout(
@@ -306,7 +316,7 @@ async fn native_stdio_mcp_preserves_structured_error_result_and_operands() {
 }
 
 #[test]
-fn native_preflight_opens_humans_timeouts_and_parallelism_but_keeps_http_closed() {
+fn native_preflight_allows_https_mcp_and_qualifies_endpoint_schemes() {
     let base = document(json!({"type":"call","command":"true"}));
     assert!(
         crate::agsdl_host_qualification030::product_slice030(&base.to_string(), None).is_none()
@@ -317,12 +327,14 @@ fn native_preflight_opens_humans_timeouts_and_parallelism_but_keeps_http_closed(
     assert!(
         crate::agsdl_host_qualification030::product_slice030(&steer.to_string(), None).is_none()
     );
-    let mut doc = base.clone();
+    let mut doc = document(json!({"type":"call","mcp":{"server":"remote","tool":"check"}}));
     doc["mcpServers"] = json!({"remote":{"url":"https://example.invalid/mcp"}});
+    assert!(crate::agsdl_host_qualification030::product_slice030(&doc.to_string(), None).is_none());
+    doc["mcpServers"]["remote"]["url"] = json!("http://example.invalid/mcp");
     let diagnostic =
         crate::agsdl_host_qualification030::product_slice030(&doc.to_string(), None).unwrap();
     assert_eq!(diagnostic.pointer, "/mcpServers/remote/url");
-    assert!(diagnostic.message.contains("physical cancellation"));
+    assert_eq!(diagnostic.code, "MCP_ENDPOINT_UNSUPPORTED");
     let mut doc = base.clone();
     doc["flow"]["steps"]["check"]["type"] = json!("approval");
     assert!(crate::agsdl_host_qualification030::product_slice030(&doc.to_string(), None).is_none());
@@ -334,6 +346,104 @@ fn native_preflight_opens_humans_timeouts_and_parallelism_but_keeps_http_closed(
         Some(&plan.to_string())
     )
     .is_none());
+}
+
+#[test]
+fn stdio_preflight_matches_the_confined_transport_platform() {
+    let mut doc = document(json!({"type":"call","command":"true"}));
+    doc["mcpServers"] = json!({"local":{"command":["/usr/bin/true"]}});
+    doc["agents"] = json!({"worker":{
+        "harness":"codex","mcpServers":["local"],"permissions":"workspace"
+    }});
+    let report = crate::api::qualify_product(&doc, None, None).unwrap();
+    let expected = (!cfg!(all(target_os = "macos", target_arch = "aarch64")))
+        .then_some("MCP_STDIO_UNAVAILABLE");
+    assert_eq!(report.mcp_servers["local"].agent_equipment, ["worker"]);
+    assert_eq!(
+        report.blocking_diagnostic().map(|d| d.code.as_str()),
+        expected
+    );
+
+    doc["agents"] = json!({});
+    assert!(crate::api::qualify_product(&doc, None, None)
+        .unwrap()
+        .blocking_diagnostic()
+        .is_none());
+    doc["flow"]["steps"]["check"] = json!({"type":"call","mcp":{"server":"local","tool":"check"}});
+    let report = crate::api::qualify_product(&doc, None, None).unwrap();
+    assert_eq!(
+        report.blocking_diagnostic().map(|d| d.code.as_str()),
+        expected
+    );
+}
+
+#[test]
+fn mcp_qualification_reports_direct_and_equipped_usage_after_permission_exclusions() {
+    use crate::api::{product_slice, qualify_product};
+    use crate::permissions::RequestedPermissions;
+
+    let mut doc = document(json!({"type":"call","mcp":{"server":"remote","tool":"check"}}));
+    doc["mcpServers"] = json!({
+        "remote":{"url":"https://example.invalid/mcp"},
+        "issues":{"url":"http://example.invalid/mcp"},
+        "unused":{"url":"https://example.invalid:65536/mcp"}
+    });
+    doc["agents"] = json!({"reviewer":{
+        "harness":"codex","mcpServers":["issues","remote"],
+        "permissions":{"preset":"workspace","rules":[
+            {"action":"mcp","match":"issues/check","effect":"allow"},
+            {"action":"mcp","match":"issues/*","effect":"deny"}
+        ]}
+    }});
+    doc["compositions"] = json!({"review":{"steps":{"lookup":{
+        "type":"call","mcp":{"server":"remote","tool":"check"}
+    }}}});
+
+    let report = qualify_product(&doc, None, None).unwrap();
+    assert!(report.blocking_diagnostic().is_none());
+    assert_eq!(
+        report.mcp_servers["remote"].direct_call_steps,
+        ["/flow/steps/check", "/compositions/review/steps/lookup"]
+    );
+    assert_eq!(report.mcp_servers["remote"].agent_equipment, ["reviewer"]);
+    for name in ["issues", "unused"] {
+        let server = &report.mcp_servers[name];
+        assert!(!server.is_used());
+        assert!(server.blocking_diagnostic().is_none());
+        let issue = server.diagnostic.as_ref().unwrap();
+        assert_eq!(issue.code, "MCP_ENDPOINT_UNSUPPORTED");
+        assert_eq!(issue.pointer, format!("/mcpServers/{name}/url"));
+    }
+    assert!(product_slice(&doc.to_string(), None).is_none());
+
+    // A denial for one tool still permits discovery.
+    doc["agents"]["reviewer"]["permissions"]["rules"][1]["match"] = json!("issues/write*");
+    let report = qualify_product(&doc, None, None).unwrap();
+    assert_eq!(report.mcp_servers["issues"].agent_equipment, ["reviewer"]);
+    assert_eq!(
+        report.blocking_diagnostic().unwrap().pointer,
+        "/mcpServers/issues/url"
+    );
+
+    let host: RequestedPermissions = serde_json::from_value(json!({"preset":"workspace","rules":[
+        {"action":"mcp","match":"issues/*","effect":"deny"}
+    ]}))
+    .unwrap();
+    let report = qualify_product(&doc, None, Some(&host)).unwrap();
+    assert!(report.blocking_diagnostic().is_none());
+    assert_eq!(report.mcp_servers["remote"].agent_equipment, ["reviewer"]);
+    assert!(!report.mcp_servers["issues"].is_used());
+
+    doc["flow"]["steps"]["check"]["mcp"]["server"] = json!("issues");
+    let report = qualify_product(&doc, None, Some(&host)).unwrap();
+    assert_eq!(
+        report.mcp_servers["issues"].direct_call_steps,
+        ["/flow/steps/check"]
+    );
+    assert_eq!(
+        report.blocking_diagnostic().unwrap().pointer,
+        "/mcpServers/issues/url"
+    );
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -540,4 +650,844 @@ async fn nested_entry_approval_keeps_host_prompt_provenance_through_its_output()
     };
     let output: Value = serde_json::from_str(output_json).unwrap();
     assert_eq!(output["message"]["prompt"], "Synthetic entry");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn retained_stdio_refuses_unverified_programs_and_reserved_secrets_before_vault_access() {
+    use crate::{
+        agsdl_host_call_executor030::mcp_server,
+        agsdl_host_calls::CommandGrant,
+        agsdl_host_confinement::{OsCeiling, SandboxPolicy},
+    };
+    use std::{fs, os::unix::fs::PermissionsExt};
+
+    let project = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let root = workspace.path().canonicalize().unwrap();
+    let mutable = root.join("server");
+    fs::write(&mutable, "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(&mutable, fs::Permissions::from_mode(0o700)).unwrap();
+    let sandbox =
+        SandboxPolicy::from_authorized_ceilings("mcp-config-test".into(), &[OsCeiling::default()])
+            .unwrap();
+    let doc = json!({
+        "projectFormat":"agsdl-project-1","contract":"agsdl-0.4.0",
+        "id":"retained-mcp-refusal","agents":{},
+        "mcpServers":{
+            "absolute":{"command":[mutable]},
+            "shell":{"command":["/bin/sh",mutable]},
+            "inline":{"command":["sh","-c","exit 0"]},
+            "system":{"command":["/bin/echo"]},
+            "relative":{"command":["relative.sh"]},
+            "path":{"command":["sh","server.sh"]},
+            "loader":{"command":["sh","server.sh"]}
+        },
+        "mcpFiles":{"relative":["relative.sh"],"path":["server.sh"],"loader":["server.sh"]},
+        "secrets":{"file":"requirements.json"}
+    });
+    fs::write(project.path().join("agsdl.json"), doc.to_string()).unwrap();
+    fs::write(project.path().join("server.sh"), "#!/bin/sh\nexit 0\n").unwrap();
+    let relative = project.path().join("relative.sh");
+    fs::write(&relative, "#!  tools/interp\nexit 0\n").unwrap();
+    fs::set_permissions(&relative, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(
+        project.path().join("requirements.json"),
+        r#"{"absolute":["TOKEN"],"relative":["TOKEN"]}"#,
+    )
+    .unwrap();
+    let f = Fixture::new_with_project(r#"{"entry":{},"timeline":[]}"#, false, Some(project.path()))
+        .await;
+    let mut capture = flow::inspect_run(f.host.flow030(), &f.host, &f.pool, &f.owner)
+        .await
+        .unwrap()
+        .capture;
+    // Older retained captures could declare reserved names.
+    let mut private: Value = serde_json::from_str(&capture.private_capture_json).unwrap();
+    let mut scope: Value =
+        serde_json::from_str(private["callScopeJson"].as_str().unwrap()).unwrap();
+    scope["projectMcp"]["secrets"]["path"] = json!(["PATH"]);
+    scope["projectMcp"]["secrets"]["loader"] = json!(["DYLD_INSERT_LIBRARIES"]);
+    private["callScopeJson"] = json!(scope.to_string());
+    capture.private_capture_json = private.to_string();
+    let config = f.config.clone().with_mcp_secrets(Arc::new(|_, _, _| {
+        panic!("Refused MCP configuration must not query the vault")
+    }));
+    for (server, expected) in [
+        ("absolute", "CALL_FAILED"),
+        ("shell", "CALL_FAILED"),
+        ("inline", "CALL_FAILED"),
+        ("system", "CALL_FAILED"),
+        ("relative", "CALL_FAILED"),
+        ("path", "MCP_SECRET_RESERVED"),
+        ("loader", "MCP_SECRET_RESERVED"),
+    ] {
+        let grant = CommandGrant {
+            workspace: root.clone(),
+            environment: BTreeMap::from([("PATH".into(), "/usr/bin:/bin".into())]),
+            sandbox: sandbox.clone(),
+        };
+        let error = mcp_server(&config, grant, &capture, server)
+            .err()
+            .unwrap_or_else(|| panic!("MCP config for {server} was accepted"));
+        assert_eq!(error.code, expected, "{server}: {error:?}");
+        if server == "relative" {
+            assert!(
+                error.detail.contains("absolute shebang interpreter"),
+                "{error:?}"
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+struct RetainedStdio(crate::host::HostContext);
+
+#[cfg(unix)]
+impl crate::agsdl_host_call_executor030::CallTransport030 for RetainedStdio {
+    fn start(
+        &self,
+        grant: crate::agsdl_host_calls::CommandGrant,
+        prepared: crate::agsdl_host_calls030::PreparedCall030,
+        capture: StartCapture030,
+        attempt: crate::agsdl_host_calls030::CallAttempt030,
+        control: crate::agsdl_host_calls::Control,
+        admit_tool: crate::agsdl_host_calls::raw_mcp::ToolAdmission,
+    ) -> crate::agsdl_host_calls::Result<
+        BoxFuture<'static, Result<crate::persistence::call_protocol030::CallEnd030>>,
+    > {
+        use crate::agsdl_host_call_executor030::{
+            mcp_server, run_transport, NoHuman, StartedTransport,
+        };
+        let crate::agsdl_host_calls030::PreparedCall030::Mcp { server, .. } = &prepared else {
+            unreachable!();
+        };
+        let config = mcp_server(&self.0, grant, &capture, server)?;
+        let started = crate::agsdl_host_calls::raw_mcp::start_test_stdio(config)?;
+        Ok(Box::pin(async move {
+            run_transport(
+                StartedTransport::Mcp(started),
+                &prepared,
+                &attempt,
+                &control,
+                Arc::new(NoHuman),
+                admit_tool,
+            )
+            .await
+        }))
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn retained_stdio_uses_workspace_and_isolates_secrets_across_servers_and_reopen() {
+    use std::{fs, os::unix::fs::PermissionsExt};
+    const FIRST: &str = "runtime-test-first-secret";
+    const SECOND: &str = "runtime-test-second-secret";
+    let project = tempfile::tempdir().unwrap();
+    fs::create_dir(project.path().join("mcp")).unwrap();
+    let doc = json!({
+        "projectFormat":"agsdl-project-1","contract":"agsdl-0.4.0","id":"retained-mcp","agents":{},
+        "mcpServers":{"first":{"command":["./mcp/first.sh"]},"second":{"command":["sh","mcp/second.sh"]}},
+        "mcpFiles":{"first":["mcp/first.sh"],"second":["mcp/second.sh"]},
+        "secrets":{"file":"requirements.json"},
+        "flow":{"entry":"first","steps":{
+            "first":{"type":"call","mcp":{"server":"first","tool":"check"},"next":"second"},
+            "second":{"type":"call","mcp":{"server":"second","tool":"check"}}
+        }}
+    });
+    fs::write(project.path().join("agsdl.json"), doc.to_string()).unwrap();
+    fs::write(
+        project.path().join("requirements.json"),
+        r#"{"first":["FIRST_TOKEN"],"second":["SECOND_TOKEN"]}"#,
+    )
+    .unwrap();
+    for (server, name, other, size) in [
+        ("first", "FIRST_TOKEN", "SECOND_TOKEN", FIRST.len()),
+        ("second", "SECOND_TOKEN", "FIRST_TOKEN", SECOND.len()),
+    ] {
+        let script = format!(
+            r#"#!/bin/sh
+set -eu
+test -f cwd-marker
+test "${{#{name}}}" = "{size}"
+test -z "${{{other}+set}}"
+printf '%s\n' "${{{name}}}" >&2
+IFS= read -r init
+printf '%s\n' '{{"jsonrpc":"2.0","id":"1","result":{{"protocolVersion":"2025-11-25","capabilities":{{}},"serverInfo":{{"name":"fixture","version":"1"}}}}}}'
+IFS= read -r initialized
+IFS= read -r call
+printf '%s\n' '{{"jsonrpc":"2.0","id":"2","result":{{"structuredContent":{{"checked":"{server}"}},"content":[]}}}}'
+"#
+        );
+        let path = project.path().join(format!("mcp/{server}.sh"));
+        fs::write(&path, script).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let f = Fixture::new_with_project(r#"{"entry":{},"timeline":[]}"#, false, Some(project.path()))
+        .await;
+    let unstarted =
+        Fixture::new_with_project(r#"{"entry":{},"timeline":[]}"#, false, Some(project.path()))
+            .await;
+    project.close().unwrap();
+    fs::write(f._temp.path().join("workspace/cwd-marker"), "").unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let observed = seen.clone();
+    let config = f
+        .config
+        .clone()
+        .with_mcp_secrets(Arc::new(move |source, server, names| {
+            assert_eq!(source.owner.project_id, "project");
+            observed.lock().unwrap().push(server.to_owned());
+            let (key, value) = match server {
+                "first" => ("FIRST_TOKEN", FIRST),
+                "second" => ("SECOND_TOKEN", SECOND),
+                _ => unreachable!(),
+            };
+            assert_eq!(names, [key]);
+            Some(BTreeMap::from([(key.into(), value.into())]))
+        }));
+    let _tasks = start_calls(&f, config.clone(), Arc::new(RetainedStdio(config)));
+    let view = finish(&f).await;
+    assert_eq!(view.state.verdict.as_deref(), Some("succeeded"));
+    assert_eq!(*seen.lock().unwrap(), ["first", "second"]);
+    for (index, name) in ["first", "second"].into_iter().enumerate() {
+        assert_eq!(
+            serde_json::from_str::<Value>(
+                serde_json::to_value(&view.state.activations[index].result).unwrap()["outputJson"]
+                    .as_str()
+                    .unwrap()
+            )
+            .unwrap(),
+            json!({"outcome":"passed","data":{"checked":name}}),
+        );
+    }
+    for (fixture, expected) in [(&f, "succeeded"), (&unstarted, "interrupted")] {
+        fixture.pool.close().await;
+        let path = fixture._temp.path().join("run.db");
+        let options = sqlx::sqlite::SqliteConnectOptions::new().filename(&path);
+        let pool = SqlitePool::connect_with(options).await.unwrap();
+        crate::api::interrupt_previous_runs(&pool).await.unwrap();
+        let projection = fixture
+            .host
+            .runtime_projection(
+                &pool,
+                crate::api::RuntimeProjectionQuery030 {
+                    system_start_id: fixture.identity.system_start_id.clone(),
+                    source: serde_json::from_value(fixture.plan.source.clone()).unwrap(),
+                    snapshot_id: Some(fixture.identity.snapshot_id.clone()),
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(projection.verdict.as_deref(), Some(expected));
+        pool.close().await;
+        let db = fs::read(path).unwrap();
+        for secret in [FIRST, SECOND] {
+            assert!(!db
+                .windows(secret.len())
+                .any(|window| window == secret.as_bytes()));
+        }
+    }
+    assert_eq!(*seen.lock().unwrap(), ["first", "second"]);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn native_http_mcp_isolates_server_secrets_and_rejects_echoes_before_persistence() {
+    use crate::test_context::mcp::*;
+    let peer = Peer::start().await;
+    let project = tempfile::tempdir().unwrap();
+    let mut servers = peer.servers();
+    // A URI allowed by AgSDL that the native HTTP client cannot use.
+    servers["unused"] = json!({"url":"https://example.invalid:65536/mcp"});
+    let doc = json!({
+        "projectFormat":"agsdl-project-1","contract":"agsdl-0.4.0","id":"remote-calls","agents":{},
+        "mcpServers":servers, "secrets":{"file":"requirements.json"},
+        "flow":{"entry":"first","steps":{
+            "first":{"type":"call","mcp":{"server":"first","tool":"check"},"arguments":{"value":{"value":9007199254740993u64}},"next":"echo"},
+            "echo":{"type":"call","mcp":{"server":"first","tool":"echo"},"onError":"second"},
+            "second":{"type":"call","mcp":{"server":"second","tool":"check"}}
+        }}
+    });
+    std::fs::write(project.path().join("agsdl.json"), doc.to_string()).unwrap();
+    std::fs::write(project.path().join("requirements.json"), REQUIREMENTS).unwrap();
+    let fixture =
+        Fixture::new_with_project(r#"{"entry":{},"timeline":[]}"#, false, Some(project.path()))
+            .await;
+    project.close().unwrap();
+    let config = peer.configure(fixture.config.clone());
+    let _tasks = start_calls(
+        &fixture,
+        config.clone(),
+        Arc::new(crate::agsdl_host_call_executor030::NativeCallTransport030 {
+            config,
+            humans: None,
+        }),
+    );
+    let view = finish(&fixture).await;
+    assert_eq!(view.state.verdict.as_deref(), Some("succeeded"));
+    assert_eq!(
+        peer.calls(),
+        [
+            ("first".into(), "check".into()),
+            ("first".into(), "echo".into()),
+            ("second".into(), "check".into())
+        ]
+    );
+    assert!(
+        matches!(&view.state.activations[1].result, Some(WorkResultRecord030::Failed { error }) if error.code == "CALL_FAILED")
+    );
+    let output = serde_json::to_value(&view.state.activations[0].result).unwrap();
+    assert!(output["outputJson"]
+        .as_str()
+        .unwrap()
+        .contains("9007199254740993"));
+    assert_no_secrets(&fixture._temp.path().join("run.db"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn native_http_mcp_stop_leaves_unconfirmed_tool_in_stopping_state() {
+    remote_mcp_unconfirmed(false).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn native_http_mcp_default_deadline_pauses_for_forms() {
+    remote_mcp_unconfirmed(true).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn native_remote_mcp_routes_safe_budget_expiration_and_honors_authored_timeout() {
+    use crate::test_context::mcp::Peer;
+    use futures::FutureExt;
+    use std::{num::NonZeroU64, time::Duration};
+
+    for (before_launch, authored, deadline, code) in [
+        (true, None, 20, "CALL_FAILED"),
+        (false, None, 20, "CALL_FAILED"),
+        (false, Some(120_000), 120_000, "TIMEOUT"),
+    ] {
+        let peer = Peer::start().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let initializing = Arc::new(tokio::sync::Notify::new());
+        let server = tokio::spawn({
+            let initializing = initializing.clone();
+            async move {
+                let app = axum::Router::new().route(
+                    "/first",
+                    axum::routing::post(move |axum::Json(message): axum::Json<Value>| async move {
+                        assert_eq!(message["method"], "initialize");
+                        initializing.notify_one();
+                        std::future::pending::<axum::http::StatusCode>().await
+                    }),
+                );
+                axum::serve(listener, app).await.unwrap();
+            }
+        });
+        let mut step =
+            json!({"type":"call","mcp":{"server":"first","tool":"check"},"onError":"after"});
+        if let Some(authored) = authored {
+            step["timeoutMs"] = json!(authored);
+        }
+        let project = tempfile::tempdir().unwrap();
+        let mut servers = peer.servers();
+        servers["first"]["url"] = json!(format!("http://{addr}/first"));
+        let doc = json!({
+            "projectFormat":"agsdl-project-1","contract":"agsdl-0.4.0","id":"expire-remote","agents":{},
+            "mcpServers":servers,"secrets":{"file":"requirements.json"},
+            "flow":{"entry":"first","steps":{
+                "first":step,
+                "after":{"type":"call","mcp":{"server":"second","tool":"check"}}
+            }}
+        });
+        std::fs::write(project.path().join("agsdl.json"), doc.to_string()).unwrap();
+        std::fs::write(
+            project.path().join("requirements.json"),
+            r#"{"second":["SECOND_TOKEN"]}"#,
+        )
+        .unwrap();
+        let f =
+            Fixture::new_with_project(r#"{"entry":{},"timeline":[]}"#, false, Some(project.path()))
+                .await;
+        let clock = f
+            .host
+            .flow030()
+            .human_runtime()
+            .virtual_clock()
+            .await
+            .unwrap();
+        let authorize = peer.authorize();
+        let config = peer
+            .configure(f.config.clone())
+            .with_remote_mcp_tool_budget_ms(NonZeroU64::new(20).unwrap())
+            .with_mcp_http(Arc::new(move |source, server, url, addresses, names| {
+                if server == "first" {
+                    assert_eq!(addresses, [addr]);
+                    assert!(names.is_empty());
+                    Some(BTreeMap::new())
+                } else {
+                    authorize(source, server, url, addresses, names)
+                }
+            }));
+        let gate = before_launch.then(|| {
+            f.host
+                .flow030()
+                .install_operator_test_hook("call.before_launch")
+        });
+        let _tasks = start_calls(
+            &f,
+            config.clone(),
+            Arc::new(crate::agsdl_host_call_executor030::NativeCallTransport030 {
+                config,
+                humans: None,
+            }),
+        );
+        if let Some(gate) = &gate {
+            tokio::time::timeout(Duration::from_secs(10), gate.reached())
+                .await
+                .unwrap();
+        } else {
+            tokio::time::timeout(Duration::from_secs(10), initializing.notified())
+                .await
+                .unwrap();
+        }
+        let recorded: String = sqlx::query_scalar(
+            "SELECT timeout_json FROM engine_flow030_clock_works WHERE kind='call'",
+        )
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+        assert_eq!(recorded, deadline.to_string());
+        clock.advance_to(deadline + 1).unwrap();
+        if let Some(gate) = gate {
+            let broker = f
+                .host
+                .flow030()
+                .humans
+                .broker(&f.host, &f.pool, &f.identity)
+                .await
+                .unwrap();
+            let _operation = broker.operation.lock().await;
+            broker.tick(&f.host).await.unwrap();
+            broker
+                .pump(&f.host, &CancellationToken::new())
+                .await
+                .unwrap();
+            assert_eq!(broker.timeout_controls().await.unwrap().len(), 1);
+            gate.release();
+        }
+        f.host
+            .flow030()
+            .supervisors
+            .wake(&f.identity.system_start_id);
+        let view = finish(&f).await;
+        assert_eq!(view.state.verdict.as_deref(), Some("succeeded"));
+        assert!(
+            matches!(&view.state.activations[0].result, Some(WorkResultRecord030::Failed { error }) if error.code == code)
+        );
+        assert_eq!(peer.calls(), [("second".into(), "check".into())]);
+        if before_launch {
+            assert!(initializing.notified().now_or_never().is_none());
+        }
+        let replay = crate::persistence::replay_verify030::verify_path030(
+            &f._temp.path().join("run.db"),
+            &f.identity.system_start_id,
+            &f.identity.flow_invocation_id,
+        )
+        .await;
+        assert!(replay.ok, "{:?}", replay.divergence);
+        server.abort();
+    }
+}
+
+#[cfg(unix)]
+async fn remote_mcp_unconfirmed(expire: bool) {
+    use crate::test_context::mcp::*;
+    let peer = Peer::start().await;
+    let project = tempfile::tempdir().unwrap();
+    let tool = if expire { "form" } else { "blocked" };
+    let doc = json!({
+        "projectFormat":"agsdl-project-1","contract":"agsdl-0.4.0","id":"stop-remote","agents":{},
+        "mcpServers":peer.servers(),"secrets":{"file":"requirements.json"},
+        "flow":{"entry":"first","steps":{
+            "first":{"type":"call","mcp":{"server":"first","tool":tool},"onError":"after","next":"after"},
+            "after":{"type":"call","mcp":{"server":"second","tool":"check"}}
+        }}
+    });
+    std::fs::write(project.path().join("agsdl.json"), doc.to_string()).unwrap();
+    std::fs::write(project.path().join("requirements.json"), REQUIREMENTS).unwrap();
+    let f = Fixture::new_with_project(r#"{"entry":{},"timeline":[]}"#, false, Some(project.path()))
+        .await;
+    let clock = if expire {
+        Some(
+            f.host
+                .flow030()
+                .human_runtime()
+                .virtual_clock()
+                .await
+                .unwrap(),
+        )
+    } else {
+        None
+    };
+    let config = peer.configure(f.config.clone());
+    let tasks = start_calls(
+        &f,
+        config.clone(),
+        Arc::new(crate::agsdl_host_call_executor030::NativeCallTransport030 {
+            config,
+            humans: expire.then(|| {
+                Arc::new(crate::agsdl_host_human_executor030::CallHumans030 {
+                    app: f.host.clone(),
+                    pool: f.pool.clone(),
+                    identity: f.identity.clone(),
+                }) as Arc<dyn crate::agsdl_host_calls::HostPort>
+            }),
+        }),
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while peer.calls().is_empty() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    if let Some(clock) = clock {
+        let budget = crate::host::HostContext::DEFAULT_REMOTE_MCP_TOOL_BUDGET_MS.get();
+        let recorded: String = sqlx::query_scalar(
+            "SELECT timeout_json FROM engine_flow030_clock_works WHERE kind='call'",
+        )
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+        assert_eq!(recorded, budget.to_string());
+        let request =
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                loop {
+                    if let Some(request) = sqlx::query_scalar::<_, String>(
+                    "SELECT request_id FROM engine_flow030_human_requests WHERE kind='question'",
+                ).fetch_optional(&f.pool).await.unwrap() {
+                    break request;
+                }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+        let broker = f
+            .host
+            .flow030()
+            .humans
+            .broker(&f.host, &f.pool, &f.identity)
+            .await
+            .unwrap();
+        {
+            let _operation = broker.operation.lock().await;
+            clock.advance_to(budget + 1).unwrap();
+            broker.tick(&f.host).await.unwrap();
+            broker
+                .pump(&f.host, &CancellationToken::new())
+                .await
+                .unwrap();
+            assert!(broker.timeout_controls().await.unwrap().is_empty());
+        }
+        f.host
+            .submit_person(
+                &f.pool,
+                crate::api::HumanSubmission {
+                    scope: crate::persistence::public030::HumanScope030 {
+                        system_start_id: f.identity.system_start_id.clone(),
+                        source: serde_json::from_value(f.plan.source.clone()).unwrap(),
+                    },
+                    request_id: request.clone(),
+                    expected_revision: "0".into(),
+                    answer: crate::api::HumanAnswer030::Question {
+                        answer_json: r#"{"action":"accept","content":{}}"#.into(),
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let delivery: String = sqlx::query_scalar(
+                    "SELECT delivery FROM engine_flow030_human_requests WHERE request_id=?",
+                )
+                .bind(&request)
+                .fetch_one(&f.pool)
+                .await
+                .unwrap();
+                if delivery == "acknowledged" {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        clock.advance_to(2 * budget + 2).unwrap();
+        f.host
+            .flow030()
+            .supervisors
+            .wake(&f.identity.system_start_id);
+    } else {
+        crate::agsdl_host_stop030::request(
+            f.host.flow030(),
+            &f.pool,
+            &tasks,
+            &crate::persistence::dto::EngineStopRequest {
+                system_start_id: f.owner.system_start_id.clone(),
+                request_id: "stop-remote".into(),
+                activation_id: None,
+            },
+        )
+        .await
+        .unwrap();
+    }
+    let error = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        f.host.flow030().supervisors.wait(&f.owner.system_start_id),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert_eq!(error.code, "MCP_TERMINATION_UNCERTAIN");
+    let projection = f
+        .host
+        .runtime_projection(
+            &f.pool,
+            crate::api::RuntimeProjectionQuery030 {
+                system_start_id: f.owner.system_start_id.clone(),
+                source: serde_json::from_value(f.plan.source.clone()).unwrap(),
+                snapshot_id: Some(f.identity.snapshot_id.clone()),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(projection.stopping, !expire);
+    assert!(projection.termination_uncertain);
+    assert_eq!(
+        projection.verdict.as_deref(),
+        expire.then_some("interrupted")
+    );
+    assert_eq!(peer.calls(), [("first".into(), tool.into())]);
+    if expire {
+        let reason: String = sqlx::query_scalar("SELECT reason FROM engine_flow030_clock_controls")
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+        assert_eq!(reason, "TIMEOUT");
+        let replay = crate::persistence::replay_verify030::verify_path030(
+            &f._temp.path().join("run.db"),
+            &f.identity.system_start_id,
+            &f.identity.flow_invocation_id,
+        )
+        .await;
+        assert!(replay.ok, "{:?}", replay.divergence);
+    }
+    f.pool.close().await;
+    assert_no_secrets(&f._temp.path().join("run.db"));
+}
+
+#[cfg(unix)]
+#[derive(Default)]
+struct PausedInitialization {
+    received: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
+    deleted: tokio::sync::Notify,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(unix)]
+async fn start_initializing_call(
+    timeout: Option<u64>,
+) -> (
+    Fixture,
+    crate::tasks::StreamTasks,
+    Arc<PausedInitialization>,
+    Arc<crate::agsdl_host_clock030::VirtualClock030>,
+    tokio::task::JoinHandle<()>,
+) {
+    use axum::{http::StatusCode, response::IntoResponse, routing::post};
+    use std::{num::NonZeroU64, sync::atomic::Ordering::SeqCst, time::Duration};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let peer = Arc::new(PausedInitialization::default());
+    let route = post({
+        let peer = peer.clone();
+        move |axum::Json(message): axum::Json<Value>| {
+            let peer = peer.clone();
+            async move {
+                let result = match message["method"].as_str().unwrap() {
+                    "initialize" => {
+                        peer.received.notify_one();
+                        peer.resume.notified().await;
+                        json!({"protocolVersion":"2025-11-25","capabilities":{"tools":{}},
+                            "serverInfo":{"name":"paused","version":"1"}})
+                    }
+                    "notifications/initialized" => return StatusCode::ACCEPTED.into_response(),
+                    "tools/call" => {
+                        peer.calls.fetch_add(1, SeqCst);
+                        json!({"content":[]})
+                    }
+                    other => panic!("Unexpected MCP method {other}"),
+                };
+                (
+                    [("mcp-session-id", "paused")],
+                    axum::Json(json!({"jsonrpc":"2.0","id":message["id"],"result":result})),
+                )
+                    .into_response()
+            }
+        }
+    })
+    .delete({
+        let peer = peer.clone();
+        move || async move {
+            peer.deleted.notify_one();
+            StatusCode::NO_CONTENT
+        }
+    });
+    let server = tokio::spawn(async move {
+        axum::serve(listener, axum::Router::new().route("/mcp", route))
+            .await
+            .unwrap();
+    });
+    let project = tempfile::tempdir().unwrap();
+    let mut step = json!({"type":"call","mcp":{"server":"remote","tool":"check"}});
+    if let Some(timeout) = timeout {
+        step["timeoutMs"] = json!(timeout);
+    }
+    let doc = json!({
+        "projectFormat":"agsdl-project-1","contract":"agsdl-0.4.0","id":"paused-remote","agents":{},
+        "mcpServers":{"remote":{"url":format!("http://{addr}/mcp")}},
+        "flow":{"entry":"check","steps":{"check":step}}
+    });
+    std::fs::write(project.path().join("agsdl.json"), doc.to_string()).unwrap();
+    let fixture =
+        Fixture::new_with_project(r#"{"entry":{},"timeline":[]}"#, false, Some(project.path()))
+            .await;
+    let clock = fixture
+        .host
+        .flow030()
+        .human_runtime()
+        .virtual_clock()
+        .await
+        .unwrap();
+    let config = fixture
+        .config
+        .clone()
+        .with_remote_mcp_tool_budget_ms(NonZeroU64::new(50).unwrap())
+        .with_mcp_http(Arc::new(move |_, _, _, addresses, names| {
+            assert_eq!(addresses, [addr]);
+            assert!(names.is_empty());
+            Some(BTreeMap::new())
+        }));
+    let tasks = start_calls(
+        &fixture,
+        config.clone(),
+        Arc::new(crate::agsdl_host_call_executor030::NativeCallTransport030 {
+            config,
+            humans: None,
+        }),
+    );
+    tokio::time::timeout(Duration::from_secs(10), peer.received.notified())
+        .await
+        .unwrap();
+    (fixture, tasks, peer, clock, server)
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn direct_remote_mcp_does_not_dispatch_after_durable_stop_during_initialize() {
+    use std::{sync::atomic::Ordering::SeqCst, time::Duration};
+    let (f, tasks, peer, _, server) = start_initializing_call(None).await;
+    let (dispatch, _) = f
+        .host
+        .flow030()
+        .supervisors
+        .dispatcher(&f.owner.system_start_id)
+        .unwrap();
+    let guard = dispatch.lock().await;
+    f.host
+        .request_stop(
+            &f.pool,
+            &tasks,
+            &EngineStopRequest {
+                system_start_id: f.owner.system_start_id.clone(),
+                activation_id: None,
+                request_id: "stop-during-initialize".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+    // The dispatcher cannot process StopWork until the transport has closed.
+    peer.resume.notify_one();
+    tokio::time::timeout(Duration::from_secs(10), peer.deleted.notified())
+        .await
+        .unwrap();
+    assert_eq!(peer.calls.load(SeqCst), 0);
+    drop(guard);
+    assert_eq!(finish(&f).await.state.verdict.as_deref(), Some("cancelled"));
+    server.abort();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn shutdown_attests_expired_remote_call_deadlines_for_replay() {
+    use std::time::Duration;
+    for timeout in [Some(25), None] {
+        let (f, tasks, _, clock, server) = start_initializing_call(timeout).await;
+        let (dispatch, _) = f
+            .host
+            .flow030()
+            .supervisors
+            .dispatcher(&f.owner.system_start_id)
+            .unwrap();
+        let guard = dispatch.lock().await;
+        clock.advance_to(timeout.unwrap_or(50) + 1).unwrap();
+        let approved = f.host.shutdown_active_runs(&f.pool).await.unwrap();
+        let shutdown = f.host.prepare_shutdown(&f.pool, &tasks, &approved);
+        let stopping = async {
+            while !sqlx::query_scalar::<_, bool>(
+                "SELECT json_extract(state_json,'$.stopping') FROM engine_flow030_runs",
+            )
+            .fetch_one(&f.pool)
+            .await
+            .unwrap()
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            drop(guard);
+        };
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(15), async {
+            tokio::join!(shutdown, stopping)
+        })
+        .await
+        .unwrap();
+        result.unwrap();
+        let joined: i64 = sqlx::query_scalar(
+            "SELECT joined FROM engine_flow030_clock_controls WHERE reason='TIMEOUT'",
+        )
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+        assert_eq!(joined, 1);
+        f.pool.close().await;
+        let replay = crate::persistence::replay_verify030::verify_path030(
+            &f._temp.path().join("run.db"),
+            &f.identity.system_start_id,
+            &f.identity.flow_invocation_id,
+        )
+        .await;
+        assert!(replay.ok, "{replay:?}");
+        server.abort();
+    }
 }

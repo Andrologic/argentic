@@ -1,8 +1,13 @@
 //! Approved host policy inputs. These leases freeze inputs, never grant work.
-use crate::{permissions::RequestedPermissions, persistence::Result};
+use crate::{
+    permissions::RequestedPermissions,
+    persistence::{dto::EngineSourceRevision, Result},
+};
 use serde_json::Value;
 use std::{
+    collections::BTreeMap,
     future::Future,
+    num::NonZeroU64,
     path::{Path, PathBuf},
     pin::Pin,
     sync::Arc,
@@ -61,20 +66,54 @@ pub trait PolicySource: Send + Sync {
     fn lock_ceiling(&self) -> PolicyFuture<'_, HostPolicyLease>;
 }
 
+/// Resolves one server's declared secrets just before connecting or spawning.
+/// Return exactly the requested names, or None if they cannot be supplied.
+pub type McpSecretProvider = dyn Fn(&EngineSourceRevision, &str, &[String]) -> Option<BTreeMap<String, String>>
+    + Send
+    + Sync;
+
+/// Where to send one declared secret on a remote MCP connection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum McpHttpSecret {
+    Bearer,
+    Header(String),
+}
+
+/// Authorizes the exact source, server, URL and frozen destination addresses.
+/// Return the delivery rule for each declared secret, or None to refuse.
+pub type McpHttpAuthorizer = dyn Fn(
+        &EngineSourceRevision,
+        &str,
+        &url::Url,
+        &[std::net::SocketAddr],
+        &[String],
+    ) -> Option<BTreeMap<String, McpHttpSecret>>
+    + Send
+    + Sync;
+
 #[derive(Clone)]
 pub struct HostContext {
     root: PathBuf,
     policy: Arc<dyn PolicySource>,
     network: Arc<dyn crate::content_network::ContentNetwork>,
     codex_auth_file: Option<PathBuf>,
+    mcp_secrets: Option<Arc<McpSecretProvider>>,
+    mcp_http: Option<Arc<McpHttpAuthorizer>>,
+    remote_mcp_tool_budget_ms: NonZeroU64,
 }
 impl HostContext {
+    pub(crate) const DEFAULT_REMOTE_MCP_TOOL_BUDGET_MS: NonZeroU64 =
+        NonZeroU64::new(60_000).unwrap();
+
     pub fn new(root: PathBuf, policy: Arc<dyn PolicySource>) -> Self {
         Self {
             root,
             policy,
             network: Arc::new(crate::content_network::UnavailableNetwork),
             codex_auth_file: None,
+            mcp_secrets: None,
+            mcp_http: None,
+            remote_mcp_tool_budget_ms: Self::DEFAULT_REMOTE_MCP_TOOL_BUDGET_MS,
         }
     }
     pub fn with_network(
@@ -96,6 +135,35 @@ impl HostContext {
     }
     pub(crate) fn codex_auth_file(&self) -> Option<&Path> {
         self.codex_auth_file.as_deref()
+    }
+    pub fn with_mcp_secrets(mut self, provider: Arc<McpSecretProvider>) -> Self {
+        self.mcp_secrets = Some(provider);
+        self
+    }
+    /// Enables remote MCP with per-connection endpoint consent and secret routing.
+    pub fn with_mcp_http(mut self, authorize: Arc<McpHttpAuthorizer>) -> Self {
+        self.mcp_http = Some(authorize);
+        self
+    }
+    /// Sets the remote MCP machine budget in milliseconds for work without an
+    /// authored timeoutMs. The default is 60 seconds.
+    pub fn with_remote_mcp_tool_budget_ms(mut self, budget: NonZeroU64) -> Self {
+        self.remote_mcp_tool_budget_ms = budget;
+        self
+    }
+    pub(crate) fn remote_mcp_tool_budget_ms(&self) -> NonZeroU64 {
+        self.remote_mcp_tool_budget_ms
+    }
+    pub(crate) fn mcp_http(&self) -> Option<&McpHttpAuthorizer> {
+        self.mcp_http.as_deref()
+    }
+    pub(crate) fn mcp_secrets(
+        &self,
+        source: &EngineSourceRevision,
+        server: &str,
+        names: &[String],
+    ) -> Option<BTreeMap<String, String>> {
+        self.mcp_secrets.as_ref()?(source, server, names)
     }
     pub fn root(&self) -> &Path {
         &self.root

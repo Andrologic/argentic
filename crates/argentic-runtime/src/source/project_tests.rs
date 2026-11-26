@@ -44,12 +44,9 @@ fn pack(files: &BTreeMap<String, Vec<u8>>) -> Vec<u8> {
 
 fn files(opened: &OpenedSource) -> BTreeMap<String, Vec<u8>> {
     opened
-        .project
-        .as_ref()
+        .selected_files()
         .unwrap()
-        .files
-        .iter()
-        .map(|(name, file)| (name.clone(), file.bytes.clone()))
+        .map(|file| (file.path.to_owned(), file.bytes.to_vec()))
         .collect()
 }
 
@@ -98,6 +95,32 @@ fn symlinks_in_a_selected_path_are_refused() {
     write(temp.path(), "real/notes.md", "Notes.\n");
     std::os::unix::fs::symlink(temp.path().join("real"), temp.path().join("linked")).unwrap();
     assert!(refused(OpenedSource::open_path(temp.path())).contains("symbolic link"));
+}
+
+#[cfg(unix)]
+#[test]
+fn member_open_requires_real_directories_at_each_component() {
+    let temp = tempfile::tempdir().unwrap();
+    write(temp.path(), "real/nested/notes.md", "Notes.\n");
+    let root = open_project_root(temp.path()).unwrap();
+    let path = Path::new("real/nested/notes.md");
+    assert_eq!(
+        read_regular(&root, path, MAX_TOTAL, &SourceBudget::default())
+            .unwrap()
+            .bytes,
+        b"Notes.\n"
+    );
+
+    std::os::unix::fs::symlink("real", temp.path().join("alias")).unwrap();
+    assert!(read_regular(
+        &root,
+        Path::new("alias/nested/notes.md"),
+        MAX_TOTAL,
+        &SourceBudget::default()
+    )
+    .is_err());
+    std::os::unix::fs::symlink("nested", temp.path().join("real/alias")).unwrap();
+    assert!(member::with_directory(&root, Path::new("real/alias"), Dir::entries).is_err());
 }
 
 #[test]
@@ -169,6 +192,25 @@ fn json_budget_counts_every_reference_like_the_official_reader() {
 }
 
 #[test]
+fn project_json_structure_check_spends_source_work() {
+    let bytes = br#"{"items":[0,1,2]}"#;
+    let parse_only = SourceBudget::default();
+    parse_json(bytes, MANIFEST, false, &parse_only).unwrap();
+
+    let budget = SourceBudget::default();
+    // Leave exactly enough work for the parse and four of the five visits.
+    budget
+        .work(
+            argentic_core::MAX_SOURCE_WORK - parse_only.usage().0 - 4,
+            "",
+        )
+        .unwrap();
+    let error = parse_json(bytes, MANIFEST, true, &budget).unwrap_err();
+    assert_eq!(error.code, GRAPH_LIMIT_CODE);
+    assert_eq!(error.source.unwrap().path, MANIFEST);
+}
+
+#[test]
 fn json_documents_keep_the_host_source_codes() {
     let temp = tempfile::tempdir().unwrap();
     let code = |path: &Path| match OpenedSource::open_path(path) {
@@ -207,6 +249,36 @@ fn json_documents_keep_the_host_source_codes() {
 }
 
 #[test]
+fn direct_manifest_parse_errors_match_folder_diagnostics() {
+    let temp = tempfile::tempdir().unwrap();
+    let manifest = temp.path().join(MANIFEST);
+    for bytes in [
+        b"{".as_slice(),
+        br#"{"projectFormat":"agsdl-project-1","projectFormat":null}"#,
+        b"\xff",
+    ] {
+        std::fs::write(&manifest, bytes).unwrap();
+        let folder = OpenedSource::open_path(temp.path()).err().unwrap();
+        let direct = OpenedSource::open_path(&manifest).err().unwrap();
+        assert_eq!(direct, folder);
+        assert_eq!(direct.code, "PROJECT");
+        assert_eq!(
+            direct.source.as_deref(),
+            Some(&SourceDiagnostic {
+                path: MANIFEST.into(),
+                pointer: String::new(),
+                kind: SourceErrorKind::InvalidContent,
+            })
+        );
+    }
+    let standalone = "{ \"contract\": \"agsdl-0.4.0\", \"id\": \"standalone\", \"agents\": {} }\n";
+    std::fs::write(&manifest, standalone).unwrap();
+    let opened = OpenedSource::open_path(&manifest).unwrap();
+    assert!(opened.is_document());
+    assert_eq!(opened.authored_json(), standalone);
+}
+
+#[test]
 fn a_folder_is_limited_to_an_inventory_its_archive_could_hold() {
     let temp = tempfile::tempdir().unwrap();
     project(temp.path(), "../notes.md", Some("skills/review/SKILL.md"));
@@ -227,10 +299,7 @@ fn retain_never_publishes_an_index_it_cannot_reopen() {
     let files: Files = (0..3000)
         .map(|i| {
             let name = format!("{}/{i:05}", "p".repeat(3000));
-            let file = ProjectFile {
-                bytes: b"x".to_vec(),
-                executable: false,
-            };
+            let file = ProjectFile::new(b"x".to_vec(), false);
             (name, file)
         })
         .collect();
@@ -370,11 +439,16 @@ fn a_linked_project_root_or_snapshot_folder_is_refused() {
 
 #[test]
 fn skill_tree_directories_follow_the_name_rules_even_when_empty() {
-    for directory in [".git", "CON", "Sub"] {
+    for (directory, resource) in [
+        (".git", "../notes.md"),
+        ("CON", "../notes.md"),
+        // An authored spelling can collide with an empty directory even on a
+        // filesystem that cannot create entries named both Sub and sub.
+        ("Sub", "../skills/review/sub/../../../notes.md"),
+    ] {
         let temp = tempfile::tempdir().unwrap();
-        project(temp.path(), "../notes.md", Some("skills/review/SKILL.md"));
+        project(temp.path(), resource, Some("skills/review/SKILL.md"));
         write(temp.path(), "skills/review/SKILL.md", "Review.\n");
-        write(temp.path(), "skills/review/sub", "File.\n");
         std::fs::create_dir(temp.path().join("skills/review").join(directory)).unwrap();
         let message = refused(OpenedSource::open_path(temp.path()));
         assert!(
@@ -394,11 +468,13 @@ fn a_linked_root_is_refused_with_a_trailing_separator() {
     std::os::unix::fs::symlink(&real, temp.path().join("link")).unwrap();
     let mut spelled = temp.path().join("link").into_os_string();
     spelled.push("/");
-    let message = refused(OpenedSource::open_path(Path::new(&spelled)));
-    assert!(
-        message.contains("root cannot be a symbolic link"),
-        "{message}"
-    );
+    for path in [PathBuf::from(spelled), temp.path().join("link/agsdl.json")] {
+        let message = refused(OpenedSource::open_path(&path));
+        assert!(
+            message.contains("root cannot be a symbolic link"),
+            "{message}"
+        );
+    }
 }
 
 /// A plain JSON source is read without listing its directory, as before.
@@ -428,10 +504,7 @@ fn a_retained_copy_does_not_depend_on_file_modes() {
     let files: Files = [("run.sh", true), ("notes.md", false)]
         .into_iter()
         .map(|(name, executable)| {
-            let file = ProjectFile {
-                bytes: b"x".to_vec(),
-                executable,
-            };
+            let file = ProjectFile::new(b"x".to_vec(), executable);
             (name.to_owned(), file)
         })
         .collect();
@@ -439,4 +512,240 @@ fn a_retained_copy_does_not_depend_on_file_modes() {
     let script = first.resource_root().join("run.sh");
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o600)).unwrap();
     snapshot::retain(temp.path(), &sha256(b"{}"), &files).unwrap();
+}
+
+#[test]
+fn component_errors_report_the_file_and_distinguish_io_from_content() {
+    let temp = tempfile::tempdir().unwrap();
+    project(temp.path(), "../notes.md", None);
+    let component = temp.path().join("agents/a.json");
+    std::fs::remove_file(&component).unwrap();
+    for kind in [SourceErrorKind::Io, SourceErrorKind::InvalidContent] {
+        let error = OpenedSource::open_path(temp.path()).err().unwrap();
+        assert_eq!(error.code, "PROJECT");
+        assert_eq!(error.pointer, "");
+        assert_eq!(
+            error.source.as_deref(),
+            Some(&SourceDiagnostic {
+                path: "agents/a.json".into(),
+                pointer: String::new(),
+                kind,
+            })
+        );
+        let encoded = serde_json::to_value(&error).unwrap();
+        assert_eq!(encoded["source"]["path"], "agents/a.json");
+        assert_eq!(
+            encoded["source"]["kind"],
+            if kind == SourceErrorKind::Io {
+                "io"
+            } else {
+                "invalidContent"
+            }
+        );
+        assert_eq!(
+            serde_json::from_value::<EngineFailure>(encoded).unwrap(),
+            error
+        );
+        std::fs::write(&component, "{").unwrap();
+    }
+}
+
+#[test]
+fn missing_uri_reports_the_resource_and_keeps_the_declaring_pointer() {
+    let temp = tempfile::tempdir().unwrap();
+    project(temp.path(), "../notes.md", None);
+    write(
+        temp.path(),
+        "agents/a.json",
+        br#"{"harness":"codex","permissions":"read-only",
+             "instructions":[{"uri":"../instructions.md"}]}"#,
+    );
+    let error = OpenedSource::open_path(temp.path()).err().unwrap();
+    assert_eq!(error.code, "PROJECT");
+    assert_eq!(error.pointer, "/instructions/0/uri");
+    assert!(error
+        .message
+        .starts_with("agents/a.json#/instructions/0/uri: instructions.md: "));
+    assert_eq!(
+        error.source.as_deref(),
+        Some(&SourceDiagnostic {
+            path: "instructions.md".into(),
+            pointer: String::new(),
+            kind: SourceErrorKind::Io,
+        })
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn folder_reads_from_the_opened_directory_after_a_rename() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("first");
+    project(&root, "../notes.md", None);
+    let dir = open_project_root(&root).unwrap();
+    std::fs::rename(&root, temp.path().join("moved")).unwrap();
+    project(&root, "../notes.md", None);
+    write(&root, "notes.md", "Replacement.");
+    let source = OpenedSource::folder(dir, None).unwrap();
+    assert_eq!(files(&source)["notes.md"], b"Notes.\n");
+}
+
+#[test]
+fn folder_sidecar_round_trip_preserves_archive_modes() {
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/conformance-050");
+    let input = std::fs::File::open(fixtures.join("review-project.agsdl")).unwrap();
+    let mut original = archive::read(input).unwrap();
+    original.values_mut().next_back().unwrap().executable = true;
+    let mut zipped = Vec::new();
+    archive::write(&original, &mut zipped).unwrap();
+    let original = OpenedSource::open_archive_bytes(&zipped).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let selected = original.selected_files().unwrap();
+    let mut modes = BTreeMap::new();
+    for file in selected {
+        write(temp.path(), file.path, file.bytes);
+        modes.insert(file.path, file.executable);
+    }
+    let mut metadata = String::from("AgSDL executable paths v1\n");
+    for (&path, _) in modes.iter().filter(|(_, executable)| **executable) {
+        metadata.push_str(path);
+        metadata.push('\n');
+    }
+    assert!(modes.values().any(|&executable| executable));
+    metadata.push_str("removed.sh\n../outside");
+    write(temp.path(), ".AGSDL-EXECUTABLES.3", &metadata);
+
+    let open = |native_modes| {
+        let dir = open_project_root(temp.path())?;
+        OpenedSource::assembled(project::assemble_folder(dir, None, native_modes)?)
+    };
+    assert!(open(false)
+        .unwrap()
+        .selected_files()
+        .unwrap()
+        .all(|file| !file.executable));
+    write(temp.path(), ".agsdl-executables.1", &metadata);
+    write(temp.path(), ".agsdl-executables.2", metadata);
+    let folder = open(false).unwrap();
+    let mut exported = Vec::new();
+    folder.write_archive(&mut exported).unwrap();
+    let reopened = OpenedSource::open_archive_bytes(&exported).unwrap();
+    assert_eq!(
+        reopened
+            .selected_files()
+            .unwrap()
+            .map(|file| (file.path, file.executable))
+            .collect::<BTreeMap<_, _>>(),
+        modes,
+    );
+    #[cfg(unix)]
+    assert!(open(true)
+        .unwrap()
+        .selected_files()
+        .unwrap()
+        .all(|file| !file.executable));
+}
+
+#[test]
+fn a_selected_sidecar_name_is_ordinary_content_in_folder_and_archive() {
+    let temp = tempfile::tempdir().unwrap();
+    project(temp.path(), "../.agsdl-executables", None);
+    let mut agent: Value =
+        serde_json::from_slice(&std::fs::read(temp.path().join("agents/a.json")).unwrap()).unwrap();
+    agent["resources"]["notes"] = json!({"uri":"../notes.md"});
+    write(temp.path(), "agents/a.json", agent.to_string());
+    let metadata = b"AgSDL executable paths v1\nnotes.md";
+    write(temp.path(), ".agsdl-executables", metadata);
+
+    let dir = open_project_root(temp.path()).unwrap();
+    let folder =
+        OpenedSource::assembled(project::assemble_folder(dir, None, false).unwrap()).unwrap();
+    let archived = OpenedSource::open_archive_bytes(&pack(&files(&folder))).unwrap();
+    for opened in [folder, archived] {
+        assert_eq!(files(&opened)[".agsdl-executables"], metadata);
+        assert!(opened
+            .selected_files()
+            .unwrap()
+            .all(|file| !file.executable));
+    }
+}
+
+#[test]
+fn graph_limit_identifies_the_declaring_component_on_open() {
+    let temp = tempfile::tempdir().unwrap();
+    let compose = |target: String, route: Value| {
+        json!({
+            "type":"compose", "composition":target,"next":{"done":route},
+        })
+    };
+    let depth = argentic_core::MAX_COMPOSITION_DEPTH + 1;
+    let bodies = (1..=depth)
+        .map(|index| {
+            let output = json!({"output":"done"});
+            let step = if index == depth {
+                json!({"type":"agent","agent":"a","next":output})
+            } else {
+                compose(format!("body{}", index + 1), output)
+            };
+            let body = json!({"entry":"step","outputs":["done"],"steps":{"step":step}});
+            let name = format!("body{index}");
+            if index == depth {
+                write(temp.path(), "body.json", body.to_string());
+                (name, json!({"file":"body.json"}))
+            } else {
+                (name, body)
+            }
+        })
+        .collect::<serde_json::Map<_, _>>();
+    write(
+        temp.path(),
+        MANIFEST,
+        json!({
+            "projectFormat":"agsdl-project-1","contract":"agsdl-0.4.0","id":"depth",
+            "agents":{"a":{"harness":"codex","permissions":"read-only"}},
+            "flow":{"entry":"step","steps":{"step":compose("body1".into(), json!([]))}},
+            "compositions":bodies,
+        })
+        .to_string(),
+    );
+    for path in [temp.path().to_owned(), temp.path().join(MANIFEST)] {
+        let error = OpenedSource::open_path(&path).err().unwrap();
+        assert_eq!(error.code, argentic_core::GRAPH_LIMIT_CODE);
+        let location = error.source.unwrap();
+        assert_eq!(location.path, "body.json");
+        assert_eq!(location.pointer, "");
+    }
+}
+
+#[test]
+fn project_open_locates_secret_names_reserved_by_the_mcp_launcher() {
+    let temp = tempfile::tempdir().unwrap();
+    let requirements = temp.path().join("requirements.json");
+    std::fs::write(
+        temp.path().join("agsdl.json"),
+        json!({
+            "projectFormat":"agsdl-project-1", "contract":"agsdl-0.4.0",
+            "id":"secret-names", "agents":{},
+            "mcpServers":{"local":{"command":["true"]}},
+            "secrets":{"file":"requirements.json"}
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    for name in ["PATH", "BASH_ENV", "LD_PRELOAD", "DYLD_INSERT_LIBRARIES"] {
+        std::fs::write(&requirements, json!({"local":["TOKEN", name]}).to_string()).unwrap();
+        let error = OpenedSource::open_path(temp.path()).err().unwrap();
+        assert_eq!(error.code, "MCP_SECRET_RESERVED", "{name}");
+        let source = error.source.unwrap();
+        assert_eq!(source.path, "requirements.json");
+        assert_eq!(source.pointer, "/local/1");
+    }
+
+    std::fs::write(
+        &requirements,
+        r#"{"local":["HOME","TMPDIR","IFS","NODE_OPTIONS","PYTHONPATH"]}"#,
+    )
+    .unwrap();
+    OpenedSource::open_path(temp.path()).unwrap();
 }

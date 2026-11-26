@@ -13,11 +13,12 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 pub use crate::agsdl_host_codex::CodexStatus;
+pub use crate::agsdl_host_flow030::operator030::{OperatorAction, OperatorRequest};
 pub use crate::agsdl_host_flow030::{DeliveryReceipt030, DeliveryRequest030};
 pub use crate::agsdl_host_human030::HumanAnswer030;
 pub use crate::agsdl_host_projection030::{
-    RuntimeProjectionContinuation030, RuntimeProjectionItem030, RuntimeProjectionPage030,
-    RuntimeProjectionQuery030, RuntimeProjectionScope030,
+    OperatorWorkState, RuntimeProjectionContinuation030, RuntimeProjectionItem030,
+    RuntimeProjectionPage030, RuntimeProjectionQuery030, RuntimeProjectionScope030,
 };
 pub use crate::tasks::StreamTasks;
 
@@ -103,6 +104,14 @@ impl HostState {
         continuation: Option<RuntimeProjectionContinuation030>,
     ) -> Result<RuntimeProjectionPage030> {
         crate::agsdl_host_projection030::read(self, pool, query, continuation).await
+    }
+    /// Commit a live operator transition and wake the run supervisor.
+    pub async fn control_run(
+        &self,
+        pool: &SqlitePool,
+        request: OperatorRequest,
+    ) -> Result<persistence::flow030::FlowReceipt030> {
+        flow::operator030::control(self, pool, request).await
     }
     pub async fn deliver_message(
         &self,
@@ -286,17 +295,24 @@ pub fn qualify_skill_folders(document: &Value, root: &std::path::Path) -> Result
 pub fn declared_steps(document: &Value) -> impl Iterator<Item = (String, &Value)> {
     crate::agsdl_host_qualification030::declared_steps030(document)
 }
-pub struct Diagnostic {
-    pub code: String,
-    pub pointer: String,
-    pub message: String,
+pub use crate::agsdl_host_qualification030::{
+    Diagnostic, McpServerQualification, ProductQualification,
+};
+
+/// Checks native product capabilities for an assembled AgSDL document. Supply
+/// the approved host ceiling to match Codex equipment admission. With no ceiling
+/// the report uses the agents' requested permissions alone.
+pub fn qualify_product(
+    document: &Value,
+    compiled: Option<&str>,
+    host_permissions: Option<&crate::permissions::RequestedPermissions>,
+) -> Result<ProductQualification> {
+    crate::agsdl_host_qualification030::qualify_product030(document, compiled, host_permissions)
 }
+
+/// Returns the first native product blocker under the authored permissions.
 pub fn product_slice(authored: &str, compiled: Option<&str>) -> Option<Diagnostic> {
-    crate::agsdl_host_qualification030::product_slice030(authored, compiled).map(|d| Diagnostic {
-        code: d.code,
-        pointer: d.pointer,
-        message: d.message,
-    })
+    crate::agsdl_host_qualification030::product_slice030(authored, compiled)
 }
 
 impl StartSession<'_> {
@@ -330,14 +346,17 @@ impl StartSession<'_> {
         let plan: persistence::flow030::FlowPlan030 =
             serde_json::from_str(&capture.compiled_plan_json)?;
         let document: Value = serde_json::from_str(&plan.document_json)?;
-        let needs_clock = plan.steps.iter().any(|step| {
-            step.r#type == "approval" || step.r#type == "call" || step.timeout_ms_json.is_some()
-        }) || document["agents"].as_object().is_some_and(|agents| {
-            agents
-                .values()
-                .any(|agent| agent.get("answerTimeoutMs").is_some())
-        });
+        let needs_clock = plan.versions.contract == argentic_core::AGSDL_040
+            || plan.steps.iter().any(|step| {
+                step.r#type == "approval" || step.r#type == "call" || step.timeout_ms_json.is_some()
+            })
+            || document["agents"].as_object().is_some_and(|agents| {
+                agents
+                    .values()
+                    .any(|agent| agent.get("answerTimeoutMs").is_some())
+            });
         let agents = crate::agsdl_host_codex030::CodexExecutor030::new(context.clone())
+            .with_mcp_equipment(&document)
             .with_approvals(Arc::new(
                 crate::agsdl_host_action_approval030::AgentActionHumans030 {
                     host: self.engine.clone(),
@@ -346,7 +365,7 @@ impl StartSession<'_> {
                 },
             ));
         let agents: Arc<dyn crate::agsdl_host_runtime030::AgentExecutor030> = Arc::new(agents);
-        #[cfg(feature = "dev-support")]
+        #[cfg(any(test, feature = "dev-support"))]
         let agents = self
             .engine
             .flow030()
@@ -364,6 +383,7 @@ impl StartSession<'_> {
                     tasks: tasks.clone(),
                     transport: Arc::new(
                         crate::agsdl_host_call_executor030::NativeCallTransport030 {
+                            config: context.clone(),
                             humans: Some(Arc::new(
                                 crate::agsdl_host_human_executor030::CallHumans030 {
                                     app: self.engine.clone(),

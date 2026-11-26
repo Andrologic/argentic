@@ -119,7 +119,7 @@ async fn native_action_delivery_requires_exact_payload_live_work_and_one_resolut
                 .unwrap();
         }
         pump(&f).await;
-        let decision = f.broker.take_resolution(&f.host, &ticket).await.unwrap();
+        let decision = f.broker.action_resolution(&f.host, &ticket).await.unwrap();
         if outcome == "stop" {
             stop_fence(&f).await;
         }
@@ -1516,18 +1516,15 @@ async fn a_pending_retirement_is_applied_before_the_next_admission() {
     // Submitting the next ticket while the retire still occupies the single
     // slot must apply that retire with its original timestamp first.
     f.clock.at(1);
-    let (second, ()) = tokio::try_join!(
-        f.broker.admit_host_work(&f.host, "second-start"),
-        async {
-            let job = f.broker.jobs.next().await.unwrap();
-            let output = evaluate(&job).await;
-            f.broker
-                .jobs
-                .complete(&job.generation, complete(&job, output))
-                .unwrap();
-            Ok(())
-        },
-    )
+    let (second, ()) = tokio::try_join!(f.broker.admit_host_work(&f.host, "second-start"), async {
+        let job = f.broker.jobs.next().await.unwrap();
+        let output = evaluate(&job).await;
+        f.broker
+            .jobs
+            .complete(&job.generation, complete(&job, output))
+            .unwrap();
+        Ok(())
+    },)
     .unwrap();
     let result = pump(&f).await;
     assert_eq!(result["clocks"][0]["workId"], second.work_id());

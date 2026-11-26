@@ -303,7 +303,7 @@ impl HumanBroker030 {
                 && attempt.generation() == self.generation,
             "Foreign agent attempt",
         )?;
-        self.admit(host, attempt.start_effect_id(), Some(attempt))
+        self.admit(host, attempt.start_effect_id(), Some(attempt), None)
             .await
     }
     /// For Call/Approval this authenticates the owned host handoff and capture.
@@ -313,15 +313,31 @@ impl HumanBroker030 {
         host: &HostState,
         start_effect_id: &str,
     ) -> Result<OwnedHumanWork030> {
-        self.admit(host, start_effect_id, None).await
+        self.admit(
+            host,
+            start_effect_id,
+            None,
+            Some(crate::host::HostContext::DEFAULT_REMOTE_MCP_TOOL_BUDGET_MS),
+        )
+        .await
+    }
+    pub(crate) async fn admit_call(
+        &self,
+        host: &HostState,
+        start_effect_id: &str,
+        remote_mcp_budget_ms: std::num::NonZeroU64,
+    ) -> Result<OwnedHumanWork030> {
+        self.admit(host, start_effect_id, None, Some(remote_mcp_budget_ms))
+            .await
     }
     async fn admit(
         &self,
         host: &HostState,
         effect_id: &str,
         attempt: Option<&FlowWorkAttempt030>,
+        remote_mcp_budget_ms: Option<std::num::NonZeroU64>,
     ) -> Result<OwnedHumanWork030> {
-        self.settle_pending_retirement(host).await?;
+        self.settle_pending_flow_clock(host).await?;
         let lease = host.start_lease().await?;
         let _gate = host.admission_lock().lock_owned().await;
         let mut connection = self.durable_connection().await?;
@@ -418,6 +434,16 @@ impl HumanBroker030 {
             .map(|s| serde_json::from_str(&s.declaration_json))
             .transpose()?
             .unwrap_or(Value::Null);
+        let timeout = timeout.or_else(|| {
+            remote_mcp_budget_ms
+                .filter(|_| {
+                    crate::persistence::call_protocol030::is_remote_mcp_call(
+                        &document,
+                        &declaration,
+                    )
+                })
+                .map(|budget| budget.to_string())
+        });
         let answer_timeout = if let Some(agent) = agent {
             document["agents"][agent]
                 .get("answerTimeoutMs")
@@ -468,7 +494,15 @@ impl HumanBroker030 {
             json!({"kind":"admit","workId":owned.work_id(),"timeoutMs":timeout,"answerTimeoutMs":answer_timeout,"startedAtMs":started})
         };
         self.reserve(&mut tx, event, &now).await?;
+        #[cfg(test)]
+        host.flow030()
+            .operator_test_yield("approval.clock.reserve")
+            .await;
         tx.commit().await?;
+        #[cfg(test)]
+        host.flow030()
+            .operator_test_yield("approval.clock.ack")
+            .await;
         Ok(owned)
     }
     async fn verify_work(&self, db: &mut SqliteConnection, work: &OwnedHumanWork030) -> Result<()> {
@@ -539,13 +573,20 @@ impl HumanBroker030 {
                 "Plan content absent",
             )?;
         }
-        self.settle_pending_retirement(host).await?;
+        self.settle_pending_flow_clock(host).await?;
         let lease = host.start_lease().await?;
         let _gate = host.admission_lock().lock_owned().await;
         let mut connection = self.durable_connection().await?;
         let mut tx = connection.begin_with("BEGIN IMMEDIATE").await?;
         self.guard(&mut tx, &lease).await?;
         self.verify_work(&mut tx, work).await?;
+        if kind == "ask" && self.operator_held(&mut tx, work.work_id()).await? {
+            return Err(failure(
+                "OPERATOR_HOLD",
+                "approval",
+                "The turn is being interrupted",
+            ));
+        }
         let timeout: Option<String> = sqlx::query_scalar("SELECT answer_timeout_json FROM engine_flow030_clock_works WHERE system_id=? AND invocation_id=? AND activation_id=?")
             .bind(&self.identity.system_start_id).bind(&self.identity.flow_invocation_id).bind(work.work_id()).fetch_one(&mut *tx).await?;
         let now = self.clock.now_ms().to_string();
@@ -605,7 +646,7 @@ impl HumanBroker030 {
         request_id: &str,
         works: &[OwnedHumanWork030],
     ) -> Result<()> {
-        self.settle_pending_retirement(host).await?;
+        self.settle_pending_flow_clock(host).await?;
         let lease = host.start_lease().await?;
         let _gate = host.admission_lock().lock_owned().await;
         let mut connection = self.durable_connection().await?;
@@ -648,7 +689,8 @@ impl HumanBroker030 {
             .await
     }
     /// Same entry point for product IPC and the gated QA driver. Native receipt
-    /// and timestamp are allocated only after scope/revision authentication.
+    /// is allocated only after scope/revision authentication. Capture the
+    /// broker's arrival time before evaluating any earlier flow clock ticket.
     pub(crate) async fn submit(
         &self,
         host: &HostState,
@@ -665,7 +707,8 @@ impl HumanBroker030 {
             ));
         }
         validate_json(&answer_json)?;
-        self.settle_pending_retirement(host).await?;
+        let received_ms = self.clock.now_ms().to_string();
+        self.settle_pending_flow_clock(host).await?;
         let lease = host.start_lease().await?;
         let _gate = host.admission_lock().lock_owned().await;
         let mut connection = self.durable_connection().await?;
@@ -694,12 +737,13 @@ impl HumanBroker030 {
             !state.stopping
                 && state.verdict.is_none()
                 && work_ids.iter().all(|id| {
-                    state.activations.iter().any(|a| {
-                        &a.id == id
-                            && a.phase == "running"
-                            && a.result.is_none()
-                            && a.stop_effect_id.is_none()
-                    })
+                    !state.operator_holds.contains_key(id)
+                        && state.activations.iter().any(|a| {
+                            &a.id == id
+                                && a.phase == "running"
+                                && a.result.is_none()
+                                && a.stop_effect_id.is_none()
+                        })
                 }),
             "Human answer targets a stale visit",
         )?;
@@ -752,18 +796,17 @@ impl HumanBroker030 {
                 json!({"kind":"answer","requestId":input.request_id,"nativeReceiptId":receipt_id,"answer":null})
             }
         };
-        let now = self.clock.now_ms().to_string();
         sqlx::query("INSERT INTO engine_flow030_human_submissions VALUES(?,?,?,?,?,?,?,NULL)")
             .bind(&self.identity.system_start_id)
             .bind(&self.identity.flow_invocation_id)
             .bind(&receipt_id)
             .bind(&input.request_id)
-            .bind(&now)
+            .bind(&received_ms)
             .bind(origin.name())
             .bind(&answer_json)
             .execute(&mut *tx)
             .await?;
-        self.reserve(&mut tx, event, &now).await?;
+        self.reserve(&mut tx, event, &received_ms).await?;
         tx.commit().await?;
         Ok(receipt_id)
     }
@@ -798,17 +841,98 @@ impl HumanBroker030 {
             .bind(&self.identity.system_start_id).bind(&self.identity.flow_invocation_id).bind(event_id).bind(serde_json::to_string(&input)?).execute(db).await?;
         Ok(())
     }
+    pub(crate) async fn reserve_operator_clock(
+        &self,
+        db: &mut SqliteConnection,
+        before: &FlowState030,
+        event_id: &str,
+    ) -> Result<()> {
+        let raw: String = sqlx::query_scalar(
+            "SELECT state_json FROM engine_flow030_runs WHERE system_id=? AND invocation_id=?",
+        )
+        .bind(&self.identity.system_start_id)
+        .bind(&self.identity.flow_invocation_id)
+        .fetch_one(&mut *db)
+        .await?;
+        let after: FlowState030 = serde_json::from_str(&raw)?;
+        let active: Vec<String> = sqlx::query_scalar("SELECT activation_id FROM engine_flow030_clock_works WHERE system_id=? AND invocation_id=? AND kind='agent' AND retired=0 ORDER BY rowid")
+            .bind(&self.identity.system_start_id).bind(&self.identity.flow_invocation_id)
+            .fetch_all(&mut *db).await?;
+        let mut held = Vec::new();
+        let mut released = Vec::new();
+        for id in active {
+            match (
+                before.operator_holds.contains_key(&id),
+                after.operator_holds.contains_key(&id),
+            ) {
+                (false, true) => held.push(id),
+                (true, false) => released.push(id),
+                _ => (),
+            }
+        }
+        if held.is_empty() && released.is_empty() {
+            return Ok(());
+        }
+        let requests = sqlx::query("SELECT request_id,work_ids_json,resolution_json FROM engine_flow030_human_requests WHERE system_id=? AND invocation_id=? AND kind='ask' AND delivery='pending' ORDER BY rowid")
+            .bind(&self.identity.system_start_id).bind(&self.identity.flow_invocation_id)
+            .fetch_all(&mut *db).await?;
+        let mut cancel_asks = Vec::new();
+        let mut close_asks = Vec::new();
+        for request in requests {
+            let works: Vec<String> = serde_json::from_str(request.get("work_ids_json"))?;
+            if works.iter().any(|id| held.contains(id)) {
+                let request_id: String = request.get("request_id");
+                if request.get::<Option<&str>, _>("resolution_json").is_some() {
+                    self.reserve_resolution(db, &request_id).await?;
+                } else {
+                    cancel_asks.push(request_id.clone());
+                }
+                close_asks.push(request_id);
+            }
+        }
+        let mut event =
+            json!({"kind":"operatorHold","held":held,"released":released,"cancelAsks":cancel_asks});
+        if !close_asks.is_empty() {
+            event["closedAsks"] = json!({"operatorEventId":event_id,"requestIds":close_asks});
+        }
+        self.reserve(db, event, &self.clock.now_ms().to_string())
+            .await
+    }
+
+    async fn operator_held(&self, db: &mut SqliteConnection, id: &str) -> Result<bool> {
+        Ok(sqlx::query_scalar(
+            "SELECT EXISTS (
+            SELECT 1 FROM engine_flow030_runs r, json_each(r.state_json, '$.operatorHolds') h
+            WHERE r.system_id=? AND r.invocation_id=? AND h.key=?)",
+        )
+        .bind(&self.identity.system_start_id)
+        .bind(&self.identity.flow_invocation_id)
+        .bind(id)
+        .fetch_one(db)
+        .await?)
+    }
+    /// The caller holds the broker operation lock through any dependent Stop.
+    pub(crate) async fn observe_deadlines(&self, host: &HostState) -> Result<()> {
+        let cancel = CancellationToken::new();
+        self.pump(host, &cancel).await?;
+        if self.next_wake_ms().await? == Some(0) {
+            self.tick(host).await?;
+            self.pump(host, &cancel).await?;
+        }
+        Ok(())
+    }
+
     pub(crate) async fn tick(&self, host: &HostState) -> Result<()> {
         self.event(host, json!({"kind":"tick"})).await
     }
-    // The work transaction can reserve a retirement asynchronously. Clock
-    // writers hold the broker operation lock and must apply that exact
+    // Flow transactions can reserve retirements and operator clock changes.
+    // Clock writers hold the broker operation lock and apply that exact
     // reservation before appending their own event.
-    async fn settle_pending_retirement(&self, host: &HostState) -> Result<()> {
+    async fn settle_pending_flow_clock(&self, host: &HostState) -> Result<()> {
         let pending: bool = sqlx::query_scalar(
             "SELECT EXISTS (SELECT 1 FROM engine_flow030_clock_events
               WHERE system_id=? AND invocation_id=? AND output_json IS NULL
-                AND json_extract(ticket_json ->> '$.eventJson', '$.event.kind')='retire')",
+                AND json_extract(ticket_json ->> '$.eventJson', '$.event.kind') IN ('retire','operatorHold'))",
         )
         .bind(&self.identity.system_start_id)
         .bind(&self.identity.flow_invocation_id)
@@ -821,7 +945,7 @@ impl HumanBroker030 {
     }
 
     async fn event(&self, host: &HostState, event: Value) -> Result<()> {
-        self.settle_pending_retirement(host).await?;
+        self.settle_pending_flow_clock(host).await?;
         let lease = host.start_lease().await?;
         let _gate = host.admission_lock().lock_owned().await;
         let mut connection = self.durable_connection().await?;
@@ -855,19 +979,27 @@ impl HumanBroker030 {
         let Some(input) = input else {
             return Ok(None);
         };
+        #[cfg(test)]
+        host.flow030().operator_test_yield("clock.reserved").await;
         let output = self
             .jobs
             .evaluate(&self.generation, input.clone(), cancelled)
             .await?;
+        #[cfg(test)]
+        host.flow030().operator_test_yield("clock.evaluated").await;
         let lease = host.start_lease().await?;
         let _gate = host.admission_lock().lock_owned().await;
         let mut connection = self.durable_connection().await?;
         let mut tx = connection.begin_with("BEGIN IMMEDIATE").await?;
         let capture = self.guard(&mut tx, &lease).await?;
+        #[cfg(test)]
+        host.flow030().operator_test_yield("clock.commit").await;
         self.commit(&mut tx, &input, &output, &capture.versions.contract)
             .await?;
         lease.ensure_live()?;
         tx.commit().await?;
+        #[cfg(test)]
+        host.flow030().operator_test_yield("clock.ack").await;
         Ok(Some(output))
     }
     async fn commit(
@@ -948,6 +1080,20 @@ impl HumanBroker030 {
             });
             sqlx::query("UPDATE engine_flow030_human_requests SET resolution_json=?,revision='1' WHERE system_id=? AND invocation_id=? AND request_id=? AND resolution_json IS NULL")
                 .bind(durable_resolution.to_string()).bind(&self.identity.system_start_id).bind(&self.identity.flow_invocation_id).bind(request).execute(&mut *db).await?;
+            // The deadline can win inside the hold projection. Keep the timeout
+            // resolution, but close its delivery to the turn that is ending.
+            if resolution["expired"] == true
+                && event
+                    .pointer("/event/cancelAsks")
+                    .and_then(Value::as_array)
+                    .is_some_and(|ids| ids.contains(&json!(request)))
+                && event
+                    .pointer("/event/closedAsks/requestIds")
+                    .and_then(Value::as_array)
+                    .is_some_and(|ids| ids.contains(&json!(request)))
+            {
+                self.reserve_resolution(db, request).await?;
+            }
             sqlx::query("INSERT INTO engine_flow030_human_resolution_proofs(system_id,invocation_id,request_id,event_id,resolution_json) VALUES(?,?,?,?,?) ON CONFLICT DO NOTHING")
                 .bind(&self.identity.system_start_id).bind(&self.identity.flow_invocation_id).bind(request)
                 .bind(&input.event_id).bind(durable_resolution.to_string()).execute(&mut *db).await?;
@@ -1115,12 +1261,47 @@ impl HumanBroker030 {
         host: &HostState,
         request_id: &str,
     ) -> Result<ResolvedHumanDecision030> {
+        self.read_resolution(host, request_id, true).await
+    }
+
+    // Action policy lookup can wait. Leave the answer undelivered until the
+    // actual provider write takes admission and reserves it.
+    pub(crate) async fn action_resolution(
+        &self,
+        host: &HostState,
+        request_id: &str,
+    ) -> Result<ResolvedHumanDecision030> {
+        self.read_resolution(host, request_id, false).await
+    }
+
+    async fn read_resolution(
+        &self,
+        host: &HostState,
+        request_id: &str,
+        reserve: bool,
+    ) -> Result<ResolvedHumanDecision030> {
         let lease = host.start_lease().await?;
         let _gate = host.admission_lock().lock_owned().await;
         let mut connection = self.durable_connection().await?;
         let mut tx = connection.begin_with("BEGIN IMMEDIATE").await?;
         self.guard(&mut tx, &lease).await?;
         let row = self.request_row(&mut tx, request_id).await?;
+        if !reserve {
+            require(
+                row.get::<&str, _>("kind") == "ask",
+                "Expected action request",
+            )?;
+            let work_ids: Vec<String> = serde_json::from_str(row.get("work_ids_json"))?;
+            if let [id] = work_ids.as_slice() {
+                if self.operator_held(&mut tx, id).await? {
+                    return Err(failure(
+                        "OPERATOR_HOLD",
+                        "approval",
+                        "The turn is being interrupted",
+                    ));
+                }
+            }
+        }
         let raw: Option<String> = row.get("resolution_json");
         require(
             raw.is_some() && row.get::<&str, _>("delivery") == "pending",
@@ -1137,10 +1318,20 @@ impl HumanBroker030 {
             payload: serde_json::from_str(row.get("payload_json"))?,
             resolution: serde_json::from_str(raw.as_deref().unwrap())?,
         };
-        sqlx::query("UPDATE engine_flow030_human_requests SET delivery='reserved' WHERE system_id=? AND invocation_id=? AND request_id=? AND delivery='pending'")
-            .bind(&self.identity.system_start_id).bind(&self.identity.flow_invocation_id).bind(request_id).execute(&mut *tx).await?;
+        if reserve {
+            self.reserve_resolution(&mut tx, request_id).await?;
+        }
         tx.commit().await?;
         Ok(decision)
+    }
+
+    async fn reserve_resolution(&self, db: &mut SqliteConnection, request_id: &str) -> Result<()> {
+        let update = sqlx::query("UPDATE engine_flow030_human_requests SET delivery='reserved' WHERE system_id=? AND invocation_id=? AND request_id=? AND delivery='pending'")
+            .bind(&self.identity.system_start_id).bind(&self.identity.flow_invocation_id).bind(request_id).execute(db).await?;
+        require(
+            update.rows_affected() == 1,
+            "Resolution is no longer pending",
+        )
     }
     /// Exact protocol answer bytes come from the accepted native submission,
     /// never from the pure closure marker used to resume a question's clocks.
@@ -1184,7 +1375,7 @@ impl HumanBroker030 {
                 && decision.generation == self.generation,
             "Foreign delivery acknowledgment",
         )?;
-        self.settle_pending_retirement(host).await?;
+        self.settle_pending_flow_clock(host).await?;
         let lease = host.start_lease().await?;
         let _gate = host.admission_lock().lock_owned().await;
         let mut connection = self.durable_connection().await?;
@@ -1232,13 +1423,23 @@ impl HumanBroker030 {
         )?;
         let row = self.request_row(&mut tx, &decision.request_id).await?;
         require(
-            row.get::<&str, _>("delivery") == "reserved"
-                && row.get::<Option<String>, _>("resolution_json").as_deref()
-                    == Some(decision.resolution.to_string().as_str()),
-            "Action decision is stale or already delivered",
+            row.get::<Option<String>, _>("resolution_json").as_deref()
+                == Some(decision.resolution.to_string().as_str()),
+            "Action decision is stale",
         )?;
+        if self.operator_held(&mut tx, work.work_id()).await? {
+            return Err(failure(
+                "OPERATOR_HOLD",
+                "approval",
+                "The turn is being interrupted",
+            ));
+        }
+        self.reserve_resolution(&mut tx, &decision.request_id)
+            .await?;
         tx.commit().await?;
         lease.ensure_live()?;
+        #[cfg(test)]
+        let gate = host.flow030().track_mcp_gate(gate);
         deliver(
             decision.resolution["expired"] != true
                 && decision.resolution["answer"]["decision"] == "yes",
@@ -1249,16 +1450,28 @@ impl HumanBroker030 {
         self.acknowledge(host, decision).await
     }
     pub(crate) async fn retire_finished(&self, host: &HostState, id: &str) -> Result<()> {
-        self.settle_pending_retirement(host).await?;
-        let row = sqlx::query("SELECT work_json,retired FROM engine_flow030_clock_works WHERE system_id=? AND invocation_id=? AND activation_id=?")
-            .bind(&self.identity.system_start_id).bind(&self.identity.flow_invocation_id).bind(id).fetch_one(&self.pool).await?;
-        if row.get::<bool, _>("retired") {
-            return Ok(());
+        let result = async {
+            self.settle_pending_flow_clock(host).await?;
+            let row = sqlx::query("SELECT work_json,retired FROM engine_flow030_clock_works WHERE system_id=? AND invocation_id=? AND activation_id=?")
+                .bind(&self.identity.system_start_id).bind(&self.identity.flow_invocation_id).bind(id).fetch_one(&self.pool).await?;
+            if row.get::<bool, _>("retired") {
+                return Ok(());
+            }
+            let work: OwnedHumanWork030 = serde_json::from_str(row.get("work_json"))?;
+            self.retire(host, &work).await?;
+            self.pump(host, &CancellationToken::new()).await?;
+            Ok(())
+        }.await;
+        if result.is_err() {
+            let stopping: bool = sqlx::query_scalar(
+                "SELECT json_extract(state_json,'$.stopping') FROM engine_flow030_runs WHERE system_id=? AND invocation_id=?",
+            ).bind(&self.identity.system_start_id).bind(&self.identity.flow_invocation_id)
+                .fetch_one(&self.pool).await?;
+            if stopping {
+                return Ok(());
+            }
         }
-        let work: OwnedHumanWork030 = serde_json::from_str(row.get("work_json"))?;
-        self.retire(host, &work).await?;
-        self.pump(host, &CancellationToken::new()).await?;
-        Ok(())
+        result
     }
     pub(crate) async fn reserve_agent_retirement_tx(
         &self,
@@ -1275,7 +1488,11 @@ impl HumanBroker030 {
         .fetch_one(&mut *db)
         .await?;
         if timed_out {
-            return Err(failure("TIMEOUT", "clock", "The work deadline already committed"));
+            return Err(failure(
+                "TIMEOUT",
+                "clock",
+                "The work deadline already committed",
+            ));
         }
         let active: bool = sqlx::query_scalar(
             "SELECT EXISTS (SELECT 1 FROM engine_flow030_clock_works

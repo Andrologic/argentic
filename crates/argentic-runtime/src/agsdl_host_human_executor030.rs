@@ -32,6 +32,8 @@ impl HostExecutor030 for HumanExecutor030 {
         let (pool, tasks) = (self.pool.clone(), self.tasks.clone());
         Box::pin(async move {
             let host = app.clone();
+            #[cfg(test)]
+            host.flow030().operator_test_yield("approval.claim").await;
             let claim =
                 flow::claim_expected(host.flow030(), &host, &pool, &effect.identity, &effect.id)
                     .await?
@@ -46,6 +48,10 @@ impl HostExecutor030 for HumanExecutor030 {
                     .broker(&host, &pool, &effect.identity)
                     .await?;
                 let _operation = broker.operation.lock().await;
+                #[cfg(test)]
+                host.flow030()
+                    .operator_test_yield("approval.admission")
+                    .await;
                 broker.admit_host_work(&host, &effect.id).await?;
                 broker.pump(&host, &CancellationToken::new()).await?;
                 Ok::<_, crate::persistence::dto::EngineFailure>(())
@@ -91,13 +97,8 @@ impl RuntimeClock030 for HumanClockRuntime030 {
                     .broker(&host, &self.pool, &self.identity)
                     .await?;
                 let _operation = broker.operation.lock().await;
-                broker.pump(&host, &CancellationToken::new()).await?;
-                // Timers are wake hints. Journal only actual deadlines, rather
-                // than appending unbounded periodic ticks during a person's wait.
-                if broker.next_wake_ms().await? == Some(0) {
-                    broker.tick(&host).await?;
-                    broker.pump(&host, &CancellationToken::new()).await?;
-                }
+                // Timers are wake hints. Journal only actual deadlines.
+                broker.observe_deadlines(&host).await?;
                 for request in broker.pending_resolutions().await? {
                     // Protocol questions are consumed by their native transport.
                     if broker.request_kind(&request).await? != "approval" {
@@ -125,13 +126,13 @@ impl RuntimeClock030 for HumanClockRuntime030 {
     }
     fn next_wake(&self) -> BoxFuture<'_, Result<Option<Duration>>> {
         Box::pin(async move {
-            let host = self.app.clone();
-            let broker = host
+            Ok(self
+                .app
                 .flow030()
                 .humans
-                .broker(&host, &self.pool, &self.identity)
-                .await?;
-            Ok(broker.next_wake_ms().await?.map(Duration::from_millis))
+                .next_wake_ms(&self.identity)
+                .await?
+                .map(Duration::from_millis))
         })
     }
 }

@@ -8,11 +8,13 @@ use crate::{
     },
     agsdl_host_confinement::{FileAccess, OsCeiling, PathScope, SandboxPolicy},
     agsdl_host_flow030::{self as flow, NativeFlowInspection030},
+    agsdl_host_mcp_http::{self as http, RemoteMcp},
     agsdl_host_runtime030::HostExecutor030,
     host::HostContext,
     persistence::{
         dto::EngineOwner, failure, flow030::FlowEffect030, start030::StartCapture030, Result,
     },
+    source::{McpDeclarations, Snapshot},
     tasks::StreamTasks,
 };
 use futures::future::BoxFuture;
@@ -58,6 +60,8 @@ impl HostExecutor030 for CallExecutor030 {
             let authority = NativeCallAuthority030::capture(&host, &owner).await?;
             let broker = host.start_lease().await?.call_data030()?;
             let attempt = calls::reserve_call030(&pool, &authority, &effect).await?;
+            #[cfg(test)]
+            host.flow030().operator_test_yield("call.reserved").await;
             match calls::prepare_call030(&pool, &authority, &broker, &attempt, &cancel).await? {
                 calls::CallPreparation030::Ready => (),
                 calls::CallPreparation030::Failed { .. } => return Ok(None),
@@ -70,20 +74,22 @@ impl HostExecutor030 for CallExecutor030 {
                 }
             }
             drop(authority);
-            let Some(claim) =
+            #[cfg(test)]
+            host.flow030().operator_test_yield("call.claim").await;
+            let claim =
                 flow::claim_expected(host.flow030(), &host, &pool, &effect.identity, &effect.id)
                     .await?
-            else {
-                let authority = NativeCallAuthority030::capture(&host, &owner).await?;
-                calls::stop_before_launch030(&pool, &authority, &attempt).await?;
-                return Ok(None);
-            };
+                    .ok_or_else(|| failure("STALE_REFERENCE", "call", "Call Start changed"))?;
+            if claim.effect() != &effect {
+                return Err(failure("CORRELATION", "call", "Claimed Call Start differs"));
+            }
             let request_id = claim.request_id();
             let (send, result) = tokio::sync::oneshot::channel();
             let timeout = CancellationToken::new();
             let machine_timeout = timeout.clone();
             let (owned_attempt, owned_cancel) = (attempt.clone(), cancel.clone());
             let (clock_ready, wait_clock) = tokio::sync::oneshot::channel();
+            let remote_mcp_budget_ms = config.remote_mcp_tool_budget_ms();
             let worker_app = app.clone();
             let clock_pool = pool.clone();
             claim
@@ -110,6 +116,7 @@ impl HostExecutor030 for CallExecutor030 {
                                 failure("PERMISSION", "call", "Project permissions unavailable")
                             })?;
                         let mut grant = grant(
+                            config.root(),
                             &inspection.capture,
                             &serde_json::to_value(global.permissions())?,
                             &project.tools,
@@ -119,9 +126,13 @@ impl HostExecutor030 for CallExecutor030 {
                             grant = Err(failure(
                                 "PERMISSION",
                                 "call",
-                                "Current project permissions do not allow local calls",
+                                "Current project permissions do not allow calls",
                             ));
                         }
+                        #[cfg(test)]
+                        host.flow030()
+                            .operator_test_yield("call.before_launch")
+                            .await;
                         let started = calls::launch_native030(
                             &pool,
                             &authority,
@@ -142,6 +153,12 @@ impl HostExecutor030 for CallExecutor030 {
                                             inspection.capture.clone(),
                                             owned_attempt.clone(),
                                             control.clone(),
+                                            remote_tool_admission(
+                                                host.clone(),
+                                                pool.clone(),
+                                                owner.clone(),
+                                                owned_attempt.clone(),
+                                            ),
                                         )
                                     })
                             },
@@ -151,8 +168,9 @@ impl HostExecutor030 for CallExecutor030 {
                         drop(global);
                         // A Stop can win the preparation/launch race. It authorizes no IO.
                         let end = match started {
-                            Ok(Ok(started)) => started.await?,
-                            Ok(Err(_)) => {
+                            Ok(Some(Ok(started))) => started.await?,
+                            Ok(None) => crate::persistence::call_protocol030::CallEnd030::TimedOut,
+                            Ok(Some(Err(_))) => {
                                 crate::persistence::call_protocol030::CallEnd030::Returned {
                                     event: CallEvent030::StartFailed,
                                 }
@@ -187,7 +205,9 @@ impl HostExecutor030 for CallExecutor030 {
                 .await?;
             {
                 let _operation = human.operation.lock().await;
-                human.admit_host_work(&host, &effect.id).await?;
+                human
+                    .admit_call(&host, &effect.id, remote_mcp_budget_ms)
+                    .await?;
                 human.pump(&host, &CancellationToken::new()).await?;
             }
             let _ = clock_ready.send(());
@@ -214,7 +234,8 @@ async fn prepared(pool: &SqlitePool, attempt: &CallAttempt030) -> Result<Prepare
 
 /// Calls have no agent permissions to borrow. Both captured and current host
 /// ceilings must explicitly allow local work; project read-only remains a ceiling.
-pub(crate) fn grant(
+fn grant(
+    data: &Path,
     capture: &StartCapture030,
     current_host: &Value,
     tools: &Value,
@@ -239,9 +260,33 @@ pub(crate) fn grant(
         return Err(failure(
             "PERMISSION",
             "call",
-            "Local calls require approved workspace permissions and a writable project",
+            "Calls require approved workspace permissions and a writable project",
         ));
     }
+    let mcp = match prepared {
+        PreparedCall030::Mcp { server, .. } => Some(server.as_str()),
+        PreparedCall030::Command { .. } => None,
+    };
+    workspace_grant(data, capture, &scope, mcp, true)
+}
+
+pub(crate) fn agent_mcp_grant(
+    config: &HostContext,
+    capture: &StartCapture030,
+    scope: &Value,
+    server: &str,
+    read_only: bool,
+) -> Result<CommandGrant> {
+    workspace_grant(config.root(), capture, scope, Some(server), !read_only)
+}
+
+fn workspace_grant(
+    data: &Path,
+    capture: &StartCapture030,
+    scope: &Value,
+    mcp: Option<&str>,
+    writable: bool,
+) -> Result<CommandGrant> {
     let root = PathBuf::from(
         scope["root"]
             .as_str()
@@ -261,9 +306,35 @@ pub(crate) fn grant(
             "Workspace changed since capture",
         ));
     }
-    let _ = prepared;
     let mut read = vec![PathScope::Subtree(root.clone())];
-    let mut write = vec![PathScope::Subtree(root.clone())];
+    let mut write = Vec::new();
+    if writable {
+        write.push(PathScope::Subtree(root.clone()));
+    }
+    let mut block = Vec::new();
+    if let Some(server) = mcp {
+        if let Some(project) = RetainedMcp::open(data, capture, scope, server)? {
+            if root.starts_with(&project.snapshot.root) || project.snapshot.root.starts_with(&root)
+            {
+                return Err(failure(
+                    "PERMISSION",
+                    "call",
+                    "Workspace overlaps the retained project",
+                ));
+            }
+            for (name, path) in project.files {
+                project.snapshot.verify_member(&name)?;
+                read.push(PathScope::Literal(path.clone()));
+                read.extend(
+                    path.ancestors()
+                        .skip(1)
+                        .take_while(|path| path.starts_with(&project.snapshot.root))
+                        .map(|path| PathScope::Literal(path.to_owned())),
+                );
+            }
+            block.push(PathScope::Subtree(project.snapshot.root));
+        }
+    }
     // Explicit native runtime dependencies. User home and application profiles
     // are outside these roots; the environment inherits no credentials.
     if cfg!(unix) {
@@ -293,7 +364,7 @@ pub(crate) fn grant(
             },
             write: FileAccess {
                 allow: write,
-                block: vec![],
+                block,
             },
             network: false,
         }],
@@ -303,6 +374,34 @@ pub(crate) fn grant(
         workspace: root,
         environment: BTreeMap::from([("PATH".into(), "/usr/bin:/bin".into())]),
         sandbox,
+    })
+}
+
+fn remote_tool_admission(
+    host: HostState,
+    pool: SqlitePool,
+    owner: EngineOwner,
+    attempt: CallAttempt030,
+) -> raw_mcp::ToolAdmission {
+    Box::new(move || {
+        let (host, pool, owner, attempt) =
+            (host.clone(), pool.clone(), owner.clone(), attempt.clone());
+        Box::pin(async move {
+            let admit = async {
+                let authority = NativeCallAuthority030::capture(&host, &owner).await?;
+                let gate = host.admission_lock().lock_owned().await;
+                let mut tx = pool.begin().await?;
+                crate::persistence::call_protocol030::admit_remote_tool_tx(
+                    &mut tx, &authority, &attempt,
+                )
+                .await?;
+                tx.commit().await?;
+                Ok::<_, crate::persistence::dto::EngineFailure>(gate)
+            };
+            admit
+                .await
+                .map_err(|e| transport::CallError::new(&e.code, e.message))
+        })
     })
 }
 
@@ -316,11 +415,13 @@ pub(crate) trait CallTransport030: Send + Sync {
         capture: StartCapture030,
         attempt: CallAttempt030,
         control: Control,
+        admit_tool: raw_mcp::ToolAdmission,
     ) -> transport::Result<
         BoxFuture<'static, Result<crate::persistence::call_protocol030::CallEnd030>>,
     >;
 }
 pub(crate) struct NativeCallTransport030 {
+    pub config: HostContext,
     pub humans: Option<std::sync::Arc<dyn transport::HostPort>>,
 }
 impl CallTransport030 for NativeCallTransport030 {
@@ -331,25 +432,28 @@ impl CallTransport030 for NativeCallTransport030 {
         capture: StartCapture030,
         attempt: CallAttempt030,
         control: Control,
+        admit_tool: raw_mcp::ToolAdmission,
     ) -> transport::Result<
         BoxFuture<'static, Result<crate::persistence::call_protocol030::CallEnd030>>,
     > {
-        let started = start_transport(grant, &prepared, &capture)?;
+        let started = start_transport(&self.config, grant, &prepared, &capture)?;
         let humans = self
             .humans
             .clone()
             .unwrap_or_else(|| std::sync::Arc::new(NoHuman));
         Ok(Box::pin(async move {
-            run_transport(started, &prepared, &attempt, &control, humans).await
+            run_transport(started, &prepared, &attempt, &control, humans, admit_tool).await
         }))
     }
 }
 
-enum StartedTransport {
+pub(crate) enum StartedTransport {
     Command(crate::process::ContainedBackgroundProcess, SandboxPolicy),
     Mcp(raw_mcp::Session),
+    RemoteMcp(Box<RemoteMcp>),
 }
 fn start_transport(
+    config: &HostContext,
     grant: CommandGrant,
     prepared: &PreparedCall030,
     capture: &StartCapture030,
@@ -369,63 +473,271 @@ fn start_transport(
         }
         PreparedCall030::Mcp { server, .. } => {
             let document: Value = serde_json::from_str(&capture.authored_source)
-                .map_err(|e| transport::CallError::transport(e.to_string()))?;
-            let command = document["mcpServers"][server]["command"]
-                .as_array()
-                .ok_or_else(|| {
-                    transport::CallError::transport("Only local stdio MCP servers are supported")
-                })?;
-            let program = command
-                .first()
-                .and_then(Value::as_str)
-                .ok_or_else(|| transport::CallError::transport("MCP program missing"))?;
-            // Resolve bare program names only within the fixed native PATH.
-            let program = if Path::new(program).is_absolute() {
-                PathBuf::from(program)
-            } else if program.contains('/') {
-                grant.workspace.join(program)
+                .map_err(|_| transport::CallError::transport("MCP document is invalid"))?;
+            if let Some(url) = document["mcpServers"][server]["url"].as_str() {
+                let remote = remote_mcp(config, capture, server, url)?;
+                Ok(StartedTransport::RemoteMcp(Box::new(remote)))
             } else {
-                ["/usr/bin", "/bin"]
-                    .iter()
-                    .map(|dir| Path::new(dir).join(program))
-                    .find(|path| path.is_file())
-                    .ok_or_else(|| {
-                        transport::CallError::transport(
-                            "MCP executable not found in the confined PATH",
-                        )
-                    })?
-            };
-            let arguments = command
-                .iter()
-                .skip(1)
-                .map(|v| {
-                    v.as_str()
-                        .map(str::to_owned)
-                        .ok_or_else(|| transport::CallError::transport("MCP argument is not text"))
-                })
-                .collect::<transport::Result<Vec<_>>>()?;
-            raw_mcp::start(raw_mcp::CapturedServer {
-                document_name: server.clone(),
-                capture_digest: capture.source.source_sha256.clone(),
-                protocol: raw_mcp::Protocol::Legacy,
-                transport: raw_mcp::ServerTransport::Stdio(raw_mcp::StdioServer {
-                    program,
-                    arguments,
-                    grant,
-                }),
-            })
-            .map(StartedTransport::Mcp)
+                raw_mcp::require_stdio()?;
+                raw_mcp::start(mcp_server(config, grant, capture, server)?)
+                    .map(StartedTransport::Mcp)
+            }
         }
     }
 }
-async fn run_transport(
+
+struct RetainedMcp {
+    snapshot: Snapshot,
+    files: BTreeMap<String, PathBuf>,
+    names: Vec<String>,
+}
+
+impl RetainedMcp {
+    fn open(
+        data: &Path,
+        capture: &StartCapture030,
+        scope: &Value,
+        server: &str,
+    ) -> Result<Option<Self>> {
+        let Some(snapshot) = Snapshot::from_capture(data, capture)? else {
+            return Ok(None);
+        };
+        let mut declarations: McpDeclarations = serde_json::from_value(scope["projectMcp"].clone())
+            .map_err(|_| {
+                failure(
+                    "CORRELATION",
+                    "projectSnapshot",
+                    "Retain and bind the project MCP declarations before Start",
+                )
+            })?;
+        let mut files = BTreeMap::new();
+        for name in declarations.files.remove(server).unwrap_or_default() {
+            files.insert(name.clone(), snapshot.root.join(name));
+        }
+        Ok(Some(Self {
+            snapshot,
+            files,
+            names: declarations.secrets.remove(server).unwrap_or_default(),
+        }))
+    }
+
+    fn file(&self, argument: &str) -> Option<&Path> {
+        if argument.contains('\\') {
+            return None;
+        }
+        let mut parts = Vec::new();
+        for part in Path::new(argument).components() {
+            match part {
+                std::path::Component::Normal(part) => parts.push(part.to_str()?),
+                std::path::Component::CurDir => (),
+                std::path::Component::ParentDir => {
+                    parts.pop()?;
+                }
+                _ => return None,
+            }
+        }
+        self.files.get(&parts.join("/")).map(PathBuf::as_path)
+    }
+}
+
+fn retained_mcp(
+    config: &HostContext,
+    capture: &StartCapture030,
+    server: &str,
+) -> transport::Result<Option<RetainedMcp>> {
+    let private: Value = serde_json::from_str(&capture.private_capture_json)
+        .map_err(|_| transport::CallError::transport("MCP capture is invalid"))?;
+    let scope: Value = serde_json::from_str(private["callScopeJson"].as_str().unwrap_or(""))
+        .map_err(|_| transport::CallError::transport("MCP scope is invalid"))?;
+    RetainedMcp::open(config.root(), capture, &scope, server)
+        .map_err(|error| transport::CallError::new(&error.code, error.message))
+}
+
+pub(crate) fn remote_mcp(
+    config: &HostContext,
+    capture: &StartCapture030,
+    server: &str,
+    url: &str,
+) -> transport::Result<RemoteMcp> {
+    Ok(RemoteMcp {
+        config: config.clone(),
+        source: capture.source.clone(),
+        server: server.to_owned(),
+        url: http::endpoint(url)?,
+        names: retained_mcp(config, capture, server)?
+            .map(|project| project.names)
+            .unwrap_or_default(),
+    })
+}
+
+pub(crate) fn server_secrets(
+    config: &HostContext,
+    source: &crate::persistence::dto::EngineSourceRevision,
+    server: &str,
+    names: &[String],
+) -> transport::Result<BTreeMap<String, String>> {
+    if names.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    if names
+        .iter()
+        .any(|name| crate::source::mcp_secret_is_reserved(name))
+    {
+        return Err(transport::CallError::new(
+            "MCP_SECRET_RESERVED",
+            "MCP secret name is reserved by the launcher",
+        ));
+    }
+    let unavailable = || {
+        transport::CallError::new(
+            "MCP_SECRETS_UNAVAILABLE",
+            "MCP server secrets are unavailable",
+        )
+    };
+    let secrets = config
+        .mcp_secrets(source, server, names)
+        .ok_or_else(unavailable)?;
+    if secrets.len() != names.len()
+        || names.iter().any(|name| !secrets.contains_key(name))
+        || secrets.values().any(|value| value.as_bytes().contains(&0))
+    {
+        return Err(unavailable());
+    }
+    Ok(secrets)
+}
+
+pub(crate) fn mcp_server(
+    config: &HostContext,
+    mut grant: CommandGrant,
+    capture: &StartCapture030,
+    server: &str,
+) -> transport::Result<raw_mcp::CapturedServer> {
+    let project = retained_mcp(config, capture, server)?;
+    let document: Value = serde_json::from_str(&capture.authored_source)
+        .map_err(|e| transport::CallError::transport(e.to_string()))?;
+    let command = document["mcpServers"][server]["command"]
+        .as_array()
+        .ok_or_else(|| {
+            transport::CallError::transport("Only local stdio MCP servers are supported")
+        })?;
+    let program = command
+        .first()
+        .and_then(Value::as_str)
+        .ok_or_else(|| transport::CallError::transport("MCP program missing"))?;
+    let program = if let Some(project) = &project {
+        if let Some(path) = project.file(program) {
+            if !project.snapshot.executable(path) {
+                return Err(transport::CallError::transport(
+                    "Retained MCP program is not executable",
+                ));
+            }
+            if !project
+                .snapshot
+                .allows_shebang(path)
+                .map_err(|error| transport::CallError::new(&error.code, error.message))?
+            {
+                return Err(transport::CallError::transport(
+                    "Retained MCP program requires an absolute shebang interpreter",
+                ));
+            }
+            path.to_owned()
+        } else if matches!(program, "sh" | "/bin/sh")
+            && command
+                .get(1)
+                .and_then(Value::as_str)
+                .and_then(|script| project.file(script))
+                .is_some()
+        {
+            // The system shell may interpret only a declared retained script.
+            PathBuf::from("/bin/sh")
+        } else {
+            return Err(transport::CallError::transport(
+                "Project MCP requires a retained executable or /bin/sh with a declared script",
+            ));
+        }
+    } else if Path::new(program).is_absolute() {
+        PathBuf::from(program)
+    } else if program.contains('/') {
+        grant.workspace.join(program)
+    } else {
+        ["/usr/bin", "/bin"]
+            .iter()
+            .map(|dir| Path::new(dir).join(program))
+            .find(|path| path.is_file())
+            .ok_or_else(|| {
+                transport::CallError::transport("MCP executable not found in the confined PATH")
+            })?
+    };
+    let arguments = command
+        .iter()
+        .skip(1)
+        .map(|v| {
+            v.as_str()
+                .ok_or_else(|| transport::CallError::transport("MCP argument is not text"))
+                .and_then(|argument| {
+                    match project.as_ref().and_then(|project| project.file(argument)) {
+                        Some(path) => path.to_str().map(str::to_owned).ok_or_else(|| {
+                            transport::CallError::transport("MCP asset path is not UTF-8")
+                        }),
+                        None => Ok(argument.to_owned()),
+                    }
+                })
+        })
+        .collect::<transport::Result<Vec<_>>>()?;
+    let mut secret_values = Vec::new();
+    if let Some(project) = project.filter(|project| !project.names.is_empty()) {
+        if project
+            .names
+            .iter()
+            .any(|name| grant.environment.contains_key(name))
+        {
+            return Err(transport::CallError::new(
+                "MCP_SECRET_RESERVED",
+                "MCP secret name is reserved by the launcher",
+            ));
+        }
+        let secrets = server_secrets(config, &capture.source, server, &project.names)?;
+        secret_values.extend(secrets.values().filter(|value| !value.is_empty()).cloned());
+        grant.environment.extend(secrets);
+    }
+    Ok(raw_mcp::CapturedServer {
+        document_name: server.to_owned(),
+        capture_digest: capture.source.source_sha256.clone(),
+        protocol: raw_mcp::Protocol::Legacy,
+        transport: raw_mcp::ServerTransport::Stdio(raw_mcp::StdioServer {
+            program,
+            arguments,
+            grant,
+            secret_values,
+        }),
+    })
+}
+pub(crate) async fn run_transport(
     started: StartedTransport,
     prepared: &PreparedCall030,
     attempt: &CallAttempt030,
     control: &Control,
     humans: std::sync::Arc<dyn transport::HostPort>,
+    admit_tool: raw_mcp::ToolAdmission,
 ) -> Result<crate::persistence::call_protocol030::CallEnd030> {
-    let (event, failure, evidence) = match started {
+    use crate::persistence::call_protocol030::CallEnd030;
+    let started = match started {
+        StartedTransport::RemoteMcp(remote) => match remote.start(control).await {
+            Ok(mut session) => {
+                session.set_tool_admission(admit_tool);
+                StartedTransport::Mcp(session)
+            }
+            Err(_) if control.stop.is_cancelled() => return Ok(CallEnd030::Stopped),
+            Err(_) => {
+                return Ok(CallEnd030::Returned {
+                    event: CallEvent030::StartFailed,
+                })
+            }
+        },
+        other => other,
+    };
+    let (event, call_failure, evidence) = match started {
+        StartedTransport::RemoteMcp(_) => unreachable!(),
         StartedTransport::Command(child, policy) => {
             let (receipt, failure, evidence) =
                 transport::run_command(child, &policy, control, None).await;
@@ -458,7 +770,14 @@ async fn run_transport(
             let result = session
                 .call(tool, arguments_json, humans, &identity, control)
                 .await;
-            let (evidence, cleanup) = session.shutdown(result.is_ok()).await;
+            let tool_in_flight = session.tool_in_flight();
+            let (mut evidence, cleanup) = session.shutdown(result.is_ok()).await;
+            if let PhysicalEvidence::Remote {
+                termination_proven, ..
+            } = &mut evidence
+            {
+                *termination_proven = !tool_in_flight && cleanup.is_none();
+            }
             match result {
                 Ok(r) => (
                     Some(CallEvent030::ToolReturned {
@@ -480,35 +799,46 @@ async fn run_transport(
             tree_termination_succeeded: true,
             streams_joined: true,
             ..
+        } | PhysicalEvidence::Remote {
+            response_received: true,
+            ..
+        } | PhysicalEvidence::Remote {
+            termination_proven: true,
+            ..
         }
     ) {
-        return Err(failure_fn("Call process cleanup did not complete"));
+        let code = if matches!(evidence, PhysicalEvidence::Remote { .. }) {
+            "MCP_TERMINATION_UNCERTAIN"
+        } else {
+            "UNCERTAIN"
+        };
+        return Err(failure(
+            code,
+            "call",
+            "Call termination could not be confirmed",
+        ));
     }
-    use crate::persistence::call_protocol030::CallEnd030;
     if control.stop.is_cancelled() {
         return Ok(CallEnd030::Stopped);
     }
     Ok(CallEnd030::Returned {
-        event: if failure
+        event: if call_failure
             .as_ref()
             .is_some_and(|error| error.code == "OUTPUT_INVALID")
             && matches!(prepared, PreparedCall030::Command { .. })
         {
             CallEvent030::OutputInvalid
-        } else if failure.is_some() {
+        } else if call_failure.is_some() {
             CallEvent030::StartFailed
         } else {
             event.unwrap_or(CallEvent030::StartFailed)
         },
     })
 }
-fn failure_fn(message: &str) -> crate::persistence::dto::EngineFailure {
-    failure("UNCERTAIN", "call", message)
-}
 
 // The transport's human callbacks fail explicitly until lot 3.2. No implicit
 // approval/decline, fixed watchdog or historical work protocol is introduced.
-struct NoHuman;
+pub(crate) struct NoHuman;
 #[async_trait::async_trait]
 impl transport::HostPort for NoHuman {
     fn supports_human_requests(&self) -> bool {

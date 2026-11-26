@@ -25,7 +25,7 @@ use sha2::{Digest, Sha256};
 use sqlx::{SqliteConnection, SqlitePool};
 use std::{
     fs::File,
-    io::Read,
+    io::{self, Read},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -218,6 +218,24 @@ impl ActionPolicySource for Policies {
                     "Approved policy cannot be normalized",
                 )
             })?;
+            let native = &payload["nativeRequest"];
+            if native["method"] == "mcp/tool/requestApproval" {
+                let params = &native["params"];
+                let allowed = params["server"]
+                    .as_str()
+                    .zip(params["tool"].as_str())
+                    .is_some_and(|(server, tool)| {
+                        evaluate_requested(
+                            &policy,
+                            &ActionRequest::Mcp {
+                                server: server.into(),
+                                tool: Some(tool.into()),
+                            },
+                        )
+                        .is_ok_and(|effect| effect != Effect::Deny)
+                    });
+                return Ok(ActionPolicyLease::new(allowed, guard));
+            }
             let path = payload
                 .pointer("/nativeRequest/params/additionalPermissions/fileSystem/write/0")
                 .and_then(Value::as_str)
@@ -242,6 +260,26 @@ impl ActionPolicySource for Policies {
     }
 }
 
+// flock follows the open file description on Unix. Unlock explicitly when
+// ownership ends so a descriptor inherited by a concurrent fork cannot keep it.
+struct DatabaseLock(Option<File>);
+
+impl DatabaseLock {
+    fn release(&mut self) -> io::Result<()> {
+        if let Some(file) = &self.0 {
+            file.unlock()?;
+            self.0 = None;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for DatabaseLock {
+    fn drop(&mut self) {
+        let _ = self.release();
+    }
+}
+
 /// Owns one database lock, engine incarnation and all execution resources.
 /// Keep it alive until `shutdown` succeeds, then call `close`. Dropping a value
 /// is not a physical Stop receipt. No credentials are read by this API.
@@ -251,13 +289,21 @@ pub struct Host {
     tasks: StreamTasks,
     policies: Policies,
     context: HostContext,
-    _database_lock: File,
+    database_lock: Mutex<DatabaseLock>,
     shutdown_complete: std::sync::atomic::AtomicBool,
 }
 impl Host {
     /// Native host configuration, before preflight/Start. Never a document input.
     pub fn with_codex_auth_file(mut self, path: PathBuf) -> Self {
         self.context = self.context.with_codex_auth_file(path);
+        self
+    }
+    pub fn with_mcp_secrets(mut self, provider: Arc<crate::host::McpSecretProvider>) -> Self {
+        self.context = self.context.with_mcp_secrets(provider);
+        self
+    }
+    pub fn with_mcp_http(mut self, authorize: Arc<crate::host::McpHttpAuthorizer>) -> Self {
+        self.context = self.context.with_mcp_http(authorize);
         self
     }
     /// Opens only this runtime's standalone schema. The data directory must be
@@ -311,13 +357,22 @@ impl Host {
             .truncate(false)
             .open(data.join("engine.lock"))
             .map_err(io_error)?;
-        lock.try_lock().map_err(|_| {
-            failure(
-                "RUNTIME_UNAVAILABLE",
-                "data",
-                "Standalone database is already owned",
-            )
-        })?;
+        loop {
+            match lock.try_lock() {
+                Ok(()) => break,
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    return Err(failure(
+                        "RUNTIME_UNAVAILABLE",
+                        "data",
+                        "Standalone database is already owned",
+                    ));
+                }
+                Err(std::fs::TryLockError::Error(error))
+                    if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(std::fs::TryLockError::Error(error)) => return Err(io_error(error)),
+            }
+        }
+        let lock = DatabaseLock(Some(lock));
         let retained = opened.retain(&data)?;
         let inputs = Inputs {
             scope: scope(&workspace, &policy_value.owner, &retained)?,
@@ -360,7 +415,7 @@ impl Host {
             tasks: StreamTasks::default(),
             policies,
             context,
-            _database_lock: lock,
+            database_lock: Mutex::new(lock),
             shutdown_complete: std::sync::atomic::AtomicBool::new(false),
         })
     }
@@ -371,7 +426,9 @@ impl Host {
     async fn prepare(&self, entry: Option<&EngineEntry>, allow_codex: bool) -> Result<Prepared> {
         let inputs = self.policies.acquire().await?;
         let doc: Value = serde_json::from_str(inputs.opened.authored_json())?;
-        if let Some(d) = api::product_slice(inputs.opened.authored_json(), None) {
+        let qualification = api::qualify_product(&doc, None, Some(&inputs.policy.permissions))
+            .map_err(|error| inputs.opened.locate_error(error))?;
+        if let Some(d) = qualification.blocking_diagnostic() {
             return Err(inputs
                 .opened
                 .locate_error(failure(&d.code, &d.pointer, &d.message)));
@@ -459,7 +516,7 @@ impl Host {
                 registry.to_string(),
             )
             .await?;
-        let result: Value = serde_json::from_str(&compiled.result_json)?;
+        let mut result: Value = serde_json::from_str(&compiled.result_json)?;
         if result.pointer("/static/valid") != Some(&json!(true))
             || result.pointer("/runtime/supported") != Some(&json!(true))
         {
@@ -494,6 +551,7 @@ impl Host {
             }
             return Err(failure("UNSUPPORTED", "source", &result.to_string()));
         }
+        result["mcpQualification"] = serde_json::to_value(qualification.mcp_servers)?;
         Ok(Prepared {
             result,
             observation,
@@ -613,6 +671,12 @@ impl Host {
     pub async fn submit_person(&self, answer: HumanSubmission) -> Result<String> {
         self.engine.submit_person(&self.pool, answer).await
     }
+    pub async fn control_run(
+        &self,
+        input: api::OperatorRequest,
+    ) -> Result<persistence::flow030::FlowReceipt030> {
+        self.engine.control_run(&self.pool, input).await
+    }
     pub async fn deliver(&self, input: api::DeliveryRequest030) -> Result<api::DeliveryReceipt030> {
         self.engine.deliver_message(&self.pool, input).await
     }
@@ -653,7 +717,11 @@ impl Host {
             ));
         }
         self.pool.close().await;
-        Ok(())
+        self.database_lock
+            .lock()
+            .expect("database ownership lock")
+            .release()
+            .map_err(io_error)
     }
 }
 struct Prepared {
@@ -985,10 +1053,16 @@ mod tests {
     }
     #[tokio::test]
     async fn standalone_real_start_human_submission_stop_and_reopen() {
-        let f = Fixture::new(WAIT);
+        let mut document: Value = serde_json::from_str(WAIT).unwrap();
+        document["mcpServers"] = json!({"unused":{"url":"http://example.invalid/mcp"}});
+        let f = Fixture::new(&document.to_string());
         let host = f.open().await.unwrap();
         let result = host.preflight(entry().as_ref(), false).await.unwrap();
         assert_eq!(result["runtime"]["supported"], true);
+        let unused = &result["mcpQualification"]["unused"];
+        assert_eq!(unused["diagnostic"]["code"], "MCP_ENDPOINT_UNSUPPORTED");
+        assert_eq!(unused["directCallSteps"], json!([]));
+        assert_eq!(unused["agentEquipment"], json!([]));
         let started = host.start("start".into(), entry(), false).await.unwrap();
         let replay = host.start("start".into(), entry(), false).await.unwrap();
         assert_eq!(started.receipt, replay.receipt);
@@ -1309,6 +1383,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn close_releases_database_ownership_with_a_duplicated_descriptor() {
+        let f = Fixture::new(WAIT);
+        let host = f.open().await.unwrap();
+        // Duplicated descriptors share an open file description on Unix.
+        // A child can briefly keep one between fork and exec.
+        let duplicate = host
+            .database_lock
+            .lock()
+            .unwrap()
+            .0
+            .as_ref()
+            .unwrap()
+            .try_clone()
+            .unwrap();
+        assert_eq!(f.open().await.err().unwrap().code, "RUNTIME_UNAVAILABLE");
+        assert!(host.close().await.is_err());
+        assert_eq!(f.open().await.err().unwrap().code, "RUNTIME_UNAVAILABLE");
+        host.shutdown(&[]).await.unwrap();
+        host.close().await.unwrap();
+        let reopened = f.open().await.unwrap();
+        host.close().await.unwrap();
+        assert_eq!(f.open().await.err().unwrap().code, "RUNTIME_UNAVAILABLE");
+        drop(duplicate);
+        reopened.shutdown(&[]).await.unwrap();
+        reopened.close().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn restart_marks_unfinished_run_interrupted_without_adoption() {
         const CHILD: &str = "ARGENTIC_SYNTHETIC_CRASH_ROOT";
         if let Some(root) = std::env::var_os(CHILD) {
@@ -1402,7 +1504,7 @@ mod tests {
         })
         .await
         .unwrap();
-        sqlx::query("CREATE TRIGGER reject_standalone_stop BEFORE INSERT ON engine_flow030_events WHEN NEW.event_id LIKE 'retire:%' BEGIN SELECT RAISE(ABORT, 'synthetic storage failure'); END")
+        sqlx::query("CREATE TRIGGER reject_standalone_stop BEFORE INSERT ON engine_flow030_events WHEN NEW.event_id LIKE 'system-stop:retire:%' BEGIN SELECT RAISE(ABORT, 'synthetic storage failure'); END")
             .execute(&host.pool).await.unwrap();
         let active = host.active_runs().await.unwrap();
         assert!(host.shutdown(&active).await.is_err());

@@ -205,6 +205,9 @@ impl Fixture {
         Self::new_mode(raw, false).await
     }
     async fn new_mode(raw: &str, memory: bool) -> Self {
+        Self::new_with_project(raw, memory, None).await
+    }
+    async fn new_with_project(raw: &str, memory: bool, project: Option<&std::path::Path>) -> Self {
         let fixture: Value = serde_json::from_str(raw).unwrap();
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
@@ -217,12 +220,24 @@ impl Fixture {
         // Read exact source text from the fixture, preserving numeric tokens.
         let fields: BTreeMap<String, Box<serde_json::value::RawValue>> =
             serde_json::from_str(raw).unwrap();
-        let authored = scenarios::fixture_document(fields["document"].get())
-            .unwrap()
-            .to_owned();
+        let opened = project.map(|path| crate::source::OpenedSource::open_path(path).unwrap());
+        let authored = match &opened {
+            Some(source) => source.authored_json().to_owned(),
+            None => scenarios::fixture_document(fields["document"].get())
+                .unwrap()
+                .to_owned(),
+        };
         let document: Value = serde_json::from_str(&authored).unwrap();
         let source = json!({"owner":{"projectId":"project","planId":"source","branch":"develop"},"revision":"1","sourceSha256":format!("{:x}",Sha256::digest(authored.as_bytes()))});
-        let scope = json!({"projectId":"project","root":workspace,"rootIdentity":crate::content_io::admitted::workspace_root_identity(&workspace).unwrap().observation_key().unwrap(),"sourceOwner":source["owner"]});
+        let mut scope = json!({"projectId":"project","root":workspace,"rootIdentity":crate::content_io::admitted::workspace_root_identity(&workspace).unwrap().observation_key().unwrap(),"sourceOwner":source["owner"]});
+        if let Some(opened) = opened {
+            std::fs::create_dir_all(config.root()).unwrap();
+            opened
+                .retain(config.root())
+                .unwrap()
+                .bind_scope(&mut scope)
+                .unwrap();
+        }
         let mut registry = if document["agents"].as_object().unwrap().is_empty() {
             json!({"format":"macro-agsdl-registry/030", "version":"fixture", "modules":[], "harnesses":[], "agents":[], "hostCapabilities":[{"name":"call.command","support":"native","evidenceJson":"{\"transport\":\"native-call-test\"}"},{"name":"call.mcp","support":"native","evidenceJson":"{\"transport\":\"native-call-test\"}"},{"name":"approval","support":"native","evidenceJson":"{\"transport\":\"native-human-test\"}"}]})
         } else if document["agents"]
@@ -231,8 +246,16 @@ impl Fixture {
             .values()
             .all(|a| a["harness"] == "codex")
         {
+            let mut models = vec![
+                json!({"name":"fixture","efforts":["medium"],"defaultEffort":"medium","isDefault":true}),
+            ];
+            if fixture.get("modelOverrides").is_some() {
+                models.push(json!({"name":"fixture-replacement","efforts":["high","low"],"defaultEffort":"high","isDefault":false}));
+            }
             let observed = crate::agsdl_host_codex::CodexObservation030 {
                 profile: crate::agsdl_host_codex::profile::Profile {
+                    mcp: None,
+                    runtime: None,
                     executable: workspace.join("bin/codex"),
                     directory: workspace.join("profile"),
                     home: workspace.join("profile/home"),
@@ -240,9 +263,7 @@ impl Fixture {
                     digest: "synthetic-profile".into(),
                 },
                 version: "0.167.0".into(),
-                models: vec![
-                    json!({"name":"fixture","efforts":["medium"],"defaultEffort":"medium","isDefault":true}),
-                ],
+                models,
                 account_digest: "synthetic-account".into(),
             };
             let (harness, agents) = crate::test_context::codex_registry030(
@@ -264,6 +285,13 @@ impl Fixture {
                 .unwrap()
         };
         registry["format"] = "macro-agsdl-registry/030".into();
+        if let Some(models) = fixture.get("modelOverrides") {
+            crate::capture::apply_model_overrides(
+                &mut registry,
+                &serde_json::from_value(models.clone()).unwrap(),
+            )
+            .unwrap();
+        }
         registry["version"] = json!(format!(
             "sha256:{:x}",
             Sha256::digest(registry.to_string().as_bytes())
@@ -415,6 +443,7 @@ impl crate::agsdl_host_call_executor030::CallTransport030 for CallTransport {
         _capture: StartCapture030,
         attempt: crate::agsdl_host_calls030::CallAttempt030,
         control: crate::agsdl_host_calls::Control,
+        _admit_tool: crate::agsdl_host_calls::raw_mcp::ToolAdmission,
     ) -> crate::agsdl_host_calls::Result<
         BoxFuture<'static, Result<crate::persistence::call_protocol030::CallEnd030>>,
     > {
@@ -567,6 +596,7 @@ impl AgentExecutor030 for Executor {
                                 }
                             })).is_none());
                         } else {
+                            drop(delivery.wire_admission().await?);
                             delivery.acknowledge(&work.tasks, &work.attempt)?;
                         }
                         wake.send_modify(|n| *n += 1);
@@ -615,101 +645,117 @@ async fn idle(
     deferred: &DeferredSteers,
     hold_steers: bool,
 ) -> crate::persistence::flow_store030::FlowView030 {
-    tokio::time::timeout(std::time::Duration::from_secs(15), async {
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(12);
-        loop {
-            let host = &f.host;
-            let view = flow::inspect_run(host.flow030(), &host, &f.pool, &f.owner)
+    let stall_limit = std::time::Duration::from_secs(12);
+    let mut deadline = tokio::time::Instant::now() + stall_limit;
+    let mut previous_progress = None;
+    loop {
+        let host = &f.host;
+        let view = flow::inspect_run(host.flow030(), &host, &f.pool, &f.owner)
+            .await
+            .unwrap()
+            .flow;
+        let clock_works: Vec<String> =
+            sqlx::query_scalar("SELECT activation_id FROM engine_flow030_clock_works")
+                .fetch_all(&f.pool)
                 .await
-                .unwrap()
-                .flow;
-            let clock_works: Vec<String> =
-                sqlx::query_scalar("SELECT activation_id FROM engine_flow030_clock_works")
-                    .fetch_all(&f.pool)
-                    .await
-                    .unwrap();
-            let pending_clock: i64 = sqlx::query_scalar(
-                "SELECT count(*) FROM engine_flow030_clock_events WHERE output_json IS NULL",
+                .unwrap();
+        let (clock_revision, pending_clock, pending_controls): (Option<String>, i64, i64) =
+            sqlx::query_as(
+                "SELECT
+                    (SELECT revision FROM engine_flow030_clock WHERE system_id=? AND invocation_id=?),
+                    (SELECT count(*) FROM engine_flow030_clock_events WHERE output_json IS NULL),
+                    (SELECT count(*) FROM engine_flow030_clock_controls WHERE joined=0)",
             )
+            .bind(&f.identity.system_start_id)
+            .bind(&f.identity.flow_invocation_id)
             .fetch_one(&f.pool)
             .await
             .unwrap();
-            let pending_controls: i64 = sqlx::query_scalar(
-                "SELECT count(*) FROM engine_flow030_clock_controls WHERE joined=0",
-            )
-            .fetch_one(&f.pool)
-            .await
-            .unwrap();
-            let agents = running.lock().unwrap();
-            let ready = pending_clock == 0
-                && pending_controls == 0
-                && view
-                    .state
+        let agents = running.lock().unwrap();
+        let ready = pending_clock == 0
+            && pending_controls == 0
+            && view
+                .state
+                .activations
+                .iter()
+                .filter(|a| a.physical)
+                .all(|a| clock_works.contains(&a.id))
+            && !view.effects.iter().any(|r| {
+                if r["status"] != "pending" && r["status"] != "uncertain" {
+                    return false;
+                }
+                let kind = &r["effect"]["kind"];
+                if view.state.stopping && kind["kind"] == "stopWork" && r["status"] == "uncertain" {
+                    return false;
+                }
+                if hold_steers
+                    && kind["kind"] == "steer"
+                    && kind["deliveryActivationId"]
+                        .as_str()
+                        .is_some_and(|id| deferred.lock().unwrap().contains_key(id))
+                {
+                    return false;
+                }
+                !view.state.stopping
+                    || crate::persistence::flow_store030::eligible(
+                        &view.state,
+                        &serde_json::from_value(r["effect"].clone()).unwrap(),
+                    )
+            })
+            && view
+                .state
+                .preparations
+                .iter()
+                .all(|p| p.status != "pending")
+            && view
+                .state
+                .activations
+                .iter()
+                .filter(|a| a.physical)
+                .all(|a| {
+                    agents.iter().any(|w| w.activation == a.id)
+                        || calls.lock().unwrap().iter().any(|w| w.activation == a.id)
+                        || a.agent.is_none()
+                            && a.step.as_ref().is_some_and(|step| {
+                                f.plan
+                                    .steps
+                                    .iter()
+                                    .any(|s| &s.address == step && s.r#type == "approval")
+                            })
+                })
+            && ended.is_none_or(|id| {
+                view.state
                     .activations
                     .iter()
-                    .filter(|a| a.physical)
-                    .all(|a| clock_works.contains(&a.id))
-                && !view
-                    .effects
-                    .iter()
-                    .any(|r| {
-                        if r["status"] != "pending" && r["status"] != "uncertain" {
-                            return false;
-                        }
-                        let kind = &r["effect"]["kind"];
-                        if view.state.stopping && kind["kind"] == "stopWork" && r["status"] == "uncertain" {
-                            return false;
-                        }
-                        if hold_steers && kind["kind"] == "steer"
-                            && kind["deliveryActivationId"].as_str()
-                                .is_some_and(|id| deferred.lock().unwrap().contains_key(id))
-                        {
-                            return false;
-                        }
-                        !view.state.stopping || crate::persistence::flow_store030::eligible(
-                            &view.state, &serde_json::from_value(r["effect"].clone()).unwrap())
-                    })
-                && view
-                    .state
-                    .preparations
-                    .iter()
-                    .all(|p| p.status != "pending")
-                && view
-                    .state
-                    .activations
-                    .iter()
-                    .filter(|a| a.physical)
-                    .all(|a| {
-                        agents.iter().any(|w| w.activation == a.id)
-                            || calls.lock().unwrap().iter().any(|w| w.activation == a.id)
-                            || a.agent.is_none()
-                                && a.step.as_ref().is_some_and(|step| {
-                                    f.plan
-                                        .steps
-                                        .iter()
-                                        .any(|s| &s.address == step && s.r#type == "approval")
-                                })
-                    })
-                && ended.is_none_or(|id| {
-                    view.state
-                        .activations
-                        .iter()
-                        .any(|a| a.id == id && !a.physical)
-                });
-            drop(agents);
-            if ready {
-                return view;
-            }
-            assert!(tokio::time::Instant::now() < deadline,
-                "Timeline did not quiesce: stopping={}, verdict={:?}, ended={ended:?}, activations={:?}, effects={:?}, clock={pending_clock}/{pending_controls}",
+                    .any(|a| a.id == id && !a.physical)
+            });
+        drop(agents);
+        if ready {
+            return view;
+        }
+        // The scenario's overall watchdog already bounds its duration.
+        // Here the elapsed time measures a stall in durable progress.
+        let progress = (
+            view.state.revision.clone(),
+            view.effects
+                .iter()
+                .filter(|row| row["status"] == "settled")
+                .count(),
+            clock_revision,
+        );
+        if previous_progress.as_ref() != Some(&progress) {
+            deadline = tokio::time::Instant::now() + stall_limit;
+            previous_progress = Some(progress);
+        }
+        assert!(tokio::time::Instant::now() < deadline,
+                "Timeline stalled: stopping={}, verdict={:?}, ended={ended:?}, activations={:?}, effects={:?}, clock={pending_clock}/{pending_controls}, route jobs={}",
                 view.state.stopping, view.state.verdict,
                 view.state.activations.iter().map(|a| (&a.id, &a.step, &a.phase, a.physical)).collect::<Vec<_>>(),
-                view.effects.iter().filter(|row| row["status"] != "settled").collect::<Vec<_>>());
-            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-        }
-    })
-    .await
-    .expect("Supervisor did not reach the next timeline boundary")
+                view.effects.iter().filter(|row| row["status"] != "settled").collect::<Vec<_>>(),
+                f.route_captures.lock().unwrap().len());
+        // Each snapshot takes the same admission gate as the supervisor.
+        tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+    }
 }
 
 async fn wait_for_steer(f: &Fixture, id: &str, stopping: bool, outcome: &SteerOutcome040) {
@@ -1713,12 +1759,12 @@ fn agsdl030_conformance_runs_with_only_bun_removed_from_path() {
     );
     assert_eq!(
         String::from_utf8_lossy(&output.stderr)
-            .matches("CONFORMANCE TOTAL: N=33 M=4 K=0")
+            .matches("CONFORMANCE TOTAL: N=34 M=3 K=0")
             .count(),
         2,
         "Both file and memory must retain the official qualification"
     );
-    eprintln!("NATIVE_WITHOUT_BUN: 37 complete base projections, N33/M4/K0; all other PATH entries retained");
+    eprintln!("NATIVE_WITHOUT_BUN: 37 complete base projections, N34/M3/K0; all other PATH entries retained");
 }
 
 #[tokio::test]
@@ -1938,8 +1984,8 @@ async fn run_all_37(compare_ts: bool, memory: bool) {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
     assert_eq!(
         (native, scripted),
-        (33, 4),
-        "Pinned qualification is unchanged"
+        (34, 3),
+        "Remote MCP qualifies the published call-answer-timeout scenario"
     );
     assert_eq!(
         capture_manifest.len(),
@@ -2218,4 +2264,121 @@ async fn native_approval_roundtrip_in_shared_sqlite_memory() {
         "{observed}"
     );
     f.pool.close().await;
+}
+
+#[tokio::test]
+async fn model_override_is_admitted_projected_and_replay_checked() {
+    let document = json!({
+        "contract":"agsdl-0.4.0","id":"model-override",
+        "agents":{"worker":{"harness":"codex","permissions":"read-only",
+            "model":{"name":"not-installed","effort":"medium"}}},
+        "flow":{"entry":"check","steps":{"check":{"type":"agent","agent":"worker"}}}
+    });
+    let f = Fixture::new(
+        &json!({
+            "document":document,"entry":{},"timeline":[],
+            "modelOverrides":{"worker":{"name":"fixture-replacement"}}
+        })
+        .to_string(),
+    )
+    .await;
+    let capture_json: String =
+        sqlx::query_scalar("SELECT capture_json FROM engine_start030_requests")
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+    let capture: StartCapture030 = serde_json::from_str(&capture_json).unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&capture.authored_source).unwrap(),
+        document
+    );
+    assert_eq!(f.plan.document_json, capture.authored_source);
+    assert_eq!(
+        capture.source.source_sha256,
+        format!("{:x}", Sha256::digest(capture.authored_source.as_bytes()))
+    );
+    assert_eq!(f.plan.agents[0]["modelName"], "fixture-replacement");
+    assert_eq!(f.plan.agents[0]["modelEffort"], "high");
+    assert_eq!(
+        f.plan.agents[0]["modelOverride"],
+        json!({"name":"fixture-replacement"})
+    );
+    let page = f
+        .host
+        .runtime_projection(
+            &f.pool,
+            crate::api::RuntimeProjectionQuery030 {
+                system_start_id: f.identity.system_start_id.clone(),
+                source: capture.source.clone(),
+                snapshot_id: Some(f.identity.snapshot_id.clone()),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        page.model_overrides["worker"],
+        crate::capture::ModelOverride {
+            name: "fixture-replacement".into(),
+            effort: Some("high".into()),
+        }
+    );
+    let path = f._temp.path().join("run.db");
+    let run_path = &path;
+    let replay = || {
+        crate::persistence::replay_verify030::verify_path030(
+            run_path,
+            &f.identity.system_start_id,
+            &f.identity.flow_invocation_id,
+        )
+    };
+    let positive = replay().await;
+    assert!(positive.ok, "{:?}", positive.divergence);
+
+    let registry: Value = serde_json::from_str(&capture.registry_json).unwrap();
+    for (replacement, capability, diagnostic) in [
+        (json!({"name":"unavailable"}), None, "MODEL_UNAVAILABLE"),
+        (
+            json!({"name":"fixture-replacement","effort":"medium"}),
+            None,
+            "MODEL_UNAVAILABLE",
+        ),
+        (
+            json!({"name":"fixture-replacement","effort":"low"}),
+            Some("model.effort"),
+            "HARNESS_CAPABILITY",
+        ),
+    ] {
+        let mut registry = registry.clone();
+        registry["agents"][0]["modelOverride"] = replacement;
+        if let Some(capability) = capability {
+            registry["harnesses"][0]["capabilities"]
+                .as_array_mut()
+                .unwrap()
+                .retain(|entry| entry["name"] != capability);
+        }
+        let result = f
+            .host
+            .compile_document(
+                capture.source.clone(),
+                capture.authored_source.clone(),
+                registry.to_string(),
+            )
+            .await
+            .unwrap();
+        let report: Value = serde_json::from_str(&result.result_json).unwrap();
+        assert_eq!(report["runtime"]["diagnostics"][0]["code"], diagnostic);
+    }
+
+    // Deliberately bypass redundant immutability guards on the private test DB
+    // to prove that replay checks the choice independently of plan equality.
+    sqlx::raw_sql(
+        "DROP TRIGGER engine_flow030_capture_immutable;
+         DROP TRIGGER engine_start030_immutable;
+         UPDATE engine_flow030_runs SET plan_json = json_set(plan_json, '$.agents[0].modelEffort', 'low');
+         UPDATE engine_start030_requests SET capture_json =
+           json_set(capture_json, '$.compiledPlanJson', (SELECT plan_json FROM engine_flow030_runs));",
+    ).execute(&f.pool).await.unwrap();
+    let divergence = replay().await.divergence.unwrap();
+    assert_eq!(divergence.field, "start.modelOverrides");
 }

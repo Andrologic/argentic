@@ -11,18 +11,29 @@ use std::path::{Path, PathBuf};
 
 pub(crate) const ADAPTER: &str = "codex-app-server-v1";
 pub(crate) const VERSION: &str = "0.167.0";
+const READ_ONLY_RELEASE: &str = "0.171.0";
 const HELPERS: &[&str] = &["codex-code-mode-host", "codex-exec-server"];
 
 /// Presence/executability and capture binding, not release qualification. The
 /// installer must supply the complete official package from the same release.
-fn package_helpers(executable: &Path) -> Result<Vec<(&'static str, String)>> {
+fn package_helpers(executable: &Path, version: &str) -> Result<Vec<(&'static str, String)>> {
     use std::io::Read;
     let unavailable = || {
-        failure("CODEX_PACKAGE_INCOMPLETE", "engine", "Install the complete official Codex package, including its same-release code-mode-host and exec-server siblings")
+        failure(
+            "CODEX_PACKAGE_INCOMPLETE",
+            "engine",
+            "Install the complete official Codex package with its same-release helpers",
+        )
     };
     let directory = executable.parent().ok_or_else(unavailable)?;
     let mut digests = Vec::new();
-    for &name in HELPERS {
+    // 0.171.0 Linux dispatches the exec-server through the main binary.
+    let required = if cfg!(target_os = "linux") && version == READ_ONLY_RELEASE {
+        &HELPERS[..1]
+    } else {
+        HELPERS
+    };
+    for &name in required {
         let path = directory.join(name);
         let meta = path.symlink_metadata().map_err(|_| unavailable())?;
         if !meta.is_file() {
@@ -65,6 +76,8 @@ pub(crate) struct Profile {
     pub home: PathBuf,
     pub bootstrap: PathBuf,
     pub digest: String,
+    pub mcp: Option<crate::agsdl_host_codex030::mcp::SessionConfig>,
+    pub runtime: Option<std::sync::Arc<tempfile::TempDir>>,
 }
 fn unavailable(code: &str) -> CodexStatus {
     CodexStatus {
@@ -281,15 +294,14 @@ fn private_directory(path: &Path) -> Result<()> {
         ))
     }
 }
-pub(crate) fn prepare(manager: &HostContext) -> Result<Profile> {
+fn environment(manager: &HostContext) -> Result<Profile> {
     let executable = executable().ok_or_else(|| {
         failure(
             "CODEX_NOT_INSTALLED",
             "engine",
-            "Codex CLI 0.167.x is required",
+            "An official qualified Codex CLI package is required",
         )
     })?;
-    let helpers = package_helpers(&executable)?;
     let directory = manager.root().join("native-engines").join("codex-v1");
     let home = directory.join("home");
     for path in [
@@ -304,7 +316,31 @@ pub(crate) fn prepare(manager: &HostContext) -> Result<Profile> {
     }
     context_roots_are_empty(&directory, &home)?;
     let bootstrap = bootstrap(&directory, &manager.root().join("native-contexts/codex-v1"))?;
-    let bytes = std::fs::read(&executable).map_err(|_| {
+    Ok(Profile {
+        executable,
+        directory,
+        home,
+        bootstrap,
+        digest: String::new(),
+        mcp: None,
+        runtime: None,
+    })
+}
+
+pub(crate) fn prepare(manager: &HostContext, version: &str) -> Result<Profile> {
+    if !qualified_version(version) {
+        return Err(failure(
+            "CODEX_VERSION_UNQUALIFIED",
+            "engine",
+            "Codex version is outside the qualified profile",
+        ));
+    }
+    prepare_profile(manager, version, environment(manager)?)
+}
+
+fn prepare_profile(manager: &HostContext, version: &str, mut profile: Profile) -> Result<Profile> {
+    let helpers = package_helpers(&profile.executable, version)?;
+    let bytes = std::fs::read(&profile.executable).map_err(|_| {
         failure(
             "CODEX_NOT_INSTALLED",
             "engine",
@@ -314,12 +350,16 @@ pub(crate) fn prepare(manager: &HostContext) -> Result<Profile> {
     let mut digest = format!(
         "sha256:{:x}",
         Sha256::digest(serde_json::to_vec(&(
-            VERSION,
+            if version == READ_ONLY_RELEASE {
+                READ_ONLY_RELEASE
+            } else {
+                VERSION
+            },
             std::env::consts::OS,
             std::env::consts::ARCH,
             format!("{:x}", Sha256::digest(bytes)),
-            directory.to_string_lossy().as_ref(),
-            bootstrap.to_string_lossy().as_ref(),
+            profile.directory.to_string_lossy().as_ref(),
+            profile.bootstrap.to_string_lossy().as_ref(),
             "native-bootstrap-v1",
             helpers
         ))?)
@@ -334,13 +374,28 @@ pub(crate) fn prepare(manager: &HostContext) -> Result<Profile> {
             ))?)
         );
     }
-    Ok(Profile {
-        executable,
-        directory,
-        home,
-        bootstrap,
-        digest,
-    })
+    profile.digest = digest;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if version == READ_ONLY_RELEASE {
+        use std::os::unix::fs::PermissionsExt;
+        // The app-server's Unix sockets need a short, owned runtime directory.
+        // Give each invocation one outside the profile's denied subtree.
+        // macOS resolves /tmp through a symlink; use its physical path to
+        // satisfy the owned-directory check and stay within sockaddr_un's limit.
+        let temporary_root = if cfg!(target_os = "macos") {
+            "/private/tmp"
+        } else {
+            "/tmp"
+        };
+        let runtime = tempfile::Builder::new()
+            .prefix("argentic-codex-")
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir_in(temporary_root)
+            .map_err(context_io)?;
+        private_directory(runtime.path())?;
+        profile.runtime = Some(std::sync::Arc::new(runtime));
+    }
+    Ok(profile)
 }
 impl Profile {
     pub fn command(&self) -> tokio::process::Command {
@@ -354,9 +409,32 @@ impl Profile {
             .env("PATH", "/usr/local/bin:/usr/bin:/bin")
             .env("LANG", "C.UTF-8")
             .current_dir(&self.directory);
+        if let Some(runtime) = &self.runtime {
+            command.env("XDG_RUNTIME_DIR", runtime.path());
+            #[cfg(target_os = "macos")]
+            command.env("TMPDIR", runtime.path());
+        }
         command
     }
     pub fn settings(&self, root: &Path, read_only: bool) -> Result<Value> {
+        if let Some(runtime) = &self.runtime {
+            if !read_only || self.directory.starts_with("/tmp") {
+                return Err(failure(
+                    "CODEX_PROFILE_UNQUALIFIED",
+                    "scope",
+                    "Codex 0.171.0 requires read-only execution and private host data outside /tmp",
+                ));
+            }
+            if cfg!(target_os = "macos")
+                && (runtime.path().starts_with(root) || root.starts_with(runtime.path()))
+            {
+                return Err(failure(
+                    "CODEX_PROFILE_UNQUALIFIED",
+                    "scope",
+                    "Workspace and private Codex runtime directory overlap",
+                ));
+            }
+        }
         if self.directory.starts_with(root)
             || root.starts_with(&self.directory)
             || self.bootstrap.starts_with(root)
@@ -412,7 +490,10 @@ impl Profile {
         root: &Path,
         read_only: bool,
     ) -> Result<tokio::process::Command> {
-        let settings = self.settings(root, read_only)?;
+        let mut settings = self.settings(root, read_only)?;
+        if let Some(mcp) = &self.mcp {
+            settings["mcp_servers"] = mcp.servers.clone();
+        }
         let mut flags = Vec::new();
         fn inline_toml(value: &Value) -> Result<String> {
             if let Some(object) = value.as_object() {
@@ -435,6 +516,9 @@ impl Profile {
             flags.push(format!("{key}={}", inline_toml(value)?));
         }
         let mut command = self.command();
+        if let Some(mcp) = &self.mcp {
+            command.env(crate::agsdl_host_codex030::mcp::TOKEN_ENV, mcp.token());
+        }
         for flag in &flags {
             command.args(["-c", flag]);
         }
@@ -446,13 +530,20 @@ impl Profile {
             .stderr(std::process::Stdio::null());
         Ok(command)
     }
+    fn identity_version(&self) -> &'static str {
+        if self.runtime.is_some() {
+            READ_ONLY_RELEASE
+        } else {
+            VERSION
+        }
+    }
     pub fn identity(&self) -> String {
-        json!({"format":"macro-codex-native-profile/1","version":VERSION,"platform":format!("{}-{}",std::env::consts::OS,std::env::consts::ARCH),
+        json!({"format":"macro-codex-native-profile/1","version":self.identity_version(),"platform":format!("{}-{}",std::env::consts::OS,std::env::consts::ARCH),
             "digest":self.digest,"toolPolicy":"codex-native","approvalPolicy":"never"}).to_string()
     }
     #[cfg(test)]
     pub fn attestation(&self, read_only: bool, scope: &Value) -> Result<String> {
-        Ok(json!({"format":"macro-codex-native-profile/1","version":VERSION,"platform":format!("{}-{}",std::env::consts::OS,std::env::consts::ARCH),
+        Ok(json!({"format":"macro-codex-native-profile/1","version":self.identity_version(),"platform":format!("{}-{}",std::env::consts::OS,std::env::consts::ARCH),
             "digest":self.digest,"toolPolicy":"codex-native","approvalPolicy":"never","readOnly":read_only,"contextCwd":self.bootstrap,
             "scopeDigest":format!("sha256:{:x}",Sha256::digest(serde_json::to_vec(scope)?)),
             "policyDigest":format!("sha256:{:x}",Sha256::digest(serde_json::to_vec(&self.settings(Path::new(scope["root"].as_str().ok_or_else(|| failure("CORRELATION","scope","Scope root absent"))?),read_only)?)?))}).to_string())
@@ -462,6 +553,7 @@ pub(super) fn qualified_version(version: &str) -> bool {
     version
         .strip_prefix("0.167.")
         .is_some_and(|patch| !patch.is_empty() && patch.bytes().all(|byte| byte.is_ascii_digit()))
+        || qualified_platform() && version == READ_ONLY_RELEASE
 }
 fn qualified_platform() -> bool {
     cfg!(any(
@@ -469,26 +561,57 @@ fn qualified_platform() -> bool {
         all(target_os = "macos", target_arch = "aarch64")
     ))
 }
-pub(crate) async fn status(manager: &HostContext) -> CodexStatus {
-    let profile = match prepare(manager) {
-        Ok(profile) => profile,
-        Err(error) => return unavailable(&error.code),
-    };
+async fn observed_version(profile: &Profile) -> Option<String> {
     let output = tokio::time::timeout(
         std::time::Duration::from_secs(5),
         profile.command().arg("--version").output(),
     )
-    .await;
-    let mut result = unavailable("CODEX_VERSION_UNQUALIFIED");
-    let Ok(Ok(output)) = output else {
-        return result;
+    .await
+    .ok()?
+    .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let observed = std::str::from_utf8(&output.stdout).ok()?;
+    observed
+        .trim()
+        .strip_prefix("codex-cli ")
+        .map(str::to_owned)
+}
+
+#[cfg(test)]
+pub(crate) async fn prepare_physical_qa(manager: &HostContext) -> Result<Profile> {
+    let profile = environment(manager)?;
+    let version = observed_version(&profile).await;
+    let unqualified = || {
+        failure(
+            "CODEX_VERSION_UNQUALIFIED",
+            "engine",
+            "Codex version is outside the physical QA profile",
+        )
     };
-    let observed = String::from_utf8_lossy(&output.stdout);
-    let Some(version) = observed.trim().strip_prefix("codex-cli ") else {
+    let version = version.as_deref().ok_or_else(unqualified)?;
+    if !qualified_version(version) {
+        return Err(unqualified());
+    }
+    prepare_profile(manager, version, profile)
+}
+
+pub(crate) async fn status(manager: &HostContext) -> CodexStatus {
+    let profile = match environment(manager) {
+        Ok(profile) => profile,
+        Err(error) => return unavailable(&error.code),
+    };
+    let mut result = unavailable("CODEX_VERSION_UNQUALIFIED");
+    let version = observed_version(&profile).await;
+    let Some(version) = version.as_deref() else {
         return result;
     };
     if !qualified_version(version) {
         return result;
+    }
+    if let Err(error) = package_helpers(&profile.executable, version) {
+        return unavailable(&error.code);
     }
     result.version = Some(version.into());
     if manager.codex_auth_file().is_some() && version != VERSION {
@@ -585,15 +708,40 @@ pub(crate) fn verify_layers(
         layer["name"]["type"] == "sessionFlags"
             && layer["config"].pointer("/tools/update_plan/enabled") == Some(&json!(true))
     });
+    let actual_mcp = config["mcp_servers"].as_object();
+    let valid_mcp = match &profile.mcp {
+        Some(mcp) => actual_mcp.is_some_and(|servers| {
+            servers.len() == mcp.servers.as_object().expect("prepared MCP servers").len()
+                && contains(&config["mcp_servers"], &mcp.servers)
+                && servers.values().all(|server| {
+                    server["enabled"].as_bool().unwrap_or(true)
+                        && server["environment_id"]
+                            .as_str()
+                            .is_none_or(|id| id == "local")
+                        && [
+                            "command",
+                            "args",
+                            "env",
+                            "env_vars",
+                            "http_headers",
+                            "env_http_headers",
+                            "disabled_tools",
+                            "tools",
+                            "oauth_resource",
+                            "scopes",
+                        ]
+                        .into_iter()
+                        .all(|key| server[key].is_null())
+                })
+        }),
+        None => actual_mcp.is_none_or(serde_json::Map::is_empty),
+    };
     let mut comparable = expected.clone();
     comparable.as_object_mut().unwrap().remove("tools");
     if !plan_enabled
         || !contains(config, &comparable)
         || without_null_defaults(&config["permissions"]) != expected["permissions"]
-        || config
-            .get("mcp_servers")
-            .and_then(Value::as_object)
-            .is_some_and(|servers| !servers.is_empty())
+        || !valid_mcp
     {
         return Err(failure(
             "CODEX_PROFILE_UNQUALIFIED",
@@ -637,7 +785,7 @@ mod tests {
         let cli = temp.path().join("codex");
         std::fs::write(&cli, "synthetic CLI").unwrap();
         assert_eq!(
-            package_helpers(&cli).unwrap_err().code,
+            package_helpers(&cli, VERSION).unwrap_err().code,
             "CODEX_PACKAGE_INCOMPLETE"
         );
         for &name in HELPERS {
@@ -645,22 +793,32 @@ mod tests {
             std::fs::write(&path, "synthetic helper, never executed").unwrap();
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
         }
-        let first = package_helpers(&cli).unwrap();
+        let first = package_helpers(&cli, VERSION).unwrap();
+        let expected = if cfg!(target_os = "linux") {
+            &first[..1]
+        } else {
+            &first[..]
+        };
+        assert_eq!(package_helpers(&cli, READ_ONLY_RELEASE).unwrap(), expected);
         std::fs::write(temp.path().join(HELPERS[0]), "changed synthetic helper").unwrap();
-        assert_ne!(first, package_helpers(&cli).unwrap());
+        assert_ne!(first, package_helpers(&cli, VERSION).unwrap());
         std::fs::set_permissions(
             temp.path().join(HELPERS[1]),
             std::fs::Permissions::from_mode(0o600),
         )
         .unwrap();
         assert_eq!(
-            package_helpers(&cli).unwrap_err().code,
+            package_helpers(&cli, VERSION).unwrap_err().code,
             "CODEX_PACKAGE_INCOMPLETE"
         );
         std::fs::remove_file(temp.path().join(HELPERS[1])).unwrap();
+        assert_eq!(
+            package_helpers(&cli, READ_ONLY_RELEASE).is_ok(),
+            cfg!(target_os = "linux")
+        );
         std::os::unix::fs::symlink(&cli, temp.path().join(HELPERS[1])).unwrap();
         assert_eq!(
-            package_helpers(&cli).unwrap_err().code,
+            package_helpers(&cli, VERSION).unwrap_err().code,
             "CODEX_PACKAGE_INCOMPLETE"
         );
     }
@@ -669,7 +827,23 @@ mod tests {
         for version in ["0.167.0", "0.167.12"] {
             assert!(qualified_version(version));
         }
-        for version in ["0.163.0", "0.168.0", "0.167.", "0.167.0-beta", "0.167.0.1"] {
+        assert_eq!(
+            qualified_version(READ_ONLY_RELEASE),
+            cfg!(all(
+                target_arch = "aarch64",
+                any(target_os = "linux", target_os = "macos")
+            ))
+        );
+        for version in [
+            "0.163.0",
+            "0.168.0",
+            "0.170.0",
+            "0.171.1",
+            "0.171.0-beta",
+            "0.167.",
+            "0.167.0-beta",
+            "0.167.0.1",
+        ] {
             assert!(!qualified_version(version));
         }
     }
@@ -678,6 +852,8 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         let profile = Profile {
+            mcp: None,
+            runtime: None,
             executable: root.join("bin/codex"),
             directory: root.join("profile"),
             home: root.join("profile/home"),

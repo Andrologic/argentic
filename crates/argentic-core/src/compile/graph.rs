@@ -6,11 +6,17 @@ use crate::argentic_core::{
     graph::{
         analyse_joins,
         ordered::{OrderedMap, OrderedSet},
-        step_routes, Graph, JoinInfo,
+        step_routes, ExpansionBudget, Graph, JoinInfo,
     },
-    native::{self, a, fail, o, s, Error, Value},
-    route::{self, RouteTarget, Scope, ScopeStep},
+    native::{a, fail, o, s, Error, Text, Value},
+    route::{self, NormalizedTarget},
 };
+use crate::SourceBudget;
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+};
+
 type Result<T> = std::result::Result<T, Error>;
 pub(crate) struct CompiledGraph {
     pub(crate) entry: Value,
@@ -20,6 +26,7 @@ pub(crate) struct CompiledGraph {
     pub(crate) joins: Vec<Value>,
     pub(crate) handlers: Vec<Value>,
     pub(crate) graphless: Value,
+    pub(crate) remaining_json: usize,
 }
 impl CompiledGraph {
     pub(crate) fn has_shared_stop(&self) -> bool {
@@ -40,8 +47,8 @@ impl CompiledGraph {
         false
     }
 
-    pub(crate) fn value(self) -> Value {
-        o([
+    pub(crate) fn append_to(self, target: &mut Value) {
+        for (key, value) in [
             ("entry", self.entry),
             ("scopes", a(self.scopes)),
             ("steps", a(self.steps)),
@@ -49,15 +56,10 @@ impl CompiledGraph {
             ("joins", a(self.joins)),
             ("handlers", a(self.handlers)),
             ("graphlessSubmissionContracts", self.graphless),
-        ])
+        ] {
+            target.set(key, value);
+        }
     }
-}
-fn internal<T>(_: T) -> Error {
-    Error::new(
-        "COMPILATION",
-        "",
-        "Invalid compilation input or inconsistent dependency contract.",
-    )
 }
 fn addr(prefix: &[String], name: &str) -> Vec<String> {
     let mut parts = prefix.to_vec();
@@ -67,24 +69,79 @@ fn addr(prefix: &[String], name: &str) -> Vec<String> {
 fn address(parts: &[String]) -> Value {
     a(parts.iter().cloned().map(s))
 }
-fn key(v: &Value) -> String {
-    v.array()
-        .unwrap()
-        .iter()
-        .map(|v| v.text().unwrap().utf8().unwrap())
-        .collect::<Vec<_>>()
-        .join("/")
-}
 fn optional(v: Option<&E>) -> Result<&Object> {
     match v {
         None | Some(E::Null) => Ok(crate::argentic_core::graph::empty_object()),
         v => Ok(exact::record(v, "")?),
     }
 }
-fn number_json(decl: &Object, key: &str) -> Value {
-    decl.get(key)
-        .map(|v| s(exact::encode(v)))
-        .unwrap_or(Value::Null)
+enum JsonWriter<'a> {
+    Count {
+        count: crate::resource::EncodeCount<crate::graph::Unshaped>,
+        budget: &'a ExpansionBudget,
+        composition: Option<&'a str>,
+    },
+    Text(Vec<u16>),
+}
+
+impl fmt::Write for JsonWriter<'_> {
+    fn write_str(&mut self, text: &str) -> fmt::Result {
+        match self {
+            Self::Count {
+                count,
+                budget,
+                composition,
+            } => count.write(text, true, |work| budget.work(work, *composition)),
+            Self::Text(output) => {
+                output.extend(text.encode_utf16());
+                Ok(())
+            }
+        }
+    }
+}
+
+fn budgeted_json(
+    budget: &mut ExpansionBudget,
+    composition: Option<&str>,
+    write: impl Fn(&mut JsonWriter<'_>) -> fmt::Result,
+) -> Result<Value> {
+    let mut output = JsonWriter::Count {
+        count: crate::resource::EncodeCount::new(budget.remaining_json()),
+        budget,
+        composition,
+    };
+    let measured = write(&mut output);
+    let JsonWriter::Count { mut count, .. } = output else {
+        unreachable!()
+    };
+    let finished = count.flush(|work| budget.work(work, composition));
+    if let Some(error) = count.error {
+        return Err(error.into());
+    }
+    if measured.is_err() || finished.is_err() {
+        return Err(budget.json_limit(composition).into());
+    }
+    budget.work(count.bytes.div_ceil(16), composition)?;
+    budget.json(count.bytes, composition)?;
+    let mut output = JsonWriter::Text(Vec::with_capacity(count.units));
+    write(&mut output).expect("text writer");
+    let JsonWriter::Text(text) = output else {
+        unreachable!()
+    };
+    Ok(s(Text::from_units(text)))
+}
+
+fn encoded_json(
+    value: Option<&E>,
+    budget: &mut ExpansionBudget,
+    composition: Option<&str>,
+) -> Result<Value> {
+    match value {
+        Some(value) => budgeted_json(budget, composition, |out| {
+            exact::values::stringify_to(out, value)
+        }),
+        None => Ok(Value::Null),
+    }
 }
 /// The document schema restricts names to ASCII letters/digits/_/-. Expanded
 /// addresses add '/'. These are the en collation primary ranks on that alphabet;
@@ -116,8 +173,9 @@ struct Context<'a> {
     composition: Option<String>,
     bindings: Vec<(String, String)>,
     stack: Vec<String>,
-    route_scope: Scope,
-    joins: OrderedMap<String, JoinInfo>,
+    scope_key: String,
+    outputs: Vec<String>,
+    steps: HashMap<&'a str, &'a E>,
 }
 fn resolve_agent(
     value: Option<&E>,
@@ -143,96 +201,138 @@ fn resolve_agent(
         ),
     }
 }
-fn target_value(target: &RouteTarget, prefix: &[String]) -> Value {
-    match target {
-        RouteTarget::Output { name } => o([
+struct CompiledRoute<'a> {
+    scope: usize,
+    source: String,
+    kind: &'static str,
+    choice: Option<&'a str>,
+    targets: Vec<NormalizedTarget<'a, ()>>,
+    value: Value,
+}
+
+fn target_value(
+    target: &NormalizedTarget<'_, ()>,
+    context: &Context<'_>,
+    budget: &mut ExpansionBudget,
+) -> Result<Value> {
+    let composition = context.composition.as_deref();
+    budget.bytes(512, composition)?;
+    Ok(match target {
+        NormalizedTarget::Output { name } => o([
             ("kind", s("output")),
-            ("scope", address(prefix)),
-            ("name", s(name.clone())),
+            ("scope", address(&context.prefix)),
+            ("name", s(*name)),
         ]),
-        RouteTarget::Step {
+        NormalizedTarget::Step {
             address: parts,
-            message_json,
-            each_path_json,
-            concurrency_json,
-            max_json,
+            message,
+            each,
+            concurrency,
+            max,
             ..
         } => o([
             ("kind", s("step")),
             ("address", address(parts)),
-            (
-                "messageJson",
-                message_json
-                    .as_ref()
-                    .map(|v| s(v.clone()))
-                    .unwrap_or(Value::Null),
-            ),
-            (
-                "eachPathJson",
-                each_path_json
-                    .as_ref()
-                    .map(|v| s(v.clone()))
-                    .unwrap_or(Value::Null),
-            ),
+            ("messageJson", encoded_json(*message, budget, composition)?),
+            ("eachPathJson", encoded_json(*each, budget, composition)?),
             (
                 "concurrencyJson",
-                concurrency_json
-                    .as_ref()
-                    .map(|v| s(v.clone()))
-                    .unwrap_or(Value::Null),
+                encoded_json(*concurrency, budget, composition)?,
             ),
-            (
-                "maxJson",
-                max_json
-                    .as_ref()
-                    .map(|v| s(v.clone()))
-                    .unwrap_or(Value::Null),
-            ),
+            ("maxJson", encoded_json(*max, budget, composition)?),
         ]),
-    }
+    })
 }
-fn add_route(
-    routes: &mut Vec<Value>,
-    context: &Context<'_>,
+
+fn add_route<'a>(
+    output: (&mut Vec<CompiledRoute<'a>>, &mut ExpansionBudget),
+    scope: (usize, &Context<'a>),
     step: &[String],
-    kind: &str,
-    choice: Option<&str>,
-    raw: &E,
+    kind: &'static str,
+    choice: Option<&'a str>,
+    raw: &'a E,
     inherited: bool,
 ) -> Result<()> {
-    let declaration = exact::encode(raw);
-    let targets = route::normalize_route(&declaration, &context.route_scope)?;
-    routes.push(o([
-        ("source", address(step)),
-        ("kind", s(kind)),
-        ("key", choice.map(s).unwrap_or(Value::Null)),
-        ("declarationJson", s(declaration)),
-        (
-            "targets",
-            a(targets.iter().map(|t| target_value(t, &context.prefix))),
-        ),
-        ("inherited", Value::Bool(inherited)),
-    ]));
+    let (routes, budget) = output;
+    let (index, context) = scope;
+    let composition = context.composition.as_deref();
+    budget.route(raw, composition)?;
+    budget.bytes(
+        640 + step.iter().map(|part| part.len() * 4 + 64).sum::<usize>(),
+        composition,
+    )?;
+    let declaration = encoded_json(Some(raw), budget, composition)?;
+    let targets =
+        route::normalize_targets(raw, &context.prefix, Some(&context.outputs), |address| {
+            let definition = context
+                .steps
+                .get(address.last().unwrap().as_str())
+                .ok_or_else(|| {
+                    crate::argentic_core::error::Failure::new(
+                        "REFERENCE",
+                        "",
+                        "Unknown step in route scope.",
+                    )
+                })?;
+            let step = exact::record(Some(definition), "")?;
+            Ok((
+                (),
+                route::receives_messages(exact::text(step.get("type"), "")?),
+            ))
+        })?;
+    let target_values = targets
+        .iter()
+        .map(|t| target_value(t, context, budget))
+        .collect::<Result<Vec<_>>>()?;
+    routes.push(CompiledRoute {
+        scope: index,
+        source: step.join("/"),
+        kind,
+        choice,
+        targets,
+        value: o([
+            ("source", address(step)),
+            ("kind", s(kind)),
+            ("key", choice.map(s).unwrap_or(Value::Null)),
+            ("declarationJson", declaration),
+            ("targets", a(target_values)),
+            ("inherited", Value::Bool(inherited)),
+        ]),
+    });
     Ok(())
 }
+
+#[cfg(test)]
 pub(crate) fn compile(document: &Object) -> Result<CompiledGraph> {
+    compile_with_budget(document, &SourceBudget::default())
+}
+
+pub(crate) fn compile_with_budget(
+    document: &Object,
+    source: &SourceBudget,
+) -> Result<CompiledGraph> {
     let agents = exact::record(document.get("agents"), "")?;
     let compositions = optional(document.get("compositions"))?;
     let mut scopes = vec![];
+    let mut budget = ExpansionBudget::new(source);
+    let mut local_budget = ExpansionBudget::new(source);
     let mut steps = vec![];
+    let mut step_contexts = vec![];
+
     let mut routes = vec![];
     let mut joins = vec![];
     let mut handlers = vec![];
-    let mut cache: OrderedMap<Option<String>, OrderedMap<String, JoinInfo>> = OrderedMap::new();
+    let mut cache: OrderedMap<Option<String>, (OrderedMap<String, JoinInfo>, usize)> =
+        OrderedMap::new();
     let mut covered = OrderedSet::new();
     if document.contains_key("flow") {
-        let graph = Graph::for_scope(document, None, None).map_err(internal)?;
-        let (initial, _) = analyse_joins(&graph).map_err(internal)?;
+        let graph = Graph::for_scope(document, None, None, &mut ExpansionBudget::new(source))?;
+        let (initial, _) = analyse_joins(&graph, &mut ExpansionBudget::new(source))?;
         let members = initial
             .values()
             .flat_map(|i| i.branches.values().flat_map(|b| b.iter().cloned()))
             .collect();
-        covered = Graph::flow_error_covered(document, &members).map_err(internal)?;
+        covered = Graph::flow_error_covered(document, &members, &ExpansionBudget::new(source))?;
     }
     enum Task<'a> {
         Visit(
@@ -247,17 +347,14 @@ pub(crate) fn compile(document: &Object) -> Result<CompiledGraph> {
     }
     let mut tasks = vec![];
     let mut contexts = Vec::<Context<'_>>::new();
+    let empty_route = E::Array(vec![]);
     if document.contains_key("flow") {
-        tasks.push(Task::Visit(
-            exact::record(document.get("flow"), "")?,
-            vec![],
-            None,
-            None,
-            vec![],
-            vec![],
-        ));
+        let flow = exact::record(document.get("flow"), "")?;
+        budget.scope(exact::record(flow.get("steps"), "")?.len(), 0, None)?;
+        tasks.push(Task::Visit(flow, vec![], None, None, vec![], vec![]));
     }
     while let Some(task) = tasks.pop() {
+        budget.work(1, None)?;
         match task {
             Task::Visit(container, prefix, parent, composition, bindings, stack) => {
                 let declarations = exact::record(container.get("steps"), "")?;
@@ -268,22 +365,11 @@ pub(crate) fn compile(document: &Object) -> Result<CompiledGraph> {
                         .map(|v| exact::text(Some(v), "").map(str::to_owned))
                         .collect::<std::result::Result<Vec<_>, _>>()?,
                 };
-                let route_scope = Scope {
-                    prefix: prefix.clone(),
-                    outputs: Some(outputs.clone()),
-                    steps: declarations
+                let binding_value = Value::from_entries(
+                    bindings
                         .iter()
-                        .map(|(name, decl)| ScopeStep {
-                            address: addr(&prefix, name),
-                            declaration_json: exact::encode(decl),
-                        })
-                        .collect(),
-                    output_routes: None,
-                };
-                let mut binding_value = o([]);
-                for (k, v) in &bindings {
-                    binding_value.set(k.as_str(), s(v.clone()));
-                }
+                        .map(|(k, v)| (Text::from(k.as_str()), s(v.as_str()))),
+                );
                 scopes.push(o([
                     ("address", address(&prefix)),
                     (
@@ -301,7 +387,10 @@ pub(crate) fn compile(document: &Object) -> Result<CompiledGraph> {
                         "entry",
                         address(&addr(&prefix, exact::text(container.get("entry"), "")?)),
                     ),
-                    ("outputs", a(outputs.into_iter().map(s))),
+                    (
+                        "outputs",
+                        a(outputs.iter().map(|output| s(output.as_str()))),
+                    ),
                     ("agents", binding_value),
                 ]));
                 if !cache.contains_key(&composition) {
@@ -309,23 +398,25 @@ pub(crate) fn compile(document: &Object) -> Result<CompiledGraph> {
                         document,
                         composition.as_deref(),
                         composition.is_none().then(|| covered.clone()),
-                    )
-                    .map_err(internal)?;
-                    let (infos, problems) = analyse_joins(&graph).map_err(internal)?;
+                        &mut local_budget,
+                    )?;
+                    let (infos, problems) = analyse_joins(&graph, &mut local_budget)?;
                     if !problems.is_empty() {
                         return fail("JOIN", "", "Validated graph disagrees with join analysis.");
                     }
-                    cache.set(composition.clone(), infos);
+                    let comparisons = infos.values().map(|info| 1 + info.branches.len()).sum();
+                    cache.set(composition.clone(), (infos, comparisons));
                 }
                 let ctx = contexts.len();
                 contexts.push(Context {
                     container,
+                    scope_key: prefix.join("/"),
                     prefix,
                     composition: composition.clone(),
                     bindings,
                     stack,
-                    route_scope,
-                    joins: cache.get(&composition).unwrap().clone(),
+                    outputs,
+                    steps: declarations.iter().collect(),
                 });
                 tasks.extend(
                     declarations
@@ -336,6 +427,15 @@ pub(crate) fn compile(document: &Object) -> Result<CompiledGraph> {
             }
             Task::Step(index, name, value) => {
                 let context = &contexts[index];
+                let composition = context.composition.as_deref();
+                // A step allocates a native row, its handler and their
+                // address fields, independently of the authored JSON size.
+                let address_bytes = context
+                    .prefix
+                    .iter()
+                    .map(|part| 6 * part.len() + 96)
+                    .sum::<usize>();
+                budget.bytes(1536 + address_bytes + name.len() * 8, composition)?;
                 let decl = exact::record(Some(value), "")?;
                 let step = addr(&context.prefix, name);
                 let kind = exact::text(decl.get("type"), "")?;
@@ -364,22 +464,32 @@ pub(crate) fn compile(document: &Object) -> Result<CompiledGraph> {
                         },
                     )
                 };
+                let first_route = routes.len();
                 steps.push(o([
                     ("address", address(&step)),
                     ("scope", address(&context.prefix)),
                     ("type", s(kind)),
-                    ("declarationJson", s(exact::encode(value))),
+                    (
+                        "declarationJson",
+                        encoded_json(Some(value), &mut budget, composition)?,
+                    ),
                     ("agent", agent),
                     ("instance", instance),
                     ("delivery", delivery),
-                    ("maxVisitsJson", number_json(decl, "maxVisits")),
-                    ("timeoutMsJson", number_json(decl, "timeoutMs")),
+                    (
+                        "maxVisitsJson",
+                        encoded_json(decl.get("maxVisits"), &mut budget, composition)?,
+                    ),
+                    (
+                        "timeoutMsJson",
+                        encoded_json(decl.get("timeoutMs"), &mut budget, composition)?,
+                    ),
                     ("submissionContractJson", Value::Null),
                 ]));
                 for route in step_routes(decl, &[]) {
                     add_route(
-                        &mut routes,
-                        context,
+                        (&mut routes, &mut budget),
+                        (index, context),
                         &step,
                         route.kind.as_str(),
                         route.key,
@@ -389,20 +499,20 @@ pub(crate) fn compile(document: &Object) -> Result<CompiledGraph> {
                 }
                 if !decl.contains_key("next") {
                     add_route(
-                        &mut routes,
-                        context,
+                        (&mut routes, &mut budget),
+                        (index, context),
                         &step,
                         "normal",
                         None,
-                        &E::Array(vec![]),
+                        &empty_route,
                         false,
                     )?;
                 }
                 let flow = context.composition.is_none() && covered.contains(name);
                 if flow {
                     add_route(
-                        &mut routes,
-                        context,
+                        (&mut routes, &mut budget),
+                        (index, context),
                         &step,
                         "error",
                         None,
@@ -410,10 +520,17 @@ pub(crate) fn compile(document: &Object) -> Result<CompiledGraph> {
                         true,
                     )?;
                 }
+                step_contexts.push((index, first_route..routes.len()));
                 let mut containing = vec![];
-                for (join, info) in context.joins.iter() {
+                let (scope_joins, comparisons) = cache
+                    .get(&context.composition)
+                    .expect("compiled scope joins");
+                budget.work(*comparisons, composition)?;
+                for (join, info) in scope_joins.iter() {
                     for (start, members) in info.branches.iter() {
                         if members.contains(name) {
+                            budget.join_analysis(1, composition)?;
+                            budget.bytes(256 + address_bytes + join.len() * 8, composition)?;
                             containing.push((
                                 addr(&context.prefix, join),
                                 info.names.get(start).unwrap().clone(),
@@ -422,9 +539,10 @@ pub(crate) fn compile(document: &Object) -> Result<CompiledGraph> {
                         }
                     }
                 }
+                // All these addresses share the scope prefix.
                 containing.sort_by(|(a, _, n), (b, _, m)| {
                     n.cmp(m)
-                        .then_with(|| compare_addresses_en(&a.join("/"), &b.join("/")))
+                        .then_with(|| compare_addresses_en(a.last().unwrap(), b.last().unwrap()))
                 });
                 handlers.push(o([
                     ("address", address(&step)),
@@ -442,7 +560,7 @@ pub(crate) fn compile(document: &Object) -> Result<CompiledGraph> {
                     ),
                 ]));
                 if kind == "join" {
-                    let Some(info) = context.joins.get(name) else {
+                    let Some(info) = scope_joins.get(name) else {
                         return fail("JOIN", "", "Validated join has no origin.");
                     };
                     let quorum = if decl.contains_key("quorum") {
@@ -450,8 +568,14 @@ pub(crate) fn compile(document: &Object) -> Result<CompiledGraph> {
                     } else {
                         None
                     };
-                    let branches = info.branches.iter().map(|(target, members)| {
-                        o([
+                    let mut branches = Vec::with_capacity(info.branches.len());
+                    for (target, members) in info.branches.iter() {
+                        budget.join_analysis(members.len() + 1, composition)?;
+                        budget.bytes(
+                            256 + (members.len() + 1) * (address_bytes + 96),
+                            composition,
+                        )?;
+                        branches.push(o([
                             (
                                 "name",
                                 info.names
@@ -467,8 +591,8 @@ pub(crate) fn compile(document: &Object) -> Result<CompiledGraph> {
                                 a(members.iter().map(|m| address(&addr(&context.prefix, m)))),
                             ),
                             ("fanout", Value::Bool(info.fanout.contains(target))),
-                        ])
-                    });
+                        ]));
+                    }
                     joins.push(o([
                         ("address", address(&step)),
                         ("scope", address(&context.prefix)),
@@ -485,13 +609,17 @@ pub(crate) fn compile(document: &Object) -> Result<CompiledGraph> {
                                 },
                             ),
                         ),
-                        ("maxFailuresJson", number_json(decl, "maxFailures")),
+                        (
+                            "maxFailuresJson",
+                            encoded_json(decl.get("maxFailures"), &mut budget, composition)?,
+                        ),
                         (
                             "quorumCountJson",
-                            quorum
-                                .and_then(|q| q.get("count"))
-                                .map(|v| s(exact::encode(v)))
-                                .unwrap_or(Value::Null),
+                            encoded_json(
+                                quorum.and_then(|q| q.get("count")),
+                                &mut budget,
+                                composition,
+                            )?,
                         ),
                         (
                             "accept",
@@ -521,6 +649,12 @@ pub(crate) fn compile(document: &Object) -> Result<CompiledGraph> {
                     if context.stack.iter().any(|v| v == target) {
                         return fail("COMPOSITION", "", "Composition cycle reached the compiler.");
                     }
+                    let composition = exact::record(compositions.get(target), "")?;
+                    budget.scope(
+                        exact::record(composition.get("steps"), "")?.len(),
+                        context.stack.len() + 1,
+                        Some(target),
+                    )?;
                     let child_bindings = optional(decl.get("agents"))?
                         .iter()
                         .map(|(parameter, v)| {
@@ -531,7 +665,7 @@ pub(crate) fn compile(document: &Object) -> Result<CompiledGraph> {
                     let mut stack = context.stack.clone();
                     stack.push(target.to_owned());
                     tasks.push(Task::Visit(
-                        exact::record(compositions.get(target), "")?,
+                        composition,
                         step,
                         Some(context.prefix.clone()),
                         Some(target.to_owned()),
@@ -542,120 +676,118 @@ pub(crate) fn compile(document: &Object) -> Result<CompiledGraph> {
             }
         }
     }
-    let expectation_scope = Scope {
-        prefix: vec![],
-        outputs: None,
-        output_routes: None,
-        steps: steps
-            .iter()
-            .map(|step| ScopeStep {
-                address: vec![key(step.get("address"))],
-                declaration_json: step.get("declarationJson").text().unwrap().utf8().unwrap(),
-            })
-            .collect(),
-    };
-    let expectation = |agent_json: &str, route: &Value| -> Result<Value> {
-        let mut todo: Vec<&Value> = route.get("targets").array().unwrap().iter().rev().collect();
-        let mut targets = vec![];
-        while let Some(target) = todo.pop() {
-            if target.get("kind").eq_str("step") {
-                targets.push(target);
-            } else {
-                let outward = routes.iter().find(|r| {
-                    key(r.get("source")) == key(target.get("scope"))
-                        && r.get("kind").eq_str("normal")
-                        && native::equal(r.get("key"), target.get("name"))
-                });
-                let Some(outward) = outward else {
-                    return fail(
-                        "COMPOSITION",
-                        "",
-                        "Composition output has no enclosing route.",
-                    );
-                };
-                todo.extend(outward.get("targets").array().unwrap().iter().rev());
-            }
-        }
-        let route = E::Array(
-            targets
-                .into_iter()
-                .map(|target| {
-                    let mut object = exact::Object::from_entries([(
-                        "step".to_owned(),
-                        E::String(key(target.get("address"))),
-                    )]);
-                    for (field, json) in [
-                        ("message", "messageJson"),
-                        ("each", "eachPathJson"),
-                        ("concurrency", "concurrencyJson"),
-                        ("max", "maxJson"),
-                    ] {
-                        if !matches!(target.get(json), Value::Null) {
-                            object.set(
-                                field.to_owned(),
-                                exact::decode(&target.get(json).text().unwrap().utf8().unwrap())?,
-                            );
+    budget.bytes(routes.len() * 64 + agents.len() * 64, None)?;
+    let outward: HashMap<_, _> = routes
+        .iter()
+        .filter(|route| route.kind == "normal")
+        .map(|route| ((route.source.as_str(), route.choice), route))
+        .collect();
+    let mut expectation_budget = ExpansionBudget::new(source);
+    let mut expectation =
+        |instructs, route: &CompiledRoute<'_>, composition: Option<&str>| -> Result<Value> {
+            expectation_budget.edges(route.targets.len(), composition)?;
+            let mut todo: Vec<_> = route
+                .targets
+                .iter()
+                .rev()
+                .map(|target| (target, route.scope))
+                .collect();
+            let mut targets = Vec::new();
+            let mut seen = HashSet::new();
+            while let Some((target, scope)) = todo.pop() {
+                match target {
+                    NormalizedTarget::Step {
+                        address,
+                        receives,
+                        message,
+                        each,
+                        ..
+                    } => {
+                        if !seen.insert(address) {
+                            return fail("DUPLICATE", "", "Repeated route target.");
+                        }
+                        if *receives {
+                            targets.push((*message, *each));
                         }
                     }
-                    Ok(E::Object(object))
-                })
-                .collect::<Result<Vec<_>>>()?,
-        );
-        Ok(s(route::instructions_expectation(
-            agent_json,
-            &exact::encode(&route),
-            std::slice::from_ref(&expectation_scope),
-            Some(0),
-        )?))
-    };
-    for step in &mut steps {
-        if matches!(step.get("agent"), Value::Null) {
+                    NormalizedTarget::Output { name } => {
+                        let key = (contexts[scope].scope_key.as_str(), Some(*name));
+                        let Some(route) = outward.get(&key) else {
+                            return fail(
+                                "COMPOSITION",
+                                "",
+                                "Composition output has no enclosing route.",
+                            );
+                        };
+                        expectation_budget.edges(route.targets.len(), composition)?;
+                        todo.extend(
+                            route
+                                .targets
+                                .iter()
+                                .rev()
+                                .map(|target| (target, route.scope)),
+                        );
+                    }
+                }
+            }
+            Ok(s(route::instruction_kind(instructs, targets)?))
+        };
+    let agent_definitions: HashMap<_, _> = agents.iter().collect();
+    for (step, (index, range)) in steps.iter_mut().zip(step_contexts) {
+        let Some(agent) = step.get("agent").text().and_then(|name| name.utf8()) else {
             continue;
-        }
-        let agent_name = step.get("agent").text().unwrap().utf8().unwrap();
-        let agent_json = exact::encode(agents.get(&agent_name).unwrap());
-        let normal: Vec<_> = routes
+        };
+        let composition = contexts[index].composition.as_deref();
+        let agent = agent_definitions[agent.as_str()];
+        let declaration = exact::record(Some(agent), "")?;
+        let instructs = matches!(declaration.get("instructs"), Some(E::Bool(true)));
+        let normal: Vec<_> = routes[range]
             .iter()
-            .filter(|r| {
-                key(r.get("source")) == key(step.get("address")) && r.get("kind").eq_str("normal")
-            })
+            .filter(|r| r.kind == "normal")
             .collect();
-        let choices = if normal
-            .first()
-            .is_some_and(|r| matches!(r.get("key"), Value::Null))
-        {
+        let choices = if normal.first().is_some_and(|r| r.choice.is_none()) {
             Value::Null
         } else {
-            a(normal.iter().map(|r| r.get("key").clone()))
+            a(normal.iter().map(|r| r.value.get("key").clone()))
         };
-        let mut instructions = o([]);
+        let mut instructions = Vec::new();
         if !matches!(choices, Value::Null) {
-            for r in &normal {
-                instructions.set(
-                    r.get("key").text().unwrap().clone(),
-                    expectation(&agent_json, r)?,
-                );
+            for route in &normal {
+                instructions.push((
+                    Text::from(route.choice.unwrap()),
+                    expectation(instructs, route, composition)?,
+                ));
             }
         }
+        let instructions = Value::from_entries(instructions);
         let default = if matches!(choices, Value::Null) {
-            expectation(&agent_json, normal[0])?
+            expectation(instructs, normal[0], composition)?
         } else {
             s("none")
         };
         let input = o([
-            ("agentJson", s(agent_json)),
             ("choices", choices),
             ("instructionsByChoice", instructions),
             ("defaultInstructions", default),
             ("timeoutMs", step.get("timeoutMsJson").clone()),
         ]);
-        let contract = contract::create(&input)?;
-        step.set("submissionContractJson", s(contract.stringify()));
+        let agent_json = encoded_json(Some(agent), &mut budget, composition)?;
+        let contract = contract::create_with_agent(&input, declaration, agent_json)?;
+        step.set(
+            "submissionContractJson",
+            budgeted_json(&mut budget, composition, |out| contract.stringify_to(out))?,
+        );
     }
-    let mut graphless = o([]);
+    drop(outward);
+    let mut graphless = Vec::with_capacity(agents.len());
     for (name, agent) in agents.iter() {
-        let contract = contract::create(&o([("agentJson", s(exact::encode(agent)))]))?;
-        graphless.set(name, s(contract.stringify()));
+        let declaration = exact::record(Some(agent), "")?;
+        let agent_json = encoded_json(Some(agent), &mut budget, None)?;
+        let contract = contract::create_with_agent(&o([]), declaration, agent_json)?;
+        graphless.push((
+            Text::from(name),
+            budgeted_json(&mut budget, None, |out| contract.stringify_to(out))?,
+        ));
     }
     Ok(CompiledGraph {
         entry: scopes
@@ -664,9 +796,89 @@ pub(crate) fn compile(document: &Object) -> Result<CompiledGraph> {
             .unwrap_or(Value::Null),
         scopes,
         steps,
-        routes,
+        routes: routes.into_iter().map(|route| route.value).collect(),
         joins,
         handlers,
-        graphless,
+        graphless: Value::from_entries(graphless),
+        remaining_json: budget.remaining_json(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn repeated_composition(copies: usize, payload: serde_json::Value) -> E {
+        let steps = (0..copies)
+            .map(|i| {
+                let next = if i + 1 == copies {
+                    json!([])
+                } else {
+                    json!(format!("review{}", i + 1))
+                };
+                (
+                    format!("review{i}"),
+                    json!({"type":"compose","composition":"review","next":{"done":next}}),
+                )
+            })
+            .collect::<serde_json::Map<_, _>>();
+        let source = json!({
+            "contract":"agsdl-0.4.0",
+            "id":"repeated",
+            "agents":{},
+            "flow":{"entry":"review0","steps":steps},
+            "compositions":{"review":{"entry":"ask","outputs":["done"],"steps":{"ask":payload}}}
+        });
+        exact::decode(&source.to_string()).unwrap()
+    }
+
+    #[test]
+    fn compiled_json_budget_counts_repeated_bodies_and_route_payloads() {
+        const KIB: usize = 1024;
+        let size = 128 * KIB;
+        let output = json!({"output":"done"});
+
+        // The authored step is encoded once per compiled instance. The
+        // previous compiler kept three full encodings of this declaration.
+        let steps_only = repeated_composition(
+            96,
+            json!({
+                "type":"approval","title":"x".repeat(size),
+                "next":{"yes":output,"no":[]}
+            }),
+        );
+        let graph = compile(steps_only.as_object().unwrap()).unwrap();
+        assert_eq!(graph.steps.len(), 192);
+        assert_eq!(graph.routes.len(), 288);
+        drop(graph);
+
+        // A message survives in the step declaration, route declaration and
+        // normalized target. All three count toward the compilation budget.
+        let with_message = repeated_composition(
+            96,
+            json!({
+                "type":"approval","next":{"yes":{
+                    "step":"ask","message":{"prompt":[{"text":"x".repeat(size)}]}
+                },"no":output}
+            }),
+        );
+        let error = compile(with_message.as_object().unwrap()).err().unwrap();
+        assert_eq!(error.code, crate::graph::GRAPH_LIMIT_CODE);
+        assert!(error.pointer.eq_str("/compositions/review"));
+        assert!(error.message.lossy().contains("compiled graph JSON bytes"));
+    }
+
+    #[test]
+    fn escaped_json_is_reserved_before_serialization() {
+        let value = E::String("\u{0001}é𝄞".into());
+        let size = exact::encode(&value).len();
+        let mut budget = ExpansionBudget::default();
+        budget
+            .json(crate::graph::MAX_COMPILED_GRAPH_JSON_BYTES - size + 1, None)
+            .unwrap();
+        let error = encoded_json(Some(&value), &mut budget, None).unwrap_err();
+        assert_eq!(error.code, crate::graph::GRAPH_LIMIT_CODE);
+        budget.json(size - 1, None).unwrap();
+    }
 }

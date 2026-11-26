@@ -36,6 +36,9 @@ enum Command {
     Answer {
         input: HumanSubmission,
     },
+    ControlRun {
+        input: OperatorRequest,
+    },
     Deliver {
         input: DeliveryRequest030,
     },
@@ -82,6 +85,7 @@ async fn execute(host: &Host, command: Command, codex: bool) -> persistence::Res
             continuation,
         } => serde_json::to_value(host.humans(scope, continuation).await?)?,
         Command::Answer { input } => json!({"receipt":host.submit_person(input).await?}),
+        Command::ControlRun { input } => serde_json::to_value(host.control_run(input).await?)?,
         Command::Deliver { input } => serde_json::to_value(host.deliver(input).await?)?,
         Command::Stop {
             system_start_id,
@@ -106,7 +110,7 @@ async fn execute(host: &Host, command: Command, codex: bool) -> persistence::Res
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     if args.is_empty() || args.iter().any(|a| a == "--help") {
-        println!("argentic-host --data DIR --workspace DIR --source FILE_OR_PROJECT --policy FILE --approve-policy SHA256 --stop-on-exit [--codex] [--codex-auth-file FILE]\nJSON-lines commands: preflight, start, runs, inspect, humans, answer, deliver, stop, shutdown, quit.\nNo provider is observed or started unless --codex and preflight/start are both explicit.\n--codex-auth-file opts into native, memory-only reuse of an existing ChatGPT file session, without its configuration or refresh writes.\n--stop-on-exit consents to native Stop/drain of this process's runs on EOF or Ctrl-C.");
+        println!("argentic-host --data DIR --workspace DIR --source FILE_OR_PROJECT --policy FILE --approve-policy SHA256 --stop-on-exit [--codex] [--codex-auth-file FILE]\nJSON-lines commands: preflight, start, runs, inspect, humans, answer, controlRun, deliver, stop, shutdown, quit.\nNo provider is observed or started unless --codex and preflight/start are both explicit.\n--codex-auth-file opts into native, memory-only reuse of an existing ChatGPT file session, without its configuration or refresh writes.\n--stop-on-exit consents to native Stop/drain of this process's runs on EOF or Ctrl-C.");
         return Ok(());
     }
     let mut data = None;

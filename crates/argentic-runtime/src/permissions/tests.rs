@@ -614,6 +614,27 @@ fn outside_evidence_only_applies_to_a_preset_without_a_universal_read_rule() {
 }
 
 #[test]
+fn mcp_discovery_skips_server_wide_denials_under_workspace() {
+    let f = Fixture::new();
+    for (pattern, eligible) in [
+        ("issue*/*", false),
+        ("issues/**", false),
+        ("issues/get*", true),
+        ("other/*", true),
+    ] {
+        let policy = f.effective(json!({"preset":"workspace","rules":[
+            {"action":"mcp","match":"issues/check","effect":"allow"},
+            {"action":"mcp","match":pattern,"effect":"deny"}
+        ]}));
+        assert_eq!(
+            may_equip_mcp(&policy, "issues").unwrap(),
+            eligible,
+            "{pattern}"
+        );
+    }
+}
+
+#[test]
 fn absent_mcp_needs_evidence_and_a_universal_deny_shadows_ask() {
     let f = Fixture::new();
     let p = f.effective(json!({"preset":"read-only","rules":[{"action":"mcp","effect":"ask"}]}));
@@ -1213,4 +1234,22 @@ fn lexical_evaluation_ignores_links_at_the_spelling() {
             .effect,
         Effect::Deny
     );
+}
+
+#[cfg(windows)]
+#[test]
+fn lexical_retained_member_uses_the_canonical_workspace_drive() {
+    let f = Fixture::new();
+    let policy = f.effective(json!("read-only"));
+    let member = policy
+        .policies()
+        .next()
+        .unwrap()
+        .context()
+        .workspace
+        .join("retained/absent.md");
+    let request = f.read(&native_request_path(&member).unwrap());
+    let decision = evaluate_effective_lexical(&policy, &request, ExecutionPurpose::Agent).unwrap();
+    assert_eq!(decision.effect, Effect::Allow);
+    assert_eq!(decision.resolved_path.as_deref(), member.to_str());
 }

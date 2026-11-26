@@ -52,6 +52,7 @@ pub(crate) enum Reservation030 {
 struct Binding030 {
     context: EngineContext,
     flow_revision: String,
+    contract_040: bool,
     contract_json: String,
     options_json: String,
     agent: String,
@@ -340,6 +341,7 @@ async fn binding(
     Ok(Binding030 {
         context,
         flow_revision: flow.revision.clone(),
+        contract_040: capture.versions.contract == argentic_core::AGSDL_040,
         contract_json: contract,
         options_json: options,
         agent: agent.into(),
@@ -601,7 +603,7 @@ async fn reserve_tx(
                 && current.get::<&str, _>("state_json") == ticket.state_json,
             "Pending work revision changed",
         )?;
-        if ticket.flow_revision != bound.flow_revision {
+        if !bound.contract_040 && ticket.flow_revision != bound.flow_revision {
             // Only pure evaluation is retried. The new ticket fences any old
             // mailbox reply; no check or provider effect may be replayed.
             ticket.flow_revision = bound.flow_revision;
@@ -667,9 +669,13 @@ async fn commit_tx(
         ticket.input.control,
     )
     .await?;
+    // In 0.4.0, a hold, a sibling or a delivery can advance the flow
+    // without changing the input to the pure work controller. Revalidate the
+    // exact live activation here, CAS its work journal below, and reduce any
+    // joined terminal against the current flow in this same transaction.
     require(
         bound.context == ticket.input.context
-            && bound.flow_revision == ticket.flow_revision
+            && (bound.contract_040 || bound.flow_revision == ticket.flow_revision)
             && bound.contract_json == ticket.contract_json
             && bound.options_json == ticket.options_json
             && ticket.generation == lease.generation(),
@@ -808,7 +814,13 @@ pub(crate) async fn finish_joined_agent030(
     let attempt = joined.attempt();
     let lease = host.start_lease().await?;
     let gate = host.admission_lock().lock_owned().await;
-    host.flow030().available(attempt.identity())?;
+    crate::agsdl_host_flow030::reconcile_admission030(
+        host.flow030(),
+        pool,
+        &lease,
+        attempt.identity(),
+    )
+    .await?;
     let mut db = pool.acquire().await?;
     let mut tx = db.begin_with("BEGIN IMMEDIATE").await?;
     let bound = binding(
@@ -941,7 +953,7 @@ async fn transition_inner(
 ) -> Result<ProtocolDecision030> {
     let lease = host.start_lease().await?;
     let gate = host.admission_lock().lock_owned().await;
-    host.flow030().available(id)?;
+    crate::agsdl_host_flow030::reconcile_admission030(host.flow030(), pool, &lease, id).await?;
     let mut db = pool.acquire().await?;
     sqlx::query("PRAGMA synchronous=FULL")
         .execute(&mut *db)
@@ -957,6 +969,10 @@ async fn transition_inner(
         }
     }
     let reservation = reserve_tx(&mut tx, &lease, id, input).await?;
+    #[cfg(test)]
+    host.flow030()
+        .operator_test_yield("work.reserve.commit")
+        .await;
     lease.ensure_live()?;
     tx.commit().await.map_err(|_| uncertain())?;
     lease.ensure_live().map_err(|_| uncertain())?;
@@ -968,6 +984,18 @@ async fn transition_inner(
     drop(gate);
     drop(lease);
     drop(owned);
+    #[cfg(test)]
+    if joined.is_some() {
+        host.flow030()
+            .operator_test_yield("work.join.reserved")
+            .await;
+    } else if serde_json::from_str::<serde_json::Value>(&input.event_json)?["event"]["kind"]
+        == "planPresented"
+    {
+        host.flow030()
+            .operator_test_yield("work.plan.reserved")
+            .await;
+    }
     let output = host
         .evaluate_flow_work030(
             HostWorkInput030 {
@@ -998,8 +1026,10 @@ async fn transition_inner(
         check,
     };
     let receipt: serde_json::Value = serde_json::from_str(&decision.receipt_json)?;
-    let decision_kind = receipt.pointer("/decision/kind").and_then(serde_json::Value::as_str);
-    let clock = if decision_kind == Some("accepted") {
+    let decision_kind = receipt
+        .pointer("/decision/kind")
+        .and_then(serde_json::Value::as_str);
+    let clock = if matches!(decision_kind, Some("accepted" | "finished")) {
         let clocked_040: bool = sqlx::query_scalar(
             "SELECT EXISTS (
                 SELECT 1 FROM engine_flow030_clock_works clock
@@ -1024,6 +1054,12 @@ async fn transition_inner(
     } else {
         None
     };
+    #[cfg(test)]
+    if joined.is_some() {
+        host.flow030()
+            .operator_test_yield("work.join.evaluated")
+            .await;
+    }
     let _clock_operation = if let Some(clock) = &clock {
         let operation = clock.operation.lock().await;
         clock.pump(host, cancelled).await?;
@@ -1033,7 +1069,7 @@ async fn transition_inner(
     };
     let lease = host.start_lease().await?;
     let _gate = host.admission_lock().lock_owned().await;
-    host.flow030().available(id)?;
+    crate::agsdl_host_flow030::reconcile_admission030(host.flow030(), pool, &lease, id).await?;
     if cancelled.is_cancelled() {
         return Err(failure(
             "INTERRUPTED",
@@ -1050,7 +1086,7 @@ async fn transition_inner(
         verify_agent_attempt_tx(&mut tx, &lease, id, attempt, input).await?;
     }
     commit_tx(&mut tx, &lease, &ticket, &decision).await?;
-    if decision_kind == Some("finished") {
+    let retire = if decision_kind == Some("finished") {
         let terminal = accepted_terminal030(
             attempt.ok_or_else(|| denied("Terminal decision has no native attempt"))?,
             joined.ok_or_else(|| denied("Terminal decision has no physical join"))?,
@@ -1058,7 +1094,7 @@ async fn transition_inner(
             &decision,
         )?
         .ok_or_else(|| denied("Terminal decision differs"))?;
-        crate::agsdl_host_flow030::apply_work_terminal_tx(
+        let applied = crate::agsdl_host_flow030::apply_work_terminal_tx(
             host.flow030(),
             &mut tx,
             &lease,
@@ -1066,7 +1102,10 @@ async fn transition_inner(
             joined.ok_or_else(|| denied("Terminal decision has no physical join"))?,
         )
         .await?;
-    }
+        matches!(applied, super::flow_store030::Apply030::Applied(_))
+    } else {
+        decision_kind == Some("accepted")
+    };
     lease.ensure_live()?;
     // Hash the exact bytes actually stored, not a reconstructed ticket or
     // decision. The shared admission gate prevents other run mutations until
@@ -1078,7 +1117,7 @@ async fn transition_inner(
     let decision_raw: &str = row
         .get::<Option<&str>, _>("decision_json")
         .ok_or_else(|| denied("Committed work decision missing"))?;
-    if let Some(clock) = &clock {
+    if let Some(clock) = clock.as_ref().filter(|_| retire) {
         // Reserve under the same commit and timestamp as the result. Other
         // clock operations must apply this ticket before submitting a tick.
         clock
@@ -1091,6 +1130,8 @@ async fn transition_inner(
     tx.commit().await.map_err(|_| uncertain())?;
     #[cfg(test)]
     host.flow030().pause_after_work_commit(&marker).await;
+    #[cfg(test)]
+    host.flow030().operator_test_yield("work.ack").await;
     lease
         .acknowledge_work_commit(host.flow030(), &marker)
         .map_err(|_| uncertain())?;

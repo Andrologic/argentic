@@ -196,8 +196,50 @@ pub enum FlowEventKind030 {
         stop_effect_id: Option<String>,
         evidence: PhysicalEvidence030,
     },
+    Operator(OperatorEvent030),
     Stop,
 }
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub enum OperatorEvent030 {
+    Hold {
+        activation_id: String,
+    },
+    Held {
+        activation_id: String,
+        hold_id: String,
+    },
+    ResumeWork {
+        activation_id: String,
+    },
+    Pause {
+        activation_ids: Vec<String>,
+    },
+    ResumeRun,
+}
+record!(OperatorHold030 {
+    id: String,
+    ready: bool
+});
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DeferredOperator030 {
+    Admit {
+        activation_id: String,
+        may_steer: bool,
+    },
+    Result {
+        activation_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin_event_id: Option<String>,
+    },
+    Failure {
+        activation_id: String,
+        error: Failure030,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin_event_id: Option<String>,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FlowEvent030 {
@@ -255,6 +297,8 @@ pub enum FlowEffectKind030 {
         step: Option<Address030>,
         error: Failure030,
         counted: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin_event_id: Option<String>,
     },
     Return {
         activation_id: String,
@@ -326,15 +370,24 @@ pub enum Continuation030 {
     },
 }
 record!(SteerRecord030 {effect_id:String,work:WorkRef030,delivery_activation_id:String,status:String,resolved_event_id:Option<String>,reason:Option<String>});
-record!(FlowState030 {identity:FlowIdentity030,revision:String,plan_json:Option<String>,entered:bool,stopping:bool,verdict:Option<String>,unhandled_failure:bool,activations:Vec<Activation030>,instances:Vec<InstanceState030>,preparations:Vec<Preparation030>,preparation_receipts:BTreeMap<String,String>,paths:Vec<Path030>,batches:Vec<Batch030>,groups:Vec<Group030>,route_barriers:Vec<RouteBarrier030>,visits:BTreeMap<String,String>,events:BTreeMap<String,EventRecord030>,#[serde(default, skip_serializing_if = "Vec::is_empty")] steer_deliveries:Vec<SteerRecord030>});
+record!(FlowState030 {identity:FlowIdentity030,revision:String,plan_json:Option<String>,entered:bool,stopping:bool,verdict:Option<String>,unhandled_failure:bool,activations:Vec<Activation030>,instances:Vec<InstanceState030>,preparations:Vec<Preparation030>,preparation_receipts:BTreeMap<String,String>,paths:Vec<Path030>,batches:Vec<Batch030>,groups:Vec<Group030>,route_barriers:Vec<RouteBarrier030>,visits:BTreeMap<String,String>,events:BTreeMap<String,EventRecord030>,#[serde(default, skip_serializing_if = "Vec::is_empty")] steer_deliveries:Vec<SteerRecord030>,
+    #[serde(default, skip_serializing_if = "Option::is_none")] last_event_id:Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")] paused:bool,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")] operator_holds:BTreeMap<String,OperatorHold030>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")] operator_deferred:Vec<DeferredOperator030>
+});
 impl FlowState030 {
     pub fn new(identity: FlowIdentity030) -> Self {
         Self {
             identity,
             revision: "0".into(),
+            last_event_id: None,
             plan_json: None,
             entered: false,
             stopping: false,
+            paused: false,
+            operator_holds: BTreeMap::new(),
+            operator_deferred: vec![],
             verdict: None,
             unhandled_failure: false,
             activations: vec![],

@@ -50,6 +50,21 @@ async fn http_handler(
     state.requests.lock().await.push(body.clone());
     let id = value.get("id").cloned().unwrap_or(serde_json::Value::Null);
     let method = value.get("method").and_then(|v| v.as_str()).unwrap_or("");
+    if state.mode == "legacy-2025-06-18" {
+        let version = headers
+            .get("mcp-protocol-version")
+            .and_then(|h| h.to_str().ok());
+        if method == "initialize" {
+            assert_eq!(value["params"]["protocolVersion"], "2025-11-25");
+            if version.is_some() {
+                return axum::http::StatusCode::BAD_REQUEST.into_response();
+            }
+        } else if version != Some("2025-06-18")
+            || headers.get("mcp-session-id").and_then(|h| h.to_str().ok()) != Some("captured")
+        {
+            return axum::http::StatusCode::BAD_REQUEST.into_response();
+        }
+    }
     if method.is_empty() || method == "notifications/initialized" {
         if method.is_empty() {
             state.answer_seen.notify_one();
@@ -57,6 +72,12 @@ async fn http_handler(
         return axum::http::StatusCode::ACCEPTED.into_response();
     }
     let result: String = match method {
+        "initialize" if state.mode == "initialize-stall" => std::future::pending().await,
+        "initialize" if state.mode == "invalid-version" => r#"{"protocolVersion":"unknown"}"#.into(),
+        "tools/list" if state.mode == "list-stall" => std::future::pending().await,
+        "initialize" if state.mode == "legacy-2025-06-18" => {
+            r#"{"protocolVersion":"2025-06-18","capabilities":{},"serverInfo":{"name":"synthetic","version":"1"}}"#.into()
+        }
         "initialize" => r#"{"protocolVersion":"2025-11-25","capabilities":{},"serverInfo":{"name":"synthetic","version":"1"}}"#.into(),
         "server/discover" => {
             assert!(value["params"]["_meta"].is_object());
@@ -76,6 +97,26 @@ async fn http_handler(
                 return ([("content-type", "text/event-stream")], raw).into_response();
             }
             if state.mode == "resume" { return ([("content-type", "text/event-stream"), ("mcp-session-id", "captured")], "id: cursor-1\nretry: 0\ndata:\n\n").into_response(); }
+            let error = match state.mode {
+                "rpc-error-null" => Some("null"),
+                "rpc-error-string-code" => Some(r#"{"code":"-32603","message":"failed"}"#),
+                "rpc-error-no-message" => Some(r#"{"code":-32603}"#),
+                "rpc-error-valid" | "rpc-error-with-result" => {
+                    Some(r#"{"code":-32603,"message":"failed"}"#)
+                }
+                _ => None,
+            };
+            if let Some(error) = error {
+                let result = if state.mode == "rpc-error-with-result" {
+                    r#","result":{"content":[]}"#
+                } else {
+                    ""
+                };
+                return (
+                    [("content-type", "application/json")],
+                    format!(r#"{{"jsonrpc":"2.0","id":{id},"error":{error}{result}}}"#),
+                ).into_response();
+            }
             if state.mode == "redirect" { return (axum::http::StatusCode::TEMPORARY_REDIRECT, [("location", "/other")]).into_response(); }
             if state.mode == "lost" { return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response(); }
             if state.mode == "modern" || state.mode == "modern-bad-state" {
@@ -123,8 +164,42 @@ async fn resume_handler(
     ([("content-type", "text/event-stream")], "id: cursor-2\ndata: {\"jsonrpc\":\"2.0\",\"id\":\"2\",\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"resumed\"}]}}\n\n").into_response()
 }
 
+async fn delete_session(
+    axum::extract::State(state): axum::extract::State<Arc<HttpFixture>>,
+    headers: axum::http::HeaderMap,
+) -> axum::http::StatusCode {
+    assert_eq!(headers["mcp-session-id"], "captured");
+    let expected = match state.mode {
+        "invalid-version" => None,
+        "legacy-2025-06-18" => Some("2025-06-18"),
+        _ => Some("2025-11-25"),
+    };
+    assert_eq!(
+        headers
+            .get("mcp-protocol-version")
+            .map(|h| h.to_str().unwrap()),
+        expected
+    );
+    state.requests.lock().await.push("DELETE captured".into());
+    // Servers may refuse session deletion.
+    axum::http::StatusCode::METHOD_NOT_ALLOWED
+}
+
 async fn http_fixture(
     mode: &'static str,
+) -> (
+    CapturedServer,
+    Arc<HttpFixture>,
+    tokio::task::JoinHandle<()>,
+) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    http_fixture_at(mode, listener, "127.0.0.1").await
+}
+
+async fn http_fixture_at(
+    mode: &'static str,
+    listener: tokio::net::TcpListener,
+    host: &str,
 ) -> (
     CapturedServer,
     Arc<HttpFixture>,
@@ -136,12 +211,13 @@ async fn http_fixture(
         mode,
         answer_seen: tokio::sync::Notify::new(),
     });
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let app = axum::Router::new()
         .route(
             "/mcp",
-            axum::routing::post(http_handler).get(resume_handler),
+            axum::routing::post(http_handler)
+                .get(resume_handler)
+                .delete(delete_session),
         )
         .with_state(state.clone());
     let task = tokio::spawn(async move {
@@ -157,7 +233,8 @@ async fn http_fixture(
                 Protocol::Legacy
             },
             transport: ServerTransport::Http(HttpServer {
-                url: format!("http://127.0.0.1:{}/mcp", address.port())
+                secret_values: Vec::new(),
+                url: format!("http://{host}:{}/mcp", address.port())
                     .parse()
                     .unwrap(),
                 addresses: vec![address],
@@ -186,6 +263,7 @@ fn dummy_host() -> Arc<TestHost> {
         capture_digest: "unused".into(),
         protocol: Protocol::Legacy,
         transport: ServerTransport::Http(HttpServer {
+            secret_values: Vec::new(),
             url: "http://127.0.0.1:1/mcp".parse().unwrap(),
             addresses: vec!["127.0.0.1:1".parse().unwrap()],
             headers: Default::default(),
@@ -218,6 +296,7 @@ async fn isolated(
 async fn http_exact_receipts_human_waits_modern_continuation_and_no_replay() {
     for mode in [
         "json",
+        "legacy-2025-06-18",
         "sse",
         "resume",
         "modern",
@@ -262,6 +341,17 @@ async fn http_exact_receipts_human_waits_modern_continuation_and_no_replay() {
                 .iter()
                 .any(|r| r == "GET resume"));
         }
+        assert_eq!(
+            fixture
+                .requests
+                .lock()
+                .await
+                .iter()
+                .filter(|value| *value == "DELETE captured")
+                .count(),
+            usize::from(!mode.starts_with("modern")),
+            "{mode}",
+        );
         assert!(matches!(
             evidence,
             PhysicalEvidence::Remote {
@@ -272,6 +362,162 @@ async fn http_exact_receipts_human_waits_modern_continuation_and_no_replay() {
         task.abort();
         let _ = task.await;
     }
+}
+
+#[tokio::test]
+async fn malformed_rpc_error_keeps_the_remote_tool_in_flight() {
+    for (mode, in_flight) in [
+        ("rpc-error-null", true),
+        ("rpc-error-string-code", true),
+        ("rpc-error-no-message", true),
+        ("rpc-error-with-result", true),
+        ("rpc-error-valid", false),
+    ] {
+        let (server, fixture, task) = http_fixture(mode).await;
+        let host = dummy_host();
+        let mut session = start(server).unwrap();
+        let result = session
+            .call(
+                "synthetic",
+                r#"{"n":9007199254740993}"#,
+                host.clone(),
+                &identity(),
+                &host.control,
+            )
+            .await;
+        assert!(result.is_err(), "{mode}");
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 1, "{mode}");
+        assert_eq!(session.tool_in_flight(), in_flight, "{mode}");
+        assert!(session.shutdown(false).await.1.is_none(), "{mode}");
+        task.abort();
+    }
+}
+
+#[tokio::test]
+async fn deletes_http_session_without_a_protocol_version_when_negotiation_fails() {
+    let (server, fixture, task) = http_fixture("invalid-version").await;
+    let mut session = start(server).unwrap();
+    let host = dummy_host();
+    assert!(session
+        .initialize(host.clone(), &identity(), &host.control)
+        .await
+        .is_err());
+    let _ = session.shutdown(false).await;
+    assert!(fixture
+        .requests
+        .lock()
+        .await
+        .iter()
+        .any(|r| r == "DELETE captured"));
+    task.abort();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn http_connect_preserves_pinned_ipv6_link_local_scope() {
+    use std::net::{Ipv6Addr, SocketAddrV6};
+
+    let mut interfaces = std::ptr::null_mut();
+    assert_eq!(unsafe { libc::getifaddrs(&mut interfaces) }, 0);
+    let mut current = interfaces;
+    let mut address = None;
+    // The list and its socket addresses remain valid until freeifaddrs.
+    while let Some(entry) = unsafe { current.as_ref() } {
+        if let Some(raw) = unsafe { entry.ifa_addr.as_ref() } {
+            if raw.sa_family as i32 == libc::AF_INET6 {
+                let raw = unsafe { &*entry.ifa_addr.cast::<libc::sockaddr_in6>() };
+                let ip = Ipv6Addr::from(raw.sin6_addr.s6_addr);
+                if ip.is_unicast_link_local() && entry.ifa_flags & libc::IFF_UP as u32 != 0 {
+                    let scope = unsafe { libc::if_nametoindex(entry.ifa_name) };
+                    if scope != 0 {
+                        address = Some(SocketAddrV6::new(ip, 0, 0, scope));
+                        break;
+                    }
+                }
+            }
+        }
+        current = entry.ifa_next;
+    }
+    if !interfaces.is_null() {
+        unsafe { libc::freeifaddrs(interfaces) };
+    }
+    let Some(address) = address else {
+        eprintln!("Skipping scoped MCP HTTP: no IPv6 link-local address");
+        return;
+    };
+    let listener = tokio::net::TcpListener::bind(address).await.unwrap();
+    let destination = SocketAddrV6::new(
+        *address.ip(),
+        listener.local_addr().unwrap().port(),
+        0,
+        address.scope_id(),
+    );
+    #[cfg(target_os = "macos")]
+    {
+        // A bound link-local address can complete connect without delivering a
+        // connection to the listener on macOS. Check the local fixture before
+        // exercising the HTTP connector so that failure is attributable.
+        let direct = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::try_join!(
+                tokio::net::TcpStream::connect(destination),
+                listener.accept()
+            )
+        })
+        .await;
+        if !matches!(direct, Ok(Ok(_))) {
+            eprintln!(
+                "Skipping scoped MCP HTTP: macOS did not accept the direct link-local TCP probe"
+            );
+            return;
+        }
+    }
+    let (mut server, fixture, task) =
+        http_fixture_at("legacy-2025-06-18", listener, "mcp.invalid").await;
+    let ServerTransport::Http(http) = &mut server.transport else {
+        unreachable!()
+    };
+    // Some platforms omit the scope when reporting the bound address.
+    http.addresses = vec![destination.into()];
+    let (result, _) = isolated(&dummy_host(), server).await;
+    result.unwrap();
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+    task.abort();
+}
+
+#[tokio::test]
+async fn http_mcp_discovery_bounds_initialize_and_tools_list() {
+    async fn assert_deadline(mode: &'static str) {
+        let (server, fixture, task) = http_fixture(mode).await;
+        let mut session = start(server).unwrap();
+        let host = dummy_host();
+        let error = tokio::time::timeout(HTTP_DISCOVERY_TIMEOUT + Duration::from_secs(3), async {
+            session
+                .initialize(host.clone(), &identity(), &host.control)
+                .await?;
+            session
+                .list_tools(host.as_ref(), &identity(), &host.control)
+                .await
+        })
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert_eq!(error.code, "TIMEOUT");
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+        let expected_method = if mode == "initialize-stall" {
+            "initialize"
+        } else {
+            "tools/list"
+        };
+        assert!(fixture.requests.lock().await.iter().any(|body| {
+            serde_json::from_str::<serde_json::Value>(body).unwrap()["method"] == expected_method
+        }));
+        let _ = session.shutdown(false).await;
+        task.abort();
+    }
+    tokio::join!(
+        assert_deadline("initialize-stall"),
+        assert_deadline("list-stall")
+    );
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -295,6 +541,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":"2","result":{"structuredContent":{"n":9007
         capture_digest: "capture".into(),
         protocol: Protocol::Legacy,
         transport: ServerTransport::Stdio(StdioServer {
+            secret_values: Vec::new(),
             program: "/bin/sh".into(),
             arguments: vec!["-c".into(), script.into()],
             grant: grant(root.path()),
@@ -319,6 +566,7 @@ async fn literal_endpoint_must_match_every_captured_address_and_port() {
             capture_digest: "native-capture".into(),
             protocol: Protocol::Legacy,
             transport: ServerTransport::Http(HttpServer {
+                secret_values: Vec::new(),
                 url: url.parse().unwrap(),
                 addresses: addresses
                     .iter()
@@ -419,6 +667,7 @@ async fn stop_during_legacy_get_human_closes_request_without_call_replay() {
         capture_digest: "unused".into(),
         protocol: Protocol::Legacy,
         transport: ServerTransport::Http(HttpServer {
+            secret_values: Vec::new(),
             url: "http://127.0.0.1:1/mcp".parse().unwrap(),
             addresses: vec!["127.0.0.1:1".parse().unwrap()],
             headers: Default::default(),
@@ -456,4 +705,13 @@ async fn stop_during_legacy_get_human_closes_request_without_call_replay() {
     ));
     task.abort();
     let _ = task.await;
+}
+
+#[test]
+fn secret_echoes_in_raw_and_decoded_structured_values_are_refused() {
+    let secrets = vec!["secret-marker".to_owned()];
+    assert!(reject_secret_echo(r#"{"value":"secret-marker"}"#, &secrets).is_err());
+    assert!(reject_secret_echo(r#"{"value":"secret\u002dmarker"}"#, &secrets).is_err());
+    assert!(reject_secret_echo(r#"{"secret\u002dmarker":true}"#, &secrets).is_err());
+    assert!(reject_secret_echo(r#"{"value":"normal response"}"#, &secrets).is_ok());
 }

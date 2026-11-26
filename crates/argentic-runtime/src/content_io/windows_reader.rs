@@ -14,7 +14,7 @@ use windows_sys::{
     Wdk::{
         Foundation::OBJECT_ATTRIBUTES,
         Storage::FileSystem::{
-            NtOpenFile, FILE_NON_DIRECTORY_FILE, FILE_OPEN_REPARSE_POINT,
+            NtOpenFile, FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPEN_REPARSE_POINT,
             FILE_SYNCHRONOUS_IO_NONALERT,
         },
     },
@@ -74,7 +74,7 @@ fn read_file(parent: Dir, name: &Path, cancel: &CancellationToken) -> io::Result
     if cancel.is_cancelled() {
         return Err(cancelled());
     }
-    let file = open_relative(&parent, name)?;
+    let file = open_relative(&parent, name, false)?;
     let metadata = file.metadata()?;
     if !metadata.is_file()
         || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
@@ -99,7 +99,7 @@ fn read_file(parent: Dir, name: &Path, cancel: &CancellationToken) -> io::Result
     Ok(bytes)
 }
 
-fn open_relative(parent: &Dir, name: &Path) -> io::Result<File> {
+pub(crate) fn open_relative(parent: &Dir, name: &Path, directory: bool) -> io::Result<File> {
     validate_file_name(name)?;
     let mut name: Vec<u16> = name.as_os_str().encode_wide().collect();
     // A single native filename must not name a stream or contain a terminator.
@@ -127,14 +127,22 @@ fn open_relative(parent: &Dir, name: &Path) -> io::Result<File> {
     };
     let mut status = IO_STATUS_BLOCK::default();
     let mut handle = ptr::null_mut();
+    let (kind, sharing) = if directory {
+        (FILE_DIRECTORY_FILE, FILE_SHARE_READ | FILE_SHARE_WRITE)
+    } else {
+        (
+            FILE_NON_DIRECTORY_FILE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        )
+    };
     let result = unsafe {
         NtOpenFile(
             &mut handle,
             FILE_GENERIC_READ,
             &attributes,
             &mut status,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+            sharing,
+            kind | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
         )
     };
     if result != 0 {

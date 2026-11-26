@@ -1,5 +1,6 @@
 //! Readback of 040 uses the same native deadline and pause checks as COMMIT.
 use super::*;
+use crate::agsdl_host_flow030::{NativeSystemStopReceipt030, SupersededClockTicket030};
 use std::collections::BTreeMap;
 type NativeError = Box<dyn std::error::Error + Send + Sync>;
 type Result<T> = std::result::Result<T, NativeError>;
@@ -40,15 +41,31 @@ pub(super) async fn verify(
     plan: &FlowPlan030,
 ) -> Result<HumanProjection030> {
     let id = &state.identity;
+    let mut document = None;
+    let mut host_budget_calls = std::collections::BTreeSet::new();
     let exists: i64 = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='engine_flow030_clock')",
     )
     .fetch_one(&mut *db)
     .await?;
+    let admitted = sqlx::query_scalar::<_, String>(
+        "SELECT effect_id FROM engine_flow030_handoffs
+         WHERE system_id=? AND invocation_id=? AND receipt_json ->> '$.kind'='nativeOwnedHandoff030'",
+    )
+    .bind(&id.system_start_id)
+    .bind(&id.flow_invocation_id)
+    .fetch_all(&mut *db)
+    .await?
+    .into_iter()
+    .collect::<std::collections::BTreeSet<_>>();
     let requires_clock = state
         .activations
         .iter()
-        .filter(|a| a.start_effect_id.is_some())
+        .filter(|a| {
+            a.start_effect_id
+                .as_ref()
+                .is_some_and(|effect| admitted.contains(effect))
+        })
         .any(|a| {
             let step = plan
                 .steps
@@ -92,19 +109,90 @@ pub(super) async fn verify(
     let retained_observed = ms(clock.try_get("observed_ms")?)?;
     let native_owner = sqlx::query(
         "SELECT o.owner_epoch,o.generation,o.status,EXISTS (
-            SELECT 1 FROM engine_flow030_system_stop_requests s
-            WHERE s.system_id=o.system_id AND s.invocation_id=o.invocation_id
-              AND s.owner_epoch=o.owner_epoch AND s.generation=o.generation
-              AND s.event_id IS NOT NULL
-        ) AS stopped FROM engine_flow030_owners o WHERE o.system_id=? AND o.invocation_id=?",
+            SELECT 1 FROM engine_flow030_interruptions i WHERE i.system_id=o.system_id
+        ) AS interrupted FROM engine_flow030_owners o WHERE o.system_id=? AND o.invocation_id=?",
     )
     .bind(&id.system_start_id)
     .bind(&id.flow_invocation_id)
-    .fetch_one(&mut *db).await?;
+    .fetch_one(&mut *db)
+    .await?;
+    let stops = sqlx::query(
+        "SELECT request_id,request_json,receipt_json,event_id
+         FROM engine_flow030_system_stop_requests
+         WHERE system_id=? AND invocation_id=? AND owner_epoch=? AND generation=? AND event_id IS NOT NULL",
+    )
+    .bind(&id.system_start_id)
+    .bind(&id.flow_invocation_id)
+    .bind(native_owner.get::<&str, _>("owner_epoch"))
+    .bind(native_owner.get::<&str, _>("generation"))
+    .fetch_all(&mut *db)
+    .await?;
+    require(stops.len() <= 1, "Duplicate native Stop")?;
+    let stop = if let Some(row) = stops.first() {
+        let receipt: NativeSystemStopReceipt030 =
+            serde_json::from_str(row.try_get("receipt_json")?)?;
+        let request: Value = parsed(row, "request_json")?;
+        let event_id: &str = row.try_get("event_id")?;
+        let record = state
+            .events
+            .get(event_id)
+            .ok_or("Missing native Stop event")?;
+        let event: Value = serde_json::from_str(&record.event_json)?;
+        require(
+            state.stopping
+                && receipt.identity == *id
+                && receipt.owner_epoch == native_owner.get::<&str, _>("owner_epoch")
+                && receipt.generation == native_owner.get::<&str, _>("generation")
+                && receipt.request_id == row.get::<&str, _>("request_id")
+                && request["requestId"] == receipt.request_id
+                && request["systemStartId"] == id.system_start_id
+                && request["activationId"].is_null()
+                && receipt.flow_event_id.as_deref() == Some(event_id)
+                && event_id == format!("system-stop:{}", receipt.request_id)
+                && event["kind"] == "Stop"
+                && event["expectedRevision"] == receipt.before_revision
+                && record.receipt.revision == receipt.revision
+                && receipt.stopping,
+            "Native Stop differs",
+        )?;
+        Some(receipt)
+    } else {
+        None
+    };
+    let interrupted = native_owner.get::<&str, _>("status") == "revoked"
+        && native_owner.get::<bool, _>("interrupted");
+    let interruption_schema: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='engine_flow030_interruption_clock')",
+    ).fetch_one(&mut *db).await?;
+    let interruption: Option<Option<String>> = if interruption_schema {
+        sqlx::query_scalar(
+            "SELECT ticket_json FROM engine_flow030_interruption_clock WHERE system_id=?",
+        )
+        .bind(&id.system_start_id)
+        .fetch_optional(&mut *db)
+        .await?
+    } else {
+        None
+    };
+    require(
+        interruption.is_none() || interrupted,
+        "Clock interruption has no fenced owner",
+    )?;
+    let interrupted_ticket: Option<SupersededClockTicket030> = interruption
+        .as_ref()
+        .and_then(|raw| raw.as_deref())
+        .map(serde_json::from_str)
+        .transpose()?;
+    let mut observed_interruption = false;
+    let superseded = stop
+        .as_ref()
+        .and_then(|stop| stop.superseded_clock_ticket.as_ref());
     let fenced_stop = plan.versions.contract == argentic_core::AGSDL_040
-        && state.stopping
         && native_owner.get::<&str, _>("status") == "revoked"
-        && native_owner.get::<bool, _>("stopped");
+        && stop.is_some()
+        && superseded.is_none();
+    let mut observed_supersession = false;
+    let mut superseded_retirement = None;
     require(
         clock.get::<&str, _>("owner_epoch") == native_owner.get::<&str, _>("owner_epoch")
             && clock.get::<&str, _>("generation") == native_owner.get::<&str, _>("generation"),
@@ -114,6 +202,8 @@ pub(super) async fn verify(
         json!({"systemStartId":id.system_start_id,"ownerEpoch":clock.get::<&str,_>("owner_epoch")});
     let mut works = Vec::<Work>::new();
     let mut requests = Vec::<Request>::new();
+    let mut closed_asks = std::collections::BTreeSet::new();
+    let mut operator_closures = std::collections::BTreeSet::new();
     let mut submissions = Vec::<Submission>::new();
     let mut previous = String::new();
     let mut observed = 0u64;
@@ -131,15 +221,16 @@ pub(super) async fn verify(
             "Clock ticket correlation",
         )?;
         let options: Value = serde_json::from_str(&ticket.options_json)?;
-        require(options == json!({"maxSliceMs":2147483647}), "Clock options differ")?;
+        require(
+            options == json!({"maxSliceMs":2147483647}),
+            "Clock options differ",
+        )?;
         let envelope: Value = serde_json::from_str(&ticket.event_json)?;
         let event = &envelope["event"];
         let kind = event["kind"].as_str().ok_or("Clock event kind absent")?;
         let now = ms(envelope["nowMs"].as_str().ok_or("Clock time absent")?)?;
         require(
-            now >= observed
-                && envelope["owner"] == owner
-                && envelope["eventId"] == ticket.event_id,
+            now >= observed && envelope["owner"] == owner && envelope["eventId"] == ticket.event_id,
             "Clock event identity/time",
         )?;
         match kind {
@@ -159,18 +250,47 @@ pub(super) async fn verify(
                     .iter()
                     .find(|a| a.id == work_id)
                     .ok_or("Clock activation absent")?;
-                let step = plan
-                    .steps
-                    .iter()
-                    .find(|s| Some(&s.address) == activation.step.as_ref())
-                    .ok_or("Clock step absent")?;
+                let step = match &activation.step {
+                    Some(address) => Some(
+                        plan.steps
+                            .iter()
+                            .find(|s| &s.address == address)
+                            .ok_or("Clock step absent")?,
+                    ),
+                    None if activation.agent.is_some() => None,
+                    None => return Err("Clock work has no captured declaration".into()),
+                };
+                let work_kind = step.map(|s| s.r#type.as_str()).unwrap_or("agent");
+                let declaration: Value = step
+                    .map(|s| serde_json::from_str(&s.declaration_json))
+                    .transpose()?
+                    .unwrap_or(Value::Null);
+
+                let recorded_timeout: Option<String> = r.get("timeout_json");
+                let mut timeout = step.and_then(|s| s.timeout_ms_json.clone());
+                if work_kind == "call" && timeout.is_none() && recorded_timeout.is_some() {
+                    if document.is_none() {
+                        document = Some(serde_json::from_str(&plan.document_json)?);
+                    }
+                    require(
+                        crate::persistence::call_protocol030::is_remote_mcp_call(
+                            document.as_ref().expect("parsed call document"),
+                            &declaration,
+                        ) && recorded_timeout
+                            .as_deref()
+                            .is_some_and(|value| value.parse::<std::num::NonZeroU64>().is_ok()),
+                        "Invalid host remote MCP budget",
+                    )?;
+                    timeout = recorded_timeout.clone();
+                    host_budget_calls.insert(work_id.to_owned());
+                }
                 require(
                     r.get::<&str, _>("owner_epoch") == clock.get::<&str, _>("owner_epoch")
                         && r.get::<&str, _>("generation") == clock.get::<&str, _>("generation")
                         && work["identity"] == serde_json::to_value(id)?
                         && work["owner"] == owner
                         && work["generation"] == clock.get::<&str, _>("generation")
-                        && work["kind"] == step.r#type,
+                        && work["kind"] == work_kind,
                     "Clock work metadata",
                 )?;
                 let start = r.get::<&str, _>("start_effect_id");
@@ -178,7 +298,7 @@ pub(super) async fn verify(
                     activation.start_effect_id.as_deref() == Some(start)
                         && work["reference"]
                             == json!({"activationId":activation.id,"startEffectId":start,"agentInstanceId":activation.instance_id})
-                        && r.get::<Option<String>, _>("timeout_json") == step.timeout_ms_json,
+                        && recorded_timeout == timeout,
                     "Clock work reference/duration",
                 )?;
                 let origin=sqlx::query("SELECT started_ms FROM engine_flow030_handoff_clock WHERE system_id=? AND invocation_id=? AND start_effect_id=? AND owner_epoch=? AND generation=?")
@@ -187,20 +307,24 @@ pub(super) async fn verify(
                 require(
                     origin.get::<&str, _>("started_ms") == started
                         && event["startedAtMs"] == started
-                        && event["timeoutMs"] == json!(step.timeout_ms_json),
+                        && event["timeoutMs"] == json!(timeout),
                     "Clock origin/duration",
                 )?;
-                let declaration: Value = serde_json::from_str(&step.declaration_json)?;
-                require((kind == "approval") == (step.r#type == "approval"), "Clock admission kind differs")?;
+                require(
+                    (kind == "approval") == (work_kind == "approval"),
+                    "Clock admission kind differs",
+                )?;
                 if kind == "approval" {
-                    let choices = declaration["next"].as_object().ok_or("Approval choices absent")?;
+                    let choices = declaration["next"]
+                        .as_object()
+                        .ok_or("Approval choices absent")?;
                     require(
                         !choices.is_empty()
                             && event["choices"] == json!(choices.keys().collect::<Vec<_>>()),
                         "Approval ticket choices differ",
                     )?;
                 }
-                let agent_declaration = step
+                let agent_declaration = activation
                     .agent
                     .as_ref()
                     .and_then(|name| plan.agents.iter().find(|a| a["agentName"] == *name))
@@ -221,15 +345,16 @@ pub(super) async fn verify(
                 )?;
                 works.push(Work {
                     id: work_id.into(),
-                    kind: step.r#type.clone(),
+                    kind: work_kind.into(),
                     start: ms(started)?,
-                    timeout: r.get("timeout_json"),
+                    timeout: recorded_timeout,
                     answer_timeout: r.get("answer_timeout_json"),
                     snapshot: json!({}),
                     retired: false,
                 });
             }
-            "open" | "associate" | "answer" | "approvalAnswer" | "ack" | "retire" | "tick" => {}
+            "open" | "associate" | "answer" | "approvalAnswer" | "ack" | "retire" | "tick"
+            | "operatorHold" => {}
             _ => return Err("Unknown clock event".into()),
         }
         if kind == "open" || kind == "approval" {
@@ -342,13 +467,79 @@ pub(super) async fn verify(
                 .iter_mut()
                 .find(|r| Some(r.id.as_str()) == event["requestId"].as_str())
                 .ok_or("Ack request absent")?;
-            require(r.resolution.is_some(), "Ack before resolution")?;
+            require(
+                r.resolution.is_some() && !closed_asks.contains(&r.id),
+                "Invalid request acknowledgment",
+            )?;
             r.acknowledged = true;
+        }
+        if kind == "operatorHold" && event.get("closedAsks").is_some() {
+            let closed = &event["closedAsks"];
+            let operator_id = closed["operatorEventId"]
+                .as_str()
+                .ok_or("Missing operator event")?;
+            let event_record = state
+                .events
+                .get(operator_id)
+                .ok_or("Missing operator event record")?;
+            let operator: Value = serde_json::from_str(&event_record.event_json)?;
+            let hold = &operator["kind"]["Operator"];
+            require(
+                operator["eventId"] == operator_id
+                    && operator["identity"] == json!(id)
+                    && operator_closures.insert(operator_id.to_owned()),
+                "Foreign or duplicate operator closure",
+            )?;
+            let affected = rows_json(closed, "requestIds")?;
+            require(!affected.is_empty(), "Missing closed action requests")?;
+            for request_id in affected {
+                let r = requests
+                    .iter()
+                    .find(|r| request_id == r.id)
+                    .ok_or("Unknown closed action request")?;
+                let cancelled_here = rows_json(event, "cancelAsks")?.contains(&request_id);
+                require(
+                    r.kind == "ask"
+                        && (if cancelled_here {
+                            r.resolution.is_none()
+                        } else {
+                            r.resolution
+                                .as_ref()
+                                .is_some_and(|value| value["operatorCancelled"] != true)
+                        })
+                        && !r.acknowledged
+                        && r.works.len() == 1
+                        && rows_json(event, "held")?.contains(&json!(r.works[0]))
+                        && (hold.pointer("/Hold/activation_id") == Some(&json!(r.works[0]))
+                            || hold
+                                .pointer("/Pause/activation_ids")
+                                .and_then(Value::as_array)
+                                .is_some_and(|ids| ids.contains(&json!(r.works[0]))))
+                        && closed_asks.insert(r.id.clone()),
+                    "Invalid action closure",
+                )?;
+            }
         }
         let Some(output) = row.try_get::<Option<&str>, _>("output_json")? else {
             // Verify facts written at reservation above. A fenced Stop can
             // retain an undecided tail, but it contributes no clock output.
-            require(fenced_stop && index + 1 == events.len(), "Uncommitted clock ticket")?;
+            let exact =
+                SupersededClockTicket030::new(&ticket.event_id, row.try_get("ticket_json")?);
+            observed_supersession = superseded == Some(&exact);
+            observed_interruption = interrupted_ticket.as_ref() == Some(&exact);
+            if (observed_supersession || observed_interruption) && kind == "retire" {
+                superseded_retirement = event["workId"].as_str().map(str::to_owned);
+            }
+            let legacy_interrupted_hold =
+                interruption.is_none() && interrupted && kind == "operatorHold";
+            require(
+                (observed_supersession
+                    || observed_interruption
+                    || fenced_stop
+                    || legacy_interrupted_hold)
+                    && index + 1 == events.len(),
+                "Uncommitted clock ticket",
+            )?;
             require(
                 index != 0 || now >= retained_observed,
                 "Initial clock observation is later than its reservation",
@@ -413,6 +604,14 @@ pub(super) async fn verify(
         last = receipt;
     }
     require(
+        interrupted_ticket.is_none() || observed_interruption,
+        "Interrupted clock ticket differs",
+    )?;
+    require(
+        superseded.is_none() || observed_supersession,
+        "Superseded clock ticket differs",
+    )?;
+    require(
         clock.get::<&str, _>("revision") == journal.len().to_string()
             && clock.get::<&str, _>("state_json") == previous
             && parsed(clock, "receipt_json")? == last
@@ -450,7 +649,10 @@ pub(super) async fn verify(
         )?;
         let a = state.activations.iter().find(|a| a.id == w.id).unwrap();
         require(
-            w.kind == "approval" || a.result.is_none() || w.retired,
+            w.kind == "approval"
+                || a.result.is_none()
+                || w.retired
+                || superseded_retirement.as_ref() == Some(&w.id),
             "Terminal clock remains active",
         )?;
     }
@@ -475,11 +677,33 @@ pub(super) async fn verify(
             } else {
                 "answerTimeout"
             });
+            let delivery: &str = row.get("delivery");
+            let fenced_before_delivery = (stop.is_some() || interrupted)
+                && !r.acknowledged
+                && matches!(delivery, "pending" | "reserved");
+            // A terminal approval commits its physical proof before the
+            // clock acknowledges delivery. A restart fences that exact gap
+            // even when the run already has a verdict.
+            let terminal_before_ack = native_owner.get::<&str, _>("status") == "revoked"
+                && r.kind == "approval"
+                && !r.acknowledged
+                && delivery == "reserved"
+                && state.verdict.is_some()
+                && state.events.get(&format!("human:{}:terminal", r.id)).is_some_and(|record| {
+                    serde_json::from_str::<ReadEvent>(&record.event_json).is_ok_and(|ReadEvent(event)| {
+                        matches!(event.kind, FlowEventKind030::WorkResult { work, physical: Some(proof), .. }
+                            if r.works.as_slice() == [work.activation_id.as_str()] && proof.native_receipt_id == r.id
+                                && proof.descendants_joined)
+                    })
+                });
             require(
                 parsed(row, "resolution_json")? == expected
                     && row.get::<&str, _>("revision") == "1"
-                    && row.get::<&str, _>("delivery") == "acknowledged"
-                    && r.acknowledged,
+                    && (resolution["operatorCancelled"] == true
+                        || (delivery == "acknowledged" && r.acknowledged)
+                        || (delivery == "reserved" && closed_asks.contains(&r.id))
+                        || fenced_before_delivery
+                        || terminal_before_ack),
                 "Resolution/readback differs",
             )?;
             let proof=sqlx::query("SELECT p.resolution_json,e.output_json FROM engine_flow030_human_resolution_proofs p JOIN engine_flow030_clock_events e USING(system_id,invocation_id,event_id) WHERE p.system_id=? AND p.invocation_id=? AND p.request_id=?")
@@ -540,7 +764,8 @@ pub(super) async fn verify(
                     json!(WorkResultRecord030::Completed {output_json:json!({"choice":resolution["answer"]["choice"],"comment":resolution["answer"]["comment"],"message":payload["message"]}).to_string(), route_key:resolution["answer"]["choice"].as_str().map(str::to_owned)})
                 };
                 require(
-                    serde_json::to_value(&a.result)? == expected,
+                    serde_json::to_value(&a.result)? == expected
+                        || (fenced_before_delivery && a.result.is_none()),
                     "Approval terminal differs",
                 )?;
             } else if resolution["expired"] == true {
@@ -581,6 +806,10 @@ pub(super) async fn verify(
             )?;
         }
     }
+    let mut stopped_controls = stop
+        .as_ref()
+        .map(|stop| stop.superseded_timeout_controls.clone())
+        .unwrap_or_default();
     for row in controls {
         let id = row.get::<&str, _>("activation_id");
         let w = works
@@ -588,9 +817,7 @@ pub(super) async fn verify(
             .find(|w| w.id == id)
             .ok_or("Timeout work absent")?;
         require(
-            w.snapshot["expired"] == true
-                && row.get::<i64, _>("joined") == 1
-                && row.get::<&str, _>("reason") == "TIMEOUT",
+            w.snapshot["expired"] == true && row.get::<&str, _>("reason") == "TIMEOUT",
             "Timeout control differs",
         )?;
         let a = state
@@ -598,10 +825,39 @@ pub(super) async fn verify(
             .iter()
             .find(|a| a.id == id)
             .ok_or("Timed out activation absent")?;
-        require(
-            matches!(&a.result,Some(WorkResultRecord030::Failed {error}) if error.code=="TIMEOUT"),
-            "Timeout terminal differs",
-        )?;
+        let joined = row.get::<i64, _>("joined");
+        if let Some(receipt_id) = stopped_controls.remove(id) {
+            require(
+                receipt_id == row.get::<&str, _>("receipt_id"),
+                "Stop deadline receipt differs",
+            )?;
+            let stop = stop.as_ref().unwrap();
+            let physical_end = state.events.values().any(|record| {
+                let Ok(ReadEvent(event)) = serde_json::from_str::<ReadEvent>(&record.event_json) else {
+                    return false;
+                };
+                matches!(&event.kind, FlowEventKind030::PhysicalEnded {
+                    work, stop_effect_id: Some(effect), evidence,
+                } if work.activation_id == id
+                    && a.stop_effect_id.as_ref() == Some(effect)
+                    && evidence.descendants_joined
+                    && argentic_core::flow::number::cmp(&event.expected_revision, &stop.revision).is_ge())
+            });
+            require(
+                a.result.is_none()
+                    && (joined, physical_end) == (if a.physical { (0, false) } else { (1, true) }),
+                "Stopped timeout lacks its physical proof",
+            )?;
+        } else {
+            require(
+                (joined == 1
+                    && matches!(&a.result, Some(WorkResultRecord030::Failed {error})
+                        if error.code == "TIMEOUT"
+                            || (error.code == "CALL_FAILED" && host_budget_calls.contains(id))))
+                    || (joined == 0 && a.physical && a.result.is_none()),
+                "Timeout terminal differs",
+            )?;
+        }
         let observed = row.get::<&str, _>("observed_ms");
         let mut proven = false;
         for event in events.iter().take(journal.len()) {
@@ -626,5 +882,6 @@ pub(super) async fn verify(
         require(proven, "Timeout control has no native clock decision")?;
         projection.timeout_ids.push(id.into());
     }
+    require(stopped_controls.is_empty(), "Stop names an absent deadline")?;
     Ok(projection)
 }

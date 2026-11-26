@@ -4,6 +4,7 @@ pub(crate) struct WorkClock {
     last: BigInteger,
     elapsed: BigInteger,
     expired: bool,
+    held: bool,
     requests: Vec<Value>,
     closed: Vec<Value>,
 }
@@ -15,6 +16,7 @@ impl WorkClock {
             last: monotone(now)?,
             elapsed: BigInteger::zero(),
             expired: false,
+            held: false,
             requests: vec![],
             closed: vec![],
         })
@@ -24,7 +26,7 @@ impl WorkClock {
         if now < self.last {
             return correlation("", "Monotone work time moved backwards.");
         }
-        if self.requests.is_empty() {
+        if !self.held && self.requests.is_empty() {
             self.elapsed = self.elapsed.add(&now.sub(&self.last));
         }
         self.last = now;
@@ -66,15 +68,24 @@ impl WorkClock {
         self.requests.retain(|v| !strict_equal(v, request));
         Ok(())
     }
+    pub(crate) fn set_held(&mut self, held: bool, now: &Value) -> Result<()> {
+        self.advance(now)?;
+        self.held = held;
+        Ok(())
+    }
     pub(crate) fn snapshot(&self) -> Value {
-        o([
+        let mut snapshot = o([
             ("elapsedMachineMs", s(self.elapsed.to_js_string())),
             ("openHumanRequests", a(self.requests.clone())),
             ("expired", Value::Bool(self.expired)),
-        ])
+        ]);
+        if self.held {
+            snapshot.set("operatorHeld", Value::Bool(true));
+        }
+        snapshot
     }
     pub(crate) fn next_wake(&self, slice: &Value) -> Result<Option<u32>> {
-        if !self.requests.is_empty() {
+        if self.held || !self.requests.is_empty() {
             Ok(None)
         } else {
             timer(self.timeout.as_deref(), &self.elapsed, slice)

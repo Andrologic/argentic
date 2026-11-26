@@ -42,13 +42,15 @@ fn digest(bytes: &[u8]) -> String {
 
 /// An additional recipient constraint, checked on each resolved read target.
 pub type ContentReadScope = Arc<dyn Fn(&std::path::Path) -> ContentResult<()> + Send + Sync>;
+type ReadTargetScope =
+    Arc<dyn Fn(&std::path::Path, Option<&std::path::Path>) -> ContentResult<()> + Send + Sync>;
 
 /// Only the native host constructs this. Do not expose its constructor as IPC.
 /// The host supplies the import/read location, never a message's baseUri or cwd.
 pub struct ContentContext {
     network: Arc<dyn crate::content_network::ContentNetwork>,
     resource_owner: Option<ContentResourceOwner>,
-    read_scope: Option<ContentReadScope>,
+    read_scope: Option<ReadTargetScope>,
     project_snapshot: Option<(crate::source::Snapshot, std::path::PathBuf)>,
     capture_id: String,
     source_digest: String,
@@ -114,7 +116,10 @@ impl ContentContext {
         self.network = network;
         self
     }
-    pub fn with_read_scope(mut self, scope: ContentReadScope) -> Self {
+    pub fn with_read_scope(self, scope: ContentReadScope) -> Self {
+        self.with_read_target_scope(Arc::new(move |path, _retained| scope(path)))
+    }
+    pub(crate) fn with_read_target_scope(mut self, scope: ReadTargetScope) -> Self {
         self.read_scope = Some(scope);
         self
     }
@@ -159,12 +164,12 @@ impl ContentContext {
             .map(|(snapshot, _)| snapshot.root.as_path())
     }
 
-    fn permission(
+    pub(crate) fn permission(
         &self,
         request: &ActionRequest,
-        lexical: bool,
+        retained_path: Option<&std::path::Path>,
     ) -> ContentResult<PermissionDecision> {
-        let evaluate = if lexical {
+        let evaluate = if retained_path.is_some() {
             crate::permissions::evaluate_effective_lexical
         } else {
             evaluate_effective
@@ -176,7 +181,7 @@ impl ContentContext {
                 .resolved_path
                 .as_deref()
                 .ok_or_else(|| error("PERMISSION", "Content read has no resolved target."))?;
-            scope(std::path::Path::new(path))?;
+            scope(std::path::Path::new(path), retained_path)?;
         }
         Ok(decision)
     }
@@ -279,10 +284,10 @@ impl ContentContext {
         &self,
         request: ActionRequest,
         effect: ContentEffect,
-        lexical: bool,
+        retained_path: Option<&std::path::Path>,
     ) -> ContentResult<PermissionDecision> {
         self.active()?;
-        let decision = self.permission(&request, lexical)?;
+        let decision = self.permission(&request, retained_path)?;
         match decision.effect {
             Effect::Deny => {
                 return Err(error(
@@ -307,7 +312,7 @@ impl ContentContext {
             Effect::Allow => {}
         }
         self.active()?;
-        let current = self.permission(&request, lexical)?;
+        let current = self.permission(&request, retained_path)?;
         if current.effect != decision.effect
             || current.resolved_path != decision.resolved_path
             || current.policy_digest != decision.policy_digest

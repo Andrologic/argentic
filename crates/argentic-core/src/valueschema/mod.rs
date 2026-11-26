@@ -15,11 +15,18 @@ pub(crate) mod port;
 use super::exact::{
     quote,
     scan::pointer,
-    stringify,
-    values::{compare_numbers, equal_v030, is_integer_number, json_type_matches, Num},
+    values::{compare_numbers, equal_v030_with_budget, is_integer_number, json_type_matches, Num},
     NumberToken, Object, Value,
 };
-use std::cmp::Ordering;
+use crate::{
+    calculation::Failure,
+    resource::{
+        excerpt, limit, number_excerpt, quoted_bytes, DIAGNOSTIC_LIMIT_MESSAGE, MAX_DIAGNOSTICS,
+        MAX_DIAGNOSTIC_BYTES,
+    },
+    SourceBudget,
+};
+use std::{cmp::Ordering, collections::HashSet};
 
 /// `[pointer, message]` of the TS helpers.
 pub(crate) type Problem = (String, String);
@@ -29,11 +36,21 @@ pub(crate) type Problem = (String, String);
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct OutsideShape {
     pub(crate) pointer: String,
+    pub(crate) limit: Option<Failure>,
+}
+
+impl From<Failure> for OutsideShape {
+    fn from(value: Failure) -> Self {
+        Self {
+            pointer: String::new(),
+            limit: Some(value),
+        }
+    }
 }
 
 /// One element of a TS pointer path: a property name, an internal JS index,
 /// or an authored number token.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum PointerPart {
     Key(String),
     Index(usize),
@@ -54,7 +71,7 @@ impl PointerPart {
     /// 0.3 `stringify(part)`.
     fn stringified(&self) -> String {
         match self {
-            PointerPart::Key(name) => quote(name),
+            PointerPart::Key(name) => quote(excerpt(name)),
             _ => self.segment(),
         }
     }
@@ -75,8 +92,25 @@ impl PointerPart {
 
 /// `schemacheck.pointer(parts)`.
 pub(crate) fn path_pointer(path: &[PointerPart]) -> String {
-    path.iter()
-        .fold(String::new(), |here, part| pointer(&here, &part.segment()))
+    use std::fmt::Write;
+    let mut out = String::new();
+    for part in path {
+        out.push('/');
+        match part {
+            PointerPart::Key(key) => {
+                for c in key.chars() {
+                    match c {
+                        '~' => out.push_str("~0"),
+                        '/' => out.push_str("~1"),
+                        c => out.push(c),
+                    }
+                }
+            }
+            PointerPart::Index(index) => write!(out, "{index}").expect("string writer"),
+            PointerPart::Number(token) => out.push_str(token.raw()),
+        }
+    }
+    out
 }
 
 const KINDS: [&str; 7] = [
@@ -89,12 +123,13 @@ fn nonnegative_integer(value: &Value) -> bool {
 }
 
 /// Checks the `#/$defs/valueSchema` shape, iteratively.
-pub(crate) fn check_shape(schema: &Value) -> Result<(), OutsideShape> {
+fn check_shape(schema: &Value, budget: &SourceBudget) -> Result<(), OutsideShape> {
     let mut pending = vec![(schema, String::new())];
     while let Some((node, here)) = pending.pop() {
         let outside = |at: &str| {
             Err(OutsideShape {
                 pointer: at.to_owned(),
+                limit: None,
             })
         };
         let Value::Object(object) = node else {
@@ -103,6 +138,8 @@ pub(crate) fn check_shape(schema: &Value) -> Result<(), OutsideShape> {
         if !object.contains_key("type") {
             return outside(&here);
         }
+        budget.work(object.len(), &here)?;
+        budget.bytes(object.len() * (here.len() + 64), &here)?;
         for (key, value) in object.iter() {
             let at = pointer(&here, key);
             let valid = match key {
@@ -113,9 +150,16 @@ pub(crate) fn check_shape(schema: &Value) -> Result<(), OutsideShape> {
                     pending.push((value, at.clone()));
                     true
                 }
-                "minItems" | "maxItems" => nonnegative_integer(value),
+                "minItems" | "maxItems" => {
+                    if let Some(number) = value.as_number() {
+                        charge_number(budget, number, &at)?;
+                    }
+                    nonnegative_integer(value)
+                }
                 "properties" => match value {
                     Value::Object(properties) => {
+                        budget.work(properties.len(), &at)?;
+                        budget.bytes(properties.len() * (at.len() + 48), &at)?;
                         pending.extend(
                             properties
                                 .iter()
@@ -125,15 +169,17 @@ pub(crate) fn check_shape(schema: &Value) -> Result<(), OutsideShape> {
                     }
                     _ => false,
                 },
-                "required" => value.as_array().is_some_and(|names| {
-                    names.iter().enumerate().all(|(index, name)| {
-                        name.as_str().is_some_and(|name| {
-                            !names[..index]
-                                .iter()
-                                .any(|earlier| earlier.as_str() == Some(name))
-                        })
-                    })
-                }),
+                "required" => match value.as_array() {
+                    Some(names) => {
+                        budget.work(names.len(), &at)?;
+                        budget.bytes(names.len() * 48, &at)?;
+                        let mut seen = HashSet::new();
+                        names
+                            .iter()
+                            .all(|name| name.as_str().is_some_and(|name| seen.insert(name)))
+                    }
+                    None => false,
+                },
                 "additionalProperties" => matches!(value, Value::Bool(_)),
                 _ => false,
             };
@@ -143,6 +189,24 @@ pub(crate) fn check_shape(schema: &Value) -> Result<(), OutsideShape> {
         }
     }
     Ok(())
+}
+
+fn charge_number(
+    budget: &SourceBudget,
+    number: &NumberToken,
+    at: &str,
+) -> Result<(), OutsideShape> {
+    budget.work(number.raw().len().div_ceil(8) * 2, at)?;
+    // Exact normalization can allocate a coefficient and shifted exponent.
+    budget.bytes(number.raw().len().saturating_mul(4), at)?;
+    Ok(())
+}
+
+fn number_size(number: Num<'_>) -> usize {
+    match number {
+        Num::Token(number) => number.raw().len(),
+        Num::Host(_) => 0,
+    }
 }
 
 fn schema_object(value: &Value) -> Option<&Object> {
@@ -162,19 +226,66 @@ fn additional_properties_refused(node: &Object) -> bool {
     matches!(node.get("additionalProperties"), Some(Value::Bool(false)))
 }
 
+fn collect_problems(
+    budget: &SourceBudget,
+    walk: impl FnOnce(
+        &mut dyn FnMut(&str, &dyn Fn() -> String) -> Result<(), OutsideShape>,
+    ) -> Result<(), OutsideShape>,
+) -> Result<Vec<Problem>, OutsideShape> {
+    let mut problems = Vec::new();
+    let mut encoded = 0;
+    walk(&mut |at, make| {
+        if problems.len() == MAX_DIAGNOSTICS
+            || encoded + quoted_bytes(at) + 64 > MAX_DIAGNOSTIC_BYTES
+        {
+            return Err(limit(at, DIAGNOSTIC_LIMIT_MESSAGE, MAX_DIAGNOSTIC_BYTES).into());
+        }
+        budget.work(at.len().div_ceil(8) + 1, at)?;
+        budget.bytes(at.len() + 2048, at)?;
+        let message = make();
+        let next = encoded + quoted_bytes(at) + quoted_bytes(&message) + 64;
+        if next > MAX_DIAGNOSTIC_BYTES {
+            return Err(limit(at, DIAGNOSTIC_LIMIT_MESSAGE, MAX_DIAGNOSTIC_BYTES).into());
+        }
+        encoded = next;
+        problems.push((at.to_owned(), message));
+        Ok(())
+    })?;
+    Ok(problems)
+}
+type EmitProblem<'a> = dyn FnMut(&str, &dyn Fn() -> String) -> Result<(), OutsideShape> + 'a;
+
 /// `consistency(schema, path)`: object children before the parent bounds,
 /// array items after them, problems in visit order.
 pub(crate) fn consistency(
     schema: &Value,
     path: &[PointerPart],
 ) -> Result<Vec<Problem>, OutsideShape> {
-    check_shape(schema)?;
-    let mut problems = Vec::new();
+    consistency_with_budget(schema, path, &SourceBudget::default())
+}
+
+pub(crate) fn consistency_with_budget(
+    schema: &Value,
+    path: &[PointerPart],
+    budget: &SourceBudget,
+) -> Result<Vec<Problem>, OutsideShape> {
+    collect_problems(budget, |emit| check_consistency(schema, path, budget, emit))
+}
+
+pub(crate) fn check_consistency(
+    schema: &Value,
+    path: &[PointerPart],
+    budget: &SourceBudget,
+    emit: &mut EmitProblem<'_>,
+) -> Result<(), OutsideShape> {
+    check_shape(schema, budget)?;
     let mut pending: Vec<(&Object, String, bool)> = schema_object(schema)
         .map(|node| (node, path_pointer(path), false))
         .into_iter()
         .collect();
     while let Some((node, here, children_done)) = pending.pop() {
+        budget.work(node.len() + 1, &here)?;
+        budget.bytes(node.len() * (here.len() + 80), &here)?;
         let kind = kind_of(node);
         if children_done {
             let minimum = node
@@ -185,11 +296,14 @@ pub(crate) fn consistency(
                 .get("maxItems")
                 .and_then(Value::as_number)
                 .map_or(minimum, Num::Token);
+            budget.work(
+                (number_size(minimum) + number_size(maximum)).div_ceil(8),
+                &here,
+            )?;
             if compare_numbers(minimum, maximum) == Ordering::Greater {
-                problems.push((
-                    pointer(&here, "minItems"),
-                    "minItems exceeds maxItems".to_owned(),
-                ));
+                emit(&pointer(&here, "minItems"), &|| {
+                    "minItems exceeds maxItems".to_owned()
+                })?;
             }
             if kind == "array" {
                 if let Some(items) = node.get("items").and_then(schema_object) {
@@ -201,32 +315,32 @@ pub(crate) fn consistency(
         pending.push((node, here.clone(), true));
         for key in ["items", "minItems", "maxItems"] {
             if node.contains_key(key) && kind != "array" {
-                problems.push((
-                    pointer(&here, key),
-                    format!("{key} is allowed only on arrays"),
-                ));
+                emit(&pointer(&here, key), &|| {
+                    format!("{key} is allowed only on arrays")
+                })?;
             }
         }
         for key in ["properties", "required", "additionalProperties"] {
             if node.contains_key(key) && kind != "object" {
-                problems.push((
-                    pointer(&here, key),
-                    format!("{key} is allowed only on objects"),
-                ));
+                emit(&pointer(&here, key), &|| {
+                    format!("{key} is allowed only on objects")
+                })?;
             }
         }
         if let Some(values) = node.get("enum").and_then(Value::as_array) {
             let base = pointer(&here, "enum");
+            budget.work(values.len(), &base)?;
+            budget.bytes(values.len() * (base.len() + 96), &base)?;
             for (index, value) in values.iter().enumerate() {
                 let at = pointer(&base, &index.to_string());
                 if !json_type_matches(value, kind) {
-                    problems.push((at.clone(), format!("enum value is not of type {kind}")));
+                    emit(&at, &|| format!("enum value is not of type {kind}"))?;
                 }
-                if values[..index]
-                    .iter()
-                    .any(|earlier| equal_v030(value, earlier))
-                {
-                    problems.push((at, "duplicate enum value".to_owned()));
+                for earlier in &values[..index] {
+                    if equal_v030_with_budget(value, earlier, budget, &at)? {
+                        emit(&at, &|| "duplicate enum value".to_owned())?;
+                        break;
+                    }
                 }
             }
         }
@@ -234,13 +348,14 @@ pub(crate) fn consistency(
             let declared = properties(node);
             if let Some(required) = node.get("required").and_then(Value::as_array) {
                 let base = pointer(&here, "required");
+                budget.work(required.len(), &base)?;
+                budget.bytes(required.len() * (base.len() + 256), &base)?;
                 for (index, name) in required.iter().enumerate() {
                     let name = name.as_str().unwrap_or_default();
                     if !declared.is_some_and(|declared| declared.contains_key(name)) {
-                        problems.push((
-                            pointer(&base, &index.to_string()),
-                            format!("{} is not a declared property", quote(name)),
-                        ));
+                        emit(&pointer(&base, &index.to_string()), &|| {
+                            format!("{} is not a declared property", quote(excerpt(name)))
+                        })?;
                     }
                 }
             }
@@ -254,7 +369,7 @@ pub(crate) fn consistency(
             }
         }
     }
-    Ok(problems)
+    Ok(())
 }
 
 /// `validate(value, schema, path)`: problems in the published traversal order.
@@ -263,36 +378,77 @@ pub(crate) fn validate(
     schema: &Value,
     path: &[PointerPart],
 ) -> Result<Vec<Problem>, OutsideShape> {
-    check_shape(schema)?;
+    validate_with_budget(value, schema, path, &SourceBudget::default())
+}
+
+pub(crate) fn validate_with_budget(
+    value: &Value,
+    schema: &Value,
+    path: &[PointerPart],
+    budget: &SourceBudget,
+) -> Result<Vec<Problem>, OutsideShape> {
+    collect_problems(budget, |emit| {
+        check_value(value, schema, path, budget, emit)
+    })
+}
+
+pub(crate) fn check_value(
+    value: &Value,
+    schema: &Value,
+    path: &[PointerPart],
+    budget: &SourceBudget,
+    emit: &mut EmitProblem<'_>,
+) -> Result<(), OutsideShape> {
+    check_shape(schema, budget)?;
     enum Task<'a> {
         Check(&'a Value, &'a Object, String),
-        Report(String, String),
+        Unknown(&'a str, String),
     }
-    let mut problems = Vec::new();
     let mut pending: Vec<Task<'_>> = schema_object(schema)
         .map(|node| Task::Check(value, node, path_pointer(path)))
         .into_iter()
         .collect();
     while let Some(task) = pending.pop() {
         let (item, node, here) = match task {
-            Task::Report(at, message) => {
-                problems.push((at, message));
+            Task::Unknown(name, at) => {
+                emit(&at, &|| format!("unknown {}", quote(excerpt(name))))?;
                 continue;
             }
             Task::Check(item, node, here) => (item, node, here),
         };
+        budget.work(
+            1 + item
+                .as_number()
+                .map_or(0, |token| token.raw().len().div_ceil(8)),
+            &here,
+        )?;
+        budget.bytes(here.len() + 96, &here)?;
         let kind = kind_of(node);
         if !json_type_matches(item, kind) {
-            problems.push((here, format!("expected {kind}")));
+            emit(&here, &|| format!("expected {kind}"))?;
             continue;
         }
         if let Some(allowed) = node.get("enum").and_then(Value::as_array) {
-            if !allowed.iter().any(|candidate| equal_v030(item, candidate)) {
-                let listed: Vec<String> = allowed.iter().map(stringify).collect();
-                problems.push((
-                    here.clone(),
-                    format!("expected one of {}", listed.join(", ")),
-                ));
+            let mut matched = false;
+            for candidate in allowed {
+                if equal_v030_with_budget(item, candidate, budget, &here)? {
+                    matched = true;
+                    break;
+                }
+            }
+            if !matched {
+                // Each excerpt renders at most 160 bytes, plus its marker.
+                budget.bytes(allowed.len().min(8) * 704 + 64, &here)?;
+                emit(&here, &|| {
+                    let mut listed = Vec::new();
+                    for candidate in allowed.iter().take(8) {
+                        listed.push(crate::resource::value_excerpt(candidate));
+                    }
+                    if allowed.len() > listed.len() {
+                        listed.push("…".into());
+                    }
+                    format!("expected one of {}", listed.join(", "))
+                })?;
             }
         }
         if let Value::Array(items) = item {
@@ -301,6 +457,7 @@ pub(crate) fn validate(
                 ("maxItems", Ordering::Greater, "most"),
             ] {
                 if let Some(bound) = node.get(key).and_then(Value::as_number) {
+                    charge_number(budget, bound, &here)?;
                     if compare_numbers(Num::Host(items.len()), Num::Token(bound)) == comparison {
                         let plural = if compare_numbers(Num::Token(bound), Num::Host(1))
                             == Ordering::Equal
@@ -309,14 +466,18 @@ pub(crate) fn validate(
                         } else {
                             "s"
                         };
-                        problems.push((
-                            here.clone(),
-                            format!("expected at {qualifier} {} item{plural}", bound.raw()),
-                        ));
+                        emit(&here, &|| {
+                            format!(
+                                "expected at {qualifier} {} item{plural}",
+                                number_excerpt(bound.raw())
+                            )
+                        })?;
                     }
                 }
             }
             if let Some(items_schema) = node.get("items").and_then(schema_object) {
+                budget.work(items.len(), &here)?;
+                budget.bytes(items.len() * (here.len() + 72), &here)?;
                 for (index, element) in items.iter().enumerate().rev() {
                     pending.push(Task::Check(
                         element,
@@ -328,11 +489,14 @@ pub(crate) fn validate(
         }
         if let Value::Object(object) = item {
             if kind == "object" {
+                budget.work(object.len(), &here)?;
+                budget.bytes(object.len() * (here.len() + 192), &here)?;
                 let declared = properties(node);
                 if let Some(required) = node.get("required").and_then(Value::as_array) {
                     for name in required.iter().filter_map(Value::as_str) {
+                        budget.work(1 + name.len().div_ceil(8), &here)?;
                         if !object.contains_key(name) {
-                            problems.push((here.clone(), format!("missing {}", quote(name))));
+                            emit(&here, &|| format!("missing {}", quote(excerpt(name))))?;
                         }
                     }
                 }
@@ -345,10 +509,8 @@ pub(crate) fn validate(
                             pending.push(Task::Check(child, child_schema, pointer(&here, name)))
                         }
                         None if additional_properties_refused(node) => {
-                            pending.push(Task::Report(
-                                pointer(&here, name),
-                                format!("unknown {}", quote(name)),
-                            ));
+                            budget.bytes(name.len() * 3, &here)?;
+                            pending.push(Task::Unknown(name, pointer(&here, name)));
                         }
                         None => {}
                     }
@@ -356,7 +518,7 @@ pub(crate) fn validate(
             }
         }
     }
-    Ok(problems)
+    Ok(())
 }
 
 /// Result of `descend(schema, path)`.
@@ -372,13 +534,26 @@ pub(crate) enum Descent {
 
 /// `descend(schema, path)`.
 pub(crate) fn descend(schema: &Value, path: &[PointerPart]) -> Result<Descent, OutsideShape> {
-    check_shape(schema)?;
+    let budget = SourceBudget::default();
+    check_shape(schema, &budget)?;
+    descend_checked(schema, path, &budget, "")
+}
+
+pub(crate) fn descend_checked(
+    schema: &Value,
+    path: &[PointerPart],
+    budget: &SourceBudget,
+    at: &str,
+) -> Result<Descent, OutsideShape> {
     let mut node = schema_object(schema);
     for part in path {
         let Some(current) = node else {
             return Ok(Descent::Unknown);
         };
         let kind = kind_of(current);
+        if let PointerPart::Number(number) = part {
+            charge_number(budget, number, at)?;
+        }
         match part {
             PointerPart::Key(name) if kind == "object" => {
                 match properties(current).and_then(|declared| declared.get(name)) {
@@ -386,7 +561,7 @@ pub(crate) fn descend(schema: &Value, path: &[PointerPart]) -> Result<Descent, O
                     None if additional_properties_refused(current) => {
                         return Ok(Descent::Refused(format!(
                             "{} is not a declared property",
-                            quote(name)
+                            quote(excerpt(name))
                         )));
                     }
                     None => return Ok(Descent::Unknown),
@@ -397,11 +572,12 @@ pub(crate) fn descend(schema: &Value, path: &[PointerPart]) -> Result<Descent, O
                     part.number(),
                     current.get("maxItems").and_then(Value::as_number),
                 ) {
+                    charge_number(budget, maximum, at)?;
                     if compare_numbers(index, Num::Token(maximum)) != Ordering::Less {
                         return Ok(Descent::Refused(format!(
                             "index {} is beyond the {} items the list may have",
                             part.stringified(),
-                            maximum.raw()
+                            number_excerpt(maximum.raw())
                         )));
                     }
                 }
@@ -423,13 +599,26 @@ pub(crate) fn kind_at(
     schema: &Value,
     path: &[PointerPart],
 ) -> Result<Option<String>, OutsideShape> {
-    check_shape(schema)?;
+    let budget = SourceBudget::default();
+    check_shape(schema, &budget)?;
+    kind_at_checked(schema, path, &budget, "")
+}
+
+pub(crate) fn kind_at_checked(
+    schema: &Value,
+    path: &[PointerPart],
+    budget: &SourceBudget,
+    at: &str,
+) -> Result<Option<String>, OutsideShape> {
     let mut node = schema_object(schema);
     for part in path {
         let Some(current) = node else {
             return Ok(None);
         };
         let kind = kind_of(current);
+        if let PointerPart::Number(number) = part {
+            charge_number(budget, number, at)?;
+        }
         node = match part {
             PointerPart::Key(name) if kind == "object" => properties(current)
                 .and_then(|declared| declared.get(name))
@@ -571,10 +760,15 @@ mod tests {
             assert_eq!(
                 validate(&Value::Null, &schema, &[]).err(),
                 Some(OutsideShape {
-                    pointer: at.to_owned()
+                    pointer: at.to_owned(),
+                    limit: None,
                 })
             );
         }
-        assert!(check_shape(&tree(r#"{"type":"array","minItems":-0,"maxItems":2.0e0}"#)).is_ok());
+        assert!(check_shape(
+            &tree(r#"{"type":"array","minItems":-0,"maxItems":2.0e0}"#),
+            &SourceBudget::default()
+        )
+        .is_ok());
     }
 }

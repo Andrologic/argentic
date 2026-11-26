@@ -52,19 +52,6 @@ impl<K: Eq + Hash + Clone> OrderedSet<K> {
     pub(crate) fn iter(&self) -> std::slice::Iter<'_, K> {
         self.items.iter()
     }
-
-    /// `new Set([...a].filter((value) => b.has(value)))`.
-    pub(crate) fn intersection(&self, other: &Self) -> Self {
-        self.iter()
-            .filter(|key| other.contains(*key))
-            .cloned()
-            .collect()
-    }
-
-    /// Same size and every member of `self` in `other`.
-    pub(crate) fn same_set(&self, other: &Self) -> bool {
-        self.len() == other.len() && self.iter().all(|key| other.contains(key))
-    }
 }
 
 impl<K: Eq + Hash + Clone> FromIterator<K> for OrderedSet<K> {
@@ -172,10 +159,5 @@ mod tests {
         assert_eq!(map.iter().collect::<Vec<_>>(), vec![(&"b", &3), (&"a", &2)]);
         let set: OrderedSet<&str> = ["z", "a", "z", "m"].into_iter().collect();
         assert_eq!(set.iter().copied().collect::<Vec<_>>(), vec!["z", "a", "m"]);
-        let other: OrderedSet<&str> = ["m", "z"].into_iter().collect();
-        assert_eq!(
-            set.intersection(&other).iter().copied().collect::<Vec<_>>(),
-            vec!["z", "m"]
-        );
     }
 }

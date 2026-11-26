@@ -243,6 +243,16 @@ pub(super) fn resolution(
     }
     Ok(value)
 }
+fn cancelled_ask(request: &Request, at: u64) -> Result<Value> {
+    require(
+        request.kind == "ask",
+        "Operator hold did not target a native action request",
+    )?;
+    let mut result = resolution(request, at, None)?;
+    result["expired"] = json!(false);
+    result["operatorCancelled"] = json!(true);
+    Ok(result)
+}
 fn keyed(values: &Value, key: &str) -> Result<BTreeMap<String, Value>> {
     let mut result = BTreeMap::new();
     for value in values
@@ -301,6 +311,40 @@ pub(super) fn validate_projection(
                     .works
                     .retain(|id| Some(id.as_str()) != event["workId"].as_str());
                 request.duration = duration(request, &works)?;
+            }
+        }
+    }
+    if event["kind"] == "operatorHold" {
+        let held = ids(&event["held"])?;
+        let released = ids(&event["released"])?;
+        for id in held.iter().chain(&released) {
+            let work = works
+                .iter()
+                .find(|w| &w.id == id && w.kind == "agent" && !w.retired)
+                .ok_or_else(|| {
+                    failure(
+                        "CORRELATION",
+                        "clock",
+                        "Unknown live work for operator clock",
+                    )
+                })?;
+            require(
+                held.contains(id) != released.contains(id)
+                    && (work.snapshot["operatorHeld"] == true) == released.contains(id),
+                "Contradictory operator clock transition",
+            )?;
+        }
+        for id in ids(&event["cancelAsks"])? {
+            let request = requests
+                .iter_mut()
+                .find(|r| r.id == id)
+                .ok_or_else(|| failure("CORRELATION", "clock", "Unknown action request"))?;
+            require(
+                request.kind == "ask" && request.works.iter().any(|id| held.contains(id)),
+                "Operator cancellation must belong to newly held agent work",
+            )?;
+            if request.resolution.is_none() {
+                request.resolution = Some(cancelled_ask(request, now)?);
             }
         }
     }
@@ -383,6 +427,13 @@ pub(super) fn verify_existing(request: &Request, submissions: &[Submission]) -> 
         "Stored decision lacks a committed native validation proof",
     )?;
     let at = ms(text(stored, "resolvedAtMs")?)?;
+    if stored["operatorCancelled"] == true {
+        require(
+            *stored == cancelled_ask(request, at)?,
+            "Invalid operator cancellation",
+        )?;
+        return Ok(());
+    }
     let submission = if stored["expired"] == true {
         require(
             due(request, at, 0)?.is_some(),
@@ -414,6 +465,11 @@ fn validate_clocks(
     event: &Value,
     receipt: &Value,
 ) -> Result<()> {
+    let (held, released) = if event["kind"] == "operatorHold" {
+        (ids(&event["held"])?, ids(&event["released"])?)
+    } else {
+        (vec![], vec![])
+    };
     let mut active = keyed(&receipt["clocks"], "workId")?;
     let mut retired = keyed(&receipt["retiredClocks"], "workId")?;
     let mut expired = Vec::new();
@@ -464,8 +520,10 @@ fn validate_clocks(
                 .map(ms)
                 .transpose()?
                 .unwrap_or(0);
+            let was_held = work.snapshot["operatorHeld"] == true;
+            let is_held = held.contains(&work.id) || (was_held && !released.contains(&work.id));
             let elapsed = consumed
-                .checked_add(now - start - paused)
+                .checked_add(if was_held { 0 } else { now - start - paused })
                 .ok_or_else(|| failure("CORRELATION", "clock", "Machine budget overflow"))?;
             let open = requests
                 .iter()
@@ -477,7 +535,7 @@ fn validate_clocks(
             let is_expired = work.snapshot["expired"] == true
                 || wake(work.timeout.as_deref(), elapsed, 2147483647)? == Some(0);
             if !new_retirement {
-                if let Some(delay) = if open.is_empty() {
+                if let Some(delay) = if open.is_empty() && !is_held {
                     wake(work.timeout.as_deref(), elapsed, 2147483647)?
                 } else {
                     None
@@ -485,7 +543,11 @@ fn validate_clocks(
                     wakes.push(delay);
                 }
             }
-            json!({"elapsedMachineMs":elapsed.to_string(),"openHumanRequests":open,"expired":is_expired})
+            let mut snapshot = json!({"elapsedMachineMs":elapsed.to_string(),"openHumanRequests":open,"expired":is_expired});
+            if is_held {
+                snapshot["operatorHeld"] = json!(true);
+            }
+            snapshot
         };
         let actual = if work.retired || new_retirement {
             retired.remove(&work.id)
@@ -496,6 +558,7 @@ fn validate_clocks(
         require(
             actual["snapshot"]["elapsedMachineMs"] == snapshot["elapsedMachineMs"]
                 && actual["snapshot"]["expired"] == snapshot["expired"]
+                && actual["snapshot"]["operatorHeld"] == snapshot["operatorHeld"]
                 && ids(&actual["snapshot"]["openHumanRequests"])?
                     .into_iter()
                     .collect::<std::collections::BTreeSet<_>>()
