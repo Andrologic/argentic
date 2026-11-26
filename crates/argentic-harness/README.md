@@ -4,6 +4,103 @@ In-process Rust runner for a fresh AgSDL 0.4.0 agent instance. The crate has its
 own manifest and lockfile. Its [module draft](module.json) declares the features
 available at the current integration boundary.
 
+## Try it
+
+Run Ollama or LM Studio with a model that supports tool calls. Use the model ID
+reported by the server. The example below uses Ollama at
+`http://127.0.0.1:11434/v1` with `qwen3:8b`. For LM Studio, use its local
+server address, usually `http://127.0.0.1:1234/v1`, and the ID of the loaded
+model.
+
+Create `providers.json` on the host.
+
+```json
+{
+  "providers": {
+    "local": {
+      "protocol": "chat-completions",
+      "baseUrl": "http://127.0.0.1:11434/v1",
+      "models": ["qwen3:8b"]
+    }
+  }
+}
+```
+
+The host appends `/chat/completions` to `baseUrl`. Each model in `models`
+can have a `#variant` suffix. Use the suffix in the document and the provider
+configuration. The server receives the model ID without the suffix. Set
+`apiKeyEnv` to an environment variable name if the server requires a bearer
+token. Set `reasoningCatalog` when the provider ID differs from the catalogue
+name. Preflight checks the host-configured catalogue. The first provider
+request happens when the work starts.
+
+Save this document as `read.json`.
+
+```json
+{
+  "contract": "agsdl-0.4.0",
+  "id": "read-memo",
+  "agents": {
+    "reader": {
+      "harness": "argentic",
+      "model": { "name": "local/qwen3:8b" },
+      "permissions": "read-only",
+      "results": { "memo": { "required": true, "mediaType": "text/plain" } }
+    }
+  },
+  "flow": {
+    "entry": "read",
+    "steps": {
+      "read": {
+        "type": "agent",
+        "agent": "reader",
+        "instance": "new",
+        "prompt": "Read memo.txt with the read tool. Submit its text as the memo result.",
+        "next": []
+      }
+    }
+  }
+}
+```
+
+Save this host policy as `policy.json`.
+
+```json
+{
+  "owner": { "projectId": "demo", "planId": "read-memo", "branch": "local" },
+  "sourceRevision": "1",
+  "permissions": "read-only",
+  "readOnly": true
+}
+```
+
+From the repository root, create the workspace and start the host. Keep the
+data directory separate from the workspace.
+
+```sh
+mkdir -p workspace
+printf '%s\n' 'The memo is ready.' > workspace/memo.txt
+cargo run --locked --manifest-path crates/argentic-runtime/Cargo.toml \
+  --example argentic-host -- \
+  --data "$PWD/host-data" --workspace "$PWD/workspace" \
+  --source "$PWD/read.json" --policy "$PWD/policy.json" \
+  --approve-policy "$(shasum -a 256 policy.json | cut -d ' ' -f 1)" \
+  --stop-on-exit --argentic-config "$PWD/providers.json"
+```
+
+Send one JSON command per line. Wait for the work to finish before quitting.
+EOF requests Stop for active runs.
+
+```jsonl
+{"op":"preflight","entry":{"deliveryId":"entry","messageJson":"{}"}}
+{"op":"start","requestId":"demo","entry":{"deliveryId":"entry","messageJson":"{}"}}
+{"op":"runs"}
+```
+
+`providers.json` can include a top-level `settings` object. An agent's
+`harnessSettings` can lower those ceilings. See [the host guide](../argentic-runtime/HOST.md)
+for the inspection commands.
+
 ## Running a work
 
 1. Resolve settings with `Settings::resolve(host, user, project)`. Pass an
@@ -63,19 +160,20 @@ Read and scan budgets bound the work behind a preview.
 
 | Runtime boundary | Harness mapping |
 | --- | --- |
-| `prepare(PreparedEffectiveAgentWork030)` | Validate provider selection and support for requested properties. Resolve settings and compile the effective read rules and submission schema locally. The runtime's Argentic-specific constructor for `AttestedWorkPolicy030` must bind these choices to the existing capture and lease checks. |
+| `prepare(PreparedEffectiveAgentWork030)` | Validate captured provider configuration and authored properties. Compile a read policy for each independent permission ceiling and attest it through the native capture and lease checks. |
 | `run(AgentWork030, WorkEventSink030, CancellationToken)` | Decode the admitted capture and start message into `Work`. Pass the attempt token as parent and keep the harness future in the runtime's ownership registry until join. |
 | Visible text | Project each `Event::VisibleText` to a `visibleText` frame with a unique message ID per part. Reasoning and tool replies belong in separate diagnostic channels. |
-| Submit and logical turn end | Map `Proposal::Submit` to `submit` with a work-unique call ID and the original `argumentsJson`. Map `Proposal::EndTurn` to `turnEnded`. Feed the receipt's acceptance or correction back through `Decision`. The sink owns completion-check execution and the durable result. Keep the precise check and submission correction categories. |
-| Steer | Bridge the admitted inbox to `Steer`, retaining the delivery's attempt, sender, deadline and receipt. The loop appends messages at tool-batch or end-of-turn boundaries and acknowledges that insertion. The adapter must gate insertion with `wire_admission` and translate consumed entries to runtime receipts, with unsent entries falling back to the host queue. Buffer text events if emission could wait on the pending delivery. |
+| Submit and logical turn end | Project `Proposal::Submit` and `Proposal::EndTurn` into the native work protocol. The controller validates the raw arguments and returns acceptance or a correction in the current conversation. |
+| Steer | Pull from the admitted inbox at a safe point. Gate conversation insertion with `wire_admission` and turn consumption into a runtime receipt. The host queues a message that does not reach the active work. |
 | Approvals | The slice denies reads that would require approval. Runtime review ports are future work. |
 | Physical termination | After `RunReport::physical_end`, return from the owned executor future. The native registry and its join generate durable `physicalEnded` evidence. |
 
-The crate does not register the executor with the host. Shared and named
-instances, durable steer receipts, human or model reviewers, compaction,
-MCP, writing and shell tools, and additional provider protocols remain
-outside this slice. The exact host controller remains authoritative for
-AgSDL submission semantics and deadlines.
+The standalone host registers the adapter when configured and requires explicit
+opt-in. Shared and named instances keep their conversation in memory for the
+run. Route and delivery metadata travels as untrusted message data. The
+module leaves authored resources unsupported because the adapter has no
+separate resource channel. Conversation compaction, permission reviewers, completion checks, skills,
+MCP, writing, shell tools, and other provider protocols are outside this slice.
 
 ## Source notes
 
