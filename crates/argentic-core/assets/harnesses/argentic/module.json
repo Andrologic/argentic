@@ -1,0 +1,107 @@
+{
+  "$schema": "https://raw.githubusercontent.com/Andrologic/AgSDL/v0.4.0/schema/harness-module.schema.json",
+  "name": "argentic",
+  "title": "Argentic",
+  "version": "1.0.0",
+  "contract": "agsdl-0.4.0",
+  "harnessVersions": ">=0.1.0 <0.2.0",
+  "properties": {
+    "resources": {
+      "support": "absent"
+    },
+    "model.name": {
+      "support": "approximate",
+      "note": "The standalone Chat Completions loop accepts a configured name. The engine does not resolve or observe the model."
+    },
+    "model.effort": {
+      "support": "approximate",
+      "note": "Chat Completions supports selected provider effort settings. The engine does not negotiate effort."
+    },
+    "skills": {
+      "support": "absent"
+    },
+    "mcpServers": {
+      "support": "absent"
+    },
+    "plan": {
+      "support": "absent"
+    },
+    "planFirst.auto": {
+      "support": "absent"
+    },
+    "planFirst.ask": {
+      "support": "absent"
+    },
+    "reviewer.person": {
+      "support": "absent"
+    },
+    "reviewer.model": {
+      "support": "absent"
+    },
+    "directories": {
+      "support": "absent"
+    },
+    "instance.new": {
+      "support": "approximate",
+      "note": "The standalone loop starts fresh. AgSDL work and instance lifecycle integration is pending."
+    },
+    "delivery.steer": {
+      "support": "absent"
+    }
+  },
+  "permissions": {
+    "read": {
+      "allow": "absent",
+      "ask": "absent",
+      "deny": "absent",
+      "outside": "absent",
+      "note": "The harness implements local read decisions, but enforcement for AgSDL work is pending."
+    },
+    "write": {
+      "allow": "absent",
+      "ask": "absent",
+      "deny": "absent"
+    },
+    "shell": {
+      "allow": "absent",
+      "ask": "absent",
+      "deny": "absent"
+    },
+    "network": {
+      "allow": "absent",
+      "ask": "absent",
+      "deny": "absent"
+    },
+    "mcp": {
+      "allow": "absent",
+      "ask": "absent",
+      "deny": "absent"
+    },
+    "delegate": {
+      "allow": "absent",
+      "ask": "absent",
+      "deny": "absent"
+    }
+  },
+  "settings": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "maxTurns": {
+        "type": "integer"
+      },
+      "maxOutputTokens": {
+        "type": "integer"
+      },
+      "maxTotalTokens": {
+        "type": "integer"
+      },
+      "cancelGraceMs": {
+        "type": "integer"
+      },
+      "maxParallelReads": {
+        "type": "integer"
+      }
+    }
+  }
+}
