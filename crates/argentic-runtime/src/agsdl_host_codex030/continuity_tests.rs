@@ -1008,6 +1008,43 @@ async fn codex_mcp_enforces_tool_grants_and_routes_ask_through_the_human_broker(
         "flow":{"entry":"work","steps":{"work":{"type":"agent","agent":"worker"}}}});
     std::fs::write(project.path().join("agsdl.json"), document.to_string()).unwrap();
     std::fs::write(project.path().join("requirements.json"), REQUIREMENTS).unwrap();
+    {
+        struct WithoutBroker(CodexExecutor030);
+        impl AgentExecutor030 for WithoutBroker {
+            fn prepare(
+                &self,
+                work: crate::agsdl_host_work_admission030::PreparedEffectiveAgentWork030,
+            ) -> HostResult<crate::agsdl_host_work_admission030::AttestedWorkPolicy030>
+            {
+                self.0.prepare(work)
+            }
+
+            fn run(
+                &self,
+                work: AgentWork030,
+                events: WorkEventSink030,
+                cancel: CancellationToken,
+            ) -> BoxFuture<'static, HostResult<()>> {
+                let result = self.0.run(work, events, cancel);
+                Box::pin(async move {
+                    let error = result.await.unwrap_err();
+                    assert_eq!(error.code, "MCP_APPROVAL_UNAVAILABLE", "{error:?}");
+                    Err(error)
+                })
+            }
+        }
+
+        let mut f = Fixture::from_project(project.path()).await;
+        f.config = peer.configure(f.config.clone());
+        f.policy.workspace().await;
+        let trace = f._temp.path().join("mcp-no-broker.jsonl");
+        let executor = WithoutBroker(executor(&f, &trace, None));
+        let view = run_with_clock(&f, Arc::new(executor), None).await;
+        assert_eq!(view.state.verdict.as_deref(), Some("failed"));
+        assert!(!trace.exists());
+        assert!(peer.calls().is_empty());
+        f.pool.close().await;
+    }
     for yes in [false, true] {
         let mut f = Fixture::from_project(project.path()).await;
         f.config = peer.configure(f.config.clone());

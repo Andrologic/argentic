@@ -35,6 +35,12 @@ use tokio_util::sync::CancellationToken;
 
 pub(crate) const TOKEN_ENV: &str = "ARGENTIC_MCP_BRIDGE_TOKEN";
 
+#[derive(Clone, Copy)]
+pub(crate) enum MissingApproval {
+    OmitTool,
+    FailDiscovery,
+}
+
 #[derive(Clone)]
 pub(crate) struct SessionConfig {
     pub(crate) servers: Value,
@@ -86,6 +92,7 @@ impl Equipment {
         read_only: bool,
         authored_budget: bool,
         approvals: Option<Arc<dyn CommandApprovals030>>,
+        missing_approval: MissingApproval,
         cancel: &CancellationToken,
     ) -> Result<Self> {
         let mut state = Bridge::new(
@@ -154,13 +161,22 @@ impl Equipment {
                     let decision =
                         evaluate_effective(&work.policy, &request, ExecutionPurpose::Agent)
                             .map_err(|_| invalid())?;
-                    if decision.effect == Effect::Allow
-                        || (decision.effect == Effect::Ask && state.approvals.is_some())
-                    {
-                        upstream
-                            .tools
-                            .insert(tool_name.to_owned(), (decision.effect, tool));
+                    match decision.effect {
+                        Effect::Deny => continue,
+                        Effect::Ask if state.approvals.is_none() => match missing_approval {
+                            MissingApproval::OmitTool => continue,
+                            MissingApproval::FailDiscovery => {
+                                return Err(mcp_error(
+                                    "MCP_APPROVAL_UNAVAILABLE",
+                                    "Host MCP action approvals are unavailable",
+                                ));
+                            }
+                        },
+                        Effect::Allow | Effect::Ask => {}
                     }
+                    upstream
+                        .tools
+                        .insert(tool_name.to_owned(), (decision.effect, tool));
                 }
             }
             Ok(())
@@ -220,6 +236,7 @@ impl Equipment {
             read_only,
             authored_budget,
             approvals,
+            MissingApproval::FailDiscovery,
             cancel,
         )
         .await?;

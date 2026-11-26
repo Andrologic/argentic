@@ -505,6 +505,7 @@ impl Executor {
             !writable,
             authored_budget,
             person.then(|| self.approvals.clone()),
+            crate::agsdl_host_agent_mcp030::MissingApproval::OmitTool,
             &cancel,
         )
         .await?;
