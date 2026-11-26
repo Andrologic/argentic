@@ -395,27 +395,52 @@ fn downgrade_tool_choice(body: &mut Value, full_tools: &mut Option<Value>) -> Op
     Some(2)
 }
 
-fn rejects_tool_choice(message: &str) -> bool {
-    let message = message.to_ascii_lowercase();
-    ["tool_choice", "tool choice"]
-        .iter()
-        .any(|field| message.contains(field))
-        && [
-            "unsupported",
-            "not supported",
-            "does not support",
-            "unknown parameter",
-            "unrecognized",
-            "invalid value",
-            "invalid enum",
-            "invalid tool_choice type",
-            "must be one of",
-            "must be a string",
-            "only supports",
-            "only supported",
-        ]
-        .iter()
-        .any(|reason| message.contains(reason))
+fn rejects_tool_choice(body: &str) -> bool {
+    let parsed = serde_json::from_str::<Value>(body).ok();
+    let error = parsed
+        .as_ref()
+        .map(|value| value.get("error").unwrap_or(value));
+    if let Some(param) = error.and_then(|error| error["param"].as_str()) {
+        return param == "tool_choice";
+    }
+
+    let message = error
+        .and_then(|error| error.as_str().or_else(|| error["message"].as_str()))
+        .unwrap_or(body)
+        .to_ascii_lowercase()
+        .replace(['\'', '"', '`'], "")
+        .replace("tool choice", "tool_choice");
+    let Some((before, after)) = message.trim().split_once("tool_choice") else {
+        return false;
+    };
+    if after.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_') {
+        return false;
+    }
+
+    // For errors without a parameter, require wording that names the field
+    // as the cause. Another field's rejected value can contain "tool_choice".
+    matches!(
+        before,
+        "unsupported "
+            | "unsupported parameter "
+            | "unknown parameter "
+            | "unrecognized parameter "
+            | "invalid "
+            | "invalid value for "
+            | "invalid enum value for "
+    ) || before.ends_with(" does not support ")
+        || (before.is_empty()
+            && ([
+                " is not supported",
+                " is unsupported",
+                " is invalid",
+                " must be ",
+                " required is not supported",
+                " any is not supported",
+            ]
+            .iter()
+            .any(|phrase| after.starts_with(phrase))
+                || (after.starts_with(": type ") && after.contains(" not supported"))))
 }
 
 // Based on Macro's SSE parser. Buffer bytes until a complete line arrives so

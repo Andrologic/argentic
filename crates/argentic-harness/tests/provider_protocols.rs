@@ -970,3 +970,30 @@ fn gpt_54_catalogue_supports_none() {
     let capability = reasoning_capability("openai", "gpt-5.4").unwrap().unwrap();
     assert!(capability.efforts.iter().any(|effort| effort == "none"));
 }
+
+#[tokio::test]
+async fn reasoning_400_does_not_change_tool_choice() {
+    let protocol = Protocol::Responses;
+    for rejected in [
+        r#"{"error":{"message":"Invalid value for reasoning.effort: 'tool_choice'.","code":"invalid_value","param":"reasoning.effort"}}"#,
+        "Invalid value for reasoning.effort: 'tool_choice'.",
+    ] {
+        let mock = Mock::start(
+            protocol,
+            vec![
+                protocol.success(),
+                http_error(400, None, rejected),
+                protocol.success(),
+                protocol.success(),
+            ],
+        )
+        .await;
+        correction_turns(&mock, protocol.model(), Some("tool_choice")).await;
+        let requests = mock.requests.lock().unwrap();
+        assert_eq!(requests.len(), 4);
+        assert_eq!(requests[2].1["tool_choice"], requests[1].1["tool_choice"]);
+        assert!(requests[2].1.get("reasoning").is_none());
+        assert_eq!(requests[3].1["tool_choice"], requests[1].1["tool_choice"]);
+        assert_eq!(tool_names(&requests[2].1), tool_names(&requests[0].1));
+    }
+}
