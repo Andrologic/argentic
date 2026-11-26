@@ -25,8 +25,8 @@ use super::{
 use crate::{SourceBudget, GRAPH_LIMIT_CODE};
 use std::sync::OnceLock;
 
-/// The pinned harness modules, in the import order of `reader.mjs`.
-pub(crate) const PINNED_MODULES: [(&str, &str); 4] = [
+/// Upstream pinned modules in reader.mjs order, followed by local modules.
+pub(crate) const PINNED_MODULES: [(&str, &str); 5] = [
     (
         "claude-code",
         include_str!("../../assets/harnesses/claude-code/module.json"),
@@ -40,9 +40,17 @@ pub(crate) const PINNED_MODULES: [(&str, &str); 4] = [
         include_str!("../../assets/harnesses/opencode/module.json"),
     ),
     ("pi", include_str!("../../assets/harnesses/pi/module.json")),
+    ("argentic", include_str!("../../assets/harnesses/argentic/module.json")),
 ];
 
-/// `options.modules`: omitted (the pinned four) or an explicit map, which
+// Installation metadata lives outside the AgSDL module schema. Only bundled
+// executable probes can run, never commands from a project module.
+pub(crate) const BUNDLED_VERSION_PROBES: &[(&str, &str, &str)] = &[
+    ("opencode", "opencode", "--version"),
+    ("pi", "pi", "--version"),
+];
+
+/// `options.modules`: omitted (the bundled modules) or an explicit map, which
 /// stays empty when it is empty.
 #[derive(Clone, Copy)]
 pub(crate) enum Modules<'m> {
@@ -381,7 +389,10 @@ mod tests {
         }
         let pinned = registry(Modules::Pinned).unwrap();
         let names: Vec<_> = pinned.iter().map(|(name, _)| name.as_str()).collect();
-        assert_eq!(names, ["claude-code", "codex", "opencode", "pi"]);
+        assert_eq!(
+            names,
+            ["claude-code", "codex", "opencode", "pi", "argentic"]
+        );
     }
 
     #[test]

@@ -77,28 +77,20 @@ fn cpu_now() -> Duration {
     Duration::new(time.tv_sec as u64, time.tv_nsec as u32)
 }
 
+/// GetProcessTimes advances in 15.625 ms ticks, too coarse for the short
+/// samples compared below. Process cycle counts are precise. Only ratios of
+/// these values are compared, so one cycle stands for one nanosecond.
 #[cfg(windows)]
 fn cpu_now() -> Duration {
-    use windows_sys::Win32::{
-        Foundation::FILETIME,
-        System::Threading::{GetCurrentProcess, GetProcessTimes},
+    use windows_sys::Win32::System::{
+        Threading::GetCurrentProcess, WindowsProgramming::QueryProcessCycleTime,
     };
-    let [mut created, mut exited, mut kernel, mut user] = [FILETIME::default(); 4];
+    let mut cycles = 0u64;
     assert_ne!(
-        unsafe {
-            GetProcessTimes(
-                GetCurrentProcess(),
-                &mut created,
-                &mut exited,
-                &mut kernel,
-                &mut user,
-            )
-        },
+        unsafe { QueryProcessCycleTime(GetCurrentProcess(), &mut cycles) },
         0
     );
-    let ticks =
-        |time: FILETIME| u64::from(time.dwHighDateTime) << 32 | u64::from(time.dwLowDateTime);
-    Duration::from_nanos((ticks(kernel) + ticks(user)) * 100)
+    Duration::from_nanos(cycles)
 }
 
 struct AllocationSample {
@@ -163,20 +155,12 @@ fn measure<T>(name: &str, operation: impl Fn(&SourceBudget) -> T) -> (T, Sample)
     unreachable!()
 }
 
-/// GetProcessTimes advances kernel and user time in 15.625 ms ticks, so a
-/// fast sample can read zero. Allow one tick of each on Windows only.
-const CPU_CLOCK_SLACK: Duration = if cfg!(windows) {
-    Duration::from_micros(31_250)
-} else {
-    Duration::ZERO
-};
-
 fn scales(label: &str, small: Sample, large: Sample) {
     assert!(large.work > small.work, "{label}: work did not grow");
     let charged_ratio = large.work as f64 / small.work as f64;
     let cpu_ratio = large.cpu.as_secs_f64() / small.cpu.as_secs_f64();
     eprintln!("{label}: CPU {cpu_ratio:.2}x, work {charged_ratio:.2}x");
-    let allowed = small.cpu.mul_f64(4.0 * charged_ratio) + CPU_CLOCK_SLACK;
+    let allowed = small.cpu.mul_f64(4.0 * charged_ratio);
     assert!(
         large.cpu <= allowed,
         "{label}: CPU {:?} -> {:?} ({cpu_ratio:.2}x) vs work {charged_ratio:.2}x",

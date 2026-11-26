@@ -20,7 +20,7 @@ pub struct Diagnostic {
 pub struct McpServerQualification {
     /// Authored JSON pointers to call steps, including composition definitions.
     pub direct_call_steps: Vec<String>,
-    /// Names of Codex agents eligible to discover this server.
+    /// Names of agents eligible to discover this server.
     pub agent_equipment: Vec<String>,
     /// Endpoint or transport availability diagnostic, if any.
     pub diagnostic: Option<Diagnostic>,
@@ -109,6 +109,7 @@ pub(crate) fn qualify_product030(
     document: &Value,
     compiled: Option<&str>,
     host_permissions: Option<&RequestedPermissions>,
+    harnesses: &crate::harness::HarnessRegistry030,
 ) -> Result<ProductQualification> {
     if !supported_contract(document) {
         return Ok(ProductQualification::default());
@@ -154,7 +155,12 @@ pub(crate) fn qualify_product030(
         let Some(servers) = agent["mcpServers"].as_array() else {
             continue;
         };
-        if agent["harness"] != "codex" || servers.is_empty() {
+        if !agent["harness"]
+            .as_str()
+            .and_then(|id| harnesses.get(id))
+            .is_some_and(|adapter| adapter.supports_mcp_equipment())
+            || servers.is_empty()
+        {
             continue;
         }
         let pointer = format!(
@@ -165,7 +171,7 @@ pub(crate) fn qualify_product030(
             failure(
                 "HARNESS_CAPABILITY",
                 &pointer,
-                "Codex MCP permissions are invalid",
+                "Agent MCP permissions are invalid",
             )
         };
         let requested = match serde_json::from_value(agent["permissions"].clone()) {
@@ -192,14 +198,19 @@ pub(crate) fn qualify_product030(
         report.agent_equipment.sort();
     }
     Ok(ProductQualification {
-        product_diagnostic: product_diagnostic030(document, compiled),
+        product_diagnostic: product_diagnostic030(document, compiled, harnesses),
         mcp_servers,
     })
 }
 
 pub(crate) fn product_slice030(authored: &str, compiled: Option<&str>) -> Option<Diagnostic> {
     let document = exact_json::value(authored).ok()?;
-    match qualify_product030(&document, compiled, None) {
+    match qualify_product030(
+        &document,
+        compiled,
+        None,
+        &crate::harness::HarnessRegistry030::with_codex(),
+    ) {
         Ok(report) => report.blocking_diagnostic().cloned(),
         Err(error) => Some(Diagnostic {
             code: error.code,
@@ -212,6 +223,7 @@ pub(crate) fn product_slice030(authored: &str, compiled: Option<&str>) -> Option
 pub(crate) fn product_diagnostic030(
     document: &Value,
     compiled: Option<&str>,
+    harnesses: &crate::harness::HarnessRegistry030,
 ) -> Option<Diagnostic> {
     if !supported_contract(document) {
         return None;
@@ -224,24 +236,17 @@ pub(crate) fn product_diagnostic030(
         })
     };
     for (name, agent) in document.get("agents")?.as_object()? {
-        let pointer = format!("/agents/{}", name.replace('~', "~0").replace('/', "~1"));
-        if agent.get("harness").and_then(Value::as_str) != Some("codex") {
-            return issue(
-                format!("{pointer}/harness"),
-                "Only the Codex harness is supported for this run.",
-            );
-        }
-        if let Err(refusal) = crate::agsdl_host_work_admission030::codex_permissions030(
-            &agent["permissions"],
-            &format!("{pointer}/permissions"),
-        ) {
+        let pointer = format!(
+            "/agents/{}",
+            crate::agsdl_host_work_admission030::pointer_token030(name)
+        );
+        let id = agent["harness"].as_str().unwrap_or_default();
+        let Some(adapter) = harnesses.get(id) else {
+            let error = crate::harness::missing_executor(name, id);
+            return issue(error.pointer, &error.message);
+        };
+        if let Err(refusal) = adapter.qualify_agent(agent, &pointer) {
             return issue(refusal.pointer, &refusal.message);
-        }
-        if agent.get("planFirst").and_then(Value::as_str) == Some("ask") {
-            return issue(
-                format!("{pointer}/planFirst"),
-                "agsdl.execution.codexPlanAsk030",
-            );
         }
     }
     for (pointer, step) in declared_steps030(document) {

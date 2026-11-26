@@ -4,7 +4,7 @@ use crate::{
     agsdl_host_calls::{self as calls, CommandGrant, Control, PhysicalEvidence},
     agsdl_host_confinement::{FileAccess, OsCeiling, PathScope, SandboxPolicy},
     agsdl_host_flow030::FlowWorkAttempt030,
-    agsdl_host_work_admission030::{codex_read_only030, PolicyLeases030},
+    agsdl_host_work_admission030::PolicyLeases030,
     host::HostContext,
     permissions::{evaluate_effective, ActionRequest, Effect, EffectivePolicy, ExecutionPurpose},
     persistence::{failure, flow_work_protocol030, work_dto030::CheckRequest030, Result},
@@ -19,6 +19,33 @@ use std::{
 };
 use tokio_util::sync::CancellationToken;
 
+pub(crate) fn workspace_sandbox_read_only030(
+    policy: &EffectivePolicy,
+    unsupported: &str,
+) -> Result<bool> {
+    use crate::permissions::{Action, Effect, Outside, Preset, Reviewer};
+    let mut read_only = false;
+    for ceiling in policy.policies() {
+        if !matches!(ceiling.preset(), Some(Preset::ReadOnly | Preset::Workspace))
+            || ceiling.rules().iter().any(|r| {
+                r.action != Action::Mcp
+                    && (r.action != Action::Write || r.effect != Effect::Ask || r.pattern.is_some())
+            })
+            || !ceiling.directories().is_empty()
+            || ceiling.reviewer() == Some(Reviewer::Model)
+            || ceiling.outside() != Outside::Deny
+        {
+            return Err(failure("HARNESS_CAPABILITY", "/permissions", unsupported));
+        }
+        read_only |= ceiling.preset() == Some(Preset::ReadOnly)
+            || ceiling
+                .rules()
+                .iter()
+                .any(|rule| rule.action == Action::Write);
+    }
+    Ok(read_only)
+}
+
 /// The same effective ceiling as the agent, including write-ask regions which
 /// an unmediated shell must keep read-only. Runtime files grant no user data.
 pub(crate) fn grant(policy: &EffectivePolicy, command: &str) -> Result<CommandGrant> {
@@ -30,7 +57,10 @@ fn grant_scoped(
     command: &str,
     project_read_only: bool,
 ) -> Result<CommandGrant> {
-    let read_only = codex_read_only030(policy)? || project_read_only;
+    let read_only = workspace_sandbox_read_only030(
+        policy,
+        "The effective permission ceiling cannot be represented by the completion-check sandbox",
+    )? || project_read_only;
     let decision = evaluate_effective(
         policy,
         &ActionRequest::Shell {

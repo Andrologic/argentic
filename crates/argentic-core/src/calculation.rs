@@ -39,6 +39,13 @@ fn syntax(e: native::SyntaxError) -> Failure {
     }
 }
 
+/// Native harness and adapter pairs available to the compiling host.
+pub type AvailableHarnesses = std::collections::BTreeMap<String, String>;
+
+pub fn default_available_harnesses() -> AvailableHarnesses {
+    AvailableHarnesses::from([("codex".into(), "codex-app-server-v1".into())])
+}
+
 /// Compile an authenticated authored document and its captured source/registry.
 /// This computes data only; a result does not establish admission or ownership.
 pub fn compile(
@@ -64,6 +71,25 @@ pub fn compile_with_budget(
     number: NativeNumber,
     budget: &crate::SourceBudget,
 ) -> Result<String, Failure> {
+    compile_with_harnesses(
+        authored,
+        source_json,
+        registry_json,
+        number,
+        budget,
+        &default_available_harnesses(),
+    )
+}
+
+/// Compile using the host's registered native harnesses, independent of captured observations.
+pub fn compile_with_harnesses(
+    authored: &str,
+    source_json: &str,
+    registry_json: &str,
+    number: NativeNumber,
+    budget: &crate::SourceBudget,
+    available: &AvailableHarnesses,
+) -> Result<String, Failure> {
     budget.json_input(registry_json.as_bytes(), "/registry")?;
     budget.json_input(source_json.as_bytes(), "/source")?;
     budget.bytes(authored.len().saturating_mul(2), "")?;
@@ -83,6 +109,7 @@ pub fn compile_with_budget(
         &source,
         &registry,
         budget,
+        available,
     )?)
 }
 

@@ -1,6 +1,6 @@
 //! Event-driven 0.3 dispatch. Provider futures and physical joins never run in
 //! the supervisor's dispatch pass. The existing controller owns result policy.
-use crate::agsdl_host_codex::diagnostics::{self, Stage};
+use crate::agsdl_host_diagnostics030::{self as diagnostics, Stage};
 use crate::{
     agsdl_host::HostState,
     agsdl_host_dispatch030::{self as dispatch, JoinedOwnedAgent030, SourceOwnership030},
@@ -35,7 +35,7 @@ use std::{
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
-pub(crate) trait AgentExecutor030: Send + Sync {
+pub trait AgentExecutor030: Send + Sync {
     fn supports_operator_hold(&self) -> bool {
         false
     }
@@ -51,7 +51,7 @@ pub(crate) trait AgentExecutor030: Send + Sync {
     ) -> BoxFuture<'static, Result<()>>;
 }
 
-pub(crate) struct AgentWork030 {
+pub struct AgentWork030 {
     pub attempt: FlowWorkAttempt030,
     pub capture: StartCapture030,
     pub effect: FlowEffect030,
@@ -104,14 +104,14 @@ pub(crate) type SteerDeliveryPort030 = Arc<
 /// Bound to one admitted attempt. Adapters cannot forge a physicalEnded event;
 /// finish_agent_work030 obtains that fact from the native ownership registry.
 #[derive(Clone)]
-pub(crate) struct WorkEventSink030 {
+pub struct WorkEventSink030 {
     attempt: FlowWorkAttempt030,
     emitter: EventEmitter030,
     sequence: Arc<AtomicU64>,
     serial: Arc<tokio::sync::Mutex<()>>,
 }
 impl WorkEventSink030 {
-    pub(crate) async fn emit(
+    pub async fn emit(
         &self,
         body: Value,
         cancel: &CancellationToken,
@@ -270,13 +270,14 @@ pub(crate) async fn start_agent_work030(
     tasks: &StreamTasks,
     owner: &EngineOwner,
     effect: &FlowEffect030,
-    executor: Arc<dyn AgentExecutor030>,
+    executor_for: impl FnOnce(&PreparedEffectiveAgentWork030) -> Result<Arc<dyn AgentExecutor030>>,
     emitter: EventEmitter030,
     cancel: CancellationToken,
     clock_ready: Option<tokio::sync::oneshot::Receiver<()>>,
 ) -> Result<StartedAgent030> {
     let inspection = flow::inspect_run(host.flow030(), host, pool, owner).await?;
     let prepared = prepare_effective_agent_work030(config, &inspection, effect).await?;
+    let executor = executor_for(&prepared)?;
     let effective = prepared.policy().clone();
     let policy = executor.prepare(prepared)?;
     let claim = flow::claim_expected(host.flow030(), host, pool, &effect.identity, &effect.id)
@@ -354,7 +355,7 @@ pub(crate) async fn start_agent_work030(
                         // A fixed diagnostic is independent of the work protocol's
                         // closed failure enum. No raw provider fields are emitted.
                         use std::io::Write;
-                        let _ = writeln!(std::io::stderr().lock(), "{}", crate::agsdl_host_codex::diagnostics::entry(&events.attempt, error));
+                        let _ = writeln!(std::io::stderr().lock(), "{}", crate::agsdl_host_diagnostics030::entry(&events.attempt, error));
                         let reason = if error.code == "TIMEOUT" && error.pointer == "clock" {
                             "TIMEOUT"
                         } else {
@@ -604,7 +605,7 @@ pub(crate) trait RuntimeClock030: Send + Sync {
     fn next_wake(&self) -> BoxFuture<'_, Result<Option<std::time::Duration>>>;
 }
 pub(crate) struct Executors030 {
-    pub agents: Arc<dyn AgentExecutor030>,
+    pub agents: BTreeMap<String, Arc<dyn AgentExecutor030>>,
     pub calls: Option<Arc<dyn HostExecutor030>>,
     pub humans: Option<Arc<dyn HostExecutor030>>,
     pub clock: Option<Arc<dyn RuntimeClock030>>,
@@ -915,7 +916,15 @@ impl EffectDriver030 for NativeDriver030<'_> {
                 self.tasks,
                 self.owner,
                 &effect,
-                self.executors.agents.clone(),
+                |prepared| {
+                    self.executors
+                        .agents
+                        .get(prepared.harness())
+                        .cloned()
+                        .ok_or_else(|| {
+                            crate::harness::missing_executor(prepared.agent(), prepared.harness())
+                        })
+                },
                 emitter,
                 CancellationToken::new(),
                 ready,
@@ -1286,7 +1295,10 @@ pub(crate) fn spawn_supervisor030(
             "Run already has a supervisor",
         ));
     }
-    handle.supports_operator_hold = executors.agents.supports_operator_hold();
+    handle.supports_operator_hold = executors
+        .agents
+        .values()
+        .all(|executor| executor.supports_operator_hold());
     let receiver = handle.wake.subscribe();
     let cancel = handle.cancel.clone();
     let (task_app, system, task_cancel) =

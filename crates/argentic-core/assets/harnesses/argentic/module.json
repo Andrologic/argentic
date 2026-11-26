@@ -1,0 +1,111 @@
+{
+  "$schema": "https://raw.githubusercontent.com/Andrologic/AgSDL/v0.4.0/schema/harness-module.schema.json",
+  "name": "argentic",
+  "title": "Argentic",
+  "version": "1.0.0",
+  "contract": "agsdl-0.4.0",
+  "harnessVersions": ">=0.1.0 <0.2.0",
+  "properties": {
+    "resources": {
+      "support": "absent"
+    },
+    "model.name": {
+      "support": "native"
+    },
+    "model.effort": {
+      "support": "approximate",
+      "note": "Argentic sends catalogue-listed effort values. If the provider rejects the effort parameter, Argentic retries without it and omits it for the remainder of the work attempt."
+    },
+    "skills": {
+      "support": "absent"
+    },
+    "mcpServers": {
+      "support": "absent"
+    },
+    "plan": {
+      "support": "absent"
+    },
+    "planFirst.auto": {
+      "support": "absent"
+    },
+    "planFirst.ask": {
+      "support": "absent"
+    },
+    "reviewer.person": {
+      "support": "absent"
+    },
+    "reviewer.model": {
+      "support": "absent"
+    },
+    "directories": {
+      "support": "absent"
+    },
+    "instance.new": {
+      "support": "native"
+    },
+    "delivery.steer": {
+      "support": "native"
+    }
+  },
+  "permissions": {
+    "read": {
+      "allow": "harness",
+      "ask": "absent",
+      "deny": "harness",
+      "outside": "harness",
+      "note": "Confined workspace reads. The adapter rejects authored approval rules and denies reads requiring approval under a host ceiling."
+    },
+    "write": {
+      "allow": "absent",
+      "ask": "absent",
+      "deny": "harness"
+    },
+    "shell": {
+      "allow": "absent",
+      "ask": "absent",
+      "deny": "harness"
+    },
+    "network": {
+      "allow": "absent",
+      "ask": "absent",
+      "deny": "harness"
+    },
+    "mcp": {
+      "allow": "absent",
+      "ask": "absent",
+      "deny": "harness"
+    },
+    "delegate": {
+      "allow": "absent",
+      "ask": "absent",
+      "deny": "harness"
+    }
+  },
+  "settings": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "maxTurns": {
+        "type": "integer"
+      },
+      "maxOutputTokens": {
+        "type": "integer"
+      },
+      "maxTotalTokens": {
+        "type": "integer"
+      },
+      "cancelGraceMs": {
+        "type": "integer"
+      },
+      "maxParallelReads": {
+        "type": "integer"
+      },
+      "maxTurnMs": {
+        "type": "integer"
+      },
+      "maxTurnBytes": {
+        "type": "integer"
+      }
+    }
+  }
+}

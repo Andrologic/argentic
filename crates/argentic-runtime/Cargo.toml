@@ -14,6 +14,7 @@ agsdl-content-qa = []
 [dependencies]
 axum = "0.8"
 tempfile = "3"
+argentic-harness = { version = "0.1.0", path = "../argentic-harness" }
 argentic-core = { version = "0.1.0", path = "../argentic-core" }
 serde_json = { version = "1", features = ["raw_value", "arbitrary_precision"] }
 schemars = "0.8"

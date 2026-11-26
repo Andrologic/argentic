@@ -221,7 +221,7 @@ impl crate::agsdl_host_runtime030::AgentExecutor030 for ScriptedExecutor030 {
                             let Some(delivery) = delivery else { return Ok(()); };
                             drop(delivery.wire_admission().await?);
                             deliveries.push(delivery.effect().clone());
-                            delivery.acknowledge(&work.tasks, &work.attempt)?;
+                            delivery.acknowledge(&work.tasks, &work.attempt).await?;
                         }
                         Some(event) = channels.protocol.recv() => {
                             let result = events.emit(event.body, &cancel).await;
@@ -293,7 +293,7 @@ async fn start_scripted_work030(
         tasks,
         owner,
         effect,
-        executor.clone(),
+        |_| Ok(executor.clone()),
         emitter,
         cancelled.child_token(),
         None,

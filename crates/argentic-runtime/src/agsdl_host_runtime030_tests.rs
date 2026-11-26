@@ -214,6 +214,7 @@ impl Fixture {
                 authored.clone(),
                 registry.to_string(),
                 &CancellationToken::new(),
+                argentic_core::calculation::default_available_harnesses(),
             )
             .await
             .unwrap();
@@ -363,7 +364,7 @@ impl AgentExecutor030 for DiagnosticFailure {
                 "SYNTHETIC_NATIVE_SECRET",
                 "SYNTHETIC_NATIVE_SECRET",
             );
-            *seen.lock().unwrap() = Some(crate::agsdl_host_codex::diagnostics::entry(
+            *seen.lock().unwrap() = Some(crate::agsdl_host_diagnostics030::entry(
                 &work.attempt,
                 &error,
             ));
@@ -377,7 +378,10 @@ async fn diagnostic_executor_failure_preserves_the_protocol_and_omits_raw_fields
     let tasks = StreamTasks::default();
     let seen = Arc::new(std::sync::Mutex::new(None));
     let executors = Executors030 {
-        agents: Arc::new(DiagnosticFailure(seen.clone())),
+        agents: std::collections::BTreeMap::from([(
+            "codex".into(),
+            Arc::new(DiagnosticFailure(seen.clone())) as Arc<dyn AgentExecutor030>,
+        )]),
         calls: None,
         humans: None,
         clock: None,
@@ -433,7 +437,10 @@ async fn distinct_executor_chains_two_works_without_double_dispatch() {
         independent_finish: false,
     });
     let executors: Executors030 = Executors030 {
-        agents: executor,
+        agents: std::collections::BTreeMap::from([(
+            "codex".into(),
+            executor as Arc<dyn AgentExecutor030>,
+        )]),
         calls: None,
         humans: None,
         clock: None,
@@ -476,14 +483,17 @@ async fn stop_remains_responsive_and_waits_for_physical_end() {
     let snapshot_read = Arc::new(Notify::new());
     let release_clock = Arc::new(Notify::new());
     let executors: Executors030 = Executors030 {
-        agents: Arc::new(FakeExecutor {
-            starts: starts.clone(),
-            started: started.clone(),
-            cleanup: Some(cleanup.clone()),
-            cancelled: cancelled.clone(),
-            submitted: None,
-            independent_finish: false,
-        }),
+        agents: std::collections::BTreeMap::from([(
+            "codex".into(),
+            Arc::new(FakeExecutor {
+                starts: starts.clone(),
+                started: started.clone(),
+                cleanup: Some(cleanup.clone()),
+                cancelled: cancelled.clone(),
+                submitted: None,
+                independent_finish: false,
+            }) as Arc<dyn AgentExecutor030>,
+        )]),
         calls: None,
         humans: None,
         clock: Some(Arc::new(WakeRaceClock {
@@ -566,14 +576,17 @@ async fn an_unowned_claim_is_interrupted_and_never_retried() {
     );
     let starts = Arc::new(AtomicUsize::new(0));
     let executors: Executors030 = Executors030 {
-        agents: Arc::new(FakeExecutor {
-            starts: starts.clone(),
-            started: Default::default(),
-            cleanup: None,
-            cancelled: Default::default(),
-            submitted: None,
-            independent_finish: false,
-        }),
+        agents: std::collections::BTreeMap::from([(
+            "codex".into(),
+            Arc::new(FakeExecutor {
+                starts: starts.clone(),
+                started: Default::default(),
+                cleanup: None,
+                cancelled: Default::default(),
+                submitted: None,
+                independent_finish: false,
+            }) as Arc<dyn AgentExecutor030>,
+        )]),
         calls: None,
         humans: None,
         clock: None,
@@ -628,14 +641,17 @@ async fn accepted_completion_and_stop_do_not_route_or_double_send() {
     let cancelled = Arc::new(Notify::new());
     let starts = Arc::new(AtomicUsize::new(0));
     let executors: Executors030 = Executors030 {
-        agents: Arc::new(FakeExecutor {
-            starts: starts.clone(),
-            started: Default::default(),
-            cleanup: Some(cleanup.clone()),
-            cancelled: cancelled.clone(),
-            submitted: Some(submitted.clone()),
-            independent_finish: true,
-        }),
+        agents: std::collections::BTreeMap::from([(
+            "codex".into(),
+            Arc::new(FakeExecutor {
+                starts: starts.clone(),
+                started: Default::default(),
+                cleanup: Some(cleanup.clone()),
+                cancelled: cancelled.clone(),
+                submitted: Some(submitted.clone()),
+                independent_finish: true,
+            }) as Arc<dyn AgentExecutor030>,
+        )]),
         calls: None,
         humans: None,
         clock: None,
@@ -721,14 +737,17 @@ async fn stop_during_physical_controller_evaluation_retains_the_join() {
     let tasks = StreamTasks::default();
     let starts = Arc::new(AtomicUsize::new(0));
     let executors: Executors030 = Executors030 {
-        agents: Arc::new(FakeExecutor {
-            starts: starts.clone(),
-            started: Default::default(),
-            cleanup: None,
-            cancelled: Default::default(),
-            submitted: None,
-            independent_finish: false,
-        }),
+        agents: std::collections::BTreeMap::from([(
+            "codex".into(),
+            Arc::new(FakeExecutor {
+                starts: starts.clone(),
+                started: Default::default(),
+                cleanup: None,
+                cancelled: Default::default(),
+                submitted: None,
+                independent_finish: false,
+            }) as Arc<dyn AgentExecutor030>,
+        )]),
         calls: None,
         humans: None,
         clock: None,
@@ -781,14 +800,17 @@ async fn stop_before_the_first_handoff_settles_an_unadmitted_start() {
     let tasks = StreamTasks::default();
     let starts = Arc::new(AtomicUsize::new(0));
     let executors: Executors030 = Executors030 {
-        agents: Arc::new(FakeExecutor {
-            starts: starts.clone(),
-            started: Default::default(),
-            cleanup: None,
-            cancelled: Default::default(),
-            submitted: None,
-            independent_finish: false,
-        }),
+        agents: std::collections::BTreeMap::from([(
+            "codex".into(),
+            Arc::new(FakeExecutor {
+                starts: starts.clone(),
+                started: Default::default(),
+                cleanup: None,
+                cancelled: Default::default(),
+                submitted: None,
+                independent_finish: false,
+            }) as Arc<dyn AgentExecutor030>,
+        )]),
         calls: None,
         humans: None,
         clock: None,
@@ -893,13 +915,16 @@ async fn stop_between_preparation_and_claim_does_not_start_or_interrupt_the_supe
     let tasks = StreamTasks::default();
     let starts = Arc::new(AtomicUsize::new(0));
     let executors: Executors030 = Executors030 {
-        agents: Arc::new(StopBeforeClaimExecutor {
-            host: f.host.clone(),
-            pool: f.pool.clone(),
-            owner: f.owner.clone(),
-            identity: f.identity.clone(),
-            starts: starts.clone(),
-        }),
+        agents: std::collections::BTreeMap::from([(
+            "codex".into(),
+            Arc::new(StopBeforeClaimExecutor {
+                host: f.host.clone(),
+                pool: f.pool.clone(),
+                owner: f.owner.clone(),
+                identity: f.identity.clone(),
+                starts: starts.clone(),
+            }) as Arc<dyn AgentExecutor030>,
+        )]),
         calls: None,
         humans: None,
         clock: None,
@@ -942,14 +967,17 @@ async fn qualified_codex_registry_and_policy_run_the_write_review_demo() {
     let tasks = StreamTasks::default();
     let starts = Arc::new(AtomicUsize::new(0));
     let executors: Executors030 = Executors030 {
-        agents: Arc::new(FakeExecutor {
-            starts: starts.clone(),
-            started: Default::default(),
-            cleanup: None,
-            cancelled: Default::default(),
-            submitted: None,
-            independent_finish: false,
-        }),
+        agents: std::collections::BTreeMap::from([(
+            "codex".into(),
+            Arc::new(FakeExecutor {
+                starts: starts.clone(),
+                started: Default::default(),
+                cleanup: None,
+                cancelled: Default::default(),
+                submitted: None,
+                independent_finish: false,
+            }) as Arc<dyn AgentExecutor030>,
+        )]),
         calls: None,
         humans: None,
         clock: None,
@@ -1102,7 +1130,10 @@ async fn native_flow_choices_preserve_received_prompt_through_entry_and_route() 
     let tasks = StreamTasks::default();
     let executor = Arc::new(fake_executor());
     let executors = Executors030 {
-        agents: executor.clone(),
+        agents: std::collections::BTreeMap::from([(
+            "codex".into(),
+            executor.clone() as Arc<dyn AgentExecutor030>,
+        )]),
         calls: None,
         humans: Some(Arc::new(HumanExecutor030 {
             pool: f.pool.clone(),
@@ -1248,7 +1279,10 @@ async fn supervisor_panic_waits_for_active_executor_cleanup() {
         ..fake_executor()
     });
     let executors: Executors030 = Executors030 {
-        agents: executor.clone(),
+        agents: std::collections::BTreeMap::from([(
+            "codex".into(),
+            executor.clone() as Arc<dyn AgentExecutor030>,
+        )]),
         calls: None,
         humans: None,
         clock: Some(Arc::new(PanickingClock)),

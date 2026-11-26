@@ -129,6 +129,9 @@ pub(crate) fn fixed_code(error: &EngineFailure) -> &'static str {
         return code;
     }
     const CODES: &[&str] = &[
+        "ARGENTIC_PROVIDER",
+        "ARGENTIC_PROVIDER_CONFIG",
+        "ARGENTIC_WORK_FAILED",
         "CODEX_OPT_IN_REQUIRED",
         "CODEX_NOT_INSTALLED",
         "CODEX_PLATFORM_UNQUALIFIED",

@@ -609,6 +609,7 @@ impl HostState {
         source: repository::dto::EngineSourceRevision,
         authored_source: String,
         registry_json: String,
+        available: argentic_core::calculation::AvailableHarnesses,
     ) -> Result<crate::agsdl_host_compiler::CompileReceipt> {
         let host = self
             .inner
@@ -633,6 +634,7 @@ impl HostState {
                 authored_source,
                 registry_json,
                 &host.retired,
+                available,
             )
             .await?;
         if !host.live.load(Ordering::SeqCst) || receipt.generation != host.generation {

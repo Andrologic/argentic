@@ -54,6 +54,12 @@ pub use reader::{
 };
 pub use resource::{SourceBudget, MAX_SOURCE_BYTES, MAX_SOURCE_JSON_DEPTH, MAX_SOURCE_WORK};
 
+/// Optional local version probe for a bundled descriptive harness.
+pub fn harness_version_probe(name: &str) -> Option<(&'static str, &'static str)> {
+    reader::BUNDLED_VERSION_PROBES.iter().find(|(id, _, _)| *id == name)
+        .map(|(_, executable, argument)| (*executable, *argument))
+}
+
 /// Exact bundled harness-module bytes. Descriptive support never grants an effect.
 pub fn harness_module(name: &str) -> Option<&'static str> {
     reader::PINNED_MODULES

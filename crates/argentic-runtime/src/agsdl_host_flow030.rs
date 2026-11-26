@@ -174,7 +174,7 @@ impl FlowHost030 {
 /// Only DispatchLease030 mints it from the authenticated durable effect.
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct FlowWorkAttempt030 {
+pub struct FlowWorkAttempt030 {
     identity: FlowIdentity030,
     owner: EngineOwner,
     generation: String,
@@ -186,7 +186,7 @@ pub(crate) struct FlowWorkAttempt030 {
 impl FlowWorkAttempt030 {
     /// Synthetic attribution for registry tests, never an admission or grant.
     #[cfg(any(test, feature = "dev-support"))]
-    pub(crate) fn registry_fixture030(provider_attempt_id: &str) -> Self {
+    pub fn registry_fixture030(provider_attempt_id: &str) -> Self {
         Self {
             identity: FlowIdentity030 {
                 system_start_id: "registry-system".into(),
@@ -211,25 +211,25 @@ impl FlowWorkAttempt030 {
             provider_attempt_id: provider_attempt_id.into(),
         }
     }
-    pub(crate) fn identity(&self) -> &FlowIdentity030 {
+    pub fn identity(&self) -> &FlowIdentity030 {
         &self.identity
     }
-    pub(crate) fn owner(&self) -> &EngineOwner {
+    pub fn owner(&self) -> &EngineOwner {
         &self.owner
     }
-    pub(crate) fn generation(&self) -> &str {
+    pub fn generation(&self) -> &str {
         &self.generation
     }
-    pub(crate) fn work(&self) -> &repository::dto::EngineWork {
+    pub fn work(&self) -> &repository::dto::EngineWork {
         &self.work
     }
-    pub(crate) fn start_effect_id(&self) -> &str {
+    pub fn start_effect_id(&self) -> &str {
         &self.start_effect_id
     }
-    pub(crate) fn agent(&self) -> &str {
+    pub fn agent(&self) -> &str {
         &self.agent
     }
-    pub(crate) fn provider_attempt_id(&self) -> &str {
+    pub fn provider_attempt_id(&self) -> &str {
         &self.provider_attempt_id
     }
 }

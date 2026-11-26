@@ -58,7 +58,7 @@ pub(crate) fn codex_registry030(
     scope: &Value,
     observed: &crate::agsdl_host_codex::CodexObservation030,
 ) -> Result<(Value, Vec<Value>)> {
-    crate::agsdl_host_work_admission030::validate_codex_document030(document)?;
+    crate::agsdl_host_codex030::admission::validate_codex_document030(document)?;
     if document["agents"].as_object().is_some_and(|agents| {
         agents.values().any(|agent| {
             agent["skills"]

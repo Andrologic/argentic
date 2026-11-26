@@ -37,11 +37,9 @@ fn reported_version(output: &[u8]) -> Option<String> {
 /// remains unqualified and has no adapter, capabilities, models or grants.
 #[cfg(unix)]
 pub(crate) async fn observe(name: &str) -> Option<Value> {
-    if !matches!(name, "opencode" | "pi") {
-        return None;
-    }
+    let (executable, argument) = argentic_core::harness_version_probe(name)?;
     let path = std::env::var_os("PATH")?;
-    let executable = match executable_in_path(name, &path).ok()? {
+    let executable = match executable_in_path(executable, &path).ok()? {
         Some(executable) => executable,
         None => {
             return Some(
@@ -51,7 +49,7 @@ pub(crate) async fn observe(name: &str) -> Option<Value> {
     };
     let mut command = background_contained_tokio_command(executable);
     command
-        .arg("--version")
+        .arg(argument)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());

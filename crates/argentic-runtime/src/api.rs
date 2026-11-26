@@ -57,7 +57,29 @@ impl HostState {
         authored: String,
         registry: String,
     ) -> Result<Compilation> {
-        let result = self.compile(source, authored, registry).await?;
+        let result = self
+            .compile(
+                source,
+                authored,
+                registry,
+                argentic_core::calculation::default_available_harnesses(),
+            )
+            .await?;
+        Ok(Compilation {
+            generation: result.generation,
+            result_json: result.result_json,
+        })
+    }
+    pub async fn compile_document_with_harnesses(
+        &self,
+        source: EngineSourceRevision,
+        authored: String,
+        registry: String,
+        harnesses: &crate::harness::HarnessRegistry030,
+    ) -> Result<Compilation> {
+        let result = self
+            .compile(source, authored, registry, harnesses.available())
+            .await?;
         Ok(Compilation {
             generation: result.generation,
             result_json: result.result_json,
@@ -281,16 +303,16 @@ pub fn codex_module() -> String {
     crate::agsdl_host_codex030::approvals::module030()
 }
 pub fn validate_codex_document(document: &Value) -> Result<()> {
-    crate::agsdl_host_work_admission030::validate_codex_document030(document)
+    crate::agsdl_host_codex030::admission::validate_codex_document030(document)
 }
 pub fn validate_codex_permissions(value: &Value, pointer: &str) -> Result<()> {
-    crate::agsdl_host_work_admission030::codex_permissions030(value, pointer)
+    crate::agsdl_host_codex030::admission::codex_permissions030(value, pointer)
 }
 pub fn codex_read_only(policy: &crate::permissions::EffectivePolicy) -> Result<bool> {
-    crate::agsdl_host_work_admission030::codex_read_only030(policy)
+    crate::agsdl_host_codex030::admission::codex_read_only030(policy)
 }
 pub fn qualify_skill_folders(document: &Value, root: &std::path::Path) -> Result<()> {
-    crate::agsdl_host_codex030::content::qualify_skill_folders(document, root, None)
+    crate::agsdl_host_content030::qualify_skill_folders(document, root, None)
 }
 pub fn declared_steps(document: &Value) -> impl Iterator<Item = (String, &Value)> {
     crate::agsdl_host_qualification030::declared_steps030(document)
@@ -307,7 +329,26 @@ pub fn qualify_product(
     compiled: Option<&str>,
     host_permissions: Option<&crate::permissions::RequestedPermissions>,
 ) -> Result<ProductQualification> {
-    crate::agsdl_host_qualification030::qualify_product030(document, compiled, host_permissions)
+    qualify_product_with_harnesses(
+        document,
+        compiled,
+        host_permissions,
+        &crate::harness::HarnessRegistry030::with_codex(),
+    )
+}
+
+pub fn qualify_product_with_harnesses(
+    document: &Value,
+    compiled: Option<&str>,
+    host_permissions: Option<&crate::permissions::RequestedPermissions>,
+    harnesses: &crate::harness::HarnessRegistry030,
+) -> Result<ProductQualification> {
+    crate::agsdl_host_qualification030::qualify_product030(
+        document,
+        compiled,
+        host_permissions,
+        harnesses,
+    )
 }
 
 /// Returns the first native product blocker under the authored permissions.
@@ -355,25 +396,40 @@ impl StartSession<'_> {
                     .values()
                     .any(|agent| agent.get("answerTimeoutMs").is_some())
             });
-        let agents = crate::agsdl_host_codex030::CodexExecutor030::new(context.clone())
-            .with_mcp_equipment(&document)
-            .with_approvals(Arc::new(
-                crate::agsdl_host_action_approval030::AgentActionHumans030 {
-                    host: self.engine.clone(),
-                    pool: pool.clone(),
-                    policy: current_policy,
-                },
-            ));
-        let agents: Arc<dyn crate::agsdl_host_runtime030::AgentExecutor030> = Arc::new(agents);
+        let approvals = Arc::new(crate::agsdl_host_action_approval030::AgentActionHumans030 {
+            host: self.engine.clone(),
+            pool: pool.clone(),
+            policy: current_policy,
+        });
+        let authored: Value = serde_json::from_str(&capture.authored_source)?;
+        let mut agents = std::collections::BTreeMap::new();
+        for (name, agent) in authored["agents"].as_object().into_iter().flatten() {
+            let id = agent["harness"].as_str().unwrap_or_default();
+            if agents.contains_key(id) {
+                continue;
+            }
+            let adapter = context
+                .harnesses()
+                .get(id)
+                .ok_or_else(|| crate::harness::missing_executor(name, id))?;
+            let executor = adapter.executor(crate::harness::AgentExecutorContext030 {
+                host: &context,
+                document: &document,
+                approvals: approvals.clone(),
+            })?;
+            agents.insert(id.to_owned(), executor);
+        }
         #[cfg(any(test, feature = "dev-support"))]
-        let agents = self
+        if let Some(fixture) = self
             .engine
             .flow030()
             .fixture_agents
             .lock()
             .expect("synthetic executor")
             .clone()
-            .unwrap_or(agents);
+        {
+            agents.insert("codex".into(), fixture);
+        }
         let executors = crate::agsdl_host_runtime030::Executors030 {
             agents,
             calls: Some(Arc::new(
@@ -429,7 +485,7 @@ pub async fn observe_harness(name: &str) -> Option<Value> {
 
 /// Fixed descriptive metadata for the host capture regression. No executable,
 /// provider credential, native owner or response authority is returned.
-#[cfg(feature = "dev-support")]
+#[cfg(any(test, feature = "dev-support"))]
 #[doc(hidden)]
 pub fn synthetic_codex_observation() -> CodexObservation {
     CodexObservation {

@@ -17,11 +17,15 @@ use tokio::sync::{mpsc, oneshot, Mutex, OwnedMutexGuard};
 
 #[derive(Clone)]
 pub(crate) struct SteerSender030(mpsc::Sender<QueuedSteer030>);
-pub(crate) struct SteerInbox030(mpsc::Receiver<QueuedSteer030>);
+pub struct SteerInbox030(mpsc::Receiver<QueuedSteer030>);
 
 pub(crate) fn channel030() -> (SteerSender030, SteerInbox030) {
     let (send, recv) = mpsc::channel(1);
     (SteerSender030(send), SteerInbox030(recv))
+}
+
+pub(crate) fn asynchronous_contract(contract: &serde_json::Value) -> bool {
+    contract == argentic_core::AGSDL_040
 }
 
 fn refused() -> crate::persistence::dto::EngineFailure {
@@ -102,7 +106,7 @@ impl SteerGate030 {
     }
 }
 
-pub(crate) struct SteerDelivery030 {
+pub struct SteerDelivery030 {
     effect: FlowEffect030,
     attempt: FlowWorkAttempt030,
     ack: oneshot::Sender<Result<ConsumedSteer030>>,
@@ -187,10 +191,13 @@ impl SteerSender030 {
     }
 }
 impl SteerInbox030 {
-    pub(crate) fn close(&mut self) {
+    pub fn close(&mut self) {
         self.0.close();
     }
-    pub(crate) async fn receive(&mut self) -> Option<SteerDelivery030> {
+    pub(crate) fn try_receive(&mut self) -> Option<SteerDelivery030> {
+        self.0.try_recv().ok().and_then(|mut offer| offer.0.take())
+    }
+    pub async fn receive(&mut self) -> Option<SteerDelivery030> {
         self.0.recv().await.and_then(|mut offer| offer.0.take())
     }
 }
@@ -211,7 +218,7 @@ impl Drop for QueuedSteer030 {
 }
 
 impl SteerDelivery030 {
-    pub(crate) fn effect(&self) -> &FlowEffect030 {
+    pub fn effect(&self) -> &FlowEffect030 {
         &self.effect
     }
 
@@ -239,7 +246,7 @@ impl SteerDelivery030 {
 
     /// Serialize the actual provider send with Stop and recipient completion.
     /// The adapter releases the guard before awaiting a provider response.
-    pub(crate) async fn wire_admission(&self) -> Result<Option<OwnedMutexGuard<()>>> {
+    pub async fn wire_admission(&self) -> Result<Option<OwnedMutexGuard<()>>> {
         let Some((guard, state)) = self.current_state().await? else {
             return Ok(None);
         };
@@ -269,7 +276,7 @@ impl SteerDelivery030 {
         Ok(Some(guard))
     }
 
-    pub(crate) async fn observe_turn_end_while_counted(&self) -> Result<bool> {
+    pub async fn observe_turn_end_while_counted(&self) -> Result<bool> {
         let Some((_guard, state)) = self.current_state().await? else {
             return Ok(false);
         };
@@ -279,11 +286,11 @@ impl SteerDelivery030 {
         Ok(crate::persistence::flow030::accepts_steer030(&state, work))
     }
 
-    pub(crate) fn deadline(&self) -> Option<tokio::time::Instant> {
+    pub fn deadline(&self) -> Option<tokio::time::Instant> {
         self.gate.as_ref().map(|gate| gate.deadline)
     }
 
-    pub(crate) fn unavailable_content(self) {
+    pub fn unavailable_content(self) {
         let _ = self.ack.send(Err(failure(
             "CONTENT_UNAVAILABLE",
             "steer",
@@ -295,8 +302,7 @@ impl SteerDelivery030 {
         let _ = self.ack.send(Err(refused()));
     }
 
-    /// A matching Codex notification identifies the work, but carries no
-    /// evidence that its input was received before a committed exclusion.
+    /// A provider receipt still has to precede a committed work exclusion.
     pub(crate) async fn acknowledge_from_provider(
         delivery: &mut Option<Self>,
         tasks: &StreamTasks,
@@ -306,12 +312,24 @@ impl SteerDelivery030 {
         let Some(offer) = delivery.as_ref() else {
             return Ok(());
         };
+        if offer.gate.is_some() && offer.ack.is_closed() {
+            delivery.take();
+            return Ok(());
+        }
         // Keep the proof and offer in their owner until the cancellable read
         // returns. Stop can continue this same observation if it wins the race.
-        let observation = if turn_ended_while_counted {
-            None
-        } else {
-            offer.current_state().await?
+        let observation = match (turn_ended_while_counted, offer.deadline()) {
+            (true, _) => None,
+            (false, Some(deadline)) => {
+                match tokio::time::timeout_at(deadline, offer.current_state()).await {
+                    Ok(state) => state?,
+                    Err(_) => {
+                        delivery.take();
+                        return Ok(());
+                    }
+                }
+            }
+            (false, None) => offer.current_state().await?,
         };
         let offer = delivery.take().unwrap();
         if let Some((_guard, state)) = &observation {
@@ -328,7 +346,7 @@ impl SteerDelivery030 {
         {
             return Ok(());
         }
-        offer.acknowledge(tasks, attempt)
+        offer.resolve(tasks, attempt, true)
     }
 
     /// Let the recipient return after submitting its result. Its registry
@@ -369,17 +387,21 @@ impl SteerDelivery030 {
             .map_err(|_| refused())
     }
 
+    pub(crate) fn report_uncertain(self) {
+        let _ = self.ack.send(Err(uncertain()));
+    }
+
     /// Call only after the transport has consumed the message and sender.
-    pub(crate) fn acknowledge(
+    pub async fn acknowledge(
         self,
         tasks: &StreamTasks,
         attempt: &FlowWorkAttempt030,
     ) -> Result<()> {
-        self.resolve(tasks, attempt, true)
+        Self::acknowledge_from_provider(&mut Some(self), tasks, attempt, false).await
     }
 
     /// Only before any provider send, or after an explicit provider rejection.
-    pub(crate) fn not_sent(self, tasks: &StreamTasks, attempt: &FlowWorkAttempt030) -> Result<()> {
+    pub fn not_sent(self, tasks: &StreamTasks, attempt: &FlowWorkAttempt030) -> Result<()> {
         self.resolve(tasks, attempt, false)
     }
     fn resolve(
@@ -388,6 +410,14 @@ impl SteerDelivery030 {
         attempt: &FlowWorkAttempt030,
         consumed: bool,
     ) -> Result<()> {
+        if consumed
+            && self
+                .gate
+                .as_ref()
+                .is_some_and(|gate| gate.wire_checkpoint().is_none())
+        {
+            return Err(refused());
+        }
         let asynchronous = self.gate.is_some();
         match self.evidence(tasks, attempt, consumed)?() {
             Ok(()) => Ok(()),
@@ -603,7 +633,7 @@ mod tests {
                     received.send(()).unwrap();
                     wait.await.unwrap();
                     completed
-                        .send(delivery.acknowledge(&owned_tasks, &target))
+                        .send(delivery.acknowledge(&owned_tasks, &target).await)
                         .unwrap();
                 },
             )
@@ -656,8 +686,9 @@ mod tests {
                         return;
                     }
                     let foreign = FlowWorkAttempt030::registry_fixture030("foreign");
-                    let result =
-                        delivery.acknowledge(&registry, if mode == 0 { &target } else { &foreign });
+                    let result = delivery
+                        .acknowledge(&registry, if mode == 0 { &target } else { &foreign })
+                        .await;
                     assert_eq!(result.is_ok(), mode == 0);
                     let _ = done.send(());
                 })
@@ -683,6 +714,7 @@ mod tests {
                 .await
                 .unwrap()
                 .acknowledge(&StreamTasks::default(), &attempt)
+                .await
         });
         assert!(sent.is_err());
         assert!(received.is_err());

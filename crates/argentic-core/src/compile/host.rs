@@ -203,6 +203,7 @@ pub(crate) fn compile(
     source: &Value,
     observation: &Value,
     budget: &SourceBudget,
+    available: &crate::calculation::AvailableHarnesses,
 ) -> Result<String, Error> {
     let mut registry = o([]);
     for field in ["format", "version", "modules", "harnesses", "agents"] {
@@ -222,7 +223,7 @@ pub(crate) fn compile(
         );
     }
     let mut prepared = plan::prepare(authored, source, &registry, budget);
-    let mut result = plan::finish(&mut prepared);
+    let mut result = plan::finish(&mut prepared, available);
     let mut runtime = result.get("runtime").clone();
     runtime.set("source", source.clone());
     runtime.set("registryVersion", observation.get("version").clone());

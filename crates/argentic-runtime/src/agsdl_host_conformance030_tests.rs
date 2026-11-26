@@ -332,6 +332,7 @@ impl Fixture {
                 serde_json::from_value(source.clone()).unwrap(),
                 authored.clone(),
                 registry.to_string(),
+                argentic_core::calculation::default_available_harnesses(),
             )
             .await
             .unwrap();
@@ -597,7 +598,7 @@ impl AgentExecutor030 for Executor {
                             })).is_none());
                         } else {
                             drop(delivery.wire_admission().await?);
-                            delivery.acknowledge(&work.tasks, &work.attempt)?;
+                            delivery.acknowledge(&work.tasks, &work.attempt).await?;
                         }
                         wake.send_modify(|n| *n += 1);
                     },
@@ -818,14 +819,17 @@ async fn native_timeline(
         .broker(&host, &f.pool, &f.identity)
         .await?;
     let executors: Executors030 = Executors030 {
-        agents: Arc::new(Executor {
-            whole_stop: whole_stop.clone(),
-            deferred: deferred.clone(),
-            steer_script: steer_script.clone(),
-            plans: Default::default(),
-            running: running.clone(),
-            wake: wake.clone(),
-        }),
+        agents: std::collections::BTreeMap::from([(
+            "example".into(),
+            Arc::new(Executor {
+                whole_stop: whole_stop.clone(),
+                deferred: deferred.clone(),
+                steer_script: steer_script.clone(),
+                plans: Default::default(),
+                running: running.clone(),
+                wake: wake.clone(),
+            }) as Arc<dyn AgentExecutor030>,
+        )]),
         calls: Some(Arc::new(
             crate::agsdl_host_call_executor030::CallExecutor030 {
                 config: f.config.clone(),
