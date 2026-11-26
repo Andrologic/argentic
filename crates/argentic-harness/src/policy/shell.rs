@@ -86,7 +86,7 @@ fn opaque_command(node: Node<'_>, source: &str) -> bool {
     match name.rsplit('/').next().unwrap_or(name) {
         "eval" | "source" | "." | "exec" | "xargs" | "bash" | "sh" | "dash" | "zsh" | "ksh"
         | "ash" | "alias" | "unalias" | "command" | "builtin" | "enable" | "hash" | "shopt"
-        | "trap" => true,
+        | "trap" | "time" | "coproc" => true,
         "find" => {
             let mut cursor = node.walk();
             let opaque = node
@@ -111,18 +111,31 @@ fn plain_word(word: &str) -> bool {
 
 fn redirection_end(node: Node<'_>) -> usize {
     let mut cursor = node.walk();
-    let heredoc = node
-        .children_by_field_name("redirect", &mut cursor)
-        .find(|child| child.kind() == "heredoc_redirect");
-    heredoc
-        .and_then(|heredoc| {
-            let mut cursor = heredoc.walk();
-            let delimiter = heredoc
-                .named_children(&mut cursor)
-                .find(|child| child.kind() == "heredoc_start");
-            delimiter
+    node.children_by_field_name("redirect", &mut cursor)
+        .map(|redirect| {
+            if redirect.kind() != "heredoc_redirect" {
+                return redirect.end_byte();
+            }
+            // The grammar stores arguments and redirects after the delimiter
+            // under the here-doc. Its body and following commands are separate.
+            let mut cursor = redirect.walk();
+            let end = redirect
+                .children(&mut cursor)
+                .enumerate()
+                .filter(|(index, child)| {
+                    child.kind() == "heredoc_start"
+                        || matches!(
+                            redirect.field_name_for_child(*index as u32),
+                            Some("argument" | "redirect")
+                        )
+                })
+                .map(|(_, child)| child.end_byte())
+                .max()
+                .unwrap_or(redirect.end_byte());
+            end
         })
-        .map_or(node.end_byte(), |delimiter| delimiter.end_byte())
+        .max()
+        .unwrap_or(node.end_byte())
 }
 
 fn last_command(mut node: Node<'_>) -> Option<Node<'_>> {

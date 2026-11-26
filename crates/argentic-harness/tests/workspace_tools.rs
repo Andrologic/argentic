@@ -120,6 +120,14 @@ fn bash_subcommands_use_syntax_and_original_text() {
             "cat <<'EOF'\na; b && pretend\nEOF\necho done",
             vec!["cat <<'EOF'", "echo done"],
         ),
+        (
+            "cat <<EOF >out\ndata\nEOF\necho done",
+            vec!["cat <<EOF >out", "echo done"],
+        ),
+        (
+            "cat <<EOF file\ndata\nEOF\necho done",
+            vec!["cat <<EOF file", "echo done"],
+        ),
         ("echo left | cat >out", vec!["echo left", "cat >out"]),
         (
             "echo left >out && echo right",
@@ -187,6 +195,8 @@ async fn opaque_shell_commands_use_the_strictest_shell_rule() {
         "`printf printf` hello",
         "bash -c 'printf hello'",
         "sh -c 'printf hello'",
+        "time printf hello",
+        "coproc printf hello",
         "source helper",
         ". helper",
         "exec printf hello",
