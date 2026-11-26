@@ -1,0 +1,32 @@
+{
+  "$schema": "https://raw.githubusercontent.com/Andrologic/AgSDL/v0.4.0/schema/harness-module.schema.json",
+  "name": "argentic",
+  "title": "Argentic",
+  "version": "1.0.0",
+  "contract": "agsdl-0.4.0",
+  "harnessVersions": ">=0.1.0 <0.2.0",
+  "properties": {
+    "model.name": { "support": "native" },
+    "model.effort": { "support": "native" },
+    "instance.new": { "support": "native" }
+  },
+  "permissions": {
+    "read": {
+      "allow": "harness",
+      "deny": "harness",
+      "ask": "absent",
+      "outside": "harness"
+    }
+  },
+  "settings": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "maxTurns": { "type": "integer" },
+      "maxOutputTokens": { "type": "integer" },
+      "maxTotalTokens": { "type": "integer" },
+      "cancelGraceMs": { "type": "integer" },
+      "maxParallelReads": { "type": "integer" }
+    }
+  }
+}
