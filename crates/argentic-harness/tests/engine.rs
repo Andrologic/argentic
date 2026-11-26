@@ -944,6 +944,7 @@ async fn steer_admitted_after_missing_submission_can_request_a_tool() {
         late: Mutex::new(Some(Steer {
             id: "late".into(),
             message: "Read notes.txt before you submit.".into(),
+            reference: None,
             consumed: late,
         })),
     });
