@@ -219,6 +219,7 @@ fn compilation_of_200_agents_20_joins_and_approvals_stays_below_the_budget() {
         &decoder.parse(&Text::from(source)).unwrap(),
         &decoder.parse(&Text::from(registry)).unwrap(),
         &budget,
+        &crate::calculation::default_available_harnesses(),
     )
     .unwrap();
     let elapsed = t.elapsed();

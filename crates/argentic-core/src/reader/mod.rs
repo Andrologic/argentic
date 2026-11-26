@@ -389,7 +389,10 @@ mod tests {
         }
         let pinned = registry(Modules::Pinned).unwrap();
         let names: Vec<_> = pinned.iter().map(|(name, _)| name.as_str()).collect();
-        assert_eq!(names, ["claude-code", "codex", "opencode", "pi"]);
+        assert_eq!(
+            names,
+            ["claude-code", "codex", "opencode", "pi", "argentic"]
+        );
     }
 
     #[test]

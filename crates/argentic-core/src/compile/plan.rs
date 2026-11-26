@@ -210,7 +210,10 @@ pub(crate) fn prepare(
     }
     state
 }
-pub(crate) fn finish(state: &mut Prepared) -> Value {
+pub(crate) fn finish(
+    state: &mut Prepared,
+    available: &crate::calculation::AvailableHarnesses,
+) -> Value {
     if !state.ready {
         return state.unavailable();
     }
@@ -417,13 +420,24 @@ pub(crate) fn finish(state: &mut Prepared) -> Value {
         let product = (!agents.is_empty()
             || graph.steps.iter().any(|s| s.get("type").eq_str("call")))
             && agents.iter().all(|agent| {
-                registry.get("harnesses").array().unwrap().iter().any(|v| {
-                    native::equal(v.get("harness"), agent.get("harness"))
-                        && v.get("harness").eq_str("codex")
-                        && v.get("installation").eq_str("available")
-                        && v.get("qualified").truthy()
-                        && v.get("adapterId").eq_str("codex-app-server-v1")
-                })
+                agent
+                    .get("harness")
+                    .text()
+                    .and_then(|name| name.utf8())
+                    .and_then(|name| available.get(name.as_str()))
+                    .is_some_and(|adapter| {
+                        registry
+                            .get("harnesses")
+                            .array()
+                            .unwrap()
+                            .iter()
+                            .any(|observation| {
+                                native::equal(observation.get("harness"), agent.get("harness"))
+                                    && observation.get("installation").eq_str("available")
+                                    && observation.get("qualified").truthy()
+                                    && observation.get("adapterId").eq_str(adapter)
+                            })
+                    })
             });
         let versions = o([
             ("snapshot", s("2")),
