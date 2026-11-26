@@ -6,7 +6,7 @@ use std::{
     borrow::Cow,
     collections::{HashSet, VecDeque},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicU8, Ordering},
         Arc,
     },
     time::Duration,
@@ -293,7 +293,7 @@ impl Harness {
         let cancel = parent.child_token();
         let _cancel_on_drop = cancel.clone().drop_guard();
         let tracker = TaskTracker::new();
-        let tool_choice_rejected = AtomicBool::new(false);
+        let tool_choice_rejected = AtomicU8::new(0);
         let mut instance = Instance {
             harness: self,
             port,
@@ -367,7 +367,7 @@ struct Instance<'a> {
     artifacts: Vec<Artifact>,
     corrections: u32,
     force_submission: bool,
-    tool_choice_rejected: &'a AtomicBool,
+    tool_choice_rejected: &'a AtomicU8,
     history_end: usize,
     protected_prefix: usize,
     mission_index: Option<usize>,
@@ -578,6 +578,24 @@ impl Instance<'_> {
             }
         }
         self.active()?;
+        // Force the result tool by name. A server that refuses named choices
+        // gets `required` over the result tool alone, then no forced choice.
+        let submit_only;
+        let (tools, tool_choice) = match (
+            self.force_submission,
+            self.tool_choice_rejected.load(Ordering::Relaxed),
+        ) {
+            (true, 0) => (definitions, ToolChoice::Named(SUBMIT_RESULT)),
+            (true, 1) => {
+                submit_only = definitions
+                    .iter()
+                    .filter(|tool| tool.name == SUBMIT_RESULT)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                (submit_only.as_slice(), ToolChoice::Required)
+            }
+            _ => (definitions, ToolChoice::Auto),
+        };
         let delivery = self.delivery.clone();
         let provider = self.harness.provider.clone();
         let request = provider.stream(
@@ -585,14 +603,8 @@ impl Instance<'_> {
                 model: &work.model,
                 reasoning_effort: work.reasoning_effort.as_deref(),
                 messages: &messages,
-                tools: definitions,
-                tool_choice: if self.force_submission
-                    && !self.tool_choice_rejected.load(Ordering::Relaxed)
-                {
-                    ToolChoice::Named(SUBMIT_RESULT)
-                } else {
-                    ToolChoice::Auto
-                },
+                tools,
+                tool_choice,
                 tool_choice_rejected: Some(self.tool_choice_rejected),
                 max_output_tokens,
                 limits: (&self.harness.settings).into(),

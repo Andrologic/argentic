@@ -452,8 +452,30 @@ fn http_error(status: u16, retry_after: Option<&str>, body: &'static str) -> Res
     response
 }
 
+/// The server refuses the named choice, then `required`, then accepts.
 fn correction_replies(stop: impl Fn() -> Response, rejection: &'static str) -> Vec<Response> {
-    vec![stop(), http_error(400, None, rejection), stop(), stop()]
+    vec![
+        stop(),
+        http_error(400, None, rejection),
+        http_error(400, None, rejection),
+        stop(),
+        stop(),
+    ]
+}
+
+fn tool_names(body: &Value) -> Vec<String> {
+    body["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| {
+            tool["name"]
+                .as_str()
+                .or_else(|| tool["function"]["name"].as_str())
+                .unwrap()
+                .to_owned()
+        })
+        .collect()
 }
 
 async fn correction_turns(mock: &Mock, model: &str, effort: Option<&str>) {
@@ -484,16 +506,21 @@ async fn correction_turns(mock: &Mock, model: &str, effort: Option<&str>) {
     assert!(matches!(report.outcome, Err(Failure::OutputInvalid(_))));
 }
 
-fn assert_choice_fallback(mock: &Mock, forced: Value) {
+fn assert_choice_fallback(mock: &Mock, named: Value, required: Value) {
     let requests = mock.requests.lock().unwrap();
-    assert_eq!(requests.len(), 4);
+    assert_eq!(requests.len(), 5);
     assert!(requests[0].1.get("tool_choice").is_none());
-    assert_eq!(requests[1].1["tool_choice"], forced);
+    assert_eq!(requests[1].1["tool_choice"], named);
+    // A refused named choice becomes `required` over the result tool alone.
+    assert_eq!(requests[2].1["tool_choice"], required);
+    assert_eq!(tool_names(&requests[2].1), ["agsdl_submit_result"]);
+    // A refused `required` drops the forced choice and restores every tool.
     let mut retry = requests[1].1.clone();
     retry.as_object_mut().unwrap().remove("tool_choice");
-    assert_eq!(requests[2].1, retry);
-    assert!(requests[3].1.get("tool_choice").is_none());
-    assert!(requests[3].1.to_string().contains("SUBMISSION_REQUIRED"));
+    assert_eq!(requests[3].1, retry);
+    assert!(requests[4].1.get("tool_choice").is_none());
+    assert!(tool_names(&requests[4].1).len() > 1);
+    assert!(requests[4].1.to_string().contains("SUBMISSION_REQUIRED"));
 }
 
 #[tokio::test]
@@ -514,7 +541,33 @@ async fn chat_completions_forces_submission_and_falls_back() {
     assert_choice_fallback(
         &mock,
         json!({"type":"function","function":{"name":"agsdl_submit_result"}}),
+        json!("required"),
     );
+}
+
+/// LM Studio refuses object tool choices but accepts `required`.
+#[tokio::test]
+async fn chat_completions_named_rejection_keeps_required_over_the_result_tool() {
+    let stop = || {
+        sse(concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"text only\"},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n"
+    ).into())
+    };
+    let rejection = r#"{"error":"Invalid tool_choice type: 'object'. Supported string values: none, auto, required"}"#;
+    let mock = Mock::start_at(
+        "/v1/chat/completions",
+        vec![stop(), http_error(400, None, rejection), stop(), stop()],
+        |url| Arc::new(ChatCompletions::new("fixture", url, None).unwrap()),
+    )
+    .await;
+    correction_turns(&mock, "fixture/gpt-5.4", None).await;
+    let requests = mock.requests.lock().unwrap();
+    assert_eq!(requests.len(), 4);
+    for request in &requests[2..] {
+        assert_eq!(request.1["tool_choice"], "required");
+        assert_eq!(tool_names(&request.1), ["agsdl_submit_result"]);
+    }
 }
 
 #[tokio::test]
@@ -532,6 +585,7 @@ async fn responses_forces_submission_and_falls_back() {
     assert_choice_fallback(
         &mock,
         json!({"type":"function","name":"agsdl_submit_result"}),
+        json!("required"),
     );
 }
 
@@ -548,7 +602,11 @@ async fn messages_forces_submission_and_falls_back() {
     let (_, first, _) = mock.requests.lock().unwrap().remove(0);
     assert_eq!(first["thinking"]["type"], "enabled");
     assert!(first.get("tool_choice").is_none());
-    assert_choice_fallback(&mock, json!({"type":"tool","name":"agsdl_submit_result"}));
+    assert_choice_fallback(
+        &mock,
+        json!({"type":"tool","name":"agsdl_submit_result"}),
+        json!({"type":"any"}),
+    );
 }
 
 #[tokio::test]

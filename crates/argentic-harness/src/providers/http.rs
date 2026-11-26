@@ -111,7 +111,7 @@ impl HttpStream {
         if let Some(fields) = body.as_object_mut() {
             if request
                 .tool_choice_rejected
-                .is_some_and(|rejected| rejected.load(Ordering::Relaxed))
+                .is_some_and(|level| level.load(Ordering::Relaxed) >= 2)
             {
                 fields.remove("tool_choice");
             }
@@ -120,6 +120,7 @@ impl HttpStream {
             }
         }
         let mut retries = 0;
+        let mut full_tools = None;
         let delivery = request.delivery;
         loop {
             let wire = self
@@ -175,16 +176,13 @@ impl HttpStream {
             delivery.report(DeliveryStatus::NotDelivered);
             let message = error_body(&mut response, &cancel, &budget).await?;
             if matches!(status.as_u16(), 400 | 422) {
-                if rejects_tool_choice(&message)
-                    && body
-                        .as_object_mut()
-                        .and_then(|fields| fields.remove("tool_choice"))
-                        .is_some()
-                {
-                    if let Some(rejected) = request.tool_choice_rejected {
-                        rejected.store(true, Ordering::Relaxed);
+                if rejects_tool_choice(&message) {
+                    if let Some(level) = downgrade_tool_choice(&mut body, &mut full_tools) {
+                        if let Some(shared) = request.tool_choice_rejected {
+                            shared.fetch_max(level, Ordering::Relaxed);
+                        }
+                        continue;
                     }
-                    continue;
                 }
                 if rejects_effort(&message) && self.drop_effort(&mut body, effort_field) {
                     continue;
@@ -346,6 +344,48 @@ pub(super) fn rejects_effort(message: &str) -> bool {
         ]
         .iter()
         .any(|reason| message.contains(reason))
+}
+
+/// Replaces a refused forced tool choice and returns the new fallback level.
+/// A named choice becomes `required` (`any` for Messages) over that tool
+/// alone; any other forced choice is removed and the full tool list restored.
+fn downgrade_tool_choice(body: &mut Value, full_tools: &mut Option<Value>) -> Option<u8> {
+    let fields = body.as_object_mut()?;
+    let choice = fields.get("tool_choice")?;
+    let named = choice["name"]
+        .as_str()
+        .or_else(|| choice["function"]["name"].as_str())
+        .map(str::to_owned);
+    if let (Some(name), Some(tools)) = (named, fields.get("tools").and_then(Value::as_array)) {
+        let messages_api = choice["type"] == "tool";
+        let only: Vec<Value> = tools
+            .iter()
+            .filter(|tool| {
+                tool["name"]
+                    .as_str()
+                    .or_else(|| tool["function"]["name"].as_str())
+                    == Some(name.as_str())
+            })
+            .cloned()
+            .collect();
+        if !only.is_empty() {
+            *full_tools = fields.insert("tools".into(), Value::Array(only));
+            fields.insert(
+                "tool_choice".into(),
+                if messages_api {
+                    serde_json::json!({"type": "any"})
+                } else {
+                    serde_json::json!("required")
+                },
+            );
+            return Some(1);
+        }
+    }
+    fields.remove("tool_choice")?;
+    if let Some(tools) = full_tools.take() {
+        fields.insert("tools".into(), tools);
+    }
+    Some(2)
 }
 
 fn rejects_tool_choice(message: &str) -> bool {
