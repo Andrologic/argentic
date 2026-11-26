@@ -117,6 +117,11 @@ impl std::fmt::Debug for Replay {
 }
 
 impl Replay {
+    /// Approximate serialized size, for history budgets and compaction.
+    pub(crate) fn byte_len(&self) -> usize {
+        self.items.iter().map(|item| item.to_string().len()).sum()
+    }
+
     fn items(
         &self,
         format: WireFormat,

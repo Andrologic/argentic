@@ -262,6 +262,7 @@ fn recorded_tool_turn(id: &str, output: String) -> [Message; 2] {
         Message::Assistant {
             text: String::new(),
             reasoning: String::new(),
+            replay: None,
             calls: vec![ToolCall {
                 id: id.into(),
                 name: "read".into(),

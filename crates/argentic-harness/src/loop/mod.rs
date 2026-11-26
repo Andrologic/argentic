@@ -824,6 +824,7 @@ impl Instance<'_> {
             messages.push(Message::Assistant {
                 text: self.text[start..].to_owned(),
                 reasoning: String::new(),
+                replay: None,
                 calls: Vec::new(),
             });
         }

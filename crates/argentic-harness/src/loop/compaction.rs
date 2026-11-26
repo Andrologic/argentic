@@ -179,7 +179,7 @@ impl Instance<'_> {
                         text.push_str(&part);
                     }
                     Chunk::Text(_) | Chunk::ToolCall(_) => valid = false,
-                    Chunk::Reasoning(_) => {}
+                    Chunk::Reasoning(_) | Chunk::Replay(_) => {}
                     Chunk::End { finish, usage } => {
                         if !valid || finish != Finish::Stop {
                             text.clear();
@@ -302,10 +302,12 @@ fn message_bytes(message: &Message) -> usize {
         Message::Assistant {
             text,
             reasoning,
+            replay,
             calls,
         } => {
             text.len()
                 + reasoning.len()
+                + replay.as_ref().map_or(0, |replay| replay.byte_len())
                 + calls
                     .iter()
                     .map(|call| 32 + call.id.len() + call.name.len() + call.arguments.len())
