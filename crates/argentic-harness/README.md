@@ -318,8 +318,10 @@ The standalone host registers the adapter when configured and requires explicit
 opt-in. Shared and named instances keep their conversation in memory for the
 run. Route and delivery metadata travels as untrusted message data. The
 module leaves authored resources unsupported because the adapter has no
-separate resource channel. Additional authored directories, model reviewers,
-conversation compaction, completion checks, skills and MCP remain unsupported.
+separate resource channel. Conversation compaction runs when the provider
+entry sets `contextWindowTokens` (see `docs/argentic-harness.md`). Additional
+authored directories, model reviewers, completion checks, skills and MCP remain
+unsupported.
 
 ## Source notes
 
