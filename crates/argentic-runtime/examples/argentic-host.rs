@@ -6,7 +6,7 @@ use argentic_runtime::{
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::path::PathBuf;
+use std::{collections::BTreeSet, path::PathBuf};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt};
 
 #[derive(Deserialize)]
@@ -68,11 +68,20 @@ async fn retire(host: &Host, approved: &[String]) -> persistence::Result<()> {
             )
         })?
 }
-async fn execute(host: &Host, command: Command, codex: bool) -> persistence::Result<(Value, bool)> {
+async fn execute(
+    host: &Host,
+    command: Command,
+    allowed: &BTreeSet<String>,
+) -> persistence::Result<(Value, bool)> {
     let result = match command {
-        Command::Preflight { entry } => host.preflight(entry.as_ref(), codex).await?,
+        Command::Preflight { entry } => {
+            host.preflight_with_harnesses(entry.as_ref(), allowed)
+                .await?
+        }
         Command::Start { request_id, entry } => {
-            let run = host.start(request_id, entry, codex).await?;
+            let run = host
+                .start_with_harnesses(request_id, entry, allowed)
+                .await?;
             json!({"receipt":run.receipt,"source":run.capture.source})
         }
         Command::Runs => json!(host.runs().await?),
@@ -110,7 +119,7 @@ async fn execute(host: &Host, command: Command, codex: bool) -> persistence::Res
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     if args.is_empty() || args.iter().any(|a| a == "--help") {
-        println!("argentic-host --data DIR --workspace DIR --source FILE_OR_PROJECT --policy FILE --approve-policy SHA256 --stop-on-exit [--codex] [--codex-auth-file FILE]\nJSON-lines commands: preflight, start, runs, inspect, humans, answer, controlRun, deliver, stop, shutdown, quit.\nNo provider is observed or started unless --codex and preflight/start are both explicit.\n--codex-auth-file opts into native, memory-only reuse of an existing ChatGPT file session, without its configuration or refresh writes.\n--stop-on-exit consents to native Stop/drain of this process's runs on EOF or Ctrl-C.");
+        println!("argentic-host --data DIR --workspace DIR --source FILE_OR_PROJECT --policy FILE --approve-policy SHA256 --stop-on-exit [--codex] [--codex-auth-file FILE] [--argentic-config FILE]\nJSON-lines commands: preflight, start, runs, inspect, humans, answer, controlRun, deliver, stop, shutdown, quit.\nUse --codex or --argentic-config to opt into that harness for preflight and start.\n--codex-auth-file opts into native, memory-only reuse of an existing ChatGPT file session, without its configuration or refresh writes.\n--stop-on-exit consents to native Stop/drain of this process's runs on EOF or Ctrl-C.");
         return Ok(());
     }
     let mut data = None;
@@ -118,16 +127,19 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut source = None;
     let mut policy = None;
     let mut approved = None;
-    let mut codex = false;
+    let mut allowed = BTreeSet::new();
+    let mut argentic_config = None;
     let mut stop_on_exit = false;
     let mut auth_file = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "--codex" => codex = true,
+            "--codex" => {
+                allowed.insert("codex".into());
+            }
             "--stop-on-exit" => stop_on_exit = true,
             name @ ("--data" | "--workspace" | "--source" | "--policy" | "--approve-policy"
-            | "--codex-auth-file") => {
+            | "--codex-auth-file" | "--argentic-config") => {
                 i += 1;
                 let value = args.get(i).ok_or("Missing option value")?.clone();
                 match name {
@@ -136,6 +148,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     "--source" => source = Some(PathBuf::from(value)),
                     "--policy" => policy = Some(PathBuf::from(value)),
                     "--codex-auth-file" => auth_file = Some(PathBuf::from(value)),
+                    "--argentic-config" => argentic_config = Some(PathBuf::from(value)),
                     _ => approved = Some(value),
                 }
             }
@@ -158,6 +171,21 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let host = match auth_file {
         Some(path) => host.with_codex_auth_file(path),
         None => host,
+    };
+    let host = if let Some(path) = argentic_config {
+        let bytes = std::fs::read(path)?;
+        let config = serde_json::from_slice(&bytes).map_err(|error| {
+            format!(
+                "Invalid Argentic provider configuration at line {}, column {}",
+                error.line(),
+                error.column()
+            )
+        })?;
+        allowed.insert("argentic".into());
+        host.with_argentic(config)
+            .map_err(|e| format!("{}: {}", e.code, e.message))?
+    } else {
+        host
     };
     let ready = output(
         json!({"ready":true,"source":host.source().await,"runs":host.runs().await.map_err(|e|e.code)?}),
@@ -189,7 +217,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 Err(e) => output(
                     json!({"error":{"code":"INVALID_COMMAND","message":e},"shutdownStarted":host.shutdown_started()}),
                 ),
-                Ok(command) => match execute(&host, command, codex).await {
+                Ok(command) => match execute(&host, command, &allowed).await {
                     Ok((value, quit)) => {
                         let writable = output(json!({"result":value}));
                         if quit {

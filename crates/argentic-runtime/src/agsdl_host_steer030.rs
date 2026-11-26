@@ -194,6 +194,9 @@ impl SteerInbox030 {
     pub fn close(&mut self) {
         self.0.close();
     }
+    pub(crate) fn try_receive(&mut self) -> Option<SteerDelivery030> {
+        self.0.try_recv().ok().and_then(|mut offer| offer.0.take())
+    }
     pub async fn receive(&mut self) -> Option<SteerDelivery030> {
         self.0.recv().await.and_then(|mut offer| offer.0.take())
     }
@@ -382,6 +385,29 @@ impl SteerDelivery030 {
         tasks
             .attach_cleanup030(&request, cleanup)
             .map_err(|_| refused())
+    }
+
+    /// An in-process recipient can prove insertion under the same admission
+    /// guard. The remote transport path still observes its separate receipt.
+    pub(crate) fn acknowledge_inserted(
+        self,
+        tasks: &StreamTasks,
+        attempt: &FlowWorkAttempt030,
+        guard: Option<&OwnedMutexGuard<()>>,
+    ) -> Result<bool> {
+        if let Some(gate) = &self.gate {
+            if !guard
+                .is_some_and(|guard| Arc::ptr_eq(OwnedMutexGuard::mutex(guard), &gate.admission))
+            {
+                return Err(refused());
+            }
+            if tokio::time::Instant::now() >= gate.deadline {
+                self.not_sent(tasks, attempt)?;
+                return Ok(false);
+            }
+        }
+        self.resolve(tasks, attempt, true)?;
+        Ok(true)
     }
 
     /// Call only after the transport has consumed the message and sender.

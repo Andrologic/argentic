@@ -184,27 +184,37 @@ pub fn open_workspace_capability(
             ),
         });
     }
-    let directory = CapabilityDir::open_ambient_dir(&canonical_workspace, ambient_authority())
-        .map_err(|error| io_error_to_backend_error(error, &canonical_workspace))?;
+    let directory = open_root_capability(&canonical_workspace, expected_identity)?;
+    Ok((Arc::new(directory), relative_path))
+}
+
+/// Compare the identity of the opened capability, rather than reopening the
+/// workspace after validating its path.
+pub(crate) fn open_root_capability(
+    canonical_workspace: &Path,
+    expected_identity: Option<WorkspaceRootIdentity>,
+) -> Result<CapabilityDir, ReadError> {
+    let directory = CapabilityDir::open_ambient_dir(canonical_workspace, ambient_authority())
+        .map_err(|error| io_error_to_backend_error(error, canonical_workspace))?;
     if let Some(expected_identity) = expected_identity {
         #[cfg(unix)]
         let actual_identity = workspace_root_identity_from_cap(
             &directory
                 .dir_metadata()
-                .map_err(|error| io_error_to_backend_error(error, &canonical_workspace))?,
+                .map_err(|error| io_error_to_backend_error(error, canonical_workspace))?,
         );
         #[cfg(windows)]
-        let actual_identity = workspace_root_identity_from_cap(&directory, &canonical_workspace)?;
+        let actual_identity = workspace_root_identity_from_cap(&directory, canonical_workspace)?;
         if actual_identity != expected_identity {
             return Err(ReadError::FilesystemInvalidPath {
                 message: format!(
                     "Workspace root '{}' changed after server validation",
-                    workspace.display()
+                    canonical_workspace.display()
                 ),
             });
         }
     }
-    Ok((Arc::new(directory), relative_path))
+    Ok(directory)
 }
 
 /// Open and read a confined regular file only after native admission. The final

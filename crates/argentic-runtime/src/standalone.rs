@@ -283,7 +283,7 @@ impl Drop for DatabaseLock {
 
 /// Owns one database lock, engine incarnation and all execution resources.
 /// Keep it alive until `shutdown` succeeds, then call `close`. Dropping a value
-/// is not a physical Stop receipt. No credentials are read by this API.
+/// is not a physical Stop receipt.
 pub struct Host {
     engine: Engine,
     pool: SqlitePool,
@@ -299,6 +299,15 @@ impl Host {
         self.context = self.context.with_harnesses(harnesses);
         self
     }
+    /// Configure the read-only Argentic adapter. Preflight and Start still
+    /// require an explicit "argentic" entry in the allowed harness set.
+    pub fn with_argentic(mut self, config: crate::harness::ArgenticConfig030) -> Result<Self> {
+        let mut registry = self.context.harnesses().clone();
+        registry.register(Arc::new(crate::harness::ArgenticAdapter030::new(config)?))?;
+        self.context = self.context.with_harnesses(registry);
+        Ok(self)
+    }
+
     pub fn with_codex_auth_file(mut self, path: PathBuf) -> Self {
         self.context = self.context.with_codex_auth_file(path);
         self
@@ -341,10 +350,6 @@ impl Host {
             ));
         }
         let policy_value: Policy = serde_json::from_slice(&policy_bytes)?;
-        api::validate_codex_permissions(
-            &serde_json::to_value(&policy_value.permissions)?,
-            "policy.permissions",
-        )?;
         for id in [
             &policy_value.owner.project_id,
             &policy_value.owner.plan_id,
@@ -355,6 +360,16 @@ impl Host {
         persistence::decimal(&policy_value.source_revision)?;
         let source_path = std::path::absolute(source).map_err(io_error)?;
         let opened = OpenedSource::open_path(&source_path)?;
+        let document: Value = serde_json::from_str(opened.authored_json())?;
+        let argentic_only = document["agents"].as_object().is_some_and(|agents| {
+            !agents.is_empty() && agents.values().all(|agent| agent["harness"] == "argentic")
+        });
+        if !argentic_only {
+            api::validate_codex_permissions(
+                &serde_json::to_value(&policy_value.permissions)?,
+                "policy.permissions",
+            )?;
+        }
         let lock = File::options()
             .read(true)
             .write(true)
@@ -983,6 +998,8 @@ mod tests {
             .await
         }
     }
+    mod argentic_tests;
+
     const WAIT: &str = r#"{"contract":"agsdl-0.3.0","id":"standalone","agents":{},"flow":{"entry":"wait","steps":{"wait":{"type":"approval","title":"Continue?","timeoutMs":86400000,"next":{"yes":[],"no":[]}}}}}"#;
     #[tokio::test]
     async fn captures_the_source_location_independently_of_the_workspace() {

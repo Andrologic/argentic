@@ -69,6 +69,7 @@ pub mod content;
 pub mod tool_policy;
 
 mod agsdl_host;
+mod agsdl_host_argentic030;
 mod agsdl_host_call_authority030;
 mod agsdl_host_call_executor030;
 mod agsdl_host_calls;

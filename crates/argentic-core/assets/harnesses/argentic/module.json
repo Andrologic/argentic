@@ -10,12 +10,11 @@
       "support": "absent"
     },
     "model.name": {
-      "support": "approximate",
-      "note": "The standalone Chat Completions loop accepts a configured name. The engine does not resolve or observe the model."
+      "support": "native"
     },
     "model.effort": {
-      "support": "approximate",
-      "note": "Chat Completions supports selected provider effort settings. The engine does not negotiate effort."
+      "support": "native",
+      "note": "Efforts come from the reasoning catalogue. A provider that rejects the effort parameter is retried without it for the rest of the work attempt."
     },
     "skills": {
       "support": "absent"
@@ -42,45 +41,44 @@
       "support": "absent"
     },
     "instance.new": {
-      "support": "approximate",
-      "note": "The standalone loop starts fresh. AgSDL work and instance lifecycle integration is pending."
+      "support": "native"
     },
     "delivery.steer": {
-      "support": "absent"
+      "support": "native"
     }
   },
   "permissions": {
     "read": {
-      "allow": "absent",
+      "allow": "harness",
       "ask": "absent",
-      "deny": "absent",
-      "outside": "absent",
-      "note": "The harness implements local read decisions, but enforcement for AgSDL work is pending."
+      "deny": "harness",
+      "outside": "harness",
+      "note": "Confined workspace reads. The adapter rejects authored approval rules and denies reads requiring approval under a host ceiling."
     },
     "write": {
       "allow": "absent",
       "ask": "absent",
-      "deny": "absent"
+      "deny": "harness"
     },
     "shell": {
       "allow": "absent",
       "ask": "absent",
-      "deny": "absent"
+      "deny": "harness"
     },
     "network": {
       "allow": "absent",
       "ask": "absent",
-      "deny": "absent"
+      "deny": "harness"
     },
     "mcp": {
       "allow": "absent",
       "ask": "absent",
-      "deny": "absent"
+      "deny": "harness"
     },
     "delegate": {
       "allow": "absent",
       "ask": "absent",
-      "deny": "absent"
+      "deny": "harness"
     }
   },
   "settings": {
