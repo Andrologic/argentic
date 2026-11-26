@@ -8,7 +8,7 @@ use argentic_harness::{
     policy::{Preset, ReadPolicy},
     providers::{
         Chunk, Finish, Message, Provider, ProviderError, ProviderStream, Request, ScriptedProvider,
-        ToolCall, Usage,
+        ToolCall, ToolChoice, Usage,
     },
     r#loop::{Event, Failure, Harness, Hook, Steer, Work, WorkPort},
     tools::Registry,
@@ -788,6 +788,69 @@ async fn missing_and_refused_submissions_share_the_correction_budget() {
 }
 
 #[tokio::test]
+async fn text_only_submission_gets_a_tool_call_correction() {
+    struct CorrectionScript {
+        provider: ScriptedProvider,
+        expected: ToolChoice<'static>,
+    }
+
+    #[async_trait]
+    impl Provider for CorrectionScript {
+        async fn stream(
+            &self,
+            request: Request<'_>,
+            cancel: CancellationToken,
+        ) -> Result<ProviderStream, ProviderError> {
+            let Some(Message::User(last)) = request.messages.last() else {
+                panic!("expected a user message");
+            };
+            if request.messages.len() == 1 {
+                assert_eq!(request.tool_choice, ToolChoice::Auto);
+            } else {
+                assert_eq!(request.tool_choice, self.expected);
+                let (instruction, details) = last.split_once("\n\n").unwrap();
+                assert!(instruction
+                    .starts_with("Your previous reply did not call the agsdl_submit_result tool."));
+                assert!(instruction.contains("argument schema"));
+                assert!(instruction.contains("leave the assistant text empty."));
+                assert!(instruction.contains(r#"required keys in results are ["answer"]"#));
+                let details: Value = serde_json::from_str(details).unwrap();
+                assert_eq!(details["diagnostics"][0]["rule"], "SUBMISSION_REQUIRED");
+            }
+            self.provider.stream(request, cancel).await
+        }
+    }
+
+    for (project, expected) in [
+        (json!({}), ToolChoice::Named("agsdl_submit_result")),
+        (
+            json!({"forceSubmissionOnCorrection":false}),
+            ToolChoice::Auto,
+        ),
+    ] {
+        let provider = CorrectionScript {
+            provider: scripted(vec![
+                vec![
+                    Chunk::Text(r#"agsdl_submit_result({"results":{"answer":42}})"#.into()),
+                    end(Finish::Stop),
+                ],
+                vec![submit("s1", json!({"answer":42})), end(Finish::ToolCalls)],
+            ]),
+            expected,
+        };
+        let (_dir, harness) = fixture_with_provider(Arc::new(provider), project);
+        let (_, steer) = mpsc::channel(1);
+        let report = harness
+            .run(work(true), &(), steer, CancellationToken::new())
+            .await;
+        assert_eq!(
+            report.outcome.unwrap().submission,
+            Some(json!({"results":{"answer":42}}))
+        );
+    }
+}
+
+#[tokio::test]
 async fn steer_is_not_acknowledged_or_retained_when_the_next_request_fails() {
     let (_dir, harness) = fixture(vec![vec![end(Finish::Stop)]], json!({}));
     let (send, steer) = mpsc::channel(1);
@@ -812,4 +875,88 @@ async fn steer_is_not_acknowledged_or_retained_when_the_next_request_fails() {
         .messages
         .contains(&Message::User("steer to retry".into())));
     assert!(trace.0.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn steer_admitted_after_missing_submission_can_request_a_tool() {
+    struct SteerDuringSummary {
+        recording: RecordingProvider,
+        send: mpsc::Sender<Steer>,
+        late: Mutex<Option<Steer>>,
+    }
+
+    #[async_trait]
+    impl Provider for SteerDuringSummary {
+        async fn stream(
+            &self,
+            request: Request<'_>,
+            cancel: CancellationToken,
+        ) -> Result<ProviderStream, ProviderError> {
+            if request.tools.is_empty() {
+                assert_eq!(request.tool_choice, ToolChoice::Auto);
+                self.send
+                    .try_send(self.late.lock().unwrap().take().unwrap())
+                    .unwrap();
+            }
+            if request.messages.last()
+                == Some(&Message::User("Read notes.txt before you submit.".into()))
+            {
+                assert_eq!(request.tool_choice, ToolChoice::Auto);
+                assert!(request.tools.iter().any(|tool| tool.name == "read"));
+            } else if let Some(Message::Tool { call_id, content }) = request.messages.last() {
+                if call_id == "read-notes" {
+                    assert!(content.contains("result is 42"));
+                    assert_eq!(request.tool_choice, ToolChoice::Auto);
+                }
+            } else if matches!(request.messages.last(), Some(Message::User(text))
+                if text.contains("SUBMISSION_REQUIRED"))
+            {
+                assert_eq!(
+                    request.tool_choice,
+                    ToolChoice::Named("agsdl_submit_result")
+                );
+            }
+            self.recording.stream(request, cancel).await
+        }
+    }
+
+    let (send, steer) = mpsc::channel(1);
+    let (late, late_receipt) = oneshot::channel();
+    let provider = Arc::new(SteerDuringSummary {
+        recording: RecordingProvider {
+            requests: Arc::new(Requests::default()),
+            provider: scripted(vec![
+                vec![Chunk::Text("recent ".repeat(1800)), end(Finish::Stop)],
+                vec![Chunk::Text("Earlier evidence".into()), end(Finish::Stop)],
+                vec![
+                    call("read-notes", "read", json!({"path":"notes.txt"})),
+                    end(Finish::ToolCalls),
+                ],
+                vec![end(Finish::Stop)],
+                vec![submit("done", json!({"answer":42})), end(Finish::ToolCalls)],
+            ]),
+        },
+        send,
+        late: Mutex::new(Some(Steer {
+            id: "late".into(),
+            message: "Read notes.txt before you submit.".into(),
+            consumed: late,
+        })),
+    });
+    let (_dir, harness) = fixture_with_provider(
+        provider,
+        json!({"maxOutputTokens":256,"compaction":{"threshold":0.60,"keepRecentTurns":1}}),
+    );
+    let mut work = work(true);
+    let mut older = recorded_tool_turn("old", "earlier evidence".into());
+    if let Message::Assistant { text, .. } = &mut older[0] {
+        *text = "old ".repeat(3000);
+    }
+    work.messages.extend(older);
+    let report = harness
+        .with_context_window(Some(8192))
+        .run(work, &(), steer, CancellationToken::new())
+        .await;
+    assert!(report.outcome.is_ok(), "{:?}", report.outcome);
+    late_receipt.await.unwrap();
 }

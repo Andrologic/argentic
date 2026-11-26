@@ -212,13 +212,32 @@ async fn reads_and_submits_schema_valid_result() {
         assert_eq!(first.body["model"], "gpt-5.5");
         assert_eq!(first.body["max_completion_tokens"], 256);
         assert_eq!(first.body["reasoning_effort"], "high");
+        assert!(first.body.get("tool_choice").is_none());
         assert!(first.body["messages"].to_string().contains("Read memo.txt"));
         first.tool("read", json!({"path":"memo.txt"}));
         let next = server.next().await;
+        assert!(next.body.get("tool_choice").is_none());
         assert!(next.body["messages"]
             .to_string()
             .contains("Argentic read fixture"));
-        next.tool(
+        let text =
+            json!({"choices":[{"delta":{"content":"The memo is ready."},"finish_reason":"stop"}]});
+        next.send(
+            StatusCode::OK,
+            format!("data: {text}\n\ndata: [DONE]\n\n"),
+            "text/event-stream",
+        );
+        let correction = server.next().await;
+        assert_eq!(
+            correction.body["tool_choice"],
+            json!({
+                "type":"function","function":{"name":"agsdl_submit_result"}
+            })
+        );
+        let messages = correction.body["messages"].to_string();
+        assert!(messages.contains("Your previous reply did not call the agsdl_submit_result tool."));
+        assert!(messages.contains("SUBMISSION_REQUIRED"));
+        correction.tool(
             "agsdl_submit_result",
             json!({"results":{"report":{"body":"Argentic read fixture"}}}),
         );
@@ -401,11 +420,18 @@ async fn corrects_in_same_instance_and_remembers_effort_rejection_for_the_attemp
         );
         let request = server.next().await;
         assert!(request.body.get("reasoning_effort").is_none());
-        let messages = request.body["messages"].to_string();
-        assert!(
-            messages.contains("same-wire-id") && messages.contains("Correct the result"),
-            "{messages}"
-        );
+        assert!(request.body.get("tool_choice").is_none());
+        let tool_reply = request.body["messages"].as_array().unwrap().last().unwrap();
+        assert_eq!(tool_reply["tool_call_id"], "same-wire-id");
+        let content = tool_reply["content"].as_str().unwrap();
+        let (instruction, rest) = content.split_once("\n\n").unwrap();
+        assert!(instruction.starts_with("Correct the result arguments"));
+        let (quoted_errors, details) = rest.split_once("\n\n").unwrap();
+        let decision: Value = serde_json::from_str(details).unwrap();
+        let diagnostic = decision["diagnostics"][0]["message"].as_str().unwrap();
+        assert!(quoted_errors
+            .lines()
+            .any(|line| line == format!("{diagnostic:?}")));
         request.tool(
             "agsdl_submit_result",
             json!({"results":{"report":{"body":"corrected"}}}),

@@ -323,6 +323,18 @@ entry sets `contextWindowTokens` (see `docs/argentic-harness.md`). Additional
 authored directories, model reviewers, completion checks, skills and MCP remain
 unsupported.
 
+After a missing required submission, Argentic forces the result tool by name
+by default. If the provider rejects the named choice, Argentic retries with
+`required` (`any` for Anthropic Messages) and only the result tool. If the
+provider rejects that form, Argentic restores all tools and disables forced
+choice for the rest of the attempt. Later corrections use the fallback level
+reached in that attempt. A request that delivers steering offers all tools
+with automatic selection.
+
+When Anthropic Messages retries a correction with only the result tool, the
+shorter tool list changes the prompt-cache prefix. A cache breakpoint on the
+tool list moves to the remaining tool.
+
 ## Source notes
 
 The SSE framing and call accumulation use ideas from Macro's

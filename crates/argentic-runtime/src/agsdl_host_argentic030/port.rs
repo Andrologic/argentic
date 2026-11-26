@@ -317,9 +317,22 @@ impl WorkPort for Port {
                 (Some("correction"), Some("check")) => Decision::CorrectCheck(format!(
                     "Correct the work using the completion check feedback: {decision}"
                 )),
-                (Some("correction"), Some("submission")) => Decision::CorrectSubmission(format!(
-                    "Correct the result tool arguments: {decision}"
-                )),
+                (Some("correction"), Some("submission")) => {
+                    let diagnostics = decision["diagnostics"].as_array().into_iter().flatten();
+                    if diagnostics
+                        .clone()
+                        .any(|item| item["rule"] == "SUBMISSION_REQUIRED")
+                    {
+                        Decision::RequireSubmission(decision.to_string())
+                    } else {
+                        let errors = diagnostics
+                            .filter_map(|item| item["message"].as_str())
+                            .map(|message| format!("{message:?}"))
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        Decision::CorrectSubmission(format!("{errors}\n\n{decision}"))
+                    }
+                }
                 _ => return Err(port_error(missing("decision"))),
             },
         )

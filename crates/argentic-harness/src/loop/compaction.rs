@@ -242,6 +242,8 @@ impl Instance<'_> {
                         reasoning_effort: None,
                         messages: &messages,
                         tools: &[],
+                        tool_choice: Default::default(),
+                        tool_choice_rejected: None,
                         max_output_tokens: output_tokens,
                         limits,
                         delivery: Default::default(),

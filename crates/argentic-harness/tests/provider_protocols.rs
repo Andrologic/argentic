@@ -9,9 +9,9 @@ use argentic_harness::{
     config::Settings,
     policy::{Preset, ReadPolicy},
     providers::{
-        reasoning_capability, AnthropicMessages, Chunk, DeliveryProgress, DeliveryStatus, Finish,
-        Message, OpenAiResponses, Provider, ProviderError, Request, ToolDefinition, TurnLimits,
-        Usage,
+        reasoning_capability, AnthropicMessages, ChatCompletions, Chunk, DeliveryProgress,
+        DeliveryStatus, Finish, Message, OpenAiResponses, Provider, ProviderError, Request,
+        ToolDefinition, TurnLimits, Usage,
     },
     r#loop::{Failure, Harness, Work},
     tools::Registry,
@@ -221,6 +221,27 @@ impl Drop for Mock {
 
 impl Mock {
     async fn start(protocol: Protocol, replies: Vec<Response>) -> Self {
+        Self::start_at(protocol.path(), replies, |url| match protocol {
+            Protocol::Messages => Arc::new(
+                AnthropicMessages::new("fixture", url, Some("fixture-key"))
+                    .unwrap()
+                    .with_prompt_caching(true)
+                    .with_attempt_effort_fallback(),
+            ),
+            Protocol::Responses => Arc::new(
+                OpenAiResponses::new("fixture", url, Some("fixture-key"))
+                    .unwrap()
+                    .with_attempt_effort_fallback(),
+            ),
+        })
+        .await
+    }
+
+    async fn start_at(
+        path: &str,
+        replies: Vec<Response>,
+        provider: impl FnOnce(reqwest::Url) -> Arc<dyn Provider>,
+    ) -> Self {
         async fn send(
             State((requests, replies)): State<(Requests, Script)>,
             headers: HeaderMap,
@@ -238,33 +259,16 @@ impl Mock {
         }
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!(
-            "http://{}{}",
-            listener.local_addr().unwrap(),
-            protocol.path()
-        )
-        .parse()
-        .unwrap();
+        let url = format!("http://{}{path}", listener.local_addr().unwrap())
+            .parse()
+            .unwrap();
         let requests = Requests::default();
         let app = Router::new()
-            .route(protocol.path(), post(send))
+            .route(path, post(send))
             .with_state((requests.clone(), Arc::new(Mutex::new(replies.into()))));
         let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let provider: Arc<dyn Provider> = match protocol {
-            Protocol::Messages => Arc::new(
-                AnthropicMessages::new("fixture", url, Some("fixture-key"))
-                    .unwrap()
-                    .with_prompt_caching(true)
-                    .with_attempt_effort_fallback(),
-            ),
-            Protocol::Responses => Arc::new(
-                OpenAiResponses::new("fixture", url, Some("fixture-key"))
-                    .unwrap()
-                    .with_attempt_effort_fallback(),
-            ),
-        };
         Self {
-            provider,
+            provider: provider(url),
             requests,
             task,
         }
@@ -283,6 +287,8 @@ async fn run(
                 model: &protocol.model().parse().unwrap(),
                 messages,
                 tools,
+                tool_choice: Default::default(),
+                tool_choice_rejected: None,
                 max_output_tokens: 4096,
                 reasoning_effort: Some("medium"),
                 delivery: DeliveryProgress::default(),
@@ -446,6 +452,214 @@ fn http_error(status: u16, retry_after: Option<&str>, body: &'static str) -> Res
     response
 }
 
+/// The server refuses the named choice, then `required`, then accepts.
+fn correction_replies(stop: impl Fn() -> Response, rejection: &'static str) -> Vec<Response> {
+    vec![
+        stop(),
+        http_error(400, None, rejection),
+        http_error(400, None, rejection),
+        stop(),
+        stop(),
+    ]
+}
+
+fn tool_names(body: &Value) -> Vec<String> {
+    body["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| {
+            tool["name"]
+                .as_str()
+                .or_else(|| tool["function"]["name"].as_str())
+                .unwrap()
+                .to_owned()
+        })
+        .collect()
+}
+
+async fn correction_turns(mock: &Mock, model: &str, effort: Option<&str>) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let policy = ReadPolicy::compile(&root, None, Some(Preset::ReadOnly), None, &[]).unwrap();
+    let registry = Registry::new(&[root], policy, json!({"type":"object"})).unwrap();
+    let harness = Harness::new(
+        mock.provider.clone(),
+        Arc::new(registry),
+        Settings::default(),
+    );
+    let (_, steer) = tokio::sync::mpsc::channel(1);
+    let report = harness
+        .run(
+            Work {
+                model: model.parse().unwrap(),
+                reasoning_effort: effort.map(str::to_owned),
+                messages: vec![Message::User("Submit a result".into())],
+                submission_required: true,
+                max_corrections: 2,
+            },
+            &(),
+            steer,
+            CancellationToken::new(),
+        )
+        .await;
+    assert!(matches!(report.outcome, Err(Failure::OutputInvalid(_))));
+}
+
+fn assert_choice_fallback(mock: &Mock, named: Value, required: Value) {
+    let requests = mock.requests.lock().unwrap();
+    assert_eq!(requests.len(), 5);
+    assert!(requests[0].1.get("tool_choice").is_none());
+    assert_eq!(requests[1].1["tool_choice"], named);
+    // A refused named choice becomes `required` over the result tool alone.
+    assert_eq!(requests[2].1["tool_choice"], required);
+    assert_eq!(tool_names(&requests[2].1), ["agsdl_submit_result"]);
+    // A refused `required` drops the forced choice and restores every tool.
+    let mut retry = requests[1].1.clone();
+    retry.as_object_mut().unwrap().remove("tool_choice");
+    assert_eq!(requests[3].1, retry);
+    assert!(requests[4].1.get("tool_choice").is_none());
+    assert!(tool_names(&requests[4].1).len() > 1);
+    assert!(requests[4].1.to_string().contains("SUBMISSION_REQUIRED"));
+}
+
+#[tokio::test]
+async fn chat_completions_forces_submission_and_falls_back() {
+    let stop = || {
+        sse(concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"text only\"},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n"
+    ).into())
+    };
+    let mock = Mock::start_at(
+        "/v1/chat/completions",
+        correction_replies(stop, r#"{"error":"Invalid tool_choice type: 'object'. Supported string values: none, auto, required"}"#),
+        |url| Arc::new(ChatCompletions::new("fixture", url, None).unwrap()),
+    )
+    .await;
+    correction_turns(&mock, "fixture/gpt-5.4", None).await;
+    assert_choice_fallback(
+        &mock,
+        json!({"type":"function","function":{"name":"agsdl_submit_result"}}),
+        json!("required"),
+    );
+}
+
+/// LM Studio refuses object tool choices but accepts `required`.
+#[tokio::test]
+async fn chat_completions_named_rejection_keeps_required_over_the_result_tool() {
+    let stop = || {
+        sse(concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"text only\"},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n"
+    ).into())
+    };
+    let rejection = r#"{"error":"Invalid tool_choice type: 'object'. Supported string values: none, auto, required"}"#;
+    let mock = Mock::start_at(
+        "/v1/chat/completions",
+        vec![stop(), http_error(400, None, rejection), stop(), stop()],
+        |url| Arc::new(ChatCompletions::new("fixture", url, None).unwrap()),
+    )
+    .await;
+    correction_turns(&mock, "fixture/gpt-5.4", None).await;
+    let requests = mock.requests.lock().unwrap();
+    assert_eq!(requests.len(), 4);
+    for request in &requests[2..] {
+        assert_eq!(request.1["tool_choice"], "required");
+        assert_eq!(tool_names(&request.1), ["agsdl_submit_result"]);
+    }
+}
+
+/// `required` succeeds on the first correction, then a later correction
+/// refuses it: the unconstrained retry must restore every tool.
+#[tokio::test]
+async fn chat_completions_later_required_rejection_restores_every_tool() {
+    let stop = || {
+        sse(concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"text only\"},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n"
+    ).into())
+    };
+    let named = r#"{"error":"Invalid tool_choice type: 'object'. Supported string values: none, auto, required"}"#;
+    let required = r#"{"error":"tool_choice required is not supported"}"#;
+    let mock = Mock::start_at(
+        "/v1/chat/completions",
+        vec![
+            stop(),
+            http_error(400, None, named),
+            stop(),
+            http_error(400, None, required),
+            stop(),
+        ],
+        |url| Arc::new(ChatCompletions::new("fixture", url, None).unwrap()),
+    )
+    .await;
+    correction_turns(&mock, "fixture/gpt-5.4", None).await;
+    let requests = mock.requests.lock().unwrap();
+    assert_eq!(requests.len(), 5);
+    let all = tool_names(&requests[0].1);
+    assert!(all.len() > 1);
+    for request in &requests[2..4] {
+        assert_eq!(request.1["tool_choice"], "required");
+        assert_eq!(tool_names(&request.1), ["agsdl_submit_result"]);
+    }
+    assert!(requests[4].1.get("tool_choice").is_none());
+    assert_eq!(tool_names(&requests[4].1), all);
+}
+
+#[tokio::test]
+async fn responses_forces_submission_and_falls_back() {
+    let protocol = Protocol::Responses;
+    let mock = Mock::start(
+        protocol,
+        correction_replies(
+            || protocol.success(),
+            r#"{"error":{"message":"Unsupported value","param":"tool_choice"}}"#,
+        ),
+    )
+    .await;
+    correction_turns(&mock, protocol.model(), Some("medium")).await;
+    assert_choice_fallback(
+        &mock,
+        json!({"type":"function","name":"agsdl_submit_result"}),
+        json!("required"),
+    );
+}
+
+#[tokio::test]
+async fn messages_forces_submission_and_falls_back() {
+    let protocol = Protocol::Messages;
+    let mut replies = correction_replies(
+        || protocol.success(),
+        r#"{"type":"error","error":{"type":"invalid_request_error","message":"tool_choice: type \"tool\" and \"any\" are not supported for this model."}}"#,
+    );
+    replies.insert(0, http_error(400, None, "Unsupported thinking parameter"));
+    let mock = Mock::start(protocol, replies).await;
+    correction_turns(&mock, protocol.model(), Some("medium")).await;
+    let (_, first, _) = mock.requests.lock().unwrap().remove(0);
+    assert_eq!(first["thinking"]["type"], "enabled");
+    assert!(first.get("tool_choice").is_none());
+    assert_choice_fallback(
+        &mock,
+        json!({"type":"tool","name":"agsdl_submit_result","disable_parallel_tool_use":true}),
+        json!({"type":"any","disable_parallel_tool_use":true}),
+    );
+}
+
+#[tokio::test]
+async fn messages_correction_keeps_automatic_tool_selection_with_manual_thinking() {
+    let protocol = Protocol::Messages;
+    let mock = Mock::start(protocol, (0..3).map(|_| protocol.success()).collect()).await;
+    correction_turns(&mock, protocol.model(), Some("medium")).await;
+    let requests = mock.requests.lock().unwrap();
+    assert_eq!(requests.len(), 3);
+    for (_, body, _) in requests.iter() {
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert!(body.get("tool_choice").is_none());
+    }
+    assert!(requests[1].1.to_string().contains("SUBMISSION_REQUIRED"));
+}
+
 async fn retries(protocol: Protocol) {
     let busy = http_error(529, Some("0"), "private-overload");
     let throttle = http_error(429, Some("1"), "private-rate-limit");
@@ -524,6 +738,8 @@ async fn bounds_and_errors(protocol: Protocol) {
         model: &model,
         messages: &[],
         tools: &[],
+        tool_choice: Default::default(),
+        tool_choice_rejected: None,
         max_output_tokens: 4096,
         reasoning_effort: None,
         delivery: delivery.clone(),
@@ -753,4 +969,95 @@ async fn responses_refusal_preserves_visible_text_and_filters_the_turn() {
 fn gpt_54_catalogue_supports_none() {
     let capability = reasoning_capability("openai", "gpt-5.4").unwrap().unwrap();
     assert!(capability.efforts.iter().any(|effort| effort == "none"));
+}
+
+#[tokio::test]
+async fn reasoning_400_does_not_change_tool_choice() {
+    let protocol = Protocol::Responses;
+    for rejected in [
+        r#"{"error":{"message":"Invalid value for reasoning.effort: 'tool_choice'.","code":"invalid_value","param":"reasoning.effort"}}"#,
+        "Invalid value for reasoning.effort: 'tool_choice'.",
+    ] {
+        let mock = Mock::start(
+            protocol,
+            vec![
+                protocol.success(),
+                http_error(400, None, rejected),
+                protocol.success(),
+                protocol.success(),
+            ],
+        )
+        .await;
+        correction_turns(&mock, protocol.model(), Some("tool_choice")).await;
+        let requests = mock.requests.lock().unwrap();
+        assert_eq!(requests.len(), 4);
+        assert_eq!(requests[2].1["tool_choice"], requests[1].1["tool_choice"]);
+        assert!(requests[2].1.get("reasoning").is_none());
+        assert_eq!(requests[3].1["tool_choice"], requests[1].1["tool_choice"]);
+        assert_eq!(tool_names(&requests[2].1), tool_names(&requests[0].1));
+    }
+}
+
+#[tokio::test]
+async fn messages_fallback_moves_the_tool_cache_breakpoint() {
+    let protocol = Protocol::Messages;
+    let mock = Mock::start(
+        protocol,
+        vec![
+            protocol.tool_turn(),
+            protocol.success(),
+            http_error(400, None, "Unsupported tool_choice"),
+            protocol.success(),
+            http_error(400, None, "tool_choice any is not supported"),
+            protocol.success(),
+        ],
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let policy = ReadPolicy::compile(&root, None, Some(Preset::ReadOnly), None, &[]).unwrap();
+    let registry = Registry::new(&[root], policy, json!({"type":"object"}))
+        .unwrap()
+        .with_writes();
+    let harness = Harness::new(
+        mock.provider.clone(),
+        Arc::new(registry),
+        Settings::default(),
+    );
+    let (_, steer) = tokio::sync::mpsc::channel(1);
+    let report = harness
+        .run(
+            Work {
+                model: protocol.model().parse().unwrap(),
+                reasoning_effort: None,
+                messages: vec![Message::User("Read and submit a result".into())],
+                submission_required: true,
+                max_corrections: 2,
+            },
+            &(),
+            steer,
+            CancellationToken::new(),
+        )
+        .await;
+    assert!(matches!(report.outcome, Err(Failure::OutputInvalid(_))));
+    let requests = mock.requests.lock().unwrap();
+    assert_eq!(requests.len(), 6);
+    let named = &requests[2].1;
+    let retry = &requests[3].1;
+    let later = &requests[4].1;
+    assert_eq!(retry["messages"], named["messages"]);
+    let replay = retry["messages"].to_string();
+    assert!(replay.contains(r#""name":"read""#));
+    assert!(replay.matches(r#""call_1""#).count() >= 2);
+
+    let original_tools = named["tools"].as_array().unwrap();
+    let last_tool = original_tools.last().unwrap();
+    assert_ne!(last_tool["name"], "agsdl_submit_result");
+    let cache_control = &last_tool["cache_control"];
+    assert_eq!(cache_control, &json!({"type": "ephemeral"}));
+    for body in [retry, later] {
+        assert_eq!(tool_names(body), ["agsdl_submit_result"]);
+        assert_eq!(&body["tools"][0]["cache_control"], cache_control);
+    }
+    assert_eq!(requests[5].1["tools"], named["tools"]);
 }

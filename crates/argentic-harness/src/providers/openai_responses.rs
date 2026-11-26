@@ -9,7 +9,7 @@ use super::{
     emit_items,
     http::{bearer, rejects_effort, DecodeError, Events, HttpStream},
     invalid, wire_index, wire_str, Chunk, Finish, Message, ModelName, Provider, ProviderError,
-    ProviderStream, Replay, Request, ToolCall, Usage, WireFormat,
+    ProviderStream, Replay, Request, ToolCall, ToolChoice, Usage, WireFormat,
 };
 
 pub struct OpenAiResponses {
@@ -106,6 +106,13 @@ impl Provider for OpenAiResponses {
         }
         if let Some(effort) = request.reasoning_effort {
             body["reasoning"] = json!({"effort":effort});
+        }
+        match request.tool_choice {
+            ToolChoice::Auto => {}
+            ToolChoice::Required => body["tool_choice"] = json!("required"),
+            ToolChoice::Named(name) => {
+                body["tool_choice"] = json!({"type":"function","name":name});
+            }
         }
         self.http
             .open::<ResponsesEvents>(body, cancel, request, "reasoning")

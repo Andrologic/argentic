@@ -5,7 +5,10 @@ mod compaction;
 use std::{
     borrow::Cow,
     collections::{HashSet, VecDeque},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU8, Ordering},
+        Arc,
+    },
     time::Duration,
 };
 
@@ -21,7 +24,7 @@ use crate::{
     config::{Layer, Settings},
     providers::{
         Chunk, DeliveryProgress, DeliveryStatus, Finish, Message, ModelName, Provider,
-        ProviderError, Request, ToolCall, ToolDefinition,
+        ProviderError, Request, ToolCall, ToolChoice, ToolDefinition,
     },
     tools::{Registry, SUBMIT_RESULT},
 };
@@ -138,6 +141,7 @@ pub enum Proposal<'a> {
 
 pub enum Decision {
     Accept,
+    RequireSubmission(String),
     CorrectSubmission(String),
     CorrectCheck(String),
     Fail(Failure),
@@ -193,13 +197,21 @@ pub trait WorkPort: Send + Sync {
     /// validator must also accept before execution can report success.
     async fn decide(
         &self,
-        _proposal: Proposal<'_>,
+        proposal: Proposal<'_>,
         validation_error: Option<&str>,
         _cancel: &CancellationToken,
     ) -> Result<Decision, Failure> {
-        Ok(validation_error.map_or(Decision::Accept, |message| {
-            Decision::CorrectSubmission(message.into())
-        }))
+        Ok(
+            validation_error.map_or(Decision::Accept, |message| match proposal {
+                Proposal::EndTurn { .. } => Decision::RequireSubmission(
+                    json!({"kind":"correction","category":"submission","diagnostics":[{
+                        "rule":"SUBMISSION_REQUIRED","pointer":"","message":message
+                    }]})
+                    .to_string(),
+                ),
+                Proposal::Submit { .. } => Decision::CorrectSubmission(format!("{message:?}")),
+            }),
+        )
     }
 }
 
@@ -281,6 +293,7 @@ impl Harness {
         let cancel = parent.child_token();
         let _cancel_on_drop = cancel.clone().drop_guard();
         let tracker = TaskTracker::new();
+        let tool_choice_rejected = AtomicU8::new(0);
         let mut instance = Instance {
             harness: self,
             port,
@@ -290,6 +303,8 @@ impl Harness {
             text: String::new(),
             artifacts: Vec::new(),
             corrections: 0,
+            force_submission: false,
+            tool_choice_rejected: &tool_choice_rejected,
             history_end: work.messages.len(),
             protected_prefix: compaction::prefix_len(&work.messages),
             mission_index: matches!(work.messages.last(), Some(Message::User(_)))
@@ -351,6 +366,8 @@ struct Instance<'a> {
     text: String,
     artifacts: Vec<Artifact>,
     corrections: u32,
+    force_submission: bool,
+    tool_choice_rejected: &'a AtomicU8,
     history_end: usize,
     protected_prefix: usize,
     mission_index: Option<usize>,
@@ -416,6 +433,7 @@ impl Instance<'_> {
             let calls = response.calls;
             self.response_text_start = None;
             self.correction_start = None;
+            self.force_submission = false;
             work.messages.push(Message::Assistant {
                 text: response.text,
                 reasoning: response.reasoning,
@@ -448,6 +466,7 @@ impl Instance<'_> {
                         validation.as_ref().err().map(String::as_str),
                     )
                     .await?;
+                let invalid = matches!(decision, Decision::CorrectSubmission(_));
                 match self.apply(decision, work.max_corrections)? {
                     None => {
                         accepted = Some(validation.map_err(Failure::OutputInvalid)?);
@@ -464,6 +483,11 @@ impl Instance<'_> {
                     }
                     Some(error) => {
                         self.correction_start = Some(response_index);
+                        let error = if invalid {
+                            format!("Correct the result arguments and call {SUBMIT_RESULT} again.\n\n{error}")
+                        } else {
+                            error
+                        };
                         self.publish_tool(turn, call, &error, &mut work.messages)
                             .await?;
                     }
@@ -493,6 +517,9 @@ impl Instance<'_> {
                     .submission_required
                     .then_some("Submit the required result before completing this work.");
                 let decision = self.decide(Proposal::EndTurn { turn }, validation).await?;
+                let missing_submission = matches!(decision, Decision::RequireSubmission(_))
+                    || (work.submission_required
+                        && matches!(decision, Decision::CorrectSubmission(_)));
                 match self.apply(decision, work.max_corrections)? {
                     None if validation.is_none() => {
                         return Ok(Outcome {
@@ -507,6 +534,12 @@ impl Instance<'_> {
                     }
                     Some(error) => {
                         self.correction_start = Some(response_index);
+                        let error = if missing_submission {
+                            self.force_submission = settings.force_submission_on_correction;
+                            missing_submission_prompt(&definitions, &error)
+                        } else {
+                            error
+                        };
                         work.messages.push(Message::User(error));
                         self.history_end = work.messages.len();
                     }
@@ -545,6 +578,17 @@ impl Instance<'_> {
             }
         }
         self.active()?;
+        // An admitted steer may request other tools. Otherwise, force the
+        // result tool by name when armed. The HTTP layer applies the fallback
+        // reached in this attempt and keeps the full tool list to restore.
+        let tool_choice = if index == 0
+            && self.force_submission
+            && self.tool_choice_rejected.load(Ordering::Relaxed) < 2
+        {
+            ToolChoice::Named(SUBMIT_RESULT)
+        } else {
+            ToolChoice::Auto
+        };
         let delivery = self.delivery.clone();
         let provider = self.harness.provider.clone();
         let request = provider.stream(
@@ -553,6 +597,8 @@ impl Instance<'_> {
                 reasoning_effort: work.reasoning_effort.as_deref(),
                 messages: &messages,
                 tools: definitions,
+                tool_choice,
+                tool_choice_rejected: Some(self.tool_choice_rejected),
                 max_output_tokens,
                 limits: (&self.harness.settings).into(),
                 delivery: delivery.clone(),
@@ -763,7 +809,7 @@ impl Instance<'_> {
         match decision {
             Decision::Accept => Ok(None),
             Decision::CorrectCheck(message) => Ok(Some(message)),
-            Decision::CorrectSubmission(message) => {
+            Decision::CorrectSubmission(message) | Decision::RequireSubmission(message) => {
                 if self.corrections >= limit {
                     return Err(Failure::OutputInvalid(message));
                 }
@@ -853,6 +899,26 @@ impl Instance<'_> {
             Ok(())
         }
     }
+}
+
+fn missing_submission_prompt(tools: &[ToolDefinition], details: &str) -> String {
+    let mut prompt = format!(
+        "Your previous reply did not call the {SUBMIT_RESULT} tool. Use the tool interface to call {SUBMIT_RESULT} now. Follow its argument schema and leave the assistant text empty."
+    );
+    if let Some(tool) = tools.iter().find(|tool| tool.name == SUBMIT_RESULT) {
+        for (required, location) in [
+            (&tool.parameters["required"], "argument fields"),
+            (
+                &tool.parameters["properties"]["results"]["required"],
+                "keys in results",
+            ),
+        ] {
+            if required.as_array().is_some_and(|fields| !fields.is_empty()) {
+                prompt.push_str(&format!(" The required {location} are {required}."));
+            }
+        }
+    }
+    format!("{prompt}\n\n{details}")
 }
 
 struct Response {

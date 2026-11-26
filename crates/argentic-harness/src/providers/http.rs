@@ -80,6 +80,12 @@ impl HttpStream {
         self.effort_rejected = Some(AtomicBool::new(false));
     }
 
+    pub(super) fn attempt_effort_rejected(&self) -> bool {
+        self.effort_rejected
+            .as_ref()
+            .is_some_and(|rejected| rejected.load(Ordering::Relaxed))
+    }
+
     fn drop_effort(&self, body: &mut Value, field: &str) -> bool {
         if body
             .as_object_mut()
@@ -102,16 +108,26 @@ impl HttpStream {
         effort_field: &str,
     ) -> Result<ProviderStream, ProviderError> {
         let budget = TurnBudget::new(request.limits);
-        if self
-            .effort_rejected
-            .as_ref()
-            .is_some_and(|rejected| rejected.load(Ordering::Relaxed))
-        {
-            if let Some(fields) = body.as_object_mut() {
+        if let Some(fields) = body.as_object_mut() {
+            if request
+                .tool_choice_rejected
+                .is_some_and(|level| level.load(Ordering::Relaxed) >= 2)
+            {
+                fields.remove("tool_choice");
+            }
+            if self.attempt_effort_rejected() {
                 fields.remove(effort_field);
             }
         }
         let mut retries = 0;
+        let mut full_tools = None;
+        // An earlier request of this attempt saw the named choice refused.
+        if request
+            .tool_choice_rejected
+            .is_some_and(|level| level.load(Ordering::Relaxed) == 1)
+        {
+            downgrade_tool_choice(&mut body, &mut full_tools);
+        }
         let delivery = request.delivery;
         loop {
             let wire = self
@@ -166,11 +182,18 @@ impl HttpStream {
 
             delivery.report(DeliveryStatus::NotDelivered);
             let message = error_body(&mut response, &cancel, &budget).await?;
-            if matches!(status.as_u16(), 400 | 422)
-                && rejects_effort(&message)
-                && self.drop_effort(&mut body, effort_field)
-            {
-                continue;
+            if matches!(status.as_u16(), 400 | 422) {
+                if rejects_tool_choice(&message) {
+                    if let Some(level) = downgrade_tool_choice(&mut body, &mut full_tools) {
+                        if let Some(shared) = request.tool_choice_rejected {
+                            shared.fetch_max(level, Ordering::Relaxed);
+                        }
+                        continue;
+                    }
+                }
+                if rejects_effort(&message) && self.drop_effort(&mut body, effort_field) {
+                    continue;
+                }
             }
             if let Some(delay) =
                 delay.filter(|_| status.as_u16() == 429 || status.is_server_error())
@@ -328,6 +351,104 @@ pub(super) fn rejects_effort(message: &str) -> bool {
         ]
         .iter()
         .any(|reason| message.contains(reason))
+}
+
+/// Replaces a refused forced tool choice and returns the new fallback level.
+/// A named choice becomes `required` (`any` for Messages) over that tool
+/// alone; any other forced choice is removed and the full tool list restored.
+fn downgrade_tool_choice(body: &mut Value, full_tools: &mut Option<Value>) -> Option<u8> {
+    let fields = body.as_object_mut()?;
+    let choice = fields.get("tool_choice")?;
+    let named = choice["name"]
+        .as_str()
+        .or_else(|| choice["function"]["name"].as_str())
+        .map(str::to_owned);
+    if let (Some(name), Some(tools)) = (named, fields.get("tools").and_then(Value::as_array)) {
+        let messages_api = choice["type"] == "tool";
+        let mut only: Vec<Value> = tools
+            .iter()
+            .filter(|tool| {
+                tool["name"]
+                    .as_str()
+                    .or_else(|| tool["function"]["name"].as_str())
+                    == Some(name.as_str())
+            })
+            .cloned()
+            .collect();
+        if let Some(last) = only.last_mut() {
+            if let (true, Some(marker)) = (
+                messages_api,
+                tools.last().and_then(|tool| tool.get("cache_control")),
+            ) {
+                // The Messages encoder places its single breakpoint on the
+                // last tool when no system block carries it.
+                last["cache_control"] = marker.clone();
+            }
+            *full_tools = fields.insert("tools".into(), Value::Array(only));
+            fields.insert(
+                "tool_choice".into(),
+                if messages_api {
+                    serde_json::json!({"type": "any", "disable_parallel_tool_use": true})
+                } else {
+                    serde_json::json!("required")
+                },
+            );
+            return Some(1);
+        }
+    }
+    fields.remove("tool_choice")?;
+    if let Some(tools) = full_tools.take() {
+        fields.insert("tools".into(), tools);
+    }
+    Some(2)
+}
+
+fn rejects_tool_choice(body: &str) -> bool {
+    let parsed = serde_json::from_str::<Value>(body).ok();
+    let error = parsed
+        .as_ref()
+        .map(|value| value.get("error").unwrap_or(value));
+    if let Some(param) = error.and_then(|error| error["param"].as_str()) {
+        return param == "tool_choice";
+    }
+
+    let message = error
+        .and_then(|error| error.as_str().or_else(|| error["message"].as_str()))
+        .unwrap_or(body)
+        .to_ascii_lowercase()
+        .replace(['\'', '"', '`'], "")
+        .replace("tool choice", "tool_choice");
+    let Some((before, after)) = message.trim().split_once("tool_choice") else {
+        return false;
+    };
+    if after.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_') {
+        return false;
+    }
+
+    // For errors without a parameter, require wording that names the field
+    // as the cause. Another field's rejected value can contain "tool_choice".
+    matches!(
+        before,
+        "unsupported "
+            | "unsupported parameter "
+            | "unknown parameter "
+            | "unrecognized parameter "
+            | "invalid "
+            | "invalid value for "
+            | "invalid enum value for "
+    ) || before.ends_with(" does not support ")
+        || (before.is_empty()
+            && ([
+                " is not supported",
+                " is unsupported",
+                " is invalid",
+                " must be ",
+                " required is not supported",
+                " any is not supported",
+            ]
+            .iter()
+            .any(|phrase| after.starts_with(phrase))
+                || (after.starts_with(": type ") && after.contains(" not supported"))))
 }
 
 // Based on Macro's SSE parser. Buffer bytes until a complete line arrives so
