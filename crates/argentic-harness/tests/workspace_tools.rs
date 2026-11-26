@@ -484,6 +484,14 @@ async fn shell_stops_on_staging_budget_during_execution() {
     }
     let dir = tempfile::tempdir().unwrap();
     let registry = Arc::new(registry(dir.path(), Some(Preset::Workspace), &[]).with_shell());
+    let output = call(
+        &registry,
+        "shell",
+        json!({"command": "test \"$(ulimit -n)\" -le 256 && test \"$(ulimit -u)\" -le 1024"}),
+    )
+    .await
+    .unwrap();
+    assert!(output.starts_with("Exit status: 0"), "{output}");
     for (command, expected) in [
         (
             "for i in 1 2 3 4 5; do truncate -s 14M part-$i; done; sleep 15",

@@ -214,7 +214,7 @@ processes exit. A sample exceeding 64 MiB, 20,000 directory entries, or the
 depth budget aborts the call without publishing. It counts the greater of
 logical size and allocated blocks per regular file, and allocated blocks
 for other entries. The kernel also limits each file to 16 MiB and open file
-descriptors to 256 per process. The process limit is 512, subject to Linux's
+descriptors to 256 per process. The process limit is 1,024, subject to Linux's
 real-UID accounting and exemptions. Lower inherited limits still apply.
 
 Sampling can miss transient growth and storage held by open, unlinked files.
@@ -227,9 +227,9 @@ originals and checks read and write permission for every changed path before
 applying any change. Only regular files and deletions are published, and their
 parent directories must already exist in the workspace. Publication uses the
 same atomic file replacement as the mutation tools. On timeout, Stop, or a
-staging budget error the host kills PID 1 through a pidfd and waits for it and the Bubblewrap supervisor
-before returning. The kernel terminates all processes remaining in that PID
-namespace.
+staging budget error the host kills PID 1 through a pidfd and waits for it and
+the Bubblewrap supervisor before returning. The kernel terminates all
+processes remaining in that PID namespace.
 
 The staging mount contains separate inodes from the host workspace. Workspace
 roots are host capabilities and should be managed by the host. Mutations

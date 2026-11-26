@@ -289,7 +289,7 @@ fn run_inner(
             }
             for (resource, ceiling) in [
                 (libc::RLIMIT_FSIZE, 16 * 1024 * 1024),
-                (libc::RLIMIT_NPROC, 512),
+                (libc::RLIMIT_NPROC, 1024),
                 (libc::RLIMIT_NOFILE, 256),
             ] {
                 let mut limit = libc::rlimit {
