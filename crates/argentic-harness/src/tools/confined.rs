@@ -58,7 +58,7 @@ fn walk(root: &Dir, path: &Path) -> io::Result<Dir> {
 }
 
 // Case folding and short-name aliases could reach a different read rule.
-fn check_spelling(dir: &Dir, name: &Path) -> io::Result<()> {
+pub(super) fn check_spelling(dir: &Dir, name: &Path) -> io::Result<()> {
     if cfg!(any(windows, target_os = "macos")) {
         for entry in dir.entries()? {
             if entry?.file_name() == name.as_os_str() {

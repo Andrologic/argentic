@@ -278,16 +278,27 @@ fn windows_upcase(path: &str) -> Result<String> {
     String::from_utf16(&upper).map_err(|_| invalid("Invalid uppercase Windows path"))
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 fn windows_path_spelling(path: &str) -> String {
-    let volume_path = matches!(
-        Path::new(path).components().next(),
-        Some(Component::Prefix(prefix)) if matches!(prefix.kind(), std::path::Prefix::VerbatimDisk(_))
-    );
     // Compare a DOS drive path and its canonical verbatim form in the same
     // spelling. Only the separator counts as a path boundary for globs.
-    let path = if volume_path { &path[4..] } else { path };
+    let path = path
+        .strip_prefix(r"\\?\")
+        .filter(|tail| matches!(tail.as_bytes(), [drive, b':', ..] if drive.is_ascii_alphabetic()))
+        .unwrap_or(path);
     path.replace('\\', "/")
+}
+
+#[cfg(test)]
+#[test]
+fn windows_drive_path_spelling_is_portable() {
+    for path in [
+        r"C:\work\memo.txt",
+        r"\\?\C:\work\memo.txt",
+        "C:/work/memo.txt",
+    ] {
+        assert_eq!(windows_path_spelling(path), "C:/work/memo.txt");
+    }
 }
 pub(super) fn check_mcp_identity(server: &str, tool: Option<&str>) -> Result<()> {
     if server.is_empty()

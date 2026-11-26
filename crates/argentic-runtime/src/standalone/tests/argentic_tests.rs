@@ -571,7 +571,7 @@ async fn qualification_refuses_unregistered_opted_out_and_unsupported_permission
     let error = host.preflight(entry().as_ref(), false).await.unwrap_err();
     assert_eq!(error.code, "HARNESS_OPT_IN_REQUIRED");
     close(&host).await;
-    for action in ["write", "shell", "network", "mcp", "delegate"] {
+    for action in ["mcp", "delegate"] {
         let mut doc = document();
         doc["agents"]["worker"]["permissions"] = json!({"preset":"read-only",
             "rules":[{"action":action,"effect":"allow"}]});
@@ -661,5 +661,330 @@ async fn uses_the_configured_default_model_when_the_agent_omits_name() {
         json!({"results":{"report":{"body":"done"}}}),
     );
     completed(&finish(&host, &run).await);
+    close(&host).await;
+}
+
+fn forbid_shell() -> Value {
+    json!({"action":"shell","effect":"deny"})
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn qualification_rejects_read_restrictions_on_shell_runtime_paths() {
+    for (restriction, suffix) in [
+        (
+            json!({"rules":[{"action":"read","match":"/proc/cmdline","effect":"deny"}]}),
+            "rules/0/match",
+        ),
+        (
+            json!({"rules":[{"action":"read","match":"/etc/**","effect":"ask"}]}),
+            "rules/0/match",
+        ),
+        (json!({"outside":"deny"}), "outside"),
+    ] {
+        for shell in [true, false] {
+            let mut doc = document();
+            let mut permissions = restriction.clone();
+            permissions["preset"] = json!("workspace");
+            permissions["reviewer"] = json!("person");
+            if !shell {
+                if permissions["rules"].is_null() {
+                    permissions["rules"] = json!([]);
+                }
+                permissions["rules"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(forbid_shell());
+            }
+            doc["agents"]["worker"]["permissions"] = permissions;
+            let f = Fixture::new(&doc.to_string());
+            let host = f
+                .open()
+                .await
+                .unwrap()
+                .with_argentic(
+                    serde_json::from_value(config("http://127.0.0.1:1/v1", None)).unwrap(),
+                )
+                .unwrap();
+            let report = host
+                .preflight_with_harnesses(entry().as_ref(), &opt_in())
+                .await;
+            if shell {
+                assert_eq!(
+                    report.unwrap_err().pointer,
+                    format!("/agents/worker/permissions/{suffix}")
+                );
+            } else {
+                report.unwrap();
+            }
+            close(&host).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn workspace_edits_and_denied_writes_go_through_the_host() {
+    let mut server = Server::start().await;
+    let mut doc = document();
+    doc["agents"]["worker"]["permissions"] = json!({"preset":"workspace","rules":[
+        forbid_shell(), {"action":"write","match":"protected","effect":"deny"}
+    ]});
+    let f = Fixture::new(&doc.to_string());
+    std::fs::write(f.workspace.join("memo.txt"), "before").unwrap();
+    let host = f
+        .open()
+        .await
+        .unwrap()
+        .with_argentic(server.config(None))
+        .unwrap();
+    let run = start(&host).await;
+    server.next().await.tool(
+        "edit",
+        json!({"path":"memo.txt","old_text":"before","new_text":"after"}),
+    );
+    let request = server.next().await;
+    assert!(request.body["messages"]
+        .to_string()
+        .contains("Applied 1 file change"));
+    request.tool("write", json!({"path":"protected","content":"denied"}));
+    let request = server.next().await;
+    assert!(request.body["messages"]
+        .to_string()
+        .contains("Write permission denied"));
+    request.tool(
+        "agsdl_submit_result",
+        json!({"results":{"report":{"body":"done"}}}),
+    );
+    completed(&finish(&host, &run).await);
+    assert_eq!(
+        std::fs::read_to_string(f.workspace.join("memo.txt")).unwrap(),
+        "after"
+    );
+    assert!(!f.workspace.join("protected").exists());
+    close(&host).await;
+}
+
+async fn pending_ask(
+    host: &Host,
+    scope: &persistence::public030::HumanScope030,
+) -> persistence::public030::PublicHumanRequest030 {
+    tokio::time::timeout(WAIT_FOR, async {
+        loop {
+            let page = host.humans(scope.clone(), None).await.unwrap();
+            if let Some(request) = page
+                .requests
+                .into_iter()
+                .find(|request| request.status == "open")
+            {
+                return request;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("Argentic action approval did not open")
+}
+
+#[tokio::test]
+async fn an_argentic_project_ceiling_can_supply_the_reviewer() {
+    let mut server = Server::start().await;
+    let mut doc = document();
+    doc["agents"]["worker"]["permissions"] = json!({"preset":"read-only"});
+    let mut f = Fixture::new(&doc.to_string());
+    let mut policy: Value = serde_json::from_slice(&std::fs::read(&f.policy).unwrap()).unwrap();
+    policy["permissions"] = json!({"preset":"read-only","reviewer":"person","rules":[
+        {"action":"read","match":"reviewed.txt","effect":"ask"}
+    ]});
+    let bytes = serde_json::to_vec(&policy).unwrap();
+    std::fs::write(&f.policy, &bytes).unwrap();
+    f.digest = digest(bytes);
+    std::fs::write(f.workspace.join("reviewed.txt"), "approved text").unwrap();
+    let host = open(&f, true)
+        .await
+        .with_argentic(server.config(None))
+        .unwrap();
+    let run = start(&host).await;
+    let scope = persistence::public030::HumanScope030 {
+        system_start_id: run.receipt.identity.system_start_id.clone(),
+        source: run.capture.source.clone(),
+    };
+    server
+        .next()
+        .await
+        .tool("read", json!({"path":"reviewed.txt"}));
+    let ask = pending_ask(&host, &scope).await;
+    host.submit_person(HumanSubmission {
+        scope,
+        request_id: ask.id,
+        expected_revision: ask.revision,
+        answer: api::HumanAnswer030::Decision {
+            decision: "yes".into(),
+            comment: String::new(),
+        },
+    })
+    .await
+    .unwrap();
+    let result = server.next().await;
+    assert!(result.body["messages"]
+        .to_string()
+        .contains("approved text"));
+    result.tool(
+        "agsdl_submit_result",
+        json!({"results":{"report":{"body":"done"}}}),
+    );
+    completed(&finish(&host, &run).await);
+    close(&host).await;
+}
+
+#[tokio::test]
+async fn a_write_approval_is_one_shot_and_stop_cancels_the_next_ask() {
+    let mut server = Server::start().await;
+    let mut doc = document();
+    doc["agents"]["worker"]["permissions"] = json!({"preset":"workspace","reviewer":"person","rules":[
+        forbid_shell(), {"action":"write","match":"reviewed","effect":"ask"}
+    ]});
+    let f = Fixture::new(&doc.to_string());
+    let host = f
+        .open()
+        .await
+        .unwrap()
+        .with_argentic(server.config(None))
+        .unwrap();
+    let run = start(&host).await;
+    let scope = persistence::public030::HumanScope030 {
+        system_start_id: run.receipt.identity.system_start_id.clone(),
+        source: run.capture.source.clone(),
+    };
+    server
+        .next()
+        .await
+        .tool("write", json!({"path":"reviewed","content":"first"}));
+    let first = pending_ask(&host, &scope).await;
+    assert!(!f.workspace.join("reviewed").exists());
+    host.submit_person(HumanSubmission {
+        scope: scope.clone(),
+        request_id: first.id.clone(),
+        expected_revision: first.revision,
+        answer: api::HumanAnswer030::Decision {
+            decision: "yes".into(),
+            comment: String::new(),
+        },
+    })
+    .await
+    .unwrap();
+    let next = server.next().await;
+    assert_eq!(
+        std::fs::read_to_string(f.workspace.join("reviewed")).unwrap(),
+        "first"
+    );
+    next.tool("write", json!({"path":"reviewed","content":"second"}));
+    let second = pending_ask(&host, &scope).await;
+    assert_ne!(first.id, second.id);
+    host.stop(EngineStopRequest {
+        request_id: "stop-pending-review".into(),
+        system_start_id: scope.system_start_id.clone(),
+        activation_id: None,
+    })
+    .await
+    .unwrap();
+    let state = finish(&host, &run).await;
+    assert_eq!(state["verdict"], "cancelled", "{state}");
+    assert_eq!(
+        std::fs::read_to_string(f.workspace.join("reviewed")).unwrap(),
+        "first"
+    );
+    let page = host.humans(scope, None).await.unwrap();
+    assert!(page.requests.iter().all(|request| request.status != "open"));
+    close(&host).await;
+}
+
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "aarch64", target_arch = "x86_64")
+))]
+#[tokio::test]
+async fn shell_executes_and_stop_reaps_the_namespace_before_physical_end() {
+    if ["/usr/bin/bwrap", "/bin/bwrap", "/usr/local/bin/bwrap"]
+        .into_iter()
+        .all(|path| !std::path::Path::new(path).is_file())
+    {
+        assert_ne!(
+            std::env::var("ARGENTIC_REQUIRE_BWRAP").as_deref(),
+            Ok("1"),
+            "Bubblewrap is required for the Linux standalone shell test"
+        );
+        eprintln!("Skipping Linux standalone shell test because system Bubblewrap is absent");
+        return;
+    }
+    let mut server = Server::start().await;
+    let mut doc = document();
+    doc["agents"]["worker"]["permissions"] = json!("full");
+    let mut f = Fixture::new(&doc.to_string());
+    let staging = f.workspace.parent().unwrap().join("staging");
+    std::fs::create_dir(&staging).unwrap();
+    let mut config = config(&server.base_url, None);
+    config["shellStagingDirectory"] = json!(staging);
+    let mut policy: Value = serde_json::from_slice(&std::fs::read(&f.policy).unwrap()).unwrap();
+    policy["permissions"] = json!("full");
+    let bytes = serde_json::to_vec(&policy).unwrap();
+    std::fs::write(&f.policy, &bytes).unwrap();
+    f.digest = digest(bytes);
+    let host = f
+        .open()
+        .await
+        .unwrap()
+        .with_argentic(serde_json::from_value(config).unwrap())
+        .unwrap();
+    let run = start(&host).await;
+    server
+        .next()
+        .await
+        .tool("shell", json!({"command":"printf sandboxed > output; pwd"}));
+    let request = server.next().await;
+    assert!(request.body["messages"].to_string().contains("/workspace"));
+    assert_eq!(
+        std::fs::read_to_string(f.workspace.join("output")).unwrap(),
+        "sandboxed"
+    );
+
+    // Keep a stream open in a grandchild. EOF after Stop proves the kernel
+    // closed its descriptor, independent of the work's journal marker.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    request.tool(
+        "shell",
+        json!({"command":format!(
+            "( (sleep 30) ) > /dev/tcp/127.0.0.1/{port} & wait"
+        )}),
+    );
+    let (stream, _) = tokio::time::timeout(WAIT_FOR, listener.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(std::fs::read_dir(&staging).unwrap().count(), 1);
+    host.stop(EngineStopRequest {
+        request_id: "stop-shell".into(),
+        system_start_id: run.receipt.identity.system_start_id.clone(),
+        activation_id: None,
+    })
+    .await
+    .unwrap();
+    let state = finish(&host, &run).await;
+    assert_eq!(state["verdict"], "cancelled", "{state}");
+    tokio::time::timeout(WAIT_FOR, stream.readable())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stream.try_read(&mut [0]).unwrap(), 0);
+    assert_eq!(std::fs::read_dir(&staging).unwrap().count(), 0);
+    let physical: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM engine_flow030_events WHERE
+            json_extract(event_json,'$.kind.PhysicalEnded.evidence.descendants_joined')=1
+            AND receipt_json IS NOT NULL",
+    )
+    .fetch_one(&host.pool)
+    .await
+    .unwrap();
+    assert_eq!(physical, 1);
     close(&host).await;
 }

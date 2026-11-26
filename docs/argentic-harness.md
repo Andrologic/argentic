@@ -56,6 +56,16 @@ Les exigences hors module s’appliquent aussi (`spec/agents.md`, `spec/flow.md`
 - arrêt avec preuve de terminaison physique ;
 - `harnessSettings` validés contre le schéma du module.
 
+En lot 2, les outils de fichiers peuvent écrire dans le workspace. Une
+demande `reviewer.person` passe par le port d’approbation du moteur. Le shell
+Linux utilise Bubblewrap et seccomp. Il reçoit une copie des fichiers lisibles
+et republie les modifications de fichiers ordinaires seulement quand tous les
+plafonds autorisent la lecture et l’écriture de tout le workspace. Le réseau
+exige une autorisation générale. Les chemins en dehors du workspace et les
+répertoires supplémentaires ne sont pas exposés au shell. Les contraintes
+d’installation et de publication sont détaillées dans le
+[guide du harnais](../crates/argentic-harness/README.md#linux-shell).
+
 ## Architecture
 
 ```

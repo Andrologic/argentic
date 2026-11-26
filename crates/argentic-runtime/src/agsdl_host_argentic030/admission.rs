@@ -1,10 +1,16 @@
 use crate::{
     agsdl_host_qualification030::declared_steps030,
     agsdl_host_work_admission030::pointer_token030,
-    permissions::{Action, Effect, EffectivePolicy, Outside, Preset, RequestedPermissions},
+    permissions::{
+        Action, DirectoryAccess, Effect, EffectivePolicy, Outside, Preset, RequestedPermissions,
+        Reviewer,
+    },
     persistence::{failure, Result},
 };
-use argentic_harness::policy::{Effect as ReadEffect, Preset as ReadPreset, ReadPolicy, ReadRule};
+use argentic_harness::policy::{
+    Action as NativeAction, Effect as NativeEffect, Policy, Preset as NativePreset, Rule, Zone,
+};
+use argentic_harness::tools::{shell_network_allowed, shell_read_conflict, ShellReadConflict};
 use serde_json::Value;
 
 pub(super) fn unsupported(pointer: &str, feature: &str) -> crate::persistence::dto::EngineFailure {
@@ -23,7 +29,6 @@ pub(super) fn qualify(agent: &Value, pointer: &str) -> Result<()> {
         "plan",
         "planFirst",
         "completionCheck",
-        "answerTimeoutMs",
     ] {
         if agent.get(property).is_some_and(|value| {
             value != false
@@ -36,52 +41,75 @@ pub(super) fn qualify(agent: &Value, pointer: &str) -> Result<()> {
     let at = format!("{pointer}/permissions");
     let permissions: RequestedPermissions = serde_json::from_value(agent["permissions"].clone())
         .map_err(|_| unsupported(&at, "these permissions"))?;
-    match permissions {
-        RequestedPermissions::Preset(Preset::ReadOnly) => {}
-        RequestedPermissions::Preset(_) => {
-            return Err(unsupported(&at, "presets that grant non-read permissions"))
+    if let RequestedPermissions::Object(permissions) = &permissions {
+        if !permissions.directories.is_empty() {
+            return Err(unsupported(
+                &format!("{at}/directories"),
+                "additional workspace roots",
+            ));
         }
-        RequestedPermissions::Object(permissions) => {
-            if permissions
-                .preset
-                .is_some_and(|preset| preset != Preset::ReadOnly)
+        if permissions.reviewer == Some(Reviewer::Model) {
+            return Err(unsupported(
+                &format!("{at}/reviewer"),
+                "model permission reviewers",
+            ));
+        }
+        for (index, rule) in permissions.rules.iter().enumerate() {
+            if matches!(rule.action, Action::Mcp | Action::Delegate) && rule.effect != Effect::Deny
             {
                 return Err(unsupported(
-                    &format!("{at}/preset"),
-                    "presets that grant non-read permissions",
+                    &format!("{at}/rules/{index}/effect"),
+                    "MCP or delegation permissions",
                 ));
             }
-            if !permissions.directories.is_empty() {
-                return Err(unsupported(
-                    &format!("{at}/directories"),
-                    "additional read roots",
-                ));
-            }
-            if permissions.outside == Some(Outside::Read) {
-                return Err(unsupported(
+        }
+    }
+    if shell_requested(&permissions) {
+        #[cfg(target_os = "linux")]
+        if let RequestedPermissions::Object(object) = &permissions {
+            if object.outside == Some(Outside::Deny) {
+                return Err(read_conflict(
                     &format!("{at}/outside"),
-                    "reads outside the workspace",
+                    ShellReadConflict::Outside,
                 ));
             }
-            if permissions.reviewer.is_some() {
-                return Err(unsupported(
-                    &format!("{at}/reviewer"),
-                    "permission reviewers",
-                ));
-            }
-            for (index, rule) in permissions.rules.iter().enumerate() {
-                let at = format!("{at}/rules/{index}");
-                if rule.action != Action::Read && rule.effect != Effect::Deny {
-                    return Err(unsupported(
-                        &format!("{at}/effect"),
-                        "non-deny rules for actions other than read",
-                    ));
+            for (index, rule) in object.rules.iter().enumerate() {
+                if rule.action != Action::Read
+                    || rule.effect == Effect::Allow
+                    || rule
+                        .pattern
+                        .as_deref()
+                        .is_some_and(|pattern| !pattern.starts_with('/'))
+                {
+                    continue;
                 }
-                if rule.action == Action::Read && rule.effect == Effect::Ask {
-                    return Err(unsupported(&format!("{at}/effect"), "read approval"));
+                let policy = Policy::compile_rules(
+                    std::path::Path::new("/"),
+                    None,
+                    None,
+                    None,
+                    &[Rule {
+                        action: NativeAction::Read,
+                        effect: NativeEffect::Deny,
+                        pattern: rule.pattern.clone(),
+                    }],
+                )
+                .map_err(|error| failure("PERMISSION", &format!("{at}/rules/{index}"), &error))?;
+                if let Some(conflict) = shell_read_conflict(&policy, false) {
+                    let field = if rule.pattern.is_some() {
+                        "match"
+                    } else {
+                        "effect"
+                    };
+                    return Err(read_conflict(
+                        &format!("{at}/rules/{index}/{field}"),
+                        conflict,
+                    ));
                 }
             }
         }
+        argentic_harness::tools::shell_preflight()
+            .map_err(|diagnostic| failure("HARNESS_CAPABILITY", &at, &diagnostic))?;
     }
     Ok(())
 }
@@ -104,7 +132,54 @@ pub(super) fn validate_document(document: &Value, location: Option<&url::Url>) -
     crate::agsdl_host_content030::validate_text_sources(document, location)
 }
 
-pub(super) fn compile_reads(policy: &EffectivePolicy) -> Result<Vec<ReadPolicy>> {
+pub(super) fn shell_requested(permissions: &RequestedPermissions) -> bool {
+    match permissions {
+        RequestedPermissions::Preset(preset) => *preset != Preset::ReadOnly,
+        RequestedPermissions::Object(permissions) => {
+            let mut allowed = matches!(permissions.preset, Some(Preset::Workspace | Preset::Full));
+            for rule in permissions
+                .rules
+                .iter()
+                .filter(|rule| rule.action == Action::Shell)
+            {
+                let global = rule.pattern.as_ref().is_none_or(|pattern| {
+                    !pattern.is_empty() && pattern.bytes().all(|byte| byte == b'*')
+                });
+                if global && rule.effect == Effect::Deny {
+                    return false;
+                }
+                allowed |= rule.effect != Effect::Deny;
+            }
+            allowed
+        }
+    }
+}
+
+fn read_conflict(
+    pointer: &str,
+    conflict: ShellReadConflict,
+) -> crate::persistence::dto::EngineFailure {
+    failure("HARNESS_UNSUPPORTED", pointer, &conflict.to_string())
+}
+
+pub(super) fn admit_shell(policies: &[Policy], person: bool, pointer: &str) -> Result<bool> {
+    if !policies.iter().all(|policy| policy.may_run_shell(person)) {
+        return Ok(false);
+    }
+    let network = shell_network_allowed(policies);
+    for policy in policies {
+        if let Some(conflict) = shell_read_conflict(policy, network) {
+            let at = match conflict {
+                ShellReadConflict::Outside => format!("{pointer}/permissions/outside"),
+                ShellReadConflict::Rule { .. } => format!("{pointer}/permissions/rules"),
+            };
+            return Err(read_conflict(&at, conflict));
+        }
+    }
+    Ok(true)
+}
+
+pub(super) fn compile_policy(policy: &EffectivePolicy) -> Result<Vec<Policy>> {
     policy
         .policies()
         .map(|layer| {
@@ -112,51 +187,76 @@ pub(super) fn compile_reads(policy: &EffectivePolicy) -> Result<Vec<ReadPolicy>>
             let rules = layer
                 .rules()
                 .iter()
-                .filter(|rule| rule.action == Action::Read)
                 .flat_map(|rule| {
                     let effect = match rule.effect {
-                        Effect::Allow => ReadEffect::Allow,
-                        Effect::Ask => ReadEffect::Deny,
-                        Effect::Deny => ReadEffect::Deny,
+                        Effect::Allow => NativeEffect::Allow,
+                        Effect::Ask => NativeEffect::Ask,
+                        Effect::Deny => NativeEffect::Deny,
                     };
-                    let logical = rule.logical_pattern();
-                    let physical = rule.physical_pattern();
-                    // The registry rejects aliases. Allows on an alias therefore
-                    // cannot grant access, while restrictive rules cover both names.
-                    let patterns = if effect == ReadEffect::Allow && logical != physical {
-                        vec![]
-                    } else if logical == physical {
-                        vec![logical]
+                    let action = match rule.action {
+                        Action::Read => NativeAction::Read,
+                        Action::Write => NativeAction::Write,
+                        Action::Shell => NativeAction::Shell,
+                        Action::Network => NativeAction::Network,
+                        Action::Mcp => NativeAction::Mcp,
+                        Action::Delegate => NativeAction::Delegate,
+                    };
+                    let patterns = if matches!(rule.action, Action::Read | Action::Write) {
+                        let logical = rule.logical_pattern();
+                        let physical = rule.physical_pattern();
+                        // Tools reject aliases, so an alias cannot grant access.
+                        // Restrictive rules still cover both captured names.
+                        if logical == physical {
+                            vec![logical]
+                        } else if effect == NativeEffect::Allow {
+                            vec![]
+                        } else {
+                            vec![logical, physical]
+                        }
                     } else {
-                        vec![logical, physical]
+                        vec![rule.pattern.as_deref()]
                     };
-                    patterns.into_iter().map(move |pattern| ReadRule {
-                        pattern: pattern.map(|pattern| {
-                            if cfg!(windows) {
-                                pattern.replace('\\', "/")
-                            } else {
-                                pattern.to_owned()
-                            }
-                        }),
+                    patterns.into_iter().map(move |pattern| Rule {
+                        action,
+                        pattern: pattern.map(str::to_owned),
                         effect,
                     })
                 })
                 .collect::<Vec<_>>();
-            let preset = layer.preset().map(|_| ReadPreset::ReadOnly);
-            ReadPolicy::compile(
+            let preset = layer.preset().map(|preset| match preset {
+                Preset::ReadOnly => NativePreset::ReadOnly,
+                Preset::Workspace => NativePreset::Workspace,
+                Preset::Full => NativePreset::Full,
+            });
+            Policy::compile_rules(
                 &paths.workspace,
                 Some(&paths.home),
                 preset,
-                Some(false),
+                if layer.explicitly_denies_outside_reads() {
+                    Some(false)
+                } else if layer.outside() == Outside::Read {
+                    Some(true)
+                } else {
+                    None
+                },
                 &rules,
             )
-            .map_err(|_| {
-                failure(
-                    "PERMISSION",
-                    "/permissions",
-                    "Argentic could not compile a read ceiling",
+            .map(|policy| {
+                policy.with_directories(
+                    layer
+                        .directories()
+                        .iter()
+                        .map(|directory| {
+                            let zone = match directory.access {
+                                DirectoryAccess::Read => Zone::ReadDirectory,
+                                DirectoryAccess::Write => Zone::WriteDirectory,
+                            };
+                            (directory.canonical.clone(), zone)
+                        })
+                        .collect(),
                 )
             })
+            .map_err(|error| failure("PERMISSION", "/permissions", &error))
         })
         .collect()
 }

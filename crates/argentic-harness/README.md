@@ -1,8 +1,9 @@
 # Argentic harness
 
 In-process Rust runner for a fresh AgSDL 0.4.0 agent instance. The crate has its
-own manifest and lockfile. Its [module draft](module.json) declares the features
-available at the current integration boundary.
+own manifest and lockfile. The [engine module](../argentic-core/assets/harnesses/argentic/module.json)
+describes the registered adapter. The [crate module](module.json) describes
+the default standalone loop.
 
 ## Try it
 
@@ -114,10 +115,10 @@ response data per provider turn, including error bodies and SSE comments.
    empty object for an omitted layer. All settings are ceilings. A project
    can lower inherited values, including the cancellation grace period.
    `Settings::get` returns the effective value and its source.
-2. Compile `ReadPolicy` against the canonical workspace path and open a
-   `Registry` with the host-admitted roots and the current step's submission
-   envelope schema. Use that schema to describe named results, media types,
-   allowed choices, and the requirements for route instructions.
+2. Compile a `Policy` against the canonical workspace path for each permission
+   ceiling. Open a `Registry` with the host-admitted roots and the current
+   step's submission envelope schema. Use that schema to describe named
+   results, media types, allowed choices, and route instruction requirements.
 3. Construct `Harness::new(provider, registry, settings)`. For Chat Completions,
    configure a provider ID and endpoint on `ChatCompletions`. A name such as
    `openrouter/vendor/model#fast` selects the provider, keeps `vendor/model`
@@ -131,7 +132,7 @@ response data per provider turn, including error bodies and SSE comments.
 
 The work uses a child cancellation token. The runner gives cooperative
 shutdown a grace period, then drops the provider or hook future and waits
-for tracked filesystem jobs. `RunReport::physical_end` is returned after
+for tracked filesystem and shell jobs. `RunReport::physical_end` is returned after
 the workers exit. A blocked kernel filesystem call can outlast the grace
 period. Local HTTP cancellation closes the request and does not attest to
 the remote provider's process state.
@@ -148,39 +149,123 @@ prompt before reporting its size.
 relative `path`. Directory tools default to the root. `glob` matches against
 paths relative to the selected directory. `grep` takes a regular expression
 and returns filenames, one-based line numbers and matching lines. Read calls
-run in parallel up to `maxParallelReads`. Replies retain the provider's
-call order. A submission is a barrier and an accepted submission ends work.
+can run in parallel up to `maxParallelReads` when no reviewer is attached.
+Replies retain the provider's call order. Mutations, shell calls and submissions
+are barriers. An accepted submission ends work.
 
 All tools use admitted directory handles. They refuse parent components,
-absolute paths and symbolic links. File reads also refuse multiply linked
-files. Private project metadata is excluded from reads and searches. In no-human mode, an unmatched policy falls back to the configured
-preset and zone, and an `ask` whose reviewer is unavailable is denied.
+absolute paths, symbolic links and private project metadata. File reads and
+mutations also refuse multiply linked files. Matching rules override the
+preset and its zone. When several rules match, the strictest effect wins, in
+the order `deny`, `ask`, `allow`. The registry checks each ceiling separately
+and denies an `ask` without a reviewer.
+
+The engine can enable `write`, `edit` and `apply_patch` for workspace-relative
+files. Edits and patch updates require read and write permission. Patch
+moves also require permission on the destination. Writes use per-file queues
+and atomic replacement. A patch validates its whole plan before changing files.
+An I/O failure during publication can leave some files changed, and the reply
+reports how many changes were applied. Parent directories must already exist.
+
+Use `reviewer: "person"` to have the engine ask about a direct read, write or
+shell call. The reply covers that specific action in that call. A refused or
+expired answer returns a tool error. Engine Stop closes pending questions.
+`answerTimeoutMs` bounds the human wait, which the engine excludes from step
+machine time.
+
+## Linux shell
+
+Shell qualification runs a probe with system Bubblewrap. Install `bwrap`
+and Bash on Linux ARM64 or x86-64. The host kernel must allow unprivileged user
+and PID namespaces, seccomp filters and pidfds. The probe detects container
+or AppArmor restrictions. On Ubuntu 24.04, deploy with an AppArmor policy
+that permits user namespaces for Bubblewrap. CI disables the restriction
+on its disposable runners and requires the Linux sandbox tests to run.
+macOS and Windows refuse shell at qualification.
+To use file mutations without shell, declare a global `shell` denial.
+
+The sandbox starts with a cleared environment, a private PID namespace and
+a private network namespace. It provides private `/tmp`, `/dev` and `/proc`.
+It mounts the available executable and library directories `/bin`, `/usr/bin`,
+`/lib`, `/lib64`, `/usr/lib` and `/usr/lib64` read-only, along with
+`/etc/ld.so.cache` when present. The process drops capabilities and seccomp
+blocks tracing, process introspection syscalls and other privileged kernel
+interfaces. Shell networking requires a blanket grant from every ceiling.
+The network-enabled profile allows IPv4 and IPv6 sockets and mounts
+`/etc/resolv.conf`, `/etc/hosts` and `/etc/ssl/certs` when present. Per-host
+grants cannot enable networking.
+
+The default outside denial leaves the system runtime readable as AgSDL
+specifies. Qualification refuses shell with an explicit `outside: "deny"`
+or any read denial or approval rule that overlaps a required runtime mount.
+The executor checks all effective policy layers before enabling shell.
+
+Bash sees a private copy at `/workspace` built from verified directory and
+file handles. A scan checks at most 20,000 entries and copies at most 64 MiB.
+Up to four workers create fresh staging files from the verified bytes.
+The scan omits paths without a read grant, private metadata, symlinks, special
+files and files with multiple hard links. Any ceiling that restricts workspace
+reads or writes makes the entire copy read-only. The direct file tools can
+still change individual paths according to the policy.
+
+For a writable shell, the launcher checks the staging tree before starting
+Bash, approximately every 50 ms during execution, and after all sandbox
+processes exit. A sample exceeding 64 MiB, 20,000 directory entries, or the
+depth budget aborts the call without publishing. It counts the greater of
+logical size and allocated blocks per regular file, and allocated blocks
+for other entries. The kernel also limits each file to 16 MiB and open file
+descriptors to 256 per process. The process limit is 1,024, subject to Linux's
+real-UID accounting and exemptions. Lower inherited limits still apply.
+
+Sampling can miss transient growth and storage held by open, unlinked files.
+For a hard disk budget, set the host's top-level `shellStagingDirectory` to an
+existing absolute directory outside the workspace on a volume with byte and
+inode quotas. The default is the host's temporary directory.
+
+After a writable run, the host compares the staged bytes and modes with the
+originals and checks read and write permission for every changed path before
+applying any change. Only regular files and deletions are published, and their
+parent directories must already exist in the workspace. Publication uses the
+same atomic file replacement as the mutation tools. On timeout, Stop, or a
+staging budget error the host kills PID 1 through a pidfd and waits for it and
+the Bubblewrap supervisor before returning. The kernel terminates all
+processes remaining in that PID namespace.
+
+The staging mount contains separate inodes from the host workspace. Workspace
+roots are host capabilities and should be managed by the host. Mutations
+check the location of the parent handle and the staged file immediately
+before publication, then replace or create the destination relative to that
+same parent handle. A different host process with write access can still
+rename an entry or directory between the final check and the operation.
 
 A preview contains up to 2,000 lines and 50 KiB of UTF-8 text. Use its
 `next_cursor` with the same tool arguments to continue. A truncated first
 page also saves the complete bounded output to a temporary file. The
 `RunReport` keeps that file available to the host for as long as it owns
 the artifact. The model receives a cursor, and the host receives the file.
-Read and scan budgets bound the work behind a preview.
+Read and scan budgets bound the work behind a preview. Shell output also has
+a capture cap. Shell previews omit the cursor because rerunning a shell call
+could repeat its effects.
 
 ## Mapping to AgentExecutor030
 
 | Runtime boundary | Harness mapping |
 | --- | --- |
-| `prepare(PreparedEffectiveAgentWork030)` | Validate captured provider configuration and authored properties. Compile a read policy for each independent permission ceiling and attest it through the native capture and lease checks. |
-| `run(AgentWork030, WorkEventSink030, CancellationToken)` | Decode the admitted capture and start message into `Work`. Pass the attempt token as parent and keep the harness future in the runtime's ownership registry until join. |
+| `prepare(PreparedEffectiveAgentWork030)` | Validate captured provider configuration and authored properties. Attest the permission ceilings through the native capture and lease checks. |
+| `run(AgentWork030, WorkEventSink030, CancellationToken)` | Decode the admitted capture into `Work` and compile the independent permission ceilings. Use the attempt token as the parent and keep the harness future in the runtime's ownership registry until join. |
 | Visible text | Emit one `visibleText` frame per complete assistant message through `WorkPort::assistant_message`. Stream fragments remain available to harness consumers through `Event::VisibleText`. |
 | Submit and logical turn end | Project `Proposal::Submit` and `Proposal::EndTurn` into the native work protocol. The controller validates the raw arguments and returns acceptance or a correction in the current conversation. |
 | Steer | Pull from the admitted inbox at a safe point and gate the next request with `wire_admission`. For HTTP, acknowledge on 2xx response headers. An explicit refusal or a connection failure before sending leaves the steer eligible for queue fallback. Missing evidence after a possible send leaves delivery uncertain. |
-| Approvals | The slice denies reads that would require approval. Runtime review ports are future work. |
+| Approvals | Deliver one-shot action decisions through the shared engine human broker. |
 | Physical termination | After `RunReport::physical_end`, return from the owned executor future. The native registry and its join generate durable `physicalEnded` evidence. |
 
 The standalone host registers the adapter when configured and requires explicit
 opt-in. Shared and named instances keep their conversation in memory for the
 run. Route and delivery metadata travels as untrusted message data. The
 module leaves authored resources unsupported because the adapter has no
-separate resource channel. Conversation compaction, permission reviewers, completion checks, skills,
-MCP, writing, shell tools, and other provider protocols are outside this slice.
+separate resource channel. Additional authored directories, model reviewers,
+conversation compaction, completion checks, skills, MCP and other provider
+protocols remain unsupported.
 
 ## Source notes
 
@@ -191,8 +276,9 @@ The reasoning catalog is from `src/shared/ai/reasoningCatalog.json`, with
 the resolver adapted from `src-tauri/src/ai/reasoning_catalog.rs`.
 Scoped cursors and bounded previews adapt
 `src-tauri/src/core/workspace_execution/tool_output.rs`. Capability-relative
-reads follow the approach in `src-tauri/src/fs/confined.rs`. Macro and this
-crate are AGPL-3.0-or-later.
+reads follow the approach in `src-tauri/src/fs/confined.rs`. The patch parser
+and hunk application come from `src-tauri/src/core/workspace_execution/mod.rs`.
+Macro and this crate are AGPL-3.0-or-later.
 
 Run `cargo test --locked --all-targets` here. The HTTP fixtures bind
 `127.0.0.1`.

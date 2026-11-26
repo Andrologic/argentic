@@ -6,7 +6,7 @@ use argentic_harness::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, path::PathBuf};
 use url::Url;
 
 #[derive(Deserialize)]
@@ -14,6 +14,7 @@ use url::Url;
 pub struct ArgenticConfig030 {
     providers: BTreeMap<String, ProviderConfig>,
     pub(super) default_model: Option<String>,
+    pub(super) shell_staging_directory: Option<PathBuf>,
     #[serde(default = "empty_settings")]
     settings: Value,
 }
@@ -110,6 +111,17 @@ impl ArgenticConfig030 {
                 ));
             }
         }
+        if self
+            .shell_staging_directory
+            .as_ref()
+            .is_some_and(|path| !path.is_absolute() || !path.is_dir())
+        {
+            return Err(failure(
+                "HARNESS_SETTINGS",
+                "/shellStagingDirectory",
+                "Expected an existing absolute shell staging directory",
+            ));
+        }
         self.settings(&empty_settings(), "settings")?;
         Ok(())
     }
@@ -136,9 +148,10 @@ impl ArgenticConfig030 {
 
     pub(super) fn fingerprint(&self) -> Result<String> {
         let legacy = (&self.providers, &self.settings);
-        let bytes = match &self.default_model {
-            Some(name) => serde_json::to_vec(&(legacy.0, legacy.1, name))?,
-            None => serde_json::to_vec(&legacy)?,
+        let bytes = match (&self.default_model, &self.shell_staging_directory) {
+            (name, Some(path)) => serde_json::to_vec(&(legacy.0, legacy.1, name, path))?,
+            (Some(name), None) => serde_json::to_vec(&(legacy.0, legacy.1, name))?,
+            (None, None) => serde_json::to_vec(&legacy)?,
         };
         Ok(format!("sha256:{:x}", Sha256::digest(bytes)))
     }

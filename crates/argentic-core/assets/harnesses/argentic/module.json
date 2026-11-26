@@ -32,7 +32,7 @@
       "support": "absent"
     },
     "reviewer.person": {
-      "support": "absent"
+      "support": "native"
     },
     "reviewer.model": {
       "support": "absent"
@@ -50,25 +50,28 @@
   "permissions": {
     "read": {
       "allow": "harness",
-      "ask": "absent",
-      "deny": "harness",
-      "outside": "harness",
-      "note": "Confined workspace reads. The adapter rejects authored approval rules and denies reads requiring approval under a host ceiling."
+      "ask": "sandbox",
+      "deny": "sandbox",
+      "outside": "sandbox",
+      "note": "Direct file tools enforce the compiled policy. The Linux sandbox exposes a filtered workspace snapshot and the system files needed to run programs. Qualification refuses shell with an explicit outside denial or a deny or ask rule that overlaps a required runtime mount."
     },
     "write": {
-      "allow": "absent",
-      "ask": "absent",
-      "deny": "harness"
+      "allow": "harness",
+      "ask": "sandbox",
+      "deny": "sandbox",
+      "note": "Direct file tools enforce the compiled policy. Linux shell changes to regular workspace files are published only with a blanket write grant."
     },
     "shell": {
-      "allow": "absent",
-      "ask": "absent",
-      "deny": "harness"
+      "allow": "harness",
+      "ask": "harness",
+      "deny": "harness",
+      "note": "Shell rules match the command text, including each subcommand of a compound command, but not programs that a matched command starts. Dynamic command words and shell constructs that indirectly execute commands take the most restrictive explicit shell rule. Shell requires system Bubblewrap and working PID and user namespaces on Linux ARM64 or x86-64."
     },
     "network": {
-      "allow": "absent",
-      "ask": "absent",
-      "deny": "harness"
+      "allow": "sandbox",
+      "ask": "sandbox",
+      "deny": "sandbox",
+      "note": "Linux shell uses an isolated network namespace and seccomp unless every policy layer grants network access without restrictions. Per-host rules cannot enable shell networking."
     },
     "mcp": {
       "allow": "absent",

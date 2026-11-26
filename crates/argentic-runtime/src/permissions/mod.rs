@@ -170,6 +170,8 @@ pub struct NormalizedPolicy {
     preset: Option<Preset>,
     directories: Vec<DirectoryGrant>,
     outside: Outside,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    explicit_outside_deny: bool,
     rules: Vec<NormalizedRule>,
     reviewer: Option<Reviewer>,
 }
@@ -186,6 +188,9 @@ impl NormalizedPolicy {
     }
     pub fn outside(&self) -> Outside {
         self.outside
+    }
+    pub(crate) fn explicitly_denies_outside_reads(&self) -> bool {
+        self.explicit_outside_deny
     }
     pub fn rules(&self) -> &[NormalizedRule] {
         &self.rules
@@ -230,6 +235,7 @@ pub fn normalize_requested(
             } else {
                 Outside::Deny
             }),
+        explicit_outside_deny: object.outside == Some(Outside::Deny),
         rules,
         reviewer: object.reviewer,
     })
@@ -305,6 +311,8 @@ struct StoredPolicy {
     preset: Option<Preset>,
     directories: Vec<DirectoryGrant>,
     outside: Outside,
+    #[serde(default)]
+    explicit_outside_deny: bool,
     rules: Vec<NormalizedRule>,
     reviewer: Option<Reviewer>,
 }
@@ -315,6 +323,7 @@ impl StoredPolicy {
             preset: self.preset,
             directories: self.directories,
             outside: self.outside,
+            explicit_outside_deny: self.explicit_outside_deny,
             rules: self.rules,
             reviewer: self.reviewer,
         }
@@ -375,6 +384,15 @@ impl EffectivePolicy {
     }
     pub fn policies(&self) -> impl Iterator<Item = &NormalizedPolicy> {
         self.ceilings.iter().chain(std::iter::once(&self.current))
+    }
+
+    pub(crate) fn reviewer(&self) -> Option<Reviewer> {
+        self.policies()
+            .filter_map(NormalizedPolicy::reviewer)
+            .fold(None, |reviewer, layer| match (reviewer, layer) {
+                (Some(Reviewer::Person), _) | (_, Reviewer::Person) => Some(Reviewer::Person),
+                _ => Some(Reviewer::Model),
+            })
     }
 }
 
@@ -464,7 +482,6 @@ fn evaluate_with(
     subject: fn(&PathContext, &ActionRequest) -> Result<paths::Subject>,
 ) -> Result<PermissionDecision> {
     let mut effect = Effect::Allow;
-    let mut reviewer = None;
     let mut resolved_path = None;
     for ceiling in policy.policies() {
         let subject = subject(&ceiling.context, request)?;
@@ -480,11 +497,6 @@ fn evaluate_with(
         }
         let decision = evaluate_subject(ceiling, request.action(), &subject)?;
         effect = effect.max(decision);
-        reviewer = match (reviewer, ceiling.reviewer) {
-            (Some(Reviewer::Person), _) | (_, Some(Reviewer::Person)) => Some(Reviewer::Person),
-            (Some(Reviewer::Model), _) | (_, Some(Reviewer::Model)) => Some(Reviewer::Model),
-            _ => None,
-        };
     }
     // The purpose can only narrow the intersection; it never grants a right.
     if (purpose == ExecutionPurpose::PlanLocked && request.action() != Action::Read)
@@ -493,9 +505,11 @@ fn evaluate_with(
     {
         effect = Effect::Deny;
     }
-    if effect != Effect::Ask {
-        reviewer = None;
-    }
+    let reviewer = if effect == Effect::Ask {
+        policy.reviewer()
+    } else {
+        None
+    };
     Ok(PermissionDecision {
         policy_digest: policy.fingerprint(),
         request: request.clone(),

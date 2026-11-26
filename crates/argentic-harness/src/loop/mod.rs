@@ -377,7 +377,7 @@ impl Instance<'_> {
                     .take_while(|call| call.name != SUBMIT_RESULT)
                     .count();
                 let (reads, tail) = pending.split_at(read_count);
-                self.read_batch(turn, reads, &mut work.messages).await?;
+                self.tool_batch(turn, reads, &mut work.messages).await?;
                 let Some((call, tail)) = tail.split_first() else {
                     break;
                 };
@@ -593,14 +593,26 @@ impl Instance<'_> {
         Err(ProviderError::Invalid("Provider ended without a terminal chunk".into()).into())
     }
 
-    async fn read_batch(
+    async fn tool_batch(
         &mut self,
         turn: u32,
         calls: &[ToolCall],
         messages: &mut Vec<Message>,
     ) -> Result<(), Failure> {
         let parallelism = self.harness.settings.limit("maxParallelReads") as usize;
-        for batch in calls.chunks(parallelism) {
+        let mut pending = calls;
+        while !pending.is_empty() {
+            let parallel_reads = pending
+                .iter()
+                .take(if self.harness.registry.has_authorizer() {
+                    1
+                } else {
+                    parallelism
+                })
+                .take_while(|call| matches!(call.name.as_str(), "read" | "list" | "glob" | "grep"))
+                .count();
+            let (batch, remaining) = pending.split_at(parallel_reads.max(1));
+            pending = remaining;
             for call in batch {
                 self.before(turn, call).await?;
             }
