@@ -1,9 +1,10 @@
+use crate::agsdl_host_work_admission030::pointer_token030;
 use crate::persistence::{failure, Result};
 use argentic_harness::{
     config::Settings,
     providers::{
         reasoning_capability, AnthropicMessages, ChatCompletions, ModelName, OpenAiResponses,
-        Provider,
+        Provider, ReasoningCapability,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -65,9 +66,25 @@ impl ProviderConfig {
             .as_deref()
             .unwrap_or(match self.protocol {
                 Protocol::ChatCompletions => provider_id,
-                Protocol::AnthropicMessages => "anthropic",
+                Protocol::AnthropicMessages => AnthropicMessages::REASONING_CATALOG,
                 Protocol::OpenAiResponses => "openai",
             })
+    }
+
+    fn capability(&self, id: &str, model: &str) -> Result<Option<&'static ReasoningCapability>> {
+        let catalog = self.catalog(id);
+        match self.protocol {
+            Protocol::AnthropicMessages => AnthropicMessages::reasoning_capability(catalog, model)
+                .map_err(|error| {
+                    failure(
+                        "ARGENTIC_PROVIDER_CONFIG",
+                        &format!("/providers/{}/reasoningCatalog", pointer_token030(id)),
+                        &error.to_string(),
+                    )
+                }),
+            _ => reasoning_capability(catalog, model)
+                .map_err(|_| config_error("Argentic reasoning catalogue is unavailable")),
+        }
     }
 
     fn endpoint(&self) -> Result<Url> {
@@ -128,6 +145,7 @@ impl ArgenticConfig030 {
                 if parsed.provider() != id || !seen.insert(model) {
                     return Err(config_error("Invalid provider id or duplicate model name"));
                 }
+                provider.capability(id, parsed.model())?;
             }
         }
         if let Some(name) = &self.default_model {
@@ -167,8 +185,7 @@ impl ArgenticConfig030 {
                 let model: ModelName = full
                     .parse()
                     .map_err(|_| config_error("Invalid configured model name"))?;
-                let capability = reasoning_capability(provider.catalog(id), model.model())
-                    .map_err(|_| config_error("Argentic reasoning catalogue is unavailable"))?;
+                let capability = provider.capability(id, model.model())?;
                 models.push(json!({"name":full,"efforts":capability.map(|c| c.efforts.as_slice()).unwrap_or_default(),
                     "defaultEffort":capability.map(|c| &c.default_effort)}));
             }

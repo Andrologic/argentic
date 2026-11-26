@@ -14,7 +14,7 @@
     },
     "model.effort": {
       "support": "approximate",
-      "note": "Argentic sends catalogue-listed effort values or maps them to a Claude thinking budget when supported. If the provider rejects the effort configuration, Argentic retries without it and omits it for the remainder of the work attempt."
+      "note": "The host qualifies efforts against the model's protocol catalogue. Anthropic Messages maps supported efforts to native thinking settings and enables manual thinking when the output limit allows its minimum budget. Chat Completions and OpenAI Responses receive the effort value. An effort rejection triggers a retry with the effort configuration omitted for the rest of the work attempt."
     },
     "skills": {
       "support": "absent"

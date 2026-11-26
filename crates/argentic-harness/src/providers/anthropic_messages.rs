@@ -9,7 +9,8 @@ use super::{
     emit_items,
     http::{rejects_effort, secret, DecodeError, Events, HttpStream},
     invalid, reasoning_capability, wire_index, wire_str, Chunk, Finish, Message, ModelName,
-    Provider, ProviderError, ProviderStream, Replay, Request, ToolCall, Usage, WireFormat,
+    Provider, ProviderError, ProviderStream, ReasoningCapability, Replay, Request, ToolCall, Usage,
+    WireFormat,
 };
 
 pub struct AnthropicMessages {
@@ -20,6 +21,8 @@ pub struct AnthropicMessages {
 }
 
 impl AnthropicMessages {
+    pub const REASONING_CATALOG: &str = "anthropic";
+
     /// The endpoint is the full Messages URL, including /v1/messages.
     pub fn new(
         provider: impl Into<String>,
@@ -35,7 +38,7 @@ impl AnthropicMessages {
         Ok(Self {
             http,
             provider: provider.into(),
-            reasoning_catalog: "anthropic".into(),
+            reasoning_catalog: Self::REASONING_CATALOG.into(),
             prompt_caching: false,
         })
     }
@@ -48,6 +51,18 @@ impl AnthropicMessages {
     pub fn with_reasoning_catalog(mut self, catalog: impl Into<String>) -> Self {
         self.reasoning_catalog = catalog.into();
         self
+    }
+
+    pub fn reasoning_capability(
+        catalog: &str,
+        model: &str,
+    ) -> Result<Option<&'static ReasoningCapability>, ProviderError> {
+        if !catalog.eq_ignore_ascii_case(Self::REASONING_CATALOG) {
+            return Err(invalid(
+                "anthropic-messages requires the anthropic reasoning catalogue",
+            ));
+        }
+        reasoning_capability(catalog, model).map_err(|_| invalid("Reasoning catalogue unavailable"))
     }
 
     pub fn with_attempt_effort_fallback(mut self) -> Self {
@@ -66,6 +81,8 @@ impl Provider for AnthropicMessages {
         if request.model.provider() != self.provider {
             return Err(invalid("Model belongs to a different provider"));
         }
+        let capability =
+            Self::reasoning_capability(&self.reasoning_catalog, request.model.model())?;
         let mut system = Vec::new();
         let mut messages: Vec<(bool, Vec<Value>)> = Vec::new();
         for message in request.messages {
@@ -138,10 +155,15 @@ impl Provider for AnthropicMessages {
             body["tools"] = json!(tools);
         }
         if let Some(effort) = request.reasoning_effort {
-            let capability = reasoning_capability(&self.reasoning_catalog, request.model.model())
-                .map_err(|_| invalid("Reasoning catalogue unavailable"))?;
-            if let Some(budget) = capability.and_then(|c| c.thinking_budgets.get(effort)) {
-                let budget = (*budget).min(request.max_output_tokens.saturating_sub(1));
+            let budget = capability
+                .filter(|c| c.efforts.iter().any(|supported| supported == effort))
+                .and_then(|c| c.thinking_budgets.get(effort))
+                .copied()
+                .ok_or_else(|| invalid("Unsupported Messages reasoning effort"))?;
+            if budget == 0 {
+                body["thinking"] = json!({"type":"disabled"});
+            } else {
+                let budget = budget.min(request.max_output_tokens.saturating_sub(1));
                 if budget >= 1024 {
                     body["thinking"] = json!({"type":"enabled","budget_tokens":budget});
                 }

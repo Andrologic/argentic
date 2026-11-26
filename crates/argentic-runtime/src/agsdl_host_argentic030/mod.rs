@@ -85,6 +85,34 @@ mod tests {
             adapter.qualify_agent(&agent, "/agents/worker").unwrap();
         }
     }
+
+    #[test]
+    fn anthropic_messages_rejects_catalogues_without_native_thinking_mapping() {
+        let mut config = json!({"providers":{"local":{"protocol":"anthropic-messages",
+            "baseUrl":"https://example.test","models":["claude-sonnet-4-6"],
+            "reasoningCatalog":"openrouter"}}});
+        let error = ArgenticAdapter030::new(serde_json::from_value(config.clone()).unwrap())
+            .err()
+            .expect("the host should reject OpenRouter reasoning for Messages");
+        assert_eq!(error.pointer, "/providers/local/reasoningCatalog");
+        config["providers"]["local"]["reasoningCatalog"] = json!("Anthropic");
+        let adapter = ArgenticAdapter030::new(serde_json::from_value(config).unwrap()).unwrap();
+        assert_eq!(
+            adapter.0.catalogue().unwrap()[0]["efforts"],
+            json!(["none", "low", "medium", "high"])
+        );
+        let mut agent = json!({"permissions":"read-only",
+            "model":{"name":"local/claude-sonnet-4-6","effort":"high"}});
+        adapter.qualify_agent(&agent, "/agents/worker").unwrap();
+        agent["model"]["effort"] = json!("max");
+        assert_eq!(
+            adapter
+                .qualify_agent(&agent, "/agents/worker")
+                .unwrap_err()
+                .pointer,
+            "/agents/worker/model/effort"
+        );
+    }
 }
 
 impl ArgenticAdapter030 {

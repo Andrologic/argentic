@@ -35,8 +35,13 @@ static CATALOG: LazyLock<Result<Vec<CatalogEntry>, String>> = LazyLock::new(|| {
     catalog
         .entries
         .into_iter()
-        .map(|entry| {
+        .map(|mut entry| {
             let patterns = RegexSet::new(entry.model_patterns).map_err(|e| e.to_string())?;
+            if !entry.thinking_budgets.is_empty() {
+                entry
+                    .supported_efforts
+                    .retain(|effort| entry.thinking_budgets.contains_key(effort));
+            }
             let capability = ReasoningCapability {
                 efforts: entry.supported_efforts,
                 default_effort: entry.default_effort,
