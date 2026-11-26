@@ -578,24 +578,14 @@ impl Instance<'_> {
             }
         }
         self.active()?;
-        // Force the result tool by name. A server that refuses named choices
-        // gets `required` over the result tool alone, then no forced choice.
-        let submit_only;
-        let (tools, tool_choice) = match (
-            self.force_submission,
-            self.tool_choice_rejected.load(Ordering::Relaxed),
-        ) {
-            (true, 0) => (definitions, ToolChoice::Named(SUBMIT_RESULT)),
-            (true, 1) => {
-                submit_only = definitions
-                    .iter()
-                    .filter(|tool| tool.name == SUBMIT_RESULT)
-                    .cloned()
-                    .collect::<Vec<_>>();
-                (submit_only.as_slice(), ToolChoice::Required)
-            }
-            _ => (definitions, ToolChoice::Auto),
-        };
+        // Force the result tool by name. The HTTP layer applies the fallback
+        // reached in this attempt and keeps the full tool list to restore.
+        let tool_choice =
+            if self.force_submission && self.tool_choice_rejected.load(Ordering::Relaxed) < 2 {
+                ToolChoice::Named(SUBMIT_RESULT)
+            } else {
+                ToolChoice::Auto
+            };
         let delivery = self.delivery.clone();
         let provider = self.harness.provider.clone();
         let request = provider.stream(
@@ -603,7 +593,7 @@ impl Instance<'_> {
                 model: &work.model,
                 reasoning_effort: work.reasoning_effort.as_deref(),
                 messages: &messages,
-                tools,
+                tools: definitions,
                 tool_choice,
                 tool_choice_rejected: Some(self.tool_choice_rejected),
                 max_output_tokens,

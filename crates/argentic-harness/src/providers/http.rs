@@ -121,6 +121,13 @@ impl HttpStream {
         }
         let mut retries = 0;
         let mut full_tools = None;
+        // An earlier request of this attempt saw the named choice refused.
+        if request
+            .tool_choice_rejected
+            .is_some_and(|level| level.load(Ordering::Relaxed) == 1)
+        {
+            downgrade_tool_choice(&mut body, &mut full_tools);
+        }
         let delivery = request.delivery;
         loop {
             let wire = self

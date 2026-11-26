@@ -570,6 +570,43 @@ async fn chat_completions_named_rejection_keeps_required_over_the_result_tool() 
     }
 }
 
+/// `required` succeeds on the first correction, then a later correction
+/// refuses it: the unconstrained retry must restore every tool.
+#[tokio::test]
+async fn chat_completions_later_required_rejection_restores_every_tool() {
+    let stop = || {
+        sse(concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"text only\"},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n"
+    ).into())
+    };
+    let named = r#"{"error":"Invalid tool_choice type: 'object'. Supported string values: none, auto, required"}"#;
+    let required = r#"{"error":"tool_choice required is not supported"}"#;
+    let mock = Mock::start_at(
+        "/v1/chat/completions",
+        vec![
+            stop(),
+            http_error(400, None, named),
+            stop(),
+            http_error(400, None, required),
+            stop(),
+        ],
+        |url| Arc::new(ChatCompletions::new("fixture", url, None).unwrap()),
+    )
+    .await;
+    correction_turns(&mock, "fixture/gpt-5.4", None).await;
+    let requests = mock.requests.lock().unwrap();
+    assert_eq!(requests.len(), 5);
+    let all = tool_names(&requests[0].1);
+    assert!(all.len() > 1);
+    for request in &requests[2..4] {
+        assert_eq!(request.1["tool_choice"], "required");
+        assert_eq!(tool_names(&request.1), ["agsdl_submit_result"]);
+    }
+    assert!(requests[4].1.get("tool_choice").is_none());
+    assert_eq!(tool_names(&requests[4].1), all);
+}
+
 #[tokio::test]
 async fn responses_forces_submission_and_falls_back() {
     let protocol = Protocol::Responses;
