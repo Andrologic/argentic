@@ -215,15 +215,15 @@ preset and its zone. When several rules match, the strictest effect wins, in
 the order `deny`, `ask`, `allow`. The registry checks each ceiling separately
 and denies an `ask` without a reviewer.
 
-The engine can enable `write`, `edit` and `apply_patch` for workspace-relative
-files. Edits and patch updates require read and write permission. Patch
-moves also require permission on the destination. Writes use per-file queues
+The engine can enable `write`, `edit` and `apply_patch` for paths relative to
+the selected root. Edits and patch updates require read and write permission.
+Patch moves also require permission on the destination. Writes use per-file queues
 and atomic replacement. A patch validates its whole plan before changing files.
 An I/O failure during publication can leave some files changed, and the reply
 reports how many changes were applied. Parent directories must already exist.
 
-Use `reviewer: "person"` to have the engine ask about a direct read, write or
-shell call. The reply covers that specific action in that call. A refused or
+Use `reviewer: "person"` to have the engine ask about a direct read, write,
+shell or MCP call. The reply covers that specific action in that call. A refused or
 expired answer returns a tool error. Engine Stop closes pending questions.
 `answerTimeoutMs` bounds the human wait, which the engine excludes from step
 machine time.
@@ -315,13 +315,33 @@ could repeat its effects.
 | Physical termination | After `RunReport::physical_end`, return from the owned executor future. The native registry and its join generate durable `physicalEnded` evidence. |
 
 The standalone host registers the adapter when configured and requires explicit
-opt-in. Shared and named instances keep their conversation in memory for the
-run. Route and delivery metadata travels as untrusted message data. The
-module leaves authored resources unsupported because the adapter has no
-separate resource channel. Conversation compaction runs when the provider
-entry sets `contextWindowTokens` (see `docs/argentic-harness.md`). Additional
-authored directories, model reviewers, completion checks, skills and MCP remain
-unsupported.
+opt-in. Shared and named instances keep their conversation in memory for the run.
+Compaction runs when the provider entry sets `contextWindowTokens`.
+
+- Agent and message resources appear as origin-labelled, untrusted reference
+  data in a separate user message. The Host resolves local URIs under the
+  recipient's effective read permissions.
+- The `skill` tool lists selected skills. Pass a skill key as `name` to
+  activate its instructions, and pass `name` and `path` to read an activated
+  skill's text or JSON companion file. Compaction preserves the activation
+  exchange in the conversation.
+- The Host discovers tools from selected MCP servers and exposes them with
+  provider-safe names, typically `mcp__server__tool`. Permissions apply to the
+  original `server/tool` name. An `ask` requires a person and never grants
+  lasting access. Local stdio requires macOS ARM64. Remote servers use the
+  Host's authorized Streamable HTTP transport. Stop closes admission and
+  joins local sessions. A dispatched remote call whose termination cannot be
+  confirmed yields `MCP_TERMINATION_UNCERTAIN`. Operator Hold is unavailable
+  for runs that select MCP servers.
+- File tools use `root: 0` for the workspace and positive indices for up to
+  eight additional roots. On Linux, shell commands see filtered snapshots
+  under `/directories/<index>`. A root is writable in the shell only when
+  every effective policy grants unrestricted read and write on that root.
+  Work admission refuses overlapping shell roots and roots covering private
+  Host data.
+
+The adapter's AgSDL module describes support for planning, reviewers and
+completion checks.
 
 After a missing required submission, Argentic forces the result tool by name
 by default. If the provider rejects the named choice, Argentic retries with
