@@ -455,23 +455,41 @@ fn parse_json(
         }
     })?;
     if project_limits {
-        let mut pending = vec![(&value, 0)];
-        while let Some((value, depth)) = pending.pop() {
-            match value {
-                Value::Array(items) if depth < 64 && items.len() <= 1024 => {
-                    pending.extend(items.iter().map(|item| (item, depth + 1)));
-                }
-                Value::Object(items) if depth < 64 => {
-                    pending.extend(items.values().map(|item| (item, depth + 1)));
-                }
-                Value::Array(_) | Value::Object(_) => {
-                    return Err(error("Project JSON exceeds nesting or array limits"))
-                }
-                _ => {}
-            }
-        }
+        check_project_json(&value, file, 0, budget)?;
     }
     Ok(value)
+}
+
+fn check_project_json(
+    value: &Value,
+    file: &str,
+    depth: usize,
+    budget: &SourceBudget,
+) -> Result<()> {
+    budget
+        .work(1, "")
+        .map_err(|error| source_limit(file, error))?;
+    match value {
+        Value::Array(items) if depth < 64 && items.len() <= 1024 => {
+            for item in items {
+                check_project_json(item, file, depth + 1, budget)?;
+            }
+        }
+        Value::Object(items) if depth < 64 => {
+            for item in items.values() {
+                check_project_json(item, file, depth + 1, budget)?;
+            }
+        }
+        Value::Array(_) | Value::Object(_) => {
+            return Err(invalid(
+                file,
+                "",
+                "Project JSON exceeds nesting or array limits",
+            ));
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn open_project_root(path: &Path) -> Result<Dir> {

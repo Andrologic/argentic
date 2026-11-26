@@ -192,6 +192,25 @@ fn json_budget_counts_every_reference_like_the_official_reader() {
 }
 
 #[test]
+fn project_json_structure_check_spends_source_work() {
+    let bytes = br#"{"items":[0,1,2]}"#;
+    let parse_only = SourceBudget::default();
+    parse_json(bytes, MANIFEST, false, &parse_only).unwrap();
+
+    let budget = SourceBudget::default();
+    // Leave exactly enough work for the parse and four of the five visits.
+    budget
+        .work(
+            argentic_core::MAX_SOURCE_WORK - parse_only.usage().0 - 4,
+            "",
+        )
+        .unwrap();
+    let error = parse_json(bytes, MANIFEST, true, &budget).unwrap_err();
+    assert_eq!(error.code, GRAPH_LIMIT_CODE);
+    assert_eq!(error.source.unwrap().path, MANIFEST);
+}
+
+#[test]
 fn json_documents_keep_the_host_source_codes() {
     let temp = tempfile::tempdir().unwrap();
     let code = |path: &Path| match OpenedSource::open_path(path) {
