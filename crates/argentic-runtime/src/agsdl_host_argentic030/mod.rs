@@ -61,8 +61,11 @@ impl HarnessAdapter030 for ArgenticAdapter030 {
 
     fn qualify_agent(&self, agent: &Value, pointer: &str) -> Result<()> {
         admission::qualify(agent, pointer)?;
-        let name = required(&agent["model"], "name")
-            .map_err(|_| config::invalid_model(&format!("{pointer}/model/name")))?;
+        let name = match agent.pointer("/model/name") {
+            Some(name) => name.as_str(),
+            None => self.0.default_model.as_deref(),
+        }
+        .ok_or_else(|| config::invalid_model(&format!("{pointer}/model/name")))?;
         let models = self.0.catalogue()?;
         let model = models
             .iter()
@@ -107,7 +110,6 @@ impl HarnessAdapter030 for ArgenticAdapter030 {
                 "response-attribution",
                 "instructions",
                 "model.name",
-                "model.effort",
                 "instance.new",
                 "delivery.queue",
                 "delivery.steer",
@@ -116,13 +118,14 @@ impl HarnessAdapter030 for ArgenticAdapter030 {
             .into_iter()
             .map(|name| json!({"name":name,"support":"native","evidenceJson":evidence.to_string()}))
             .collect();
+            capabilities.push(json!({"name":"model.effort","support":"approximate","evidenceJson":evidence.to_string()}));
             // Entry and route metadata can reach any recipient. We can carry
             // that data in its message but have no separate resource channel.
             capabilities.push(json!({"name":"resources","support":"approximate","evidenceJson":evidence.to_string()}));
             Ok(HarnessObservation030 {
                 version: VERSION.into(),
                 models,
-                default_model: None,
+                default_model: self.0.default_model.clone(),
                 capabilities,
                 version_receipt: digest,
                 fingerprint: evidence.clone(),
@@ -373,7 +376,9 @@ fn provider_failure(
         ProviderError::Invalid(_) => {
             "Chat Completions returned an invalid request or response".into()
         }
-        ProviderError::Stream { .. } | ProviderError::TurnTimeout | ProviderError::ResponseTooLarge => error.to_string(),
+        ProviderError::Stream { .. }
+        | ProviderError::TurnTimeout
+        | ProviderError::ResponseTooLarge => error.to_string(),
         ProviderError::Cancelled => "Chat Completions was cancelled".into(),
     };
     failure("ARGENTIC_PROVIDER", "provider", &detail)

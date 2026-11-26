@@ -26,6 +26,9 @@ Create `providers.json` on the host.
 }
 ```
 
+Set top-level `defaultModel` to a configured identifier such as
+`local/qwen3:8b` to let agents omit `model.name`.
+
 The host appends `/chat/completions` to `baseUrl`. Each model in `models`
 can have a `#variant` suffix. Use the suffix in the document and the provider
 configuration. The server receives the model ID without the suffix. Set
@@ -89,7 +92,9 @@ cargo run --locked --manifest-path crates/argentic-runtime/Cargo.toml \
 ```
 
 Send one JSON command per line. Wait for the work to finish before quitting.
-EOF requests Stop for active runs.
+EOF requests Stop for active runs. Stop evidence covers local termination,
+including closing the provider response stream and joining tool workers.
+The remote server may continue generating after the connection closes.
 
 ```jsonl
 {"op":"preflight","entry":{"deliveryId":"entry","messageJson":"{}"}}

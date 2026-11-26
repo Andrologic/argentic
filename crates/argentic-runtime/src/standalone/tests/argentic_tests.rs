@@ -600,3 +600,41 @@ async fn persists_one_assistant_message_regardless_of_sse_chunking() {
         close(&host).await;
     }
 }
+
+#[tokio::test]
+async fn uses_the_configured_default_model_when_the_agent_omits_name() {
+    let mut server = Server::start().await;
+    let mut doc = document();
+    doc["agents"]["worker"]["model"]
+        .as_object_mut()
+        .unwrap()
+        .remove("name");
+    let f = Fixture::new(&doc.to_string());
+    let unconfigured = open(&f, false)
+        .await
+        .with_argentic(server.config(None))
+        .unwrap();
+    let error = unconfigured
+        .preflight_with_harnesses(entry().as_ref(), &opt_in())
+        .await
+        .unwrap_err();
+    assert_eq!(error.pointer, "/agents/worker/model/name");
+    close(&unconfigured).await;
+
+    let mut config = config(&server.base_url, None);
+    config["defaultModel"] = json!("local/gpt-5.5#fixture");
+    let host = open(&f, false)
+        .await
+        .with_argentic(serde_json::from_value(config).unwrap())
+        .unwrap();
+    let run = start(&host).await;
+    let request = server.next().await;
+    assert_eq!(request.body["model"], "gpt-5.5");
+    assert_eq!(request.body["reasoning_effort"], "high");
+    request.tool(
+        "agsdl_submit_result",
+        json!({"results":{"report":{"body":"done"}}}),
+    );
+    completed(&finish(&host, &run).await);
+    close(&host).await;
+}

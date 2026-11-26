@@ -13,8 +13,8 @@
       "support": "native"
     },
     "model.effort": {
-      "support": "native",
-      "note": "Efforts come from the reasoning catalogue. A provider that rejects the effort parameter is retried without it for the rest of the work attempt."
+      "support": "approximate",
+      "note": "Argentic sends catalogue-listed effort values. If the provider rejects the effort parameter, Argentic retries without it and omits it for the remainder of the work attempt."
     },
     "skills": {
       "support": "absent"
@@ -101,12 +101,10 @@
         "type": "integer"
       },
       "maxTurnMs": {
-        "type": "integer",
-        "minimum": 1
+        "type": "integer"
       },
       "maxTurnBytes": {
-        "type": "integer",
-        "minimum": 1
+        "type": "integer"
       }
     }
   }

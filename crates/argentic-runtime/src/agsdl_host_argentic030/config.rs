@@ -13,6 +13,7 @@ use url::Url;
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ArgenticConfig030 {
     providers: BTreeMap<String, ProviderConfig>,
+    pub(super) default_model: Option<String>,
     #[serde(default = "empty_settings")]
     settings: Value,
 }
@@ -102,6 +103,13 @@ impl ArgenticConfig030 {
                 }
             }
         }
+        if let Some(name) = &self.default_model {
+            if !self.catalogue()?.iter().any(|model| model["name"] == *name) {
+                return Err(config_error(
+                    "The default model must be a configured provider/model",
+                ));
+            }
+        }
         self.settings(&empty_settings(), "settings")?;
         Ok(())
     }
@@ -127,7 +135,7 @@ impl ArgenticConfig030 {
     }
 
     pub(super) fn fingerprint(&self) -> Result<String> {
-        let bytes = serde_json::to_vec(&(&self.providers, &self.settings))?;
+        let bytes = serde_json::to_vec(&(&self.providers, &self.settings, &self.default_model))?;
         Ok(format!("sha256:{:x}", Sha256::digest(bytes)))
     }
 

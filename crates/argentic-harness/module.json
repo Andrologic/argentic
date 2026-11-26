@@ -15,7 +15,7 @@
     },
     "model.effort": {
       "support": "approximate",
-      "note": "Chat Completions supports selected provider effort settings. The engine does not negotiate effort."
+      "note": "Argentic sends catalogue-listed effort values. If the provider rejects the effort parameter, Argentic retries without it and omits it for the remainder of the work attempt."
     },
     "skills": {
       "support": "absent"
@@ -103,12 +103,10 @@
         "type": "integer"
       },
       "maxTurnMs": {
-        "type": "integer",
-        "minimum": 1
+        "type": "integer"
       },
       "maxTurnBytes": {
-        "type": "integer",
-        "minimum": 1
+        "type": "integer"
       }
     }
   }
