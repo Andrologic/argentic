@@ -1,5 +1,4 @@
 use crate::{
-    agsdl_host_qualification030::declared_steps030,
     agsdl_host_work_admission030::pointer_token030,
     permissions::{
         Action, DirectoryAccess, Effect, EffectivePolicy, Outside, Preset, RequestedPermissions,
@@ -12,6 +11,7 @@ use argentic_harness::policy::{
 };
 use argentic_harness::tools::{shell_network_allowed, shell_read_conflict, ShellReadConflict};
 use serde_json::Value;
+use std::path::{Path, PathBuf};
 
 pub(super) fn unsupported(pointer: &str, feature: &str) -> crate::persistence::dto::EngineFailure {
     failure(
@@ -22,14 +22,7 @@ pub(super) fn unsupported(pointer: &str, feature: &str) -> crate::persistence::d
 }
 
 pub(super) fn qualify(agent: &Value, pointer: &str) -> Result<()> {
-    for property in [
-        "resources",
-        "skills",
-        "mcpServers",
-        "plan",
-        "planFirst",
-        "completionCheck",
-    ] {
+    for property in ["plan", "planFirst", "completionCheck"] {
         if agent.get(property).is_some_and(|value| {
             value != false
                 && !value.as_array().is_some_and(Vec::is_empty)
@@ -42,10 +35,11 @@ pub(super) fn qualify(agent: &Value, pointer: &str) -> Result<()> {
     let permissions: RequestedPermissions = serde_json::from_value(agent["permissions"].clone())
         .map_err(|_| unsupported(&at, "these permissions"))?;
     if let RequestedPermissions::Object(permissions) = &permissions {
-        if !permissions.directories.is_empty() {
-            return Err(unsupported(
+        if permissions.directories.len() > 8 {
+            return Err(failure(
+                "HARNESS_CAPABILITY",
                 &format!("{at}/directories"),
-                "additional workspace roots",
+                "Argentic supports at most eight additional roots per agent",
             ));
         }
         if permissions.reviewer == Some(Reviewer::Model) {
@@ -55,11 +49,10 @@ pub(super) fn qualify(agent: &Value, pointer: &str) -> Result<()> {
             ));
         }
         for (index, rule) in permissions.rules.iter().enumerate() {
-            if matches!(rule.action, Action::Mcp | Action::Delegate) && rule.effect != Effect::Deny
-            {
+            if rule.action == Action::Delegate && rule.effect != Effect::Deny {
                 return Err(unsupported(
                     &format!("{at}/rules/{index}/effect"),
-                    "MCP or delegation permissions",
+                    "delegation permissions",
                 ));
             }
         }
@@ -118,17 +111,6 @@ pub(super) fn validate_document(document: &Value, location: Option<&url::Url>) -
     if document["contract"] != argentic_core::AGSDL_040 {
         return Err(unsupported("/contract", "contracts other than AgSDL 0.4.0"));
     }
-    for (pointer, step) in declared_steps030(document) {
-        if step["agent"]
-            .as_str()
-            .is_some_and(|agent| document["agents"][agent]["harness"] == "argentic")
-            && step["resources"]
-                .as_object()
-                .is_some_and(|resources| !resources.is_empty())
-        {
-            return Err(unsupported(&format!("{pointer}/resources"), "resources"));
-        }
-    }
     crate::agsdl_host_content030::validate_text_sources(document, location)
 }
 
@@ -177,6 +159,53 @@ pub(super) fn admit_shell(policies: &[Policy], person: bool, pointer: &str) -> R
         }
     }
     Ok(true)
+}
+
+pub(super) fn extra_roots(
+    policy: &EffectivePolicy,
+    private: &Path,
+    shell: bool,
+    pointer: &str,
+) -> Result<Vec<PathBuf>> {
+    let requested = policy
+        .policies()
+        .next()
+        .ok_or_else(|| unsupported(pointer, "missing agent policy"))?;
+    let workspace = &requested.context().workspace;
+    let at = format!("{pointer}/permissions/directories");
+    let mut roots = Vec::<PathBuf>::new();
+    let overlaps = |left: &Path, right: &Path| left.starts_with(right) || right.starts_with(left);
+    for directory in requested.directories() {
+        let path = &directory.canonical;
+        if overlaps(private, path)
+            || path
+                .ancestors()
+                .last()
+                .is_some_and(|base| argentic_harness::tools::private_project_path(base, path))
+        {
+            return Err(failure(
+                "PERMISSION",
+                &at,
+                "An additional root overlaps private host data",
+            ));
+        }
+        if path == workspace || roots.contains(path) {
+            return Err(failure(
+                "HARNESS_CAPABILITY",
+                &at,
+                "Additional roots must have distinct canonical paths",
+            ));
+        }
+        if shell && (overlaps(workspace, path) || roots.iter().any(|root| overlaps(root, path))) {
+            return Err(failure(
+                "HARNESS_CAPABILITY",
+                &at,
+                "Overlapping roots cannot be staged independently for Linux shell access",
+            ));
+        }
+        roots.push(path.clone());
+    }
+    Ok(roots)
 }
 
 pub(super) fn compile_policy(policy: &EffectivePolicy) -> Result<Vec<Policy>> {

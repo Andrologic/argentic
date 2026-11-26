@@ -13,6 +13,10 @@ use std::{fs, path::Path, sync::Arc, time::Duration};
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
+#[cfg(target_os = "linux")]
+#[path = "support/argentic_content.rs"]
+mod argentic_content;
+
 fn main() {
     // The Linux and macOS backends launch this test executable as the reader.
     if let Some(status) = file_helper::initialize().unwrap() {
@@ -36,6 +40,8 @@ fn main() {
             tokio::time::timeout(Duration::from_secs(15), async {
                 exercise_reader().await;
                 exercise_project_sources().await;
+                #[cfg(target_os = "linux")]
+                argentic_content::run().await;
             })
             .await
             .expect("content-reader integration test timed out");

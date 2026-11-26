@@ -2,12 +2,13 @@
   "$schema": "https://raw.githubusercontent.com/Andrologic/AgSDL/v0.4.0/schema/harness-module.schema.json",
   "name": "argentic",
   "title": "Argentic",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "contract": "agsdl-0.4.0",
   "harnessVersions": ">=0.1.0 <0.2.0",
   "properties": {
     "resources": {
-      "support": "absent"
+      "support": "native",
+      "note": "Text and JSON from the agent and incoming messages are labelled untrusted reference data. Local URIs use the confined content resolver."
     },
     "model.name": {
       "support": "native"
@@ -17,10 +18,12 @@
       "note": "The host qualifies efforts against the model's protocol catalogue. Anthropic Messages maps supported efforts to native thinking settings and enables manual thinking when the output limit allows its minimum budget. Chat Completions and OpenAI Responses receive the effort value. An effort rejection triggers a retry with the effort configuration omitted for the rest of the work attempt."
     },
     "skills": {
-      "support": "absent"
+      "support": "native",
+      "note": "Selected local skills are listed by name and description. The skill tool activates their instructions and reads text or JSON companion files within their package."
     },
     "mcpServers": {
-      "support": "absent"
+      "support": "native",
+      "note": "The Host discovers tools using its qualified local stdio and remote Streamable HTTP transports."
     },
     "plan": {
       "support": "absent"
@@ -38,7 +41,8 @@
       "support": "absent"
     },
     "directories": {
-      "support": "absent"
+      "support": "native",
+      "note": "Additional admitted roots are indexed for file tools. On Linux they are staged under /directories/<index> for shell calls. Overlapping shell roots are refused."
     },
     "instance.new": {
       "support": "native",
@@ -75,9 +79,10 @@
       "note": "Linux shell uses an isolated network namespace and seccomp unless every policy layer grants network access without restrictions. Per-host rules cannot enable shell networking."
     },
     "mcp": {
-      "allow": "absent",
-      "ask": "absent",
-      "deny": "harness"
+      "allow": "harness",
+      "ask": "harness",
+      "deny": "harness",
+      "note": "Each tool is evaluated by server/tool across the effective policy. Ask requires a person and is denied without one."
     },
     "delegate": {
       "allow": "absent",

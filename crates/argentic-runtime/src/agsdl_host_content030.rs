@@ -335,7 +335,7 @@ impl Sources030 {
                 return Err(failure(
                     "CONTENT_SOURCE_UNSUPPORTED",
                     pointer,
-                    "This Codex adapter cannot represent this media type as native context",
+                    "This adapter cannot represent this media type as native context",
                 ))
             }
         }
@@ -409,12 +409,8 @@ impl Sources030 {
             self.context.project_root().unwrap_or(&self.root),
             self.context.document_location(),
         )?;
-        for key in self.document["agents"][self.context.binding().map_err(content_error)?.agent]
-            ["skills"]
-            .as_array()
-            .into_iter()
-            .flatten()
-        {
+        let agent = &self.document["agents"][self.context.binding().map_err(content_error)?.agent];
+        for key in agent["skills"].as_array().into_iter().flatten() {
             let name = key.as_str().ok_or_else(|| missing("skills"))?;
             self.allowed_file(&self.document["skills"][name], &format!("/skills/{name}"))?;
         }
@@ -437,7 +433,7 @@ impl Sources030 {
                 "Selected skills exceed the work's content bound",
             ));
         }
-        for skill in &selected {
+        for skill in selected.iter().filter(|_| agent["harness"] != "argentic") {
             let root = Path::new(&skill.path)
                 .parent()
                 .ok_or_else(|| missing("skillRoot"))?;
@@ -456,6 +452,42 @@ impl Sources030 {
         self.receipts
             .extend(selected.iter().map(|skill| skill.source.clone()));
         Ok(selected)
+    }
+
+    pub async fn load_skill(
+        &self,
+        skill: &SkillDescriptor,
+    ) -> HostResult<crate::content::LoadedSkill> {
+        self.check_ceiling().await?;
+        self.allowed_file(&self.document["skills"][&skill.key], "/skills")?;
+        crate::content::load_skill(&self.context, &skill.handle)
+            .await
+            .map_err(content_error)
+    }
+
+    pub async fn skill_resource(
+        &self,
+        skill: &SkillDescriptor,
+        loaded: &crate::content::LoadedSkill,
+        path: &str,
+    ) -> HostResult<String> {
+        self.check_ceiling().await?;
+        let pointer = "/skills/resources";
+        let origin = url::Url::from_file_path(&skill.path).map_err(|_| missing("skillRoot"))?;
+        let target = origin.join(path).map_err(|_| missing("skillResource"))?;
+        self.allowed_file(&json!({"uri": target.as_str()}), pointer)?;
+        let receipt = crate::content::read_skill_resource(&self.context, loaded, path, None)
+            .await
+            .map_err(content_error)?;
+        match receipt.payload {
+            ContentPayload::Text { text } => Ok(text),
+            ContentPayload::Json { json } => Ok(json),
+            ContentPayload::Media { .. } => Err(failure(
+                "CONTENT_SOURCE_UNSUPPORTED",
+                pointer,
+                "Skill resources must be text or JSON",
+            )),
+        }
     }
 
     fn allowed_file(&self, source: &Value, pointer: &str) -> HostResult<()> {
@@ -526,6 +558,9 @@ pub(crate) fn qualify_skill_folders(
                     &pointer,
                     "Selected skill is outside the approved project data scope",
                 ));
+            }
+            if agent["harness"] == "argentic" {
+                continue;
             }
             let directory = path.parent().ok_or_else(|| missing("skills"))?;
             for entry in std::fs::read_dir(directory).map_err(|_| missing("skills"))? {

@@ -1,124 +1,12 @@
 use super::*;
-use axum::{
-    body::Body,
-    extract::State,
-    http::{HeaderMap, StatusCode},
-    response::Response,
-    routing::post,
-    Json, Router,
-};
+#[path = "../../../tests/support/mock_chat.rs"]
+mod mock_chat;
+use crate::harness::ArgenticConfig030;
+use axum::{body::Body, http::StatusCode};
 use futures::StreamExt;
+use mock_chat::{config, document, Request, Server, WAIT_FOR};
 use std::time::Duration;
-use tokio::sync::{mpsc, oneshot};
-
-const WAIT_FOR: Duration = Duration::from_secs(15);
-
-struct Request {
-    body: Value,
-    headers: HeaderMap,
-    respond: oneshot::Sender<Response>,
-}
-
-impl Request {
-    fn send(self, status: StatusCode, body: impl Into<Body>, content_type: &str) {
-        assert!(self
-            .respond
-            .send(
-                Response::builder()
-                    .status(status)
-                    .header("content-type", content_type)
-                    .body(body.into())
-                    .unwrap()
-            )
-            .is_ok());
-    }
-
-    fn tool_response(call: &str, args: Value) -> String {
-        let chunk = json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"same-wire-id",
-            "function":{"name":call,"arguments":args.to_string()}}]},"finish_reason":"tool_calls"}]});
-        format!("data: {chunk}\n\ndata: [DONE]\n\n")
-    }
-
-    fn tool(self, call: &str, args: Value) {
-        self.send(
-            StatusCode::OK,
-            Self::tool_response(call, args),
-            "text/event-stream",
-        );
-    }
-}
-
-struct Server {
-    base_url: String,
-    requests: mpsc::Receiver<Request>,
-    task: tokio::task::JoinHandle<()>,
-}
-
-impl Server {
-    async fn start() -> Self {
-        Self::start_at("/v1/chat/completions").await
-    }
-
-    async fn start_at(path: &str) -> Self {
-        async fn respond(
-            State(send): State<mpsc::Sender<Request>>,
-            headers: HeaderMap,
-            Json(body): Json<Value>,
-        ) -> Response {
-            let (respond, receive) = oneshot::channel();
-            send.send(Request {
-                body,
-                headers,
-                respond,
-            })
-            .await
-            .unwrap();
-            receive.await.unwrap()
-        }
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
-        let (send, requests) = mpsc::channel(4);
-        let app = Router::new().route(path, post(respond)).with_state(send);
-        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        Self {
-            base_url,
-            requests,
-            task,
-        }
-    }
-
-    async fn next(&mut self) -> Request {
-        tokio::time::timeout(WAIT_FOR, self.requests.recv())
-            .await
-            .expect("provider request timed out")
-            .unwrap()
-    }
-
-    fn config(&self, key_env: Option<&str>) -> crate::harness::ArgenticConfig030 {
-        serde_json::from_value(config(&self.base_url, key_env)).unwrap()
-    }
-}
-
-impl Drop for Server {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
-}
-
-fn config(url: &str, key_env: Option<&str>) -> Value {
-    json!({"providers":{"local":{"protocol":"chat-completions","baseUrl":url,
-        "models":["gpt-5.5#fixture"],"reasoningCatalog":"openai","apiKeyEnv":key_env}}})
-}
-
-fn document() -> Value {
-    json!({"contract":"agsdl-0.4.0","id":"argentic-fixture",
-        "agents":{"worker":{"harness":"argentic","model":{"name":"local/gpt-5.5#fixture","effort":"high"},
-            "permissions":"read-only","harnessSettings":{"maxOutputTokens":256},
-            "results":{"report":{"required":true,"schema":{"type":"object","required":["body"],
-                "properties":{"body":{"type":"string"}}}}}}},
-        "flow":{"entry":"read","steps":{"read":{"type":"agent","agent":"worker","instance":"new",
-            "prompt":"Read memo.txt and submit its content.","next":[]}}}})
-}
+use tokio::sync::oneshot;
 
 fn opt_in() -> BTreeSet<String> {
     BTreeSet::from(["argentic".into()])
@@ -990,7 +878,8 @@ async fn qualification_refuses_unregistered_opted_out_and_unsupported_permission
     let error = host.preflight(entry().as_ref(), false).await.unwrap_err();
     assert_eq!(error.code, "HARNESS_OPT_IN_REQUIRED");
     close(&host).await;
-    for action in ["mcp", "delegate"] {
+    {
+        let action = "delegate";
         let mut doc = document();
         doc["agents"]["worker"]["permissions"] = json!({"preset":"read-only",
             "rules":[{"action":action,"effect":"allow"}]});
@@ -1337,8 +1226,17 @@ async fn shell_executes_and_stop_reaps_the_namespace_before_physical_end() {
     }
     let mut server = Server::start().await;
     let mut doc = document();
-    doc["agents"]["worker"]["permissions"] = json!("full");
+    doc["agents"]["worker"]["permissions"] = json!({"preset":"full",
+        "directories":{"../cache":"write","../shared":"read"},
+        "rules":[{"action":"read","effect":"deny","match":"../shared/private"}]
+    });
     let mut f = Fixture::new(&doc.to_string());
+    let cache = f.workspace.with_file_name("cache");
+    let shared = f.workspace.with_file_name("shared");
+    std::fs::create_dir(&cache).unwrap();
+    std::fs::create_dir(&shared).unwrap();
+    std::fs::write(shared.join("memo"), "Shared root is mounted").unwrap();
+    std::fs::write(shared.join("private"), "Forbidden root payload").unwrap();
     let staging = f.workspace.parent().unwrap().join("staging");
     std::fs::create_dir(&staging).unwrap();
     let mut config = config(&server.base_url, None);
@@ -1358,9 +1256,18 @@ async fn shell_executes_and_stop_reaps_the_namespace_before_physical_end() {
     server
         .next()
         .await
-        .tool("shell", json!({"command":"printf sandboxed > output; pwd"}));
+        .tool("shell", json!({"command":"printf sandboxed > output; printf built > /directories/1/build; cat /directories/2/memo; test ! -e /directories/2/private || exit 1; (printf forbidden > /directories/2/write) 2>/dev/null && exit 1; pwd"}));
     let request = server.next().await;
-    assert!(request.body["messages"].to_string().contains("/workspace"));
+    let messages = request.body["messages"].to_string();
+    assert!(messages.contains("Exit status: 0") && messages.contains("/workspace"));
+    assert!(
+        messages.contains("Shared root is mounted") && !messages.contains("Forbidden root payload")
+    );
+    assert!(!shared.join("write").exists());
+    assert_eq!(
+        std::fs::read_to_string(cache.join("build")).unwrap(),
+        "built"
+    );
     assert_eq!(
         std::fs::read_to_string(f.workspace.join("output")).unwrap(),
         "sandboxed"
@@ -1380,7 +1287,7 @@ async fn shell_executes_and_stop_reaps_the_namespace_before_physical_end() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(std::fs::read_dir(&staging).unwrap().count(), 1);
+    assert_eq!(std::fs::read_dir(&staging).unwrap().count(), 3);
     host.stop(EngineStopRequest {
         request_id: "stop-shell".into(),
         system_start_id: run.receipt.identity.system_start_id.clone(),
@@ -1405,5 +1312,200 @@ async fn shell_executes_and_stop_reaps_the_namespace_before_physical_end() {
     .await
     .unwrap();
     assert_eq!(physical, 1);
+    close(&host).await;
+}
+
+#[tokio::test]
+async fn additional_directory_is_indexed_and_enforces_read_rules() {
+    let mut server = Server::start().await;
+    let mut doc = document();
+    doc["agents"]["worker"]["permissions"] = json!({
+        "preset":"read-only","directories":{"../shared":"read"},"rules":[
+            {"action":"read","effect":"deny","match":"../shared/hidden.txt"}
+        ]
+    });
+    let mut f = Fixture::new(&doc.to_string());
+    let extra = f.workspace.with_file_name("shared");
+    std::fs::create_dir(&extra).unwrap();
+    std::fs::write(extra.join("memo.txt"), "Additional root payload").unwrap();
+    std::fs::write(extra.join("hidden.txt"), "Never sent to the provider").unwrap();
+    let mut policy: Value = serde_json::from_slice(&std::fs::read(&f.policy).unwrap()).unwrap();
+    policy["permissions"] = json!({"preset":"workspace","directories":{"../shared":"read"}});
+    let bytes = serde_json::to_vec(&policy).unwrap();
+    std::fs::write(&f.policy, &bytes).unwrap();
+    f.digest = digest(bytes);
+    let host = open(&f, false)
+        .await
+        .with_argentic(server.config(None))
+        .unwrap();
+    let run = start(&host).await;
+    server
+        .next()
+        .await
+        .tool("read", json!({"root":1,"path":"memo.txt"}));
+    let request = server.next().await;
+    assert!(request.body["messages"]
+        .to_string()
+        .contains("Additional root payload"));
+    request.tool("read", json!({"root":1,"path":"hidden.txt"}));
+    let request = server.next().await;
+    assert!(request.body["messages"].to_string().contains("denied"));
+    assert!(!request.body["messages"]
+        .to_string()
+        .contains("Never sent to the provider"));
+    request.tool(
+        "agsdl_submit_result",
+        json!({"results":{"report":{"body":"done"}}}),
+    );
+    completed(&finish(&host, &run).await);
+    close(&host).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn agent_mcp_uses_per_tool_rules_and_joins_after_stop() {
+    use crate::test_context::mcp::{Peer, REQUIREMENTS};
+    for person in [true, false] {
+        let peer = Peer::start().await;
+        let mut server = Server::start().await;
+        let mut doc = document();
+        doc["projectFormat"] = json!("agsdl-project-1");
+        doc["mcpServers"] = peer.servers();
+        doc["secrets"] = json!({"file":"requirements.json"});
+        let worker = &mut doc["agents"]["worker"];
+        worker["mcpServers"] = json!(["first"]);
+        worker["permissions"] = json!({"preset":"read-only", "rules":[
+            {"action":"mcp","match":"first/*","effect":"allow"},
+            {"action":"mcp","match":"first/approve","effect":"ask"},
+            {"action":"mcp","match":"first/echo","effect":"deny"}
+        ]});
+        if person {
+            worker["permissions"]["reviewer"] = json!("person");
+        }
+        let mut f = Fixture::new("");
+        f.source = f.workspace.with_file_name("project");
+        std::fs::create_dir(&f.source).unwrap();
+        std::fs::write(f.source.join("agsdl.json"), doc.to_string()).unwrap();
+        std::fs::write(f.source.join("requirements.json"), REQUIREMENTS).unwrap();
+        let mut host = open(&f, false)
+            .await
+            .with_argentic(server.config(None))
+            .unwrap();
+        host.context = peer.configure(host.context);
+        let run = start(&host).await;
+        let first = server.next().await;
+        let tools = first.body["tools"].to_string();
+        assert!(tools.contains("mcp__first__check"));
+        assert_eq!(tools.contains("mcp__first__approve"), person);
+        assert!(!tools.contains("mcp__first__echo"));
+        first.tool("mcp__first__echo", json!({}));
+        let request = server.next().await;
+        assert!(request.body["messages"].to_string().contains("denied"));
+        assert!(peer.calls().is_empty());
+        request.tool("mcp__first__check", json!({"value":"model supplied"}));
+        let request = server.next().await;
+        assert!(request.body["messages"]
+            .to_string()
+            .contains("model supplied"));
+        assert_eq!(peer.calls(), [("first".into(), "check".into())]);
+        let scope = persistence::public030::HumanScope030 {
+            system_start_id: run.receipt.identity.system_start_id.clone(),
+            source: run.capture.source.clone(),
+        };
+        request.tool("mcp__first__approve", json!({}));
+        if person {
+            let ask = pending_ask(&host, &scope).await;
+            assert_eq!(peer.calls().len(), 1);
+            host.submit_person(HumanSubmission {
+                scope: scope.clone(),
+                request_id: ask.id,
+                expected_revision: ask.revision,
+                answer: api::HumanAnswer030::Decision {
+                    decision: "yes".into(),
+                    comment: String::new(),
+                },
+            })
+            .await
+            .unwrap();
+        }
+        let request = server.next().await;
+        assert_eq!(peer.calls().len(), if person { 2 } else { 1 });
+        if person {
+            request.tool("mcp__first__blocked", json!({}));
+            until(async || peer.calls().iter().any(|(_, tool)| tool == "blocked")).await;
+            host.stop(EngineStopRequest {
+                request_id: "stop-mcp".into(),
+                system_start_id: scope.system_start_id,
+                activation_id: None,
+            })
+            .await
+            .unwrap();
+            let error = tokio::time::timeout(
+                WAIT_FOR,
+                host.engine
+                    .flow030()
+                    .supervisors
+                    .wait(&run.receipt.identity.system_start_id),
+            )
+            .await
+            .unwrap()
+            .unwrap_err();
+            assert_eq!(error.code, "MCP_TERMINATION_UNCERTAIN");
+            let projection = host
+                .projection(
+                    api::RuntimeProjectionQuery030 {
+                        system_start_id: run.receipt.identity.system_start_id.clone(),
+                        source: run.capture.source.clone(),
+                        snapshot_id: None,
+                    },
+                    None,
+                )
+                .await
+                .unwrap();
+            assert!(projection.stopping && projection.termination_uncertain);
+            host.pool.close().await;
+        } else {
+            request.tool(
+                "agsdl_submit_result",
+                json!({"results":{"report":{"body":"done"}}}),
+            );
+            completed(&finish(&host, &run).await);
+            close(&host).await;
+        }
+        crate::test_context::mcp::assert_no_secrets(&f.data.join("engine.sqlite"));
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[tokio::test]
+async fn confined_stdio_mcp_lists_and_calls_a_tool_then_joins_on_stop() {
+    let mut server = Server::start().await;
+    let mut doc = document();
+    doc["mcpServers"] = json!({"local":{"command":["/bin/sh","-c",
+        crate::test_context::mcp::STDIO_TOOL_SCRIPT,"mcp-fixture","sent","release"]}});
+    doc["agents"]["worker"]["mcpServers"] = json!(["local"]);
+    doc["agents"]["worker"]["permissions"] = json!({"preset":"read-only","rules":[
+        {"action":"mcp","match":"local/check","effect":"allow"}
+    ]});
+    let f = Fixture::new(&doc.to_string());
+    let host = open(&f, false)
+        .await
+        .with_argentic(server.config(None))
+        .unwrap();
+    let run = start(&host).await;
+    let request = server.next().await;
+    assert!(request.body["tools"]
+        .to_string()
+        .contains("mcp__local__check"));
+    request.tool("mcp__local__check", json!({}));
+    until(async || f.workspace.join("sent").is_file()).await;
+    host.stop(EngineStopRequest {
+        request_id: "stop-stdio".into(),
+        system_start_id: run.receipt.identity.system_start_id.clone(),
+        activation_id: None,
+    })
+    .await
+    .unwrap();
+    assert_eq!(finish(&host, &run).await["verdict"], "cancelled");
     close(&host).await;
 }
