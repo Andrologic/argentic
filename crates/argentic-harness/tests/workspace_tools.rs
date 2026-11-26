@@ -295,9 +295,15 @@ async fn patches_use_normalized_context_and_preserve_line_endings() {
         .await
         .unwrap();
     assert_eq!(
-        fs::read_to_string(path).unwrap(),
+        fs::read_to_string(&path).unwrap(),
         "first\r\ncontext\nnew\r\nlast"
     );
+    fs::write(&path, "").unwrap();
+    let patch = "*** Begin Patch\n*** Update File: memo\n@@\n-\n+new\n*** End Patch";
+    call(&registry, "apply_patch", json!({"patch_text":patch}))
+        .await
+        .unwrap();
+    assert_eq!(fs::read_to_string(path).unwrap(), "new");
 }
 
 #[tokio::test]

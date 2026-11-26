@@ -156,6 +156,9 @@ pub(crate) fn parse_apply_patch(patch_text: &str) -> Result<Vec<ParsedPatchOpera
 }
 
 fn split_text_lines(content: &str) -> Vec<(&str, &str)> {
+    if content.is_empty() {
+        return vec![("", "")];
+    }
     content
         .split_inclusive('\n')
         .map(|line| {
