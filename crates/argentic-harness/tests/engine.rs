@@ -499,6 +499,58 @@ async fn compaction_reserves_tokens_for_the_next_agent_request() {
 }
 
 #[tokio::test]
+async fn compaction_rechecks_the_input_budget_after_summarizing_each_old_range() {
+    let requests = Arc::new(Requests::default());
+    let provider = Arc::new(RecordingProvider {
+        requests: requests.clone(),
+        provider: scripted(vec![
+            vec![
+                Chunk::Text("first ".repeat(670)),
+                call("first", "list", json!({})),
+                end(Finish::ToolCalls),
+            ],
+            vec![
+                Chunk::Text("recent ".repeat(2450)),
+                call("recent", "list", json!({})),
+                end(Finish::ToolCalls),
+            ],
+            vec![Chunk::Text("Prior work".into()), end(Finish::Stop)],
+            vec![Chunk::Text("Earlier tool turn".into()), end(Finish::Stop)],
+            vec![submit("done", json!({"answer":42})), end(Finish::ToolCalls)],
+        ]),
+    });
+    let (_dir, harness) = fixture_with_provider(
+        provider,
+        json!({"maxOutputTokens":256,"compaction":{"threshold":0.99,"keepRecentTurns":1}}),
+    );
+    let mut work = work(true);
+    let mut old = recorded_tool_turn("old", "Old tool result".into());
+    if let Message::Assistant { text, .. } = &mut old[0] {
+        *text = "old ".repeat(3000);
+    }
+    work.messages.extend(old);
+    let mission = Message::User("mission ".repeat(1500));
+    work.messages.push(mission.clone());
+    let (_, steer) = mpsc::channel(1);
+    let report = harness
+        .with_context_window(Some(8192))
+        .run(work, &(), steer, CancellationToken::new())
+        .await;
+    assert!(report.outcome.is_ok(), "{:?}", report.outcome);
+    let requests = requests.0.lock().unwrap();
+    assert_eq!(requests.len(), 5);
+    for request in &requests[2..4] {
+        assert!(matches!(&request[0], Message::System(prompt) if prompt.contains("Summarize")));
+    }
+    assert_eq!(requests[4][2], mission);
+    assert!(matches!(&requests[4][1], Message::User(summary) if summary.ends_with("Prior work")));
+    assert!(
+        matches!(&requests[4][3], Message::User(summary) if summary.ends_with("Earlier tool turn"))
+    );
+    assert!(matches!(&requests[4][5], Message::Tool { call_id, .. } if call_id == "recent"));
+}
+
+#[tokio::test]
 async fn compaction_leaves_history_intact_when_the_summary_finishes_at_its_limit() {
     let (_dir, harness) = fixture(
         vec![
