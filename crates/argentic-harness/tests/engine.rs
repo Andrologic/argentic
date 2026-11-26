@@ -108,6 +108,15 @@ impl WorkPort for Trace {
             } => {
                 format!("compacted {summarized_messages} messages and truncated {truncated_tool_results} tool results")
             }
+            Event::HistoryPruned {
+                before_bytes,
+                after_bytes,
+                dropped_messages,
+            } => {
+                assert!(before_bytes > 32 * 1024 * 1024);
+                assert!(after_bytes <= 32 * 1024 * 1024);
+                format!("pruned {dropped_messages} messages")
+            }
         };
         self.0.lock().unwrap().push(entry);
         Ok(())
@@ -596,6 +605,38 @@ async fn compaction_skips_an_incomplete_tool_exchange() {
         .await;
     assert!(report.outcome.is_ok(), "{:?}", report.outcome);
     assert_eq!(&report.messages[..initial.len()], &initial);
+}
+
+#[tokio::test]
+async fn starting_work_prunes_complete_old_exchanges_to_make_room_for_the_mission() {
+    let requests = Arc::new(Requests::default());
+    let provider = Arc::new(RecordingProvider {
+        requests: requests.clone(),
+        provider: scripted(vec![vec![end(Finish::Stop)]]),
+    });
+    let (_dir, harness) = fixture_with_provider(provider, json!({"compaction":{"enabled":false}}));
+    let mut work = work(false);
+    work.messages
+        .insert(0, Message::System("Instructions".into()));
+    let mut expected = work.messages.clone();
+    work.messages
+        .push(Message::User("x".repeat(32 * 1024 * 1024 - 4096)));
+    work.messages
+        .extend(recorded_tool_turn("old", "Discarded together".into()));
+    let recent = recorded_tool_turn("recent", "Retained together".into());
+    work.messages.extend(recent.clone());
+    expected.extend(recent);
+    let mission = Message::User("m".repeat(4096));
+    work.messages.push(mission.clone());
+    expected.push(mission);
+    let (_, steer) = mpsc::channel(1);
+    let trace = Trace::default();
+    let report = harness
+        .run(work, &trace, steer, CancellationToken::new())
+        .await;
+    assert!(report.outcome.is_ok(), "{:?}", report.outcome);
+    assert_eq!(requests.0.lock().unwrap().as_slice(), &[expected]);
+    assert_eq!(trace.0.lock().unwrap().as_slice(), &["pruned 3 messages"]);
 }
 
 #[tokio::test]

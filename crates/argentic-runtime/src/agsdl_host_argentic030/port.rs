@@ -95,30 +95,37 @@ impl WorkPort for Port {
         event: Event<'_>,
         _: &CancellationToken,
     ) -> std::result::Result<(), Failure> {
-        if let Event::Compaction {
-            turn,
-            before_tokens,
-            after_tokens,
-            truncated_tool_results,
-            summarized_messages,
-        } = event
-        {
-            use std::io::Write;
-            let _ = writeln!(
-                std::io::stderr().lock(),
-                "{}",
-                json!({
-                    "kind": "argentic.contextCompaction",
-                    "identity": self.0.attempt.identity(),
-                    "activationId": self.0.attempt.work().activation_id,
-                    "turn": turn,
-                    "beforeTokens": before_tokens,
-                    "afterTokens": after_tokens,
-                    "truncatedToolResults": truncated_tool_results,
-                    "summarizedMessages": summarized_messages,
-                })
-            );
-        }
+        let mut entry = match event {
+            Event::Compaction {
+                turn,
+                before_tokens,
+                after_tokens,
+                truncated_tool_results,
+                summarized_messages,
+            } => json!({
+                "kind": "argentic.contextCompaction",
+                "turn": turn,
+                "beforeTokens": before_tokens,
+                "afterTokens": after_tokens,
+                "truncatedToolResults": truncated_tool_results,
+                "summarizedMessages": summarized_messages,
+            }),
+            Event::HistoryPruned {
+                before_bytes,
+                after_bytes,
+                dropped_messages,
+            } => json!({
+                "kind": "argentic.historyPruned",
+                "beforeBytes": before_bytes,
+                "afterBytes": after_bytes,
+                "droppedMessages": dropped_messages,
+            }),
+            _ => return Ok(()),
+        };
+        entry["identity"] = json!(self.0.attempt.identity());
+        entry["activationId"] = json!(self.0.attempt.work().activation_id);
+        use std::io::Write;
+        let _ = writeln!(std::io::stderr().lock(), "{entry}");
         Ok(())
     }
 

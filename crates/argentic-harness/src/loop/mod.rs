@@ -124,6 +124,11 @@ pub enum Event<'a> {
         truncated_tool_results: usize,
         summarized_messages: usize,
     },
+    HistoryPruned {
+        before_bytes: usize,
+        after_bytes: usize,
+        dropped_messages: usize,
+    },
 }
 
 pub enum Proposal<'a> {
@@ -382,6 +387,9 @@ impl Instance<'_> {
             if max_output < min_output {
                 return Err(Failure::TokenLimit);
             }
+            if turn == 1 {
+                self.prune_start_history(work).await?;
+            }
             let charged = self
                 .compact(turn, work, tool_bytes, remaining, max_output)
                 .await?;
@@ -391,7 +399,8 @@ impl Instance<'_> {
             if max_output < min_output {
                 return Err(Failure::TokenLimit);
             }
-            if compaction::history_bytes(&work.messages) > compaction::MAX_HISTORY_BYTES {
+            if turn > 1 && compaction::history_bytes(&work.messages) > compaction::MAX_HISTORY_BYTES
+            {
                 return Err(Failure::HistoryLimit);
             }
             self.response_text_start = Some(self.text.len());
