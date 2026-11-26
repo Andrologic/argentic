@@ -248,10 +248,16 @@ impl<'a> Reader<'a> {
     /// Record one path's spelling. Names that differ only by case folding
     /// or Unicode normalization collide, including directory names.
     fn spell(&mut self, part: &str, path: &str) -> Result<()> {
+        self.spell_charged_to(part, path, path)
+    }
+
+    /// Like `spell`, but a budget exhaustion names `owner`, the component
+    /// whose walk is paying, while a collision still names `path`.
+    fn spell_charged_to(&mut self, part: &str, owner: &str, path: &str) -> Result<()> {
         self.budget
             .work(1 + part.len().div_ceil(8), "")
             .and_then(|()| self.budget.bytes(part.len() * 3 + 64, ""))
-            .map_err(|e| source_limit(path, e))?;
+            .map_err(|e| source_limit(owner, e))?;
         if self
             .spellings
             .insert(archive::path_key(part), part.into())
@@ -802,7 +808,7 @@ impl<'a> Reader<'a> {
                     if ty.is_dir() {
                         // The official walk checks empty directories too.
                         archive::portable(&name)?;
-                        self.spell(&name, &name)?;
+                        self.spell_charged_to(&name, directory, &name)?;
                         pending.push(relative);
                     } else if ty.is_file() {
                         names.push(name);
