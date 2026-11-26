@@ -42,7 +42,7 @@ struct Root {
 
 pub struct Registry {
     roots: Vec<Root>,
-    policy: ReadPolicy,
+    policy: Vec<ReadPolicy>,
     submission: jsonschema::Validator,
     definitions: Vec<ToolDefinition>,
 }
@@ -56,18 +56,32 @@ impl Registry {
         policy: ReadPolicy,
         submission_schema: Value,
     ) -> Result<Self, String> {
-        if roots.is_empty() {
-            return Err("At least one workspace root is required".into());
-        }
         let roots = roots
             .iter()
             .map(|path| {
                 let path = path.canonicalize()?;
                 let directory = Dir::open_ambient_dir(&path, ambient_authority())?;
-                Ok(Root { path, directory })
+                Ok((path, directory))
             })
             .collect::<io::Result<_>>()
             .map_err(|e| e.to_string())?;
+        Self::with_open_roots(roots, vec![policy], submission_schema)
+    }
+
+    /// Use directory handles already authenticated by the embedding host.
+    /// Each independent read ceiling must allow the path.
+    pub fn with_open_roots(
+        roots: Vec<(PathBuf, Dir)>,
+        policy: Vec<ReadPolicy>,
+        submission_schema: Value,
+    ) -> Result<Self, String> {
+        if roots.is_empty() || policy.is_empty() {
+            return Err("At least one workspace root and read ceiling are required".into());
+        }
+        let roots = roots
+            .into_iter()
+            .map(|(path, directory)| Root { path, directory })
+            .collect();
         let submission =
             jsonschema::validator_for(&submission_schema).map_err(|e| e.to_string())?;
         let mut definitions = Vec::new();
@@ -122,6 +136,12 @@ impl Registry {
         })
     }
 
+    fn allows(&self, path: &Path, in_zone: bool) -> bool {
+        self.policy
+            .iter()
+            .all(|policy| policy.allows(path, in_zone))
+    }
+
     pub fn definitions(&self) -> impl Iterator<Item = (Exposure, &ToolDefinition)> {
         self.definitions.iter().map(|def| (Exposure::Direct, def))
     }
@@ -160,7 +180,7 @@ impl Registry {
         let root = self.roots.get(args.root).ok_or("Unknown workspace root")?;
         let raw_path = args.path.as_deref().unwrap_or(".");
         let path = relative_path(raw_path).map_err(|e| e.to_string())?;
-        if !self.policy.allows(
+        if !self.allows(
             &if path.as_os_str().is_empty() {
                 root.path.clone()
             } else {
@@ -238,7 +258,7 @@ impl Registry {
                 continue;
             };
             let child = parent.join(&name);
-            if !self.policy.allows(&root.path.join(&child), true) {
+            if !self.allows(&root.path.join(&child), true) {
                 continue;
             }
             let kind = entry.file_type()?;

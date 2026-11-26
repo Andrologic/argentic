@@ -25,6 +25,7 @@ pub struct ChatCompletions {
     endpoint: Url,
     provider: String,
     authorization: Option<HeaderValue>,
+    effort_rejected: Option<std::sync::atomic::AtomicBool>,
 }
 
 impl ChatCompletions {
@@ -63,7 +64,24 @@ impl ChatCompletions {
             endpoint,
             provider: provider.into(),
             authorization,
+            effort_rejected: None,
         })
+    }
+
+    /// The host creates a fresh provider for every work attempt.
+    pub fn with_attempt_effort_fallback(mut self) -> Self {
+        self.effort_rejected = Some(std::sync::atomic::AtomicBool::new(false));
+        self
+    }
+
+    fn drop_effort(&self, body: &mut Value) -> bool {
+        if !remove_effort(body) {
+            return false;
+        }
+        if let Some(rejected) = &self.effort_rejected {
+            rejected.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        true
     }
 
     async fn open(
@@ -85,7 +103,7 @@ impl ChatCompletions {
                 let mut output = Box::pin(decode(response, cancel.clone()));
                 let first = output.next().await;
                 if matches!(&first, Some(Err(ProviderError::Invalid(message))) if rejects_effort(message))
-                    && remove_effort(&mut body)
+                    && self.drop_effort(&mut body)
                 {
                     continue;
                 }
@@ -96,7 +114,7 @@ impl ChatCompletions {
             let message = cancellable(&cancel, error_body(&mut response)).await??;
             if matches!(status.as_u16(), 400 | 422)
                 && rejects_effort(&message)
-                && remove_effort(&mut body)
+                && self.drop_effort(&mut body)
             {
                 continue;
             }
@@ -137,7 +155,11 @@ impl Provider for ChatCompletions {
             "stream": true,
             "stream_options": { "include_usage": true }
         });
-        if let Some(effort) = request.reasoning_effort {
+        if let Some(effort) = request.reasoning_effort.filter(|_| {
+            self.effort_rejected
+                .as_ref()
+                .is_none_or(|rejected| !rejected.load(std::sync::atomic::Ordering::Relaxed))
+        }) {
             body["reasoning_effort"] = json!(effort);
         }
         if !request.tools.is_empty() {

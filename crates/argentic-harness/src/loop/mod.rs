@@ -66,6 +66,7 @@ pub struct RunReport {
     pub outcome: Result<Outcome, Failure>,
     pub physical_end: PhysicalEnd,
     pub artifacts: Vec<Artifact>,
+    pub messages: Vec<Message>,
 }
 
 /// Local proof that the provider stream and all tracked tool workers have
@@ -134,12 +135,32 @@ pub trait WorkPort: Send + Sync {
         Ok(())
     }
 
+    /// Pull at most one host delivery at the same safe point as queued steer.
+    async fn take_steer(&self, _cancel: &CancellationToken) -> Result<Option<Steer>, Failure> {
+        Ok(None)
+    }
+
+    /// An embedding controller may validate the exact raw submission itself.
+    fn validates_submission(&self) -> bool {
+        false
+    }
+
     async fn admit_steer(
         &self,
         _id: &str,
         _cancel: &CancellationToken,
     ) -> Result<SteerAdmission, Failure> {
         Ok(SteerAdmission::Admit(None))
+    }
+
+    /// Confirm an in-process insertion while admission still holds its guard.
+    /// Returning false removes the message before another turn can use it.
+    fn confirm_steer(
+        &self,
+        _id: &str,
+        _guard: Option<&OwnedMutexGuard<()>>,
+    ) -> Result<bool, Failure> {
+        Ok(true)
     }
 
     /// The host may add validation or run a completion check. The local
@@ -219,7 +240,7 @@ impl Harness {
 
     pub async fn run(
         &self,
-        work: Work,
+        mut work: Work,
         port: &dyn WorkPort,
         steer: mpsc::Receiver<Steer>,
         parent: CancellationToken,
@@ -236,9 +257,10 @@ impl Harness {
             text: String::new(),
             artifacts: Vec::new(),
             corrections: 0,
+            history_end: work.messages.len(),
         };
         let (outcome, forced) = {
-            let future = instance.execute(work);
+            let future = instance.execute(&mut work);
             tokio::pin!(future);
             tokio::select! {
                 biased;
@@ -261,10 +283,12 @@ impl Harness {
         while instance.steer.try_recv().is_ok() {}
         tracker.close();
         tracker.wait().await;
+        work.messages.truncate(instance.history_end);
         RunReport {
             outcome,
             physical_end: PhysicalEnd { forced },
             artifacts: instance.artifacts,
+            messages: work.messages,
         }
     }
 }
@@ -278,10 +302,11 @@ struct Instance<'a> {
     text: String,
     artifacts: Vec<Artifact>,
     corrections: u32,
+    history_end: usize,
 }
 
 impl Instance<'_> {
-    async fn execute(&mut self, mut work: Work) -> Result<Outcome, Failure> {
+    async fn execute(&mut self, work: &mut Work) -> Result<Outcome, Failure> {
         let settings = &self.harness.settings;
         let turn_limit = settings.limit("maxTurns");
         let total = settings
@@ -302,7 +327,7 @@ impl Instance<'_> {
                 return Err(Failure::TokenLimit);
             }
             let max_output = u64::from(settings.limit("maxOutputTokens")).min(remaining) as u32;
-            let response = self.request(turn, &work, &definitions, max_output).await?;
+            let response = self.request(turn, work, &definitions, max_output).await?;
             if let Some(usage) = response.usage {
                 spent = spent
                     .saturating_add(usage.prompt_tokens)
@@ -323,6 +348,7 @@ impl Instance<'_> {
                 calls: calls.clone(),
             });
 
+            let response_index = work.messages.len() - 1;
             let mut pending = calls.as_slice();
             let mut accepted = None;
             while !pending.is_empty() {
@@ -336,7 +362,11 @@ impl Instance<'_> {
                     break;
                 };
                 self.before(turn, call).await?;
-                let validation = self.harness.registry.validate_submission(&call.arguments);
+                let validation = if self.port.validates_submission() {
+                    serde_json::from_str(&call.arguments).map_err(|e| e.to_string())
+                } else {
+                    self.harness.registry.validate_submission(&call.arguments)
+                };
                 let decision = self
                     .decide(
                         Proposal::Submit { turn, call },
@@ -348,6 +378,13 @@ impl Instance<'_> {
                         accepted = Some(validation.map_err(Failure::OutputInvalid)?);
                         self.publish_tool(turn, call, "Result accepted.", &mut work.messages)
                             .await?;
+                        let Message::Assistant {
+                            calls: reported, ..
+                        } = &mut work.messages[response_index]
+                        else {
+                            unreachable!("response message is an assistant message");
+                        };
+                        reported.truncate(calls.len() - tail.len());
                         break;
                     }
                     Some(error) => {
@@ -357,6 +394,7 @@ impl Instance<'_> {
                 }
                 pending = tail;
             }
+            self.history_end = work.messages.len();
             // With no outstanding tool messages, the next provider request
             // can include steering without breaking tool-call pairing.
             for hook in &self.harness.hooks {
@@ -603,27 +641,42 @@ impl Instance<'_> {
             let Ok(steer) = self.steer.try_recv() else {
                 break;
             };
-            if steer.consumed.is_closed() {
-                continue;
-            }
-            let SteerAdmission::Admit(guard) =
-                self.port.admit_steer(&steer.id, self.cancel).await?
-            else {
-                continue;
-            };
-            self.active()?;
-            messages.push(Message::User(steer.message));
-            if steer.consumed.send(()).is_err() {
-                messages.pop();
-                continue;
-            }
-            drop(guard);
-            self.port
-                .event(Event::SteerConsumed { id: &steer.id }, self.cancel)
-                .await?;
-            consumed = true;
+            consumed |= self.insert_steer(messages, steer).await?;
+        }
+        if let Some(steer) = self.port.take_steer(self.cancel).await? {
+            consumed |= self.insert_steer(messages, steer).await?;
         }
         Ok(consumed)
+    }
+
+    async fn insert_steer(
+        &mut self,
+        messages: &mut Vec<Message>,
+        steer: Steer,
+    ) -> Result<bool, Failure> {
+        if steer.consumed.is_closed() {
+            return Ok(false);
+        }
+        let SteerAdmission::Admit(guard) = self.port.admit_steer(&steer.id, self.cancel).await?
+        else {
+            return Ok(false);
+        };
+        self.active()?;
+        messages.push(Message::User(steer.message));
+        if steer.consumed.send(()).is_err() {
+            messages.pop();
+            return Ok(false);
+        }
+        if !self.port.confirm_steer(&steer.id, guard.as_ref())? {
+            messages.pop();
+            return Ok(false);
+        }
+        self.history_end = messages.len();
+        drop(guard);
+        self.port
+            .event(Event::SteerConsumed { id: &steer.id }, self.cancel)
+            .await?;
+        Ok(true)
     }
 
     fn active(&self) -> Result<(), Failure> {
