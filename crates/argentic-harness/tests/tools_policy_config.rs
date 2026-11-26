@@ -223,3 +223,49 @@ fn submission_rejects_duplicate_members_at_any_depth() {
         .validate_submission(r#"{"results":{"a":[1.234,9223372036854775808,null,true]}}"#)
         .is_ok());
 }
+
+#[tokio::test]
+async fn private_project_metadata_is_invisible_to_every_read_tool() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let private = [
+        ".MaCrO",
+        ".git",
+        ".aws",
+        ".codex",
+        "auth.json",
+        "credentials",
+    ];
+    std::fs::create_dir(root.join("nested")).unwrap();
+    for name in private {
+        let relative = format!("nested/{name}");
+        std::fs::write(root.join(&relative), "shared marker").unwrap();
+    }
+    std::fs::create_dir_all(root.join(".GIT")).unwrap();
+    std::fs::write(root.join(".GIT/secret"), "shared marker").unwrap();
+    std::fs::write(root.join("nested/public.txt"), "shared marker").unwrap();
+    let registry = registry(root, &[]);
+    for name in private {
+        let error = tool(&registry, "read", json!({"path":format!("nested/{name}")}))
+            .await
+            .unwrap_err();
+        assert_eq!(error, "Read permission denied");
+    }
+    for (name, args) in [
+        ("list", json!({"path":"nested"})),
+        ("glob", json!({"pattern":"**"})),
+        ("grep", json!({"pattern":"shared marker"})),
+    ] {
+        let output = tool(&registry, name, args).await.unwrap().text;
+        assert!(output.contains("nested/public.txt"), "{output}");
+        assert!(!output.contains("secret"), "{output}");
+        for name in private {
+            assert!(
+                !output
+                    .to_ascii_lowercase()
+                    .contains(&name.to_ascii_lowercase()),
+                "{output}"
+            );
+        }
+    }
+}

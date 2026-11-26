@@ -1,4 +1,5 @@
 //! Recipient-scoped native content. Nothing here grants authority to resources.
+use argentic_harness::tools::private_project_path;
 use crate::{host::HostContext, persistence::{failure, Result as HostResult}};
 use serde_json::{json, Value};
 use std::{path::Path, sync::Arc};
@@ -472,19 +473,6 @@ impl Sources030 {
         }
         Ok(())
     }
-}
-
-fn private_project_path(root: &Path, path: &Path) -> bool {
-    path.strip_prefix(root).is_ok_and(|relative| {
-        relative.components().any(|part| {
-            part.as_os_str().to_str().is_none_or(|name| {
-                matches!(
-                    name.to_ascii_lowercase().as_str(),
-                    ".macro" | ".git" | ".aws" | ".codex" | "auth.json" | "credentials"
-                )
-            })
-        })
-    })
 }
 
 /// Only inspect selected folders within the native project scope. Other skill

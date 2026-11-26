@@ -136,10 +136,9 @@ impl Registry {
         })
     }
 
-    fn allows(&self, path: &Path, in_zone: bool) -> bool {
-        self.policy
-            .iter()
-            .all(|policy| policy.allows(path, in_zone))
+    fn allows(&self, root: &Root, path: &Path) -> bool {
+        !private_project_path(&root.path, path)
+            && self.policy.iter().all(|policy| policy.allows(path, true))
     }
 
     pub fn definitions(&self) -> impl Iterator<Item = (Exposure, &ToolDefinition)> {
@@ -181,12 +180,12 @@ impl Registry {
         let raw_path = args.path.as_deref().unwrap_or(".");
         let path = relative_path(raw_path).map_err(|e| e.to_string())?;
         if !self.allows(
+            root,
             &if path.as_os_str().is_empty() {
                 root.path.clone()
             } else {
                 root.path.join(&path)
             },
-            true,
         ) {
             return Err("Read permission denied".into());
         }
@@ -224,7 +223,7 @@ impl Registry {
         } else {
             root.path.join(relative)
         };
-        if actual.as_os_str() != expected.as_os_str() || !self.allows(&actual, true) {
+        if actual.as_os_str() != expected.as_os_str() || !self.allows(root, &actual) {
             return Err(denied());
         }
         Ok(())
@@ -286,7 +285,7 @@ impl Registry {
                 continue;
             };
             let child = parent.join(&name);
-            if !self.allows(&root.path.join(&child), true) {
+            if !self.allows(root, &root.path.join(&child)) {
                 continue;
             }
             let kind = entry.file_type()?;
@@ -356,6 +355,20 @@ impl Registry {
         }
         Ok(text)
     }
+}
+
+/// Whether a project-relative component names private host metadata.
+pub fn private_project_path(root: &Path, path: &Path) -> bool {
+    path.strip_prefix(root).is_ok_and(|relative| {
+        relative.components().any(|part| {
+            part.as_os_str().to_str().is_none_or(|name| {
+                matches!(
+                    name.to_ascii_lowercase().as_str(),
+                    ".macro" | ".git" | ".aws" | ".codex" | "auth.json" | "credentials"
+                )
+            })
+        })
+    })
 }
 
 #[derive(Deserialize)]
