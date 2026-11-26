@@ -118,12 +118,7 @@ impl Equipment {
                         .await
                         .map_err(transport_error)?
                 } else {
-                    if !cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-                        return Err(mcp_error(
-                            "MCP_STDIO_UNAVAILABLE",
-                            "Confined local MCP requires macOS ARM64",
-                        ));
-                    }
+                    raw_mcp::require_stdio().map_err(transport_error)?;
                     let grant = agent_mcp_grant(context, &work.capture, scope, name, read_only)?;
                     let server =
                         mcp_server(context, grant, &work.capture, name).map_err(transport_error)?;

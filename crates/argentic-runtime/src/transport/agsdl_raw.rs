@@ -325,7 +325,21 @@ struct Body {
     retry_ms: u64,
 }
 
+pub(crate) fn require_stdio() -> Result<()> {
+    if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        Ok(())
+    } else {
+        Err(CallError::new(
+            "MCP_STDIO_UNAVAILABLE",
+            "Confined local MCP requires macOS ARM64",
+        ))
+    }
+}
+
 pub(crate) fn start(server: CapturedServer) -> Result<Session> {
+    if matches!(&server.transport, ServerTransport::Stdio(_)) {
+        require_stdio()?;
+    }
     start_with_stdio(server, |config| {
         config.grant.sandbox.command(
             &config.program,

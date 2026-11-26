@@ -349,6 +349,35 @@ fn native_preflight_allows_https_mcp_and_qualifies_endpoint_schemes() {
 }
 
 #[test]
+fn stdio_preflight_matches_the_confined_transport_platform() {
+    let mut doc = document(json!({"type":"call","command":"true"}));
+    doc["mcpServers"] = json!({"local":{"command":["/usr/bin/true"]}});
+    doc["agents"] = json!({"worker":{
+        "harness":"codex","mcpServers":["local"],"permissions":"workspace"
+    }});
+    let report = crate::api::qualify_product(&doc, None, None).unwrap();
+    let expected = (!cfg!(all(target_os = "macos", target_arch = "aarch64")))
+        .then_some("MCP_STDIO_UNAVAILABLE");
+    assert_eq!(report.mcp_servers["local"].agent_equipment, ["worker"]);
+    assert_eq!(
+        report.blocking_diagnostic().map(|d| d.code.as_str()),
+        expected
+    );
+
+    doc["agents"] = json!({});
+    assert!(crate::api::qualify_product(&doc, None, None)
+        .unwrap()
+        .blocking_diagnostic()
+        .is_none());
+    doc["flow"]["steps"]["check"] = json!({"type":"call","mcp":{"server":"local","tool":"check"}});
+    let report = crate::api::qualify_product(&doc, None, None).unwrap();
+    assert_eq!(
+        report.blocking_diagnostic().map(|d| d.code.as_str()),
+        expected
+    );
+}
+
+#[test]
 fn mcp_qualification_reports_direct_and_equipped_usage_after_permission_exclusions() {
     use crate::api::{product_slice, qualify_product};
     use crate::permissions::RequestedPermissions;

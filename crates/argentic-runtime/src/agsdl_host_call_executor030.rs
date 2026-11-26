@@ -442,6 +442,7 @@ fn start_transport(
                 let remote = remote_mcp(config, capture, server, url)?;
                 Ok(StartedTransport::RemoteMcp(Box::new(remote)))
             } else {
+                raw_mcp::require_stdio()?;
                 raw_mcp::start(mcp_server(config, grant, capture, server)?)
                     .map(StartedTransport::Mcp)
             }

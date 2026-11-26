@@ -22,7 +22,7 @@ pub struct McpServerQualification {
     pub direct_call_steps: Vec<String>,
     /// Names of Codex agents eligible to discover this server.
     pub agent_equipment: Vec<String>,
-    /// Unsupported HTTP endpoint, if any.
+    /// Endpoint or transport availability diagnostic, if any.
     pub diagnostic: Option<Diagnostic>,
 }
 
@@ -121,7 +121,20 @@ pub(crate) fn qualify_product030(
             (
                 name.clone(),
                 McpServerQualification {
-                    diagnostic: mcp_endpoint_diagnostic(name, declaration),
+                    diagnostic: if declaration.get("url").is_some() {
+                        mcp_endpoint_diagnostic(name, declaration)
+                    } else {
+                        crate::agsdl_host_calls::raw_mcp::require_stdio()
+                            .err()
+                            .map(|error| Diagnostic {
+                                code: error.code,
+                                pointer: format!(
+                                    "/mcpServers/{}",
+                                    name.replace('~', "~0").replace('/', "~1")
+                                ),
+                                message: error.detail,
+                            })
+                    },
                     ..Default::default()
                 },
             )
