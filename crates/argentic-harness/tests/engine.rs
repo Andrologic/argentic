@@ -435,6 +435,70 @@ async fn steer_arriving_during_summary_reaches_the_next_agent_request() {
 }
 
 #[tokio::test]
+async fn compaction_reserves_tokens_for_the_next_agent_request() {
+    struct BudgetProvider;
+
+    #[async_trait]
+    impl Provider for BudgetProvider {
+        fn min_output_tokens(&self) -> u32 {
+            16
+        }
+
+        async fn stream(
+            &self,
+            request: Request<'_>,
+            _: CancellationToken,
+        ) -> Result<ProviderStream, ProviderError> {
+            let (chunk, finish, prompt_tokens, completion_tokens) = if request.tools.is_empty() {
+                (
+                    Chunk::Text("Earlier evidence".into()),
+                    Finish::Stop,
+                    200,
+                    10,
+                )
+            } else {
+                (
+                    submit("done", json!({"answer":42})),
+                    Finish::ToolCalls,
+                    3960,
+                    255,
+                )
+            };
+            Ok(Box::pin(futures::stream::iter([
+                Ok(chunk),
+                Ok(Chunk::End {
+                    finish,
+                    usage: Some(Usage {
+                        prompt_tokens,
+                        completion_tokens,
+                        cache_read_tokens: 0,
+                        cache_creation_tokens: 0,
+                    }),
+                }),
+            ])))
+        }
+    }
+
+    let (_dir, harness) = fixture_with_provider(
+        Arc::new(BudgetProvider),
+        json!({"maxTotalTokens":4400,"maxOutputTokens":256,
+            "compaction":{"threshold":0.60,"keepRecentTurns":1}}),
+    );
+    let mut work = work(true);
+    work.messages
+        .extend(recorded_tool_turn("old", "x".repeat(3000)));
+    work.messages
+        .extend(recorded_tool_turn("recent", "x".repeat(12_000)));
+    let (_, steer) = mpsc::channel(1);
+    let report = harness
+        .with_context_window(Some(6000))
+        .run(work, &(), steer, CancellationToken::new())
+        .await;
+    assert!(report.outcome.is_ok(), "{:?}", report.outcome);
+    assert!(matches!(&report.messages[2], Message::Tool { call_id, .. } if call_id == "old"));
+}
+
+#[tokio::test]
 async fn compaction_leaves_history_intact_when_the_summary_finishes_at_its_limit() {
     let (_dir, harness) = fixture(
         vec![

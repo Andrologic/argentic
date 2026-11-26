@@ -65,7 +65,8 @@ impl Instance<'_> {
 
         let mut charged = 0;
         let mut summarized = 0;
-        if estimate(&work.messages) > threshold {
+        let next_input = estimate(&work.messages);
+        if next_input > threshold {
             let candidate = ranges
                 .into_iter()
                 .filter(|range| {
@@ -78,8 +79,18 @@ impl Instance<'_> {
                     .saturating_mul(4)
                     .min(MAX_HISTORY_BYTES);
                 let old_bytes = history_bytes(&work.messages[range.clone()]);
+                // Leave room for the agent request even if the summary fails
+                // to reduce it. Preserve the agent's requested output budget.
+                let reserved = (next_input as u64).saturating_add(u64::from(max_output));
                 if let Some((summary, usage)) = self
-                    .summarize(work, range.clone(), input_bytes, summary_output, remaining)
+                    .summarize(
+                        work,
+                        range.clone(),
+                        input_bytes,
+                        summary_output,
+                        remaining,
+                        reserved,
+                    )
                     .await?
                 {
                     charged = usage;
@@ -128,9 +139,12 @@ impl Instance<'_> {
         input_bytes: usize,
         output_tokens: u32,
         remaining: Option<u64>,
+        reserved: u64,
     ) -> Result<Option<(String, u64)>, Failure> {
         let bytes_per_message = input_bytes.saturating_sub(SUMMARY_PROMPT.len() + 64) / range.len();
-        if bytes_per_message < 128 || output_tokens == 0 {
+        if bytes_per_message < 128
+            || output_tokens < self.harness.provider.min_output_tokens().max(1)
+        {
             return Ok(None);
         }
         let mut transcript = String::new();
@@ -148,7 +162,9 @@ impl Instance<'_> {
             transcript.push_str("\n\n");
         }
         let prompt_tokens = (transcript.len() + SUMMARY_PROMPT.len() + 64).div_ceil(4) as u64;
-        if remaining.is_some_and(|limit| prompt_tokens + u64::from(output_tokens) >= limit) {
+        if remaining.is_some_and(|limit| {
+            prompt_tokens + u64::from(output_tokens) > limit.saturating_sub(reserved)
+        }) {
             return Ok(None);
         }
         let messages = [
