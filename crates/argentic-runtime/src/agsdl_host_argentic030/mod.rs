@@ -373,7 +373,7 @@ fn provider_failure(
         ProviderError::Invalid(_) => {
             "Chat Completions returned an invalid request or response".into()
         }
-        ProviderError::TurnTimeout | ProviderError::ResponseTooLarge => error.to_string(),
+        ProviderError::Stream { .. } | ProviderError::TurnTimeout | ProviderError::ResponseTooLarge => error.to_string(),
         ProviderError::Cancelled => "Chat Completions was cancelled".into(),
     };
     failure("ARGENTIC_PROVIDER", "provider", &detail)

@@ -316,3 +316,34 @@ async fn turn_deadline_covers_retry_delays_and_keepalive_bodies() {
     .unwrap_err();
     assert_eq!(error, ProviderError::TurnTimeout);
 }
+
+#[tokio::test]
+async fn http_and_sse_errors_redact_provider_supplied_content() {
+    const SECRET: &str = "private-provider-marker";
+    let mock = Mock::start(vec![
+        (
+            StatusCode::UNAUTHORIZED,
+            None,
+            vec![br#"{"error":"private-provider-marker"}"#],
+        ),
+        (
+            StatusCode::OK,
+            None,
+            vec![b"data: {\"error\":\"private-provider-marker\"}\n\n"],
+        ),
+        (
+            StatusCode::OK,
+            None,
+            vec![b"data: {\"choices\":[{\"finish_reason\":\"private-provider-marker\"}]}\n\n"],
+        ),
+    ])
+    .await;
+    let http = mock.request(None).await.unwrap_err();
+    let sse = mock.request(None).await.unwrap_err();
+    let invalid = mock.request(None).await.unwrap_err();
+    for error in [&http, &sse, &invalid] {
+        assert!(!format!("{error} {error:?}").contains(SECRET));
+    }
+    assert!(matches!(http, ProviderError::Http { status: 401, .. }));
+    assert!(matches!(sse, ProviderError::Stream { status: 200, .. }));
+}

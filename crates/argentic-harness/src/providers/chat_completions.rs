@@ -110,12 +110,18 @@ impl ChatCompletions {
             if status.is_success() {
                 let mut output = Box::pin(decode(response, cancel.clone(), budget.clone()));
                 let first = output.next().await;
-                if matches!(&first, Some(Err(ProviderError::Invalid(message))) if rejects_effort(message))
-                    && self.drop_effort(&mut body)
+                if matches!(
+                    &first,
+                    Some(Err(DecodeError::Remote {
+                        rejects_effort: true
+                    }))
+                ) && self.drop_effort(&mut body)
                 {
                     continue;
                 }
-                return Ok(Box::pin(stream::iter(first).chain(output)));
+                return Ok(Box::pin(stream::iter(first).chain(output).map(
+                    move |result| result.map_err(|error| error.public(status.as_u16())),
+                )));
             }
 
             let retry_after = response.headers().get(RETRY_AFTER).and_then(retry_delay);
@@ -138,7 +144,7 @@ impl ChatCompletions {
             }
             return Err(ProviderError::Http {
                 status: status.as_u16(),
-                message,
+                message: "Provider refused the request".into(),
             });
         }
     }
@@ -262,7 +268,16 @@ impl TurnBudget {
 }
 
 fn transport(error: reqwest::Error) -> ProviderError {
-    ProviderError::Transport(error.without_url().to_string())
+    ProviderError::Transport(
+        if error.is_timeout() {
+            "Network request timed out"
+        } else if error.is_connect() {
+            "Could not connect to provider"
+        } else {
+            "Network request failed"
+        }
+        .into(),
+    )
 }
 
 fn retry_delay(value: &HeaderValue) -> Option<Duration> {
@@ -426,6 +441,29 @@ struct FunctionDelta {
     arguments: Option<String>,
 }
 
+enum DecodeError {
+    Public(ProviderError),
+    Remote { rejects_effort: bool },
+}
+
+impl From<ProviderError> for DecodeError {
+    fn from(error: ProviderError) -> Self {
+        Self::Public(error)
+    }
+}
+
+impl DecodeError {
+    fn public(self, status: u16) -> ProviderError {
+        match self {
+            Self::Public(error) => error,
+            Self::Remote { .. } => ProviderError::Stream {
+                status,
+                message: "Provider reported an error in the response stream",
+            },
+        }
+    }
+}
+
 #[derive(Default)]
 struct Accumulator {
     calls: BTreeMap<u32, (String, String, String)>,
@@ -435,14 +473,16 @@ struct Accumulator {
 }
 
 impl Accumulator {
-    fn frame(&mut self, data: &str, output: &mut VecDeque<Chunk>) -> Result<bool, ProviderError> {
+    fn frame(&mut self, data: &str, output: &mut VecDeque<Chunk>) -> Result<bool, DecodeError> {
         if data == "[DONE]" {
             return Ok(true);
         }
         let frame: Frame = serde_json::from_str(data)
-            .map_err(|e| ProviderError::Invalid(format!("Invalid SSE JSON: {e}")))?;
+            .map_err(|_| ProviderError::Invalid("Invalid SSE JSON".into()))?;
         if let Some(error) = frame.error {
-            return Err(ProviderError::Invalid(error.to_string()));
+            return Err(DecodeError::Remote {
+                rejects_effort: rejects_effort(&error.to_string()),
+            });
         }
         if let Some(usage) = frame.usage {
             self.usage = Some(usage);
@@ -461,7 +501,8 @@ impl Accumulator {
                     {
                         return Err(ProviderError::Invalid(
                             "Unsupported tool call index or type".into(),
-                        ));
+                        )
+                        .into());
                     }
                     let (id, name, arguments) = self.calls.entry(call.index).or_default();
                     if let Some(part) = call.id {
@@ -479,9 +520,9 @@ impl Accumulator {
                         }
                     }
                     if self.call_bytes > MAX_EVENT_BYTES {
-                        return Err(ProviderError::Invalid(
-                            "Tool call batch exceeds 1 MiB".into(),
-                        ));
+                        return Err(
+                            ProviderError::Invalid("Tool call batch exceeds 1 MiB".into()).into(),
+                        );
                     }
                 }
             }
@@ -491,11 +532,7 @@ impl Accumulator {
                     "tool_calls" => Finish::ToolCalls,
                     "length" | "max_output_tokens" => Finish::Length,
                     "content_filter" => Finish::Filtered,
-                    _ => {
-                        return Err(ProviderError::Invalid(format!(
-                            "Unknown finish reason: {reason}"
-                        )))
-                    }
+                    _ => return Err(ProviderError::Invalid("Unknown finish reason".into()).into()),
                 });
             }
         }
@@ -536,14 +573,14 @@ struct Decoder {
     assembled: Accumulator,
     output: VecDeque<Chunk>,
     ended: bool,
-    error: Option<ProviderError>,
+    error: Option<DecodeError>,
 }
 
 fn decode(
     response: Response,
     cancel: CancellationToken,
     budget: TurnBudget,
-) -> impl futures::Stream<Item = Result<Chunk, ProviderError>> + Send {
+) -> impl futures::Stream<Item = Result<Chunk, DecodeError>> + Send {
     stream::try_unfold(
         (response, cancel, budget, Decoder::default()),
         |(mut response, cancel, budget, mut state)| async move {

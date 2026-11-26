@@ -152,6 +152,8 @@ pub enum ProviderError {
     Transport(String),
     #[error("Provider HTTP {status}: {message}")]
     Http { status: u16, message: String },
+    #[error("Provider stream HTTP {status}: {message}")]
+    Stream { status: u16, message: &'static str },
     #[error("Provider turn deadline exceeded")]
     TurnTimeout,
     #[error("Provider turn response byte budget exceeded")]
