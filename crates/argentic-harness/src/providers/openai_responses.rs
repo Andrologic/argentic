@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use async_trait::async_trait;
 use reqwest::{header::AUTHORIZATION, Url};
@@ -123,8 +123,31 @@ struct Item {
 #[derive(Default)]
 struct ResponsesEvents {
     items: BTreeMap<u64, Item>,
+    refusals: BTreeSet<(u64, u64)>,
     usage: Option<Usage>,
     finish: Option<Finish>,
+}
+
+impl ResponsesEvents {
+    fn finish_refusal(&mut self, index: (u64, u64), text: &Value, output: &mut VecDeque<Chunk>) {
+        if self.refusals.insert(index) {
+            if let Some(text) = text.as_str().filter(|text| !text.is_empty()) {
+                output.push_back(Chunk::Text(text.to_owned()));
+            }
+        }
+    }
+
+    fn finish_message(&mut self, index: u64, item: &Value, output: &mut VecDeque<Chunk>) {
+        if item["type"] == "message" {
+            if let Some(content) = item["content"].as_array() {
+                for (part_index, part) in content.iter().enumerate() {
+                    if part["type"] == "refusal" {
+                        self.finish_refusal((index, part_index as u64), &part["refusal"], output);
+                    }
+                }
+            }
+        }
+    }
 }
 
 impl Events for ResponsesEvents {
@@ -161,10 +184,9 @@ impl Events for ResponsesEvents {
                 }
             }
             "response.output_item.done" => {
-                let item = self
-                    .items
-                    .entry(wire_index(&event, "output_index")?)
-                    .or_default();
+                let index = wire_index(&event, "output_index")?;
+                self.finish_message(index, &event["item"], output);
+                let item = self.items.entry(index).or_default();
                 if item.done {
                     return Err(invalid("Duplicate Responses output item completion").into());
                 }
@@ -175,8 +197,23 @@ impl Events for ResponsesEvents {
                 item.value = value;
                 item.done = true;
             }
-            "response.output_text.delta" | "response.refusal.delta" => {
+            "response.output_text.delta" => {
                 output.push_back(Chunk::Text(wire_str(&event, "delta")?.to_owned()));
+            }
+            "response.refusal.delta" | "response.refusal.done" => {
+                let index = (
+                    wire_index(&event, "output_index")?,
+                    wire_index(&event, "content_index")?,
+                );
+                if event["type"] == "response.refusal.delta" {
+                    let delta = wire_str(&event, "delta")?;
+                    if !delta.is_empty() {
+                        self.refusals.insert(index);
+                        output.push_back(Chunk::Text(delta.to_owned()));
+                    }
+                } else {
+                    self.finish_refusal(index, &event["refusal"], output);
+                }
             }
             "response.reasoning_summary_text.delta" => {
                 output.push_back(Chunk::Reasoning(wire_str(&event, "delta")?.to_owned()));
@@ -188,7 +225,16 @@ impl Events for ResponsesEvents {
                 }
                 self.usage = parse_usage(&response["usage"]);
                 self.finish = Some(if event["type"] == "response.completed" {
-                    Finish::Stop
+                    if let Some(items) = response["output"].as_array() {
+                        for (index, item) in items.iter().enumerate() {
+                            self.finish_message(index as u64, item, output);
+                        }
+                    }
+                    if self.refusals.is_empty() {
+                        Finish::Stop
+                    } else {
+                        Finish::Filtered
+                    }
                 } else {
                     match response["incomplete_details"]["reason"].as_str() {
                         Some("max_output_tokens") => Finish::Length,

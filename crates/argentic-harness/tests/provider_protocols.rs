@@ -672,3 +672,41 @@ async fn responses_stops_locally_when_remaining_budget_is_below_provider_minimum
         }
     }
 }
+
+#[tokio::test]
+async fn responses_refusal_preserves_visible_text_and_filters_the_turn() {
+    let protocol = Protocol::Responses;
+    let message = json!({"type":"message","id":"msg_1","role":"assistant","status":"completed",
+        "content":[{"type":"refusal","refusal":"I can't help with that."}]});
+    let terminal = json!({"type":"response.completed","response":{"status":"completed",
+        "output":[message],"usage":{"input_tokens":19,"output_tokens":7}}});
+    let streamed = protocol.events([
+        json!({"type":"response.refusal.delta","output_index":0,"content_index":0,"delta":"I can't "}),
+        json!({"type":"response.refusal.delta","output_index":0,"content_index":0,"delta":"help with that."}),
+        json!({"type":"response.refusal.done","output_index":0,"content_index":0,
+            "refusal":"I can't help with that."}),
+        json!({"type":"response.output_item.done","output_index":0,"item":message}),
+        terminal.clone(),
+    ]);
+    let final_only = protocol.events([terminal]);
+    let mock = Mock::start(protocol, vec![sse(streamed), sse(final_only)]).await;
+    for expected_text in [
+        vec![
+            Chunk::Text("I can't ".into()),
+            Chunk::Text("help with that.".into()),
+        ],
+        vec![Chunk::Text("I can't help with that.".into())],
+    ] {
+        let mut expected = expected_text;
+        expected.push(Chunk::End {
+            finish: Finish::Filtered,
+            usage: Some(Usage {
+                prompt_tokens: 19,
+                completion_tokens: 7,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
+            }),
+        });
+        assert_eq!(run(&mock, protocol, &[], &[]).await, expected);
+    }
+}
