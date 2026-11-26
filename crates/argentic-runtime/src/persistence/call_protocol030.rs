@@ -619,13 +619,19 @@ pub(crate) async fn settlement_cause_tx<A: CallAuthority030>(
     if row_tx(db, attempt).await?.get::<&str, _>("status") == "terminal" {
         return Ok(None);
     }
-    let decided: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM engine_flow030_clock_controls WHERE system_id=? AND invocation_id=? AND activation_id=? AND reason='TIMEOUT')")
-        .bind(&attempt.identity.system_start_id).bind(&attempt.identity.flow_invocation_id)
-        .bind(&attempt.work().activation_id).fetch_one(&mut *db).await?;
-    if !decided {
+    if !clock_timeout_exists_tx(db, attempt).await? {
         return Ok(None);
     }
     Ok(Some(record_cause_tx(db, authority, attempt).await?))
+}
+
+async fn clock_timeout_exists_tx(
+    db: &mut SqliteConnection,
+    attempt: &CallAttempt030,
+) -> Result<bool> {
+    Ok(sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM engine_flow030_clock_controls WHERE system_id=? AND invocation_id=? AND activation_id=? AND reason='TIMEOUT')")
+        .bind(&attempt.identity.system_start_id).bind(&attempt.identity.flow_invocation_id)
+        .bind(&attempt.work().activation_id).fetch_one(&mut *db).await?)
 }
 
 /// Retained before submitting COMMIT. Its constructor hashes exact SQL bytes
@@ -1162,6 +1168,30 @@ pub(crate) async fn launch_tx<A: CallAuthority030>(
     .bind(&attempt.call_id)
     .execute(db)
     .await?;
+    Ok(())
+}
+
+/// Hold native admission through the HTTP body handoff. Initialization can
+/// outlive the launch transaction and a Stop can commit before cancellation.
+pub(crate) async fn admit_remote_tool_tx<A: CallAuthority030>(
+    db: &mut SqliteConnection,
+    authority: &A,
+    attempt: &CallAttempt030,
+) -> Result<()> {
+    authority.call_commits().require_clear(attempt.identity())?;
+    let state = verify_attempt_tx(db, authority, attempt, AttemptCheck::Attribution).await?;
+    if call_stopped(&state, attempt)? {
+        return Err(failure("STOPPED", "call", "Native work stopped"));
+    }
+    require_admission_tx(db, attempt.identity()).await?;
+    require(
+        state.verdict.is_none()
+            && row_tx(db, attempt).await?.get::<&str, _>("status") == "launched",
+        "Call is no longer active",
+    )?;
+    if clock_timeout_exists_tx(db, attempt).await? {
+        return Err(failure("TIMEOUT", "call", "Work machine budget expired"));
+    }
     Ok(())
 }
 

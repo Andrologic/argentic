@@ -752,6 +752,7 @@ impl crate::agsdl_host_call_executor030::CallTransport030 for RetainedStdio {
         capture: StartCapture030,
         attempt: crate::agsdl_host_calls030::CallAttempt030,
         control: crate::agsdl_host_calls::Control,
+        admit_tool: crate::agsdl_host_calls::raw_mcp::ToolAdmission,
     ) -> crate::agsdl_host_calls::Result<
         BoxFuture<'static, Result<crate::persistence::call_protocol030::CallEnd030>>,
     > {
@@ -770,6 +771,7 @@ impl crate::agsdl_host_call_executor030::CallTransport030 for RetainedStdio {
                 &attempt,
                 &control,
                 Arc::new(NoHuman),
+                admit_tool,
             )
             .await
         }))
@@ -1291,4 +1293,148 @@ async fn remote_mcp_unconfirmed(expire: bool) {
     }
     f.pool.close().await;
     assert_no_secrets(&f._temp.path().join("run.db"));
+}
+
+#[cfg(unix)]
+#[derive(Default)]
+struct PausedInitialization {
+    received: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
+    deleted: tokio::sync::Notify,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(unix)]
+async fn start_initializing_call(
+    timeout: Option<u64>,
+) -> (
+    Fixture,
+    crate::tasks::StreamTasks,
+    Arc<PausedInitialization>,
+    Arc<crate::agsdl_host_clock030::VirtualClock030>,
+    tokio::task::JoinHandle<()>,
+) {
+    use axum::{http::StatusCode, response::IntoResponse, routing::post};
+    use std::{num::NonZeroU64, sync::atomic::Ordering::SeqCst, time::Duration};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let peer = Arc::new(PausedInitialization::default());
+    let route = post({
+        let peer = peer.clone();
+        move |axum::Json(message): axum::Json<Value>| {
+            let peer = peer.clone();
+            async move {
+                let result = match message["method"].as_str().unwrap() {
+                    "initialize" => {
+                        peer.received.notify_one();
+                        peer.resume.notified().await;
+                        json!({"protocolVersion":"2025-11-25","capabilities":{"tools":{}},
+                            "serverInfo":{"name":"paused","version":"1"}})
+                    }
+                    "notifications/initialized" => return StatusCode::ACCEPTED.into_response(),
+                    "tools/call" => {
+                        peer.calls.fetch_add(1, SeqCst);
+                        json!({"content":[]})
+                    }
+                    other => panic!("Unexpected MCP method {other}"),
+                };
+                (
+                    [("mcp-session-id", "paused")],
+                    axum::Json(json!({"jsonrpc":"2.0","id":message["id"],"result":result})),
+                )
+                    .into_response()
+            }
+        }
+    })
+    .delete({
+        let peer = peer.clone();
+        move || async move {
+            peer.deleted.notify_one();
+            StatusCode::NO_CONTENT
+        }
+    });
+    let server = tokio::spawn(async move {
+        axum::serve(listener, axum::Router::new().route("/mcp", route))
+            .await
+            .unwrap();
+    });
+    let project = tempfile::tempdir().unwrap();
+    let mut step = json!({"type":"call","mcp":{"server":"remote","tool":"check"}});
+    if let Some(timeout) = timeout {
+        step["timeoutMs"] = json!(timeout);
+    }
+    let doc = json!({
+        "projectFormat":"agsdl-project-1","contract":"agsdl-0.4.0","id":"paused-remote","agents":{},
+        "mcpServers":{"remote":{"url":format!("http://{addr}/mcp")}},
+        "flow":{"entry":"check","steps":{"check":step}}
+    });
+    std::fs::write(project.path().join("agsdl.json"), doc.to_string()).unwrap();
+    let fixture =
+        Fixture::new_with_project(r#"{"entry":{},"timeline":[]}"#, false, Some(project.path()))
+            .await;
+    let clock = fixture
+        .host
+        .flow030()
+        .human_runtime()
+        .virtual_clock()
+        .await
+        .unwrap();
+    let config = fixture
+        .config
+        .clone()
+        .with_remote_mcp_tool_budget_ms(NonZeroU64::new(50).unwrap())
+        .with_mcp_http(Arc::new(move |_, _, _, addresses, names| {
+            assert_eq!(addresses, [addr]);
+            assert!(names.is_empty());
+            Some(BTreeMap::new())
+        }));
+    let tasks = start_calls(
+        &fixture,
+        config.clone(),
+        Arc::new(crate::agsdl_host_call_executor030::NativeCallTransport030 {
+            config,
+            humans: None,
+        }),
+    );
+    tokio::time::timeout(Duration::from_secs(10), peer.received.notified())
+        .await
+        .unwrap();
+    (fixture, tasks, peer, clock, server)
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn direct_remote_mcp_does_not_dispatch_after_durable_stop_during_initialize() {
+    use std::{sync::atomic::Ordering::SeqCst, time::Duration};
+    let (f, tasks, peer, _, server) = start_initializing_call(None).await;
+    let (dispatch, _) = f
+        .host
+        .flow030()
+        .supervisors
+        .dispatcher(&f.owner.system_start_id)
+        .unwrap();
+    let guard = dispatch.lock().await;
+    f.host
+        .request_stop(
+            &f.pool,
+            &tasks,
+            &EngineStopRequest {
+                system_start_id: f.owner.system_start_id.clone(),
+                activation_id: None,
+                request_id: "stop-during-initialize".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+    // The dispatcher cannot process StopWork until the transport has closed.
+    peer.resume.notify_one();
+    tokio::time::timeout(Duration::from_secs(10), peer.deleted.notified())
+        .await
+        .unwrap();
+    assert_eq!(peer.calls.load(SeqCst), 0);
+    drop(guard);
+    assert_eq!(finish(&f).await.state.verdict.as_deref(), Some("cancelled"));
+    server.abort();
 }

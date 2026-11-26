@@ -97,6 +97,26 @@ async fn http_handler(
                 return ([("content-type", "text/event-stream")], raw).into_response();
             }
             if state.mode == "resume" { return ([("content-type", "text/event-stream"), ("mcp-session-id", "captured")], "id: cursor-1\nretry: 0\ndata:\n\n").into_response(); }
+            let error = match state.mode {
+                "rpc-error-null" => Some("null"),
+                "rpc-error-string-code" => Some(r#"{"code":"-32603","message":"failed"}"#),
+                "rpc-error-no-message" => Some(r#"{"code":-32603}"#),
+                "rpc-error-valid" | "rpc-error-with-result" => {
+                    Some(r#"{"code":-32603,"message":"failed"}"#)
+                }
+                _ => None,
+            };
+            if let Some(error) = error {
+                let result = if state.mode == "rpc-error-with-result" {
+                    r#","result":{"content":[]}"#
+                } else {
+                    ""
+                };
+                return (
+                    [("content-type", "application/json")],
+                    format!(r#"{{"jsonrpc":"2.0","id":{id},"error":{error}{result}}}"#),
+                ).into_response();
+            }
             if state.mode == "redirect" { return (axum::http::StatusCode::TEMPORARY_REDIRECT, [("location", "/other")]).into_response(); }
             if state.mode == "lost" { return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response(); }
             if state.mode == "modern" || state.mode == "modern-bad-state" {
@@ -341,6 +361,35 @@ async fn http_exact_receipts_human_waits_modern_continuation_and_no_replay() {
         ));
         task.abort();
         let _ = task.await;
+    }
+}
+
+#[tokio::test]
+async fn malformed_rpc_error_keeps_the_remote_tool_in_flight() {
+    for (mode, in_flight) in [
+        ("rpc-error-null", true),
+        ("rpc-error-string-code", true),
+        ("rpc-error-no-message", true),
+        ("rpc-error-with-result", true),
+        ("rpc-error-valid", false),
+    ] {
+        let (server, fixture, task) = http_fixture(mode).await;
+        let host = dummy_host();
+        let mut session = start(server).unwrap();
+        let result = session
+            .call(
+                "synthetic",
+                r#"{"n":9007199254740993}"#,
+                host.clone(),
+                &identity(),
+                &host.control,
+            )
+            .await;
+        assert!(result.is_err(), "{mode}");
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 1, "{mode}");
+        assert_eq!(session.tool_in_flight(), in_flight, "{mode}");
+        assert!(session.shutdown(false).await.1.is_none(), "{mode}");
+        task.abort();
     }
 }
 

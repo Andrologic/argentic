@@ -275,11 +275,18 @@ fn parameter_headers(schema: &str, arguments: &str) -> Result<reqwest::header::H
     Ok(headers)
 }
 
+pub(crate) type ToolAdmission = Box<
+    dyn Fn() -> futures::future::BoxFuture<'static, Result<tokio::sync::OwnedMutexGuard<()>>>
+        + Send
+        + Sync,
+>;
+
 pub(crate) struct Session {
     server: String,
     protocol: Protocol,
     next_id: u64,
     tool_in_flight: bool,
+    tool_admission: Option<ToolAdmission>,
     secret_values: Vec<String>,
     wire: Wire,
 }
@@ -505,6 +512,7 @@ fn start_with_stdio(
         protocol: server.protocol,
         next_id: 1,
         tool_in_flight: false,
+        tool_admission: None,
         secret_values,
         wire,
     })
@@ -743,6 +751,10 @@ impl Session {
             .await
     }
 
+    pub(crate) fn set_tool_admission(&mut self, admission: ToolAdmission) {
+        self.tool_admission = Some(admission);
+    }
+
     /// Delivers the stdio frame or hands the HTTP body to the connection.
     /// The caller can release its admission guards before collecting the reply.
     pub(crate) async fn dispatch_tool(
@@ -771,7 +783,23 @@ impl Session {
             }
         }
         let base = format!("\"name\":{},\"arguments\":{args}", encode(&tool)?);
-        let (id, message) = self.rpc_request("tools/call", &format!("{{{base}}}"))?;
+        let (id, response) = self
+            .handoff_tool(&format!("{{{base}}}"), control, budget_deadline)
+            .await?;
+        Ok(PendingToolCall { base, id, response })
+    }
+
+    async fn handoff_tool(
+        &mut self,
+        params: &str,
+        control: &Control,
+        budget_deadline: Option<Instant>,
+    ) -> Result<(String, Option<PostResponse>)> {
+        let (id, message) = self.rpc_request("tools/call", params)?;
+        let _admission = match &self.tool_admission {
+            Some(admit) => Some(admit().await?),
+            None => None,
+        };
         control.check()?;
         let now = Instant::now();
         if budget_deadline.is_some_and(|deadline| deadline <= now) {
@@ -801,11 +829,7 @@ impl Session {
         if response.is_err() && budget_deadline.is_some_and(|budget| budget <= Instant::now()) {
             return Err(tool_budget_expired());
         }
-        Ok(PendingToolCall {
-            base,
-            id,
-            response: response?,
-        })
+        Ok((id, response?))
     }
 
     pub(crate) async fn finish_tool_call(
@@ -815,21 +839,10 @@ impl Session {
         identity: &CallIdentity,
         control: &Control,
     ) -> Result<McpReceipt> {
-        let PendingToolCall { base, id, response } = pending;
-        if let Some(response) = response {
-            let response = tokio::select! {
-                biased;
-                error = control.cancelled() => return Err(error),
-                response = response => response.map_err(|e| CallError::transport(e.to_string()))?,
-            };
-            let Wire::Http(http) = &mut self.wire else {
-                unreachable!("HTTP response requires an HTTP session");
-            };
-            http.accept_response(response)?;
-        }
         let mut raw = self
-            .receive_rpc(&id, "tools/call", host, identity, control)
+            .receive_tool(pending.id, pending.response, host, identity, control)
             .await?;
+        let base = pending.base;
         let mut continuations = 0;
         loop {
             let fields = object(&raw)?;
@@ -878,17 +891,16 @@ impl Session {
                         }
                         extra.push_str(&format!(",\"inputResponses\":{answers}"));
                     }
-                    raw = self
-                        .rpc("tools/call", &format!("{{{base}{extra}}}"), host, identity, control)
-                        .await?;
+                    let (id, response) = self.handoff_tool(&format!("{{{base}{extra}}}"), control, None).await?;
+                    raw = self.receive_tool(id, response, host, identity, control).await?;
                 }
                 Some("task") => return Err(CallError::new("UNCERTAIN", "MCP task requires a captured task completion adapter; remote effect may remain active")),
                 None | Some("complete") => {
+                    let result = receipt(raw).map_err(|_| CallError::transport("Malformed MCP tool result"))?;
                     self.tool_in_flight = false;
                     if !self.secret_values.is_empty() {
-                        reject_secret_echo(&raw, &self.secret_values)?;
+                        reject_secret_echo(&result.raw_result_json, &self.secret_values)?;
                     }
-                    let result = receipt(raw)?;
                     if self.secret_values.iter().any(|secret| result.text.contains(secret)) {
                         return Err(secret_echo());
                     }
@@ -897,6 +909,29 @@ impl Session {
                 Some(_) => return Err(CallError::transport("Unknown MCP resultType")),
             }
         }
+    }
+
+    async fn receive_tool(
+        &mut self,
+        id: String,
+        response: Option<PostResponse>,
+        host: &dyn HostPort,
+        identity: &CallIdentity,
+        control: &Control,
+    ) -> Result<String> {
+        if let Some(response) = response {
+            let response = tokio::select! {
+                biased;
+                error = control.cancelled() => return Err(error),
+                response = response => response.map_err(|e| CallError::transport(e.to_string()))?,
+            };
+            let Wire::Http(http) = &mut self.wire else {
+                unreachable!("HTTP response requires an HTTP session");
+            };
+            http.accept_response(response)?;
+        }
+        self.receive_rpc(&id, "tools/call", host, identity, control)
+            .await
     }
 
     async fn send(&mut self, message: &str, control: &Control) -> Result<()> {
@@ -1015,7 +1050,16 @@ impl Session {
                 // SSE connection open after delivering the matching result.
                 http.responses.pop_front();
             }
-            if fields.contains_key("error") {
+            if let Some(error) = fields.get("error") {
+                let error = object(error.get())?;
+                if fields.contains_key("result")
+                    || error
+                        .get("code")
+                        .is_none_or(|v| serde_json::from_str::<i64>(v.get()).is_err())
+                    || error.get("message").is_none_or(|v| string(v).is_err())
+                {
+                    return Err(CallError::transport("Malformed MCP JSON-RPC error"));
+                }
                 if method == "tools/call" {
                     self.tool_in_flight = false;
                 }

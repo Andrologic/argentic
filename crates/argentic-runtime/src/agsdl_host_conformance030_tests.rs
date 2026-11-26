@@ -443,6 +443,7 @@ impl crate::agsdl_host_call_executor030::CallTransport030 for CallTransport {
         _capture: StartCapture030,
         attempt: crate::agsdl_host_calls030::CallAttempt030,
         control: crate::agsdl_host_calls::Control,
+        _admit_tool: crate::agsdl_host_calls::raw_mcp::ToolAdmission,
     ) -> crate::agsdl_host_calls::Result<
         BoxFuture<'static, Result<crate::persistence::call_protocol030::CallEnd030>>,
     > {

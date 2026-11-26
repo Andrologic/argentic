@@ -153,6 +153,12 @@ impl HostExecutor030 for CallExecutor030 {
                                             inspection.capture.clone(),
                                             owned_attempt.clone(),
                                             control.clone(),
+                                            remote_tool_admission(
+                                                host.clone(),
+                                                pool.clone(),
+                                                owner.clone(),
+                                                owned_attempt.clone(),
+                                            ),
                                         )
                                     })
                             },
@@ -371,6 +377,34 @@ fn workspace_grant(
     })
 }
 
+fn remote_tool_admission(
+    host: HostState,
+    pool: SqlitePool,
+    owner: EngineOwner,
+    attempt: CallAttempt030,
+) -> raw_mcp::ToolAdmission {
+    Box::new(move || {
+        let (host, pool, owner, attempt) =
+            (host.clone(), pool.clone(), owner.clone(), attempt.clone());
+        Box::pin(async move {
+            let admit = async {
+                let authority = NativeCallAuthority030::capture(&host, &owner).await?;
+                let gate = host.admission_lock().lock_owned().await;
+                let mut tx = pool.begin().await?;
+                crate::persistence::call_protocol030::admit_remote_tool_tx(
+                    &mut tx, &authority, &attempt,
+                )
+                .await?;
+                tx.commit().await?;
+                Ok::<_, crate::persistence::dto::EngineFailure>(gate)
+            };
+            admit
+                .await
+                .map_err(|e| transport::CallError::new(&e.code, e.message))
+        })
+    })
+}
+
 /// start is synchronous under native admission. The future owns every resource
 /// it starts and returns only after physical cleanup, even on cancellation.
 pub(crate) trait CallTransport030: Send + Sync {
@@ -381,6 +415,7 @@ pub(crate) trait CallTransport030: Send + Sync {
         capture: StartCapture030,
         attempt: CallAttempt030,
         control: Control,
+        admit_tool: raw_mcp::ToolAdmission,
     ) -> transport::Result<
         BoxFuture<'static, Result<crate::persistence::call_protocol030::CallEnd030>>,
     >;
@@ -397,6 +432,7 @@ impl CallTransport030 for NativeCallTransport030 {
         capture: StartCapture030,
         attempt: CallAttempt030,
         control: Control,
+        admit_tool: raw_mcp::ToolAdmission,
     ) -> transport::Result<
         BoxFuture<'static, Result<crate::persistence::call_protocol030::CallEnd030>>,
     > {
@@ -406,7 +442,7 @@ impl CallTransport030 for NativeCallTransport030 {
             .clone()
             .unwrap_or_else(|| std::sync::Arc::new(NoHuman));
         Ok(Box::pin(async move {
-            run_transport(started, &prepared, &attempt, &control, humans).await
+            run_transport(started, &prepared, &attempt, &control, humans, admit_tool).await
         }))
     }
 }
@@ -682,11 +718,15 @@ pub(crate) async fn run_transport(
     attempt: &CallAttempt030,
     control: &Control,
     humans: std::sync::Arc<dyn transport::HostPort>,
+    admit_tool: raw_mcp::ToolAdmission,
 ) -> Result<crate::persistence::call_protocol030::CallEnd030> {
     use crate::persistence::call_protocol030::CallEnd030;
     let started = match started {
         StartedTransport::RemoteMcp(remote) => match remote.start(control).await {
-            Ok(session) => StartedTransport::Mcp(session),
+            Ok(mut session) => {
+                session.set_tool_admission(admit_tool);
+                StartedTransport::Mcp(session)
+            }
             Err(_) if control.stop.is_cancelled() => return Ok(CallEnd030::Stopped),
             Err(_) => {
                 return Ok(CallEnd030::Returned {
