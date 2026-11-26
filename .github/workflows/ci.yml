@@ -63,6 +63,15 @@ jobs:
         if: runner.os == 'macOS'
         run: swiftc --version
 
+      - name: Install Bubblewrap and enable unprivileged user namespaces
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+          if [[ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+
       - name: Test argentic-harness
         working-directory: crates/argentic-harness
         run: cargo test --locked --all-targets

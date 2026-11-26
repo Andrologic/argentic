@@ -1,4 +1,9 @@
-//! Direct, read-only tools. All model paths resolve beneath an admitted root.
+//! Tools operating on capabilities admitted by the embedding host.
+
+mod mutation;
+mod patch;
+mod shell;
+pub use shell::preflight as shell_preflight;
 
 mod confined;
 mod output;
@@ -20,7 +25,7 @@ use serde_json::{json, Value};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 use crate::{
-    policy::{slash_path, PathGlob, ReadPolicy},
+    policy::{slash_path, Action, Effect, PathGlob, Policy, ReadPolicy, Zone},
     providers::{ToolCall, ToolDefinition},
 };
 
@@ -40,11 +45,47 @@ struct Root {
     directory: Dir,
 }
 
+impl Root {
+    fn verify_location(&self, relative: &Path, actual: PathBuf) -> io::Result<()> {
+        let expected = if relative.as_os_str().is_empty() {
+            self.path.clone()
+        } else {
+            self.path.join(relative)
+        };
+        if actual.as_os_str() != expected.as_os_str() || private_project_path(&self.path, &actual) {
+            return Err(denied());
+        }
+        Ok(())
+    }
+}
+
 pub struct Registry {
     roots: Vec<Root>,
-    policy: Vec<ReadPolicy>,
+    policy: Vec<Policy>,
     submission: jsonschema::Validator,
     definitions: Vec<ToolDefinition>,
+    authorizer: Option<Arc<dyn Authorizer>>,
+    writes: bool,
+    shell: bool,
+    workspace_gate: Arc<tokio::sync::RwLock<()>>,
+}
+
+/// An approval belongs to this tool call and this action only.
+#[derive(Clone, Copy, Debug)]
+pub enum Approval<'a> {
+    Read(&'a Path),
+    Write(&'a Path),
+    Shell(&'a str),
+}
+
+#[async_trait::async_trait]
+pub trait Authorizer: Send + Sync {
+    async fn approve(
+        &self,
+        call: &ToolCall,
+        action: Approval<'_>,
+        cancel: &CancellationToken,
+    ) -> Result<bool, String>;
 }
 
 impl Registry {
@@ -78,6 +119,7 @@ impl Registry {
         if roots.is_empty() || policy.is_empty() {
             return Err("At least one workspace root and read ceiling are required".into());
         }
+        let workspace_gate = workspace_gate(&roots[0].0)?;
         let roots = roots
             .into_iter()
             .map(|(path, directory)| Root { path, directory })
@@ -133,12 +175,91 @@ impl Registry {
             policy,
             submission,
             definitions,
+            authorizer: None,
+            writes: false,
+            shell: false,
+            workspace_gate,
         })
     }
 
+    pub fn with_writes(mut self) -> Self {
+        self.writes = true;
+        for (name, description, required, properties) in [
+            ("write", "Create or atomically replace a workspace file. Its parent directory must exist.",
+                json!(["path","content"]), json!({"path":{"type":"string"},"content":{"type":"string"}})),
+            ("edit", "Replace one exact match in a workspace file, or all matches when requested.",
+                json!(["path","old_text","new_text"]), json!({"path":{"type":"string"},"old_text":{"type":"string"},"new_text":{"type":"string"},"replace_all":{"type":"boolean"}})),
+            ("apply_patch", "Apply a patch with Begin Patch and End Patch markers and Add File, Update File, Move to, or Delete File sections.",
+                json!(["patch_text"]), json!({"patch_text":{"type":"string"}})),
+        ] {
+            self.definitions.push(ToolDefinition {
+                name: name.into(), description: description.into(),
+                parameters: json!({"type":"object","required":required,"properties":properties,"additionalProperties":false}),
+            });
+        }
+        self
+    }
+
+    pub fn with_shell(mut self) -> Self {
+        self.shell = true;
+        self.definitions.push(ToolDefinition {
+            name: "shell".into(),
+            description: "Run Bash in a Linux sandbox with the admitted workspace at /workspace. Output is capped.".into(),
+            parameters: json!({"type":"object","required":["command"],"additionalProperties":false,
+                "properties":{"command":{"type":"string"},"timeout_ms":{"type":"integer","minimum":1,"maximum":300000}}}),
+        });
+        self
+    }
+
+    pub fn with_authorizer(mut self, authorizer: Arc<dyn Authorizer>) -> Self {
+        self.authorizer = Some(authorizer);
+        self
+    }
+
+    pub(crate) fn has_authorizer(&self) -> bool {
+        self.authorizer.is_some()
+    }
+
+    fn path_effect(&self, root: &Root, action: Action, path: &Path) -> Effect {
+        if private_project_path(&root.path, path) {
+            return Effect::Deny;
+        }
+        self.policy
+            .iter()
+            .map(|policy| policy.path_effect(action, path, Zone::Workspace))
+            .max()
+            .unwrap_or(Effect::Deny)
+    }
+
+    async fn authorize(
+        &self,
+        effect: Effect,
+        call: &ToolCall,
+        action: Approval<'_>,
+        cancel: &CancellationToken,
+    ) -> Result<(), String> {
+        check_cancel(cancel).map_err(|error| error.to_string())?;
+        let allowed = match effect {
+            Effect::Allow => true,
+            Effect::Deny => false,
+            Effect::Ask => match &self.authorizer {
+                Some(authorizer) => authorizer.approve(call, action, cancel).await?,
+                None => false,
+            },
+        };
+        if !allowed {
+            let action = match action {
+                Approval::Read(_) => "Read",
+                Approval::Write(_) => "Write",
+                Approval::Shell(_) => "Shell",
+            };
+            return Err(format!("{action} permission denied"));
+        }
+        check_cancel(cancel).map_err(|error| error.to_string())
+    }
+
     fn allows(&self, root: &Root, path: &Path) -> bool {
-        !private_project_path(&root.path, path)
-            && self.policy.iter().all(|policy| policy.allows(path, true))
+        self.path_effect(root, Action::Read, path) == Effect::Allow
     }
 
     pub fn definitions(&self) -> impl Iterator<Item = (Exposure, &ToolDefinition)> {
@@ -167,37 +288,100 @@ impl Registry {
         cancel: CancellationToken,
         tracker: &TaskTracker,
     ) -> Result<Page, String> {
+        if call.name == "shell" {
+            return self.shell(call, cancel, tracker).await;
+        }
+        if matches!(call.name.as_str(), "write" | "edit" | "apply_patch") {
+            return self.mutate(call, cancel, tracker).await;
+        }
+        let args: Arguments = serde_json::from_str(&call.arguments).map_err(|e| e.to_string())?;
+        let root = self.roots.get(args.root).ok_or("Unknown workspace root")?;
+        let path = relative_path(args.path.as_deref().unwrap_or(".")).map_err(|e| e.to_string())?;
+        let absolute = if path.as_os_str().is_empty() {
+            root.path.clone()
+        } else {
+            root.path.join(&path)
+        };
+        self.authorize(
+            self.path_effect(root, Action::Read, &absolute),
+            &call,
+            Approval::Read(&absolute),
+            &cancel,
+        )
+        .await?;
         let registry = self.clone();
         tracker
-            .spawn_blocking(move || registry.read_sync(&call, &cancel))
+            .spawn_blocking(move || registry.read_sync(&call, args, &path, &cancel))
             .await
             .map_err(|e| e.to_string())?
     }
 
-    fn read_sync(&self, call: &ToolCall, cancel: &CancellationToken) -> Result<Page, String> {
-        let args: Arguments = serde_json::from_str(&call.arguments).map_err(|e| e.to_string())?;
-        let root = self.roots.get(args.root).ok_or("Unknown workspace root")?;
-        let raw_path = args.path.as_deref().unwrap_or(".");
-        let path = relative_path(raw_path).map_err(|e| e.to_string())?;
-        if !self.allows(
-            root,
-            &if path.as_os_str().is_empty() {
-                root.path.clone()
-            } else {
-                root.path.join(&path)
-            },
-        ) {
-            return Err("Read permission denied".into());
+    async fn mutate(
+        self: &Arc<Self>,
+        call: ToolCall,
+        cancel: CancellationToken,
+        tracker: &TaskTracker,
+    ) -> Result<Page, String> {
+        if !self.writes {
+            return Err("Mutation tools are disabled".into());
         }
+        let mutation = mutation::Mutation::parse(&call.name, &call.arguments)?;
+        let mut requests = Vec::new();
+        let mut locks = std::collections::BTreeSet::new();
+        for (path, action) in mutation.requests()? {
+            let absolute = self.roots[0].path.join(path);
+            let effect = self.path_effect(&self.roots[0], action, &absolute);
+            if effect == Effect::Deny {
+                return Err(format!("{action:?} permission denied"));
+            }
+            if action == Action::Write {
+                locks.insert(absolute.clone());
+            }
+            requests.push((absolute, action, effect));
+        }
+        for (path, action, effect) in &requests {
+            let request = match action {
+                Action::Read => Approval::Read(path),
+                Action::Write => Approval::Write(path),
+                _ => unreachable!("mutation requested a non-file action"),
+            };
+            self.authorize(*effect, &call, request, &cancel).await?;
+        }
+        let workspace = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err("Mutation cancelled".into()),
+            guard = self.workspace_gate.clone().read_owned() => guard,
+        };
+        let guards = mutation::lock_paths(locks, &cancel).await?;
+        let registry = self.clone();
+        tracker
+            .spawn_blocking(move || {
+                let (_guards, _workspace) = (guards, workspace);
+                let text = mutation.run(&registry.roots[0], &cancel)?;
+                output::paginate(&text, &call.id, None, None).map_err(|error| error.to_string())
+            })
+            .await
+            .map_err(|error| error.to_string())?
+    }
+
+    fn read_sync(
+        &self,
+        call: &ToolCall,
+        args: Arguments,
+        path: &Path,
+        cancel: &CancellationToken,
+    ) -> Result<Page, String> {
+        let root = &self.roots[args.root];
+        let raw_path = args.path.as_deref().unwrap_or(".");
         let text = match call.name.as_str() {
             "read" if args.path.is_some() => self
-                .read_one(root, &path, cancel)
+                .read_one(root, path, cancel)
                 .map(|text| text.replace("\r\n", "\n")),
-            "list" => self.scan(root, &path, Search::List, cancel),
+            "list" => self.scan(root, path, Search::List, cancel),
             "glob" => {
                 let pattern = args.pattern.as_deref().ok_or("glob requires pattern")?;
                 let glob = PathGlob::compile(pattern).map_err(|e| e.to_string())?;
-                self.scan(root, &path, Search::Glob(glob), cancel)
+                self.scan(root, path, Search::Glob(glob), cancel)
             }
             "grep" => {
                 let pattern = args
@@ -206,7 +390,7 @@ impl Registry {
                     .filter(|pattern| !pattern.is_empty())
                     .ok_or("grep requires a nonempty pattern")?;
                 let pattern = regex::Regex::new(pattern).map_err(|e| e.to_string())?;
-                self.scan(root, &path, Search::Grep(pattern), cancel)
+                self.scan(root, path, Search::Grep(pattern), cancel)
             }
             _ => return Err("Unknown read tool or missing arguments".into()),
         }
@@ -215,18 +399,6 @@ impl Registry {
         check_cancel(cancel).map_err(|e| e.to_string())?;
         output::paginate(&text, &scope, args.cursor.as_deref(), args.limit)
             .map_err(|e| e.to_string())
-    }
-
-    fn verify_location(&self, root: &Root, relative: &Path, actual: PathBuf) -> io::Result<()> {
-        let expected = if relative.as_os_str().is_empty() {
-            root.path.clone()
-        } else {
-            root.path.join(relative)
-        };
-        if actual.as_os_str() != expected.as_os_str() || !self.allows(root, &actual) {
-            return Err(denied());
-        }
-        Ok(())
     }
 
     fn read_one(&self, root: &Root, path: &Path, cancel: &CancellationToken) -> io::Result<String> {
@@ -241,9 +413,9 @@ impl Registry {
         mut file: File,
         cancel: &CancellationToken,
     ) -> io::Result<String> {
-        self.verify_location(root, path, confined::location(&file)?)?;
+        root.verify_location(path, confined::location(&file)?)?;
         let text = file_text(&mut file, cancel)?;
-        self.verify_location(root, path, confined::location(&file)?)?;
+        root.verify_location(path, confined::location(&file)?)?;
         Ok(text)
     }
 
@@ -255,7 +427,7 @@ impl Registry {
         cancel: &CancellationToken,
     ) -> io::Result<String> {
         let directory = confined::directory(&root.directory, path)?;
-        self.verify_location(root, path, confined::location(&directory)?)?;
+        root.verify_location(path, confined::location(&directory)?)?;
         let mut stack = vec![(path.to_path_buf(), directory.entries()?, directory)];
         let mut records = Vec::new();
         let mut entries = 0;
@@ -268,7 +440,7 @@ impl Registry {
             };
             check_cancel(cancel)?;
             let entry = iter.next();
-            self.verify_location(root, parent, confined::location(directory)?)?;
+            root.verify_location(parent, confined::location(directory)?)?;
             let Some(entry) = entry else {
                 stack.pop();
                 continue;
@@ -289,7 +461,7 @@ impl Registry {
                 continue;
             }
             let kind = entry.file_type()?;
-            self.verify_location(root, parent, confined::location(directory)?)?;
+            root.verify_location(parent, confined::location(directory)?)?;
             if !kind.is_file() && !kind.is_dir() {
                 continue;
             }
@@ -336,7 +508,7 @@ impl Registry {
                     return Err(io::Error::other("Search depth budget exceeded"));
                 }
                 if let Ok(dir) = confined::directory(&root.directory, &child) {
-                    self.verify_location(root, &child, confined::location(&dir)?)?;
+                    root.verify_location(&child, confined::location(&dir)?)?;
                     stack.push((child, dir.entries()?, dir));
                 }
             }
@@ -403,6 +575,9 @@ fn relative_path(raw: &str) -> io::Result<PathBuf> {
     for component in Path::new(raw).components() {
         match component {
             Component::Normal(part) => {
+                if part.to_string_lossy().starts_with(".argentic-write-") {
+                    return Err(denied());
+                }
                 if cfg!(windows) && part.to_string_lossy().ends_with(['.', ' ']) {
                     return Err(denied());
                 }
@@ -417,7 +592,7 @@ fn relative_path(raw: &str) -> io::Result<PathBuf> {
 
 fn check_cancel(cancel: &CancellationToken) -> io::Result<()> {
     if cancel.is_cancelled() {
-        return Err(io::Error::other("Read cancelled"));
+        return Err(io::Error::other("Tool cancelled"));
     }
     Ok(())
 }
@@ -469,4 +644,21 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
     }
+}
+
+fn workspace_gate(path: &Path) -> Result<Arc<tokio::sync::RwLock<()>>, String> {
+    use std::{
+        collections::HashMap,
+        sync::{LazyLock, Mutex, Weak},
+    };
+    type Gate = tokio::sync::RwLock<()>;
+    static GATES: LazyLock<Mutex<HashMap<PathBuf, Weak<Gate>>>> = LazyLock::new(Mutex::default);
+    let mut gates = GATES.lock().map_err(|_| "Workspace queue is unavailable")?;
+    gates.retain(|_, gate| gate.strong_count() > 0);
+    let gate = gates.entry(path.to_path_buf()).or_default();
+    Ok(gate.upgrade().unwrap_or_else(|| {
+        let fresh = Arc::new(Gate::new(()));
+        *gate = Arc::downgrade(&fresh);
+        fresh
+    }))
 }
