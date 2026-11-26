@@ -1,9 +1,9 @@
 use super::{
-    check_cancel, confined, denied, file_text,
+    check_cancel, confined, denied, file_text, model_path,
     patch::{
         apply_patch_hunks_to_content, join_text_lines, parse_apply_patch, ParsedPatchOperation,
     },
-    private_project_path, relative_path, Root, MAX_FILE_BYTES,
+    private_project_path, Root, MAX_FILE_BYTES,
 };
 use crate::policy::Action;
 use cap_fs_ext::{FollowSymlinks, MetadataExt, OpenOptionsFollowExt};
@@ -59,7 +59,7 @@ struct PatchArgs {
 }
 
 fn file_path(raw: &str) -> Result<PathBuf, String> {
-    let path = relative_path(raw).map_err(|error| error.to_string())?;
+    let path = model_path(raw).map_err(|error| error.to_string())?;
     if path.as_os_str().is_empty() {
         return Err("A file path is required".into());
     }

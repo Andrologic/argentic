@@ -296,7 +296,7 @@ impl Registry {
         }
         let args: Arguments = serde_json::from_str(&call.arguments).map_err(|e| e.to_string())?;
         let root = self.roots.get(args.root).ok_or("Unknown workspace root")?;
-        let path = relative_path(args.path.as_deref().unwrap_or(".")).map_err(|e| e.to_string())?;
+        let path = model_path(args.path.as_deref().unwrap_or(".")).map_err(|e| e.to_string())?;
         let absolute = if path.as_os_str().is_empty() {
             root.path.clone()
         } else {
@@ -567,6 +567,33 @@ fn denied() -> io::Error {
     )
 }
 
+/// Path given by the model. The shell shows the workspace at `/workspace`,
+/// so `/workspace`, `/workspace/...` and `/` name the selected root. Any
+/// other absolute path is refused with guidance.
+fn model_path(raw: &str) -> io::Result<PathBuf> {
+    let relative = match raw {
+        "/" | SHELL_WORKSPACE => ".",
+        _ => match raw
+            .strip_prefix(SHELL_WORKSPACE)
+            .and_then(|rest| rest.strip_prefix('/'))
+        {
+            Some(rest) if !rest.is_empty() => rest,
+            Some(_) => ".",
+            None if raw.starts_with('/') => {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "Absolute paths are outside the workspace. Use a path relative to the \
+                     workspace root, such as \".\" or \"notes/todo.md\"",
+                ))
+            }
+            None => raw,
+        },
+    };
+    relative_path(relative)
+}
+
+const SHELL_WORKSPACE: &str = "/workspace";
+
 fn relative_path(raw: &str) -> io::Result<PathBuf> {
     if raw.is_empty() || raw.starts_with('/') || raw.contains(['\\', ':', '\0']) {
         return Err(denied());
@@ -661,4 +688,44 @@ fn workspace_gate(path: &Path) -> Result<Arc<tokio::sync::RwLock<()>>, String> {
         *gate = Arc::downgrade(&fresh);
         fresh
     }))
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod model_path_tests {
+    use super::model_path;
+    use std::path::PathBuf;
+
+    #[test]
+    fn shell_workspace_aliases_name_the_selected_root() {
+        for (raw, expected) in [
+            ("/", ""),
+            (".", ""),
+            ("/workspace", ""),
+            ("/workspace/", ""),
+            ("/workspace/memo.txt", "memo.txt"),
+            ("/workspace/notes/todo.md", "notes/todo.md"),
+            ("notes/todo.md", "notes/todo.md"),
+        ] {
+            assert_eq!(model_path(raw).unwrap(), PathBuf::from(expected), "{raw}");
+        }
+    }
+
+    #[test]
+    fn other_absolute_paths_and_escapes_stay_refused() {
+        for raw in [
+            "/etc/passwd",
+            "/workspaces/memo.txt",
+            "/workspace/../etc/passwd",
+            "/workspace//etc",
+            "../memo.txt",
+        ] {
+            assert!(model_path(raw).is_err(), "{raw}");
+        }
+        let message = model_path("/etc/passwd").unwrap_err().to_string();
+        assert!(
+            message.contains("relative to the workspace root"),
+            "{message}"
+        );
+    }
 }
