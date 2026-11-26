@@ -1,8 +1,9 @@
 //! Give Bash fresh inodes. Inode aliases on a live read-write bind mount can
 //! mutate or disclose files outside the authorized workspace.
 use super::super::{
-    check_cancel, confined, denied, mutation::Target, relative_path, Root, MAX_DEPTH, MAX_ENTRIES,
-    MAX_FILE_BYTES, MAX_SCAN_BYTES,
+    check_cancel, confined, denied,
+    mutation::{Change, Target},
+    relative_path, Root, MAX_DEPTH, MAX_ENTRIES, MAX_FILE_BYTES, MAX_SCAN_BYTES,
 };
 use cap_fs_ext::{DirExt, FollowSymlinks, MetadataExt, OpenOptionsFollowExt};
 use cap_std::{
@@ -98,12 +99,12 @@ impl Snapshot {
         self.staging.path()
     }
 
-    pub(super) fn publish(
+    pub(super) fn changes(
         mut self,
         root: &Root,
         cancel: &CancellationToken,
         allowed: impl Fn(&Path) -> bool,
-    ) -> io::Result<()> {
+    ) -> io::Result<Vec<Change>> {
         let path = self.staging.path().canonicalize()?;
         let staging = Root {
             directory: Dir::open_ambient_dir(&path, ambient_authority())?,
@@ -154,15 +155,7 @@ impl Snapshot {
             target.revalidate(root)?;
             changes.push(target.bytes(None));
         }
-        let total = changes.len();
-        for (index, change) in changes.into_iter().enumerate() {
-            change.apply(root, cancel).map_err(|error| {
-                io::Error::other(format!(
-                    "Published {index} of {total} file changes: {error}"
-                ))
-            })?;
-        }
-        Ok(())
+        Ok(changes)
     }
 }
 

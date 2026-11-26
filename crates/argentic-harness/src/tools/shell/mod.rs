@@ -210,17 +210,25 @@ fn run(
             .map(|(snapshot, write)| (snapshot.path(), *write))
             .collect::<Vec<_>>();
         let outcome = linux::run(&args.command, &mounts, network, args.timeout_ms, cancel)?;
+        let mut pending = Vec::new();
         for (root, (snapshot, write)) in registry.roots.iter().zip(snapshots) {
             if write {
-                snapshot
-                    .publish(root, cancel, |path| {
+                let changes = snapshot
+                    .changes(root, cancel, |path| {
                         let absolute = root.path.join(path);
                         [Action::Read, Action::Write].into_iter().all(|action| {
                             registry.path_effect(root, action, &absolute) == Effect::Allow
                         })
                     })
-                    .map_err(|e| format!("Shell workspace publication: {e}"))?;
+                    .map_err(|error| format!("Shell workspace publication: {error}"))?;
+                pending.extend(changes.into_iter().map(|change| (root, change)));
             }
+        }
+        let total = pending.len();
+        for (index, (root, change)) in pending.into_iter().enumerate() {
+            change.apply(root, cancel).map_err(|error| {
+                format!("Shell workspace publication: Published {index} of {total} file changes: {error}")
+            })?;
         }
         Ok(outcome)
     }

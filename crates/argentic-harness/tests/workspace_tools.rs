@@ -538,6 +538,52 @@ async fn shell_refuses_private_publication_before_applying_other_changes() {
     assert!(!dir.path().join("visible").exists());
 }
 
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "aarch64", target_arch = "x86_64")
+))]
+#[tokio::test]
+async fn shell_validates_additional_roots_before_publishing_workspace_edits() {
+    if !sandbox_present() {
+        return;
+    }
+    let workspace = tempfile::tempdir().unwrap();
+    let extra = tempfile::tempdir().unwrap();
+    let workspace = workspace.path().canonicalize().unwrap();
+    let extra = extra.path().canonicalize().unwrap();
+    fs::write(workspace.join("visible"), "original").unwrap();
+    fs::write(extra.join("auth.json"), "private").unwrap();
+    let policy = Policy::compile_rules(&workspace, None, Some(Preset::Workspace), None, &[])
+        .unwrap()
+        .with_directories(vec![(extra.clone(), Zone::WriteDirectory)]);
+    let registry = Arc::new(
+        Registry::new(
+            &[workspace.clone(), extra.clone()],
+            policy,
+            json!({"type":"object"}),
+        )
+        .unwrap()
+        .with_writes()
+        .with_shell(),
+    );
+    let error = call(
+        &registry,
+        "shell",
+        json!({"command":"printf changed > visible && printf changed > /directories/1/auth.json"}),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.starts_with("Shell workspace publication:"), "{error}");
+    assert_eq!(
+        fs::read_to_string(workspace.join("visible")).unwrap(),
+        "original"
+    );
+    assert_eq!(
+        fs::read_to_string(extra.join("auth.json")).unwrap(),
+        "private"
+    );
+}
+
 #[tokio::test]
 async fn shell_asks_and_denials_are_checked_before_launch() {
     let dir = tempfile::tempdir().unwrap();
