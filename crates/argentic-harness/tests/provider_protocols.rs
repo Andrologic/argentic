@@ -997,3 +997,67 @@ async fn reasoning_400_does_not_change_tool_choice() {
         assert_eq!(tool_names(&requests[2].1), tool_names(&requests[0].1));
     }
 }
+
+#[tokio::test]
+async fn messages_fallback_moves_the_tool_cache_breakpoint() {
+    let protocol = Protocol::Messages;
+    let mock = Mock::start(
+        protocol,
+        vec![
+            protocol.tool_turn(),
+            protocol.success(),
+            http_error(400, None, "Unsupported tool_choice"),
+            protocol.success(),
+            http_error(400, None, "tool_choice any is not supported"),
+            protocol.success(),
+        ],
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let policy = ReadPolicy::compile(&root, None, Some(Preset::ReadOnly), None, &[]).unwrap();
+    let registry = Registry::new(&[root], policy, json!({"type":"object"}))
+        .unwrap()
+        .with_writes();
+    let harness = Harness::new(
+        mock.provider.clone(),
+        Arc::new(registry),
+        Settings::default(),
+    );
+    let (_, steer) = tokio::sync::mpsc::channel(1);
+    let report = harness
+        .run(
+            Work {
+                model: protocol.model().parse().unwrap(),
+                reasoning_effort: None,
+                messages: vec![Message::User("Read and submit a result".into())],
+                submission_required: true,
+                max_corrections: 2,
+            },
+            &(),
+            steer,
+            CancellationToken::new(),
+        )
+        .await;
+    assert!(matches!(report.outcome, Err(Failure::OutputInvalid(_))));
+    let requests = mock.requests.lock().unwrap();
+    assert_eq!(requests.len(), 6);
+    let named = &requests[2].1;
+    let retry = &requests[3].1;
+    let later = &requests[4].1;
+    assert_eq!(retry["messages"], named["messages"]);
+    let replay = retry["messages"].to_string();
+    assert!(replay.contains(r#""name":"read""#));
+    assert!(replay.matches(r#""call_1""#).count() >= 2);
+
+    let original_tools = named["tools"].as_array().unwrap();
+    let last_tool = original_tools.last().unwrap();
+    assert_ne!(last_tool["name"], "agsdl_submit_result");
+    let cache_control = &last_tool["cache_control"];
+    assert_eq!(cache_control, &json!({"type": "ephemeral"}));
+    for body in [retry, later] {
+        assert_eq!(tool_names(body), ["agsdl_submit_result"]);
+        assert_eq!(&body["tools"][0]["cache_control"], cache_control);
+    }
+    assert_eq!(requests[5].1["tools"], named["tools"]);
+}

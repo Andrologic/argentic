@@ -323,6 +323,10 @@ entry sets `contextWindowTokens` (see `docs/argentic-harness.md`). Additional
 authored directories, model reviewers, completion checks, skills and MCP remain
 unsupported.
 
+When Anthropic Messages retries a correction with only the result tool, the
+shorter tool list changes the prompt-cache prefix. A cache breakpoint on the
+tool list moves to the remaining tool.
+
 ## Source notes
 
 The SSE framing and call accumulation use ideas from Macro's

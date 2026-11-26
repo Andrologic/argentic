@@ -365,7 +365,7 @@ fn downgrade_tool_choice(body: &mut Value, full_tools: &mut Option<Value>) -> Op
         .map(str::to_owned);
     if let (Some(name), Some(tools)) = (named, fields.get("tools").and_then(Value::as_array)) {
         let messages_api = choice["type"] == "tool";
-        let only: Vec<Value> = tools
+        let mut only: Vec<Value> = tools
             .iter()
             .filter(|tool| {
                 tool["name"]
@@ -375,7 +375,15 @@ fn downgrade_tool_choice(body: &mut Value, full_tools: &mut Option<Value>) -> Op
             })
             .cloned()
             .collect();
-        if !only.is_empty() {
+        if let Some(last) = only.last_mut() {
+            if let (true, Some(marker)) = (
+                messages_api,
+                tools.last().and_then(|tool| tool.get("cache_control")),
+            ) {
+                // The Messages encoder places its single breakpoint on the
+                // last tool when no system block carries it.
+                last["cache_control"] = marker.clone();
+            }
             *full_tools = fields.insert("tools".into(), Value::Array(only));
             fields.insert(
                 "tool_choice".into(),
