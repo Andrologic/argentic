@@ -110,7 +110,7 @@
       },
       "forceSubmissionOnCorrection": {
         "type": "boolean",
-        "description": "Force the result tool after a missing required submission. Defaults to true. If the provider rejects tool choice, omit it for the rest of the work attempt. Anthropic Messages uses automatic tool selection with manual extended thinking."
+        "description": "Force the result tool by name after a missing required submission. Defaults to true. If the provider rejects the named choice, Argentic retries with required (any for Anthropic Messages) and only the result tool. If the provider rejects that form, Argentic disables forced choice for the rest of the attempt and restores all tools. Argentic uses automatic tool selection on requests that deliver steering and on Anthropic Messages requests with manual extended thinking."
       },
       "compaction": {
         "type": "object",

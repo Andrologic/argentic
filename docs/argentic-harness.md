@@ -113,10 +113,15 @@ Lorsqu’un tour se termine sans la soumission requise, Argentic demande au mod�
 d’appeler `agsdl_submit_result` et impose cet outil sur la requête de correction.
 `harnessSettings.forceSubmissionOnCorrection` vaut `true` par défaut.
 Si le fournisseur refuse le choix nommé, Argentic relance avec `required`
-(`any` pour Anthropic Messages) et le seul outil de soumission, ce qui reste
-équivalent. S’il refuse aussi cette forme, Argentic omet le paramètre et
-rétablit tous les outils. Le niveau atteint vaut pour le reste de la tentative. Anthropic Messages conserve la sélection
-automatique des outils en mode de réflexion étendue manuelle.
+(`any` pour Anthropic Messages) et le seul outil de soumission. S’il refuse
+aussi cette forme, Argentic désactive le choix forcé pour le reste de la
+tentative et rétablit tous les outils. Les corrections suivantes de la même
+tentative reprennent au niveau de repli atteint.
+
+Une requête qui transmet un message de pilotage laisse le modèle choisir
+parmi tous les outils. Seule une nouvelle erreur `SUBMISSION_REQUIRED` peut
+réactiver le choix forcé. Anthropic Messages utilise la sélection automatique
+des outils en mode de réflexion étendue manuelle.
 
 Les instances partagées et nommées conservent leur conversation en mémoire
 pendant le run, y compris après l’arrêt d’un travail. Un redémarrage du Host
