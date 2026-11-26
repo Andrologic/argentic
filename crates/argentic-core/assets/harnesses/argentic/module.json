@@ -41,7 +41,8 @@
       "support": "absent"
     },
     "instance.new": {
-      "support": "native"
+      "support": "native",
+      "note": "Each new instance has a fresh conversation. Shared and named instances retain their conversation in memory until the Host run ends. A Host restart interrupts active runs."
     },
     "delivery.steer": {
       "support": "native"

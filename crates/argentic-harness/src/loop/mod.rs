@@ -1,4 +1,4 @@
-//! A fresh AgSDL instance for one work, with one conversation across turns.
+//! Runs one AgSDL work in a fresh or continuing conversation.
 
 use std::{
     borrow::Cow,
@@ -268,6 +268,7 @@ impl Harness {
             artifacts: Vec::new(),
             corrections: 0,
             history_end: work.messages.len(),
+            response_text_start: None,
             pending_steer: VecDeque::new(),
             accepted_steer: Vec::new(),
             delivery: DeliveryProgress::default(),
@@ -298,7 +299,11 @@ impl Harness {
         while instance.steer.try_recv().is_ok() {}
         tracker.close();
         tracker.wait().await;
-        work.messages.truncate(instance.history_end);
+        if matches!(outcome, Err(Failure::Cancelled)) {
+            instance.finish_interrupted_history(&mut work.messages);
+        } else {
+            work.messages.truncate(instance.history_end);
+        }
         RunReport {
             outcome,
             physical_end: PhysicalEnd { forced },
@@ -318,6 +323,7 @@ struct Instance<'a> {
     artifacts: Vec<Artifact>,
     corrections: u32,
     history_end: usize,
+    response_text_start: Option<usize>,
     pending_steer: VecDeque<Steer>,
     accepted_steer: Vec<Message>,
     delivery: DeliveryProgress,
@@ -346,6 +352,7 @@ impl Instance<'_> {
             if max_output < min_output {
                 return Err(Failure::TokenLimit);
             }
+            self.response_text_start = Some(self.text.len());
             let response = self.request(turn, work, &definitions, max_output).await;
             self.persist_steer(&mut work.messages);
             let response = response?;
@@ -363,6 +370,7 @@ impl Instance<'_> {
             }
             let finish = response.finish;
             let calls = response.calls;
+            self.response_text_start = None;
             work.messages.push(Message::Assistant {
                 text: response.text,
                 reasoning: response.reasoning,
@@ -451,7 +459,10 @@ impl Instance<'_> {
                             "Required submission is missing".into(),
                         ))
                     }
-                    Some(error) => work.messages.push(Message::User(error)),
+                    Some(error) => {
+                        work.messages.push(Message::User(error));
+                        self.history_end = work.messages.len();
+                    }
                 }
             }
         }
@@ -756,6 +767,29 @@ impl Instance<'_> {
             messages.truncate(self.history_end);
             messages.append(&mut self.accepted_steer);
             self.history_end = messages.len();
+        }
+    }
+
+    fn finish_interrupted_history(&self, messages: &mut Vec<Message>) {
+        if let Some(Message::Assistant { calls, .. }) = messages.get(self.history_end) {
+            let unanswered: Vec<_> = calls
+                .iter()
+                .skip(messages.len() - self.history_end - 1)
+                .map(|call| Message::Tool {
+                    call_id: call.id.clone(),
+                    content: "Work stopped before a tool result was recorded.".into(),
+                })
+                .collect();
+            messages.extend(unanswered);
+        } else if let Some(start) = self
+            .response_text_start
+            .filter(|&start| start < self.text.len())
+        {
+            messages.push(Message::Assistant {
+                text: self.text[start..].to_owned(),
+                reasoning: String::new(),
+                calls: Vec::new(),
+            });
         }
     }
 
