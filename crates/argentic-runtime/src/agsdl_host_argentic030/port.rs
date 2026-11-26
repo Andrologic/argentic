@@ -11,13 +11,13 @@ use crate::{
     tasks::StreamTasks,
 };
 use argentic_harness::{
-    providers::ToolCall,
+    providers::{DeliveryStatus, ToolCall},
     r#loop::{Decision, Failure, Hook, Proposal, Steer, SteerAdmission, WorkPort},
 };
 use serde_json::{json, Value};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
-    Arc, Mutex as SyncMutex,
+    Arc,
 };
 use tokio::sync::{oneshot, Mutex};
 use tokio_util::sync::CancellationToken;
@@ -30,10 +30,16 @@ struct PortState {
     attempt: FlowWorkAttempt030,
     tasks: StreamTasks,
     inbox: Mutex<SteerInbox030>,
-    delivery: SyncMutex<Option<(SteerDelivery030, oneshot::Receiver<()>)>>,
+    delivery: Mutex<PendingSteer>,
     sources: Mutex<Sources030>,
     sequence: AtomicU64,
     credential: Option<String>,
+}
+
+#[derive(Default)]
+struct PendingSteer {
+    offer: Option<SteerDelivery030>,
+    receipt: Option<oneshot::Receiver<()>>,
 }
 
 impl Port {
@@ -48,7 +54,7 @@ impl Port {
             attempt: work.attempt,
             tasks: work.tasks,
             inbox: Mutex::new(work.steer),
-            delivery: SyncMutex::default(),
+            delivery: Mutex::default(),
             sources: Mutex::new(sources),
             sequence: AtomicU64::new(0),
             credential,
@@ -152,9 +158,10 @@ impl WorkPort for Port {
             Ok(message) => {
                 let id = delivery.effect().id.clone();
                 let (consumed, receiver) = oneshot::channel();
-                // The native receipt is sent by Event::SteerConsumed. Keep
-                // the loop's local receiver alive until that event.
-                *self.0.delivery.lock().unwrap() = Some((delivery, receiver));
+                *self.0.delivery.lock().await = PendingSteer {
+                    offer: Some(delivery),
+                    receipt: Some(receiver),
+                };
                 Ok(Some(Steer {
                     id,
                     message,
@@ -173,47 +180,61 @@ impl WorkPort for Port {
         _: &str,
         _: &CancellationToken,
     ) -> std::result::Result<SteerAdmission, Failure> {
-        let pending = self
-            .0
-            .delivery
-            .lock()
-            .unwrap()
-            .take()
+        let mut pending = self.0.delivery.lock().await;
+        let offer = pending
+            .offer
+            .as_ref()
             .ok_or_else(|| port_error(missing("steer")))?;
-        match pending.0.wire_admission().await {
-            Ok(guard) => {
-                *self.0.delivery.lock().unwrap() = Some(pending);
-                Ok(SteerAdmission::Admit(guard))
-            }
+        match offer.wire_admission().await {
+            Ok(guard) => Ok(SteerAdmission::Admit(guard)),
             Err(_) => {
-                pending
-                    .0
-                    .not_sent(&self.0.tasks, &self.0.attempt)
-                    .map_err(port_error)?;
+                if let Some(offer) = pending.offer.take() {
+                    offer
+                        .not_sent(&self.0.tasks, &self.0.attempt)
+                        .map_err(port_error)?;
+                }
+                pending.receipt.take();
                 Ok(SteerAdmission::Defer)
             }
         }
     }
 
-    fn confirm_steer(
+    async fn settle_steer(
         &self,
         id: &str,
-        guard: Option<&tokio::sync::OwnedMutexGuard<()>>,
-    ) -> std::result::Result<bool, Failure> {
-        let (delivery, mut receipt) = self
-            .0
-            .delivery
-            .lock()
-            .unwrap()
-            .take()
-            .filter(|(delivery, _)| delivery.effect().id == id)
-            .ok_or_else(|| port_error(missing("steer")))?;
-        receipt
-            .try_recv()
-            .map_err(|_| port_error(missing("steerReceipt")))?;
-        delivery
-            .acknowledge_inserted(&self.0.tasks, &self.0.attempt, guard)
-            .map_err(port_error)
+        status: DeliveryStatus,
+    ) -> std::result::Result<(), Failure> {
+        let mut pending = self.0.delivery.lock().await;
+        let Some(offer) = pending.offer.as_ref() else {
+            return Ok(());
+        };
+        if offer.effect().id != id {
+            return Err(port_error(missing("steer")));
+        }
+        match status {
+            DeliveryStatus::Accepted => SteerDelivery030::acknowledge_from_provider(
+                &mut pending.offer,
+                &self.0.tasks,
+                &self.0.attempt,
+                false,
+            )
+            .await
+            .map_err(port_error)?,
+            DeliveryStatus::NotDelivered => {
+                if let Some(offer) = pending.offer.take() {
+                    offer
+                        .not_sent(&self.0.tasks, &self.0.attempt)
+                        .map_err(port_error)?;
+                }
+            }
+            DeliveryStatus::Uncertain => {
+                if let Some(offer) = pending.offer.take() {
+                    offer.report_uncertain();
+                }
+            }
+        }
+        pending.receipt.take();
+        Ok(())
     }
 
     async fn decide(

@@ -1,6 +1,11 @@
 //! A fresh AgSDL instance for one work, with one conversation across turns.
 
-use std::{borrow::Cow, collections::HashSet, sync::Arc, time::Duration};
+use std::{
+    borrow::Cow,
+    collections::{HashSet, VecDeque},
+    sync::Arc,
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use futures::{stream, StreamExt};
@@ -13,8 +18,8 @@ use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use crate::{
     config::{Layer, Settings},
     providers::{
-        Chunk, Finish, Message, ModelName, Provider, ProviderError, Request, ToolCall,
-        ToolDefinition,
+        Chunk, DeliveryProgress, DeliveryStatus, Finish, Message, ModelName, Provider,
+        ProviderError, Request, ToolCall, ToolDefinition,
     },
     tools::{Registry, SUBMIT_RESULT},
 };
@@ -122,8 +127,8 @@ pub enum Decision {
     Fail(Failure),
 }
 
-/// A host can serialize conversation insertion with its own Stop and
-/// completion decisions. The guard is released before events are published.
+/// A host can serialize starting a provider request with its Stop and
+/// completion decisions. The guard is released before awaiting the response.
 pub enum SteerAdmission {
     Admit(Option<OwnedMutexGuard<()>>),
     Defer,
@@ -163,14 +168,9 @@ pub trait WorkPort: Send + Sync {
         Ok(SteerAdmission::Admit(None))
     }
 
-    /// Confirm an in-process insertion while admission still holds its guard.
-    /// Returning false removes the message before another turn can use it.
-    fn confirm_steer(
-        &self,
-        _id: &str,
-        _guard: Option<&OwnedMutexGuard<()>>,
-    ) -> Result<bool, Failure> {
-        Ok(true)
+    /// Settle the offer using transport evidence from the next request.
+    async fn settle_steer(&self, _id: &str, _status: DeliveryStatus) -> Result<(), Failure> {
+        Ok(())
     }
 
     /// The host may add validation or run a completion check. The local
@@ -268,6 +268,9 @@ impl Harness {
             artifacts: Vec::new(),
             corrections: 0,
             history_end: work.messages.len(),
+            pending_steer: VecDeque::new(),
+            accepted_steer: Vec::new(),
+            delivery: DeliveryProgress::default(),
         };
         let (outcome, forced) = {
             let future = instance.execute(&mut work);
@@ -282,10 +285,12 @@ impl Harness {
                 outcome = &mut future => (outcome, false),
             }
         };
+        let steer_result = instance.settle_steer().await;
+        instance.persist_steer(&mut work.messages);
         let outcome = if cancel.is_cancelled() {
             Err(Failure::Cancelled)
         } else {
-            outcome
+            outcome.and_then(|outcome| steer_result.map(|()| outcome))
         };
         cancel.cancel();
         // Closing drops any undelivered steer receipt before joining workers.
@@ -313,6 +318,9 @@ struct Instance<'a> {
     artifacts: Vec<Artifact>,
     corrections: u32,
     history_end: usize,
+    pending_steer: VecDeque<Steer>,
+    accepted_steer: Vec<Message>,
+    delivery: DeliveryProgress,
 }
 
 impl Instance<'_> {
@@ -337,7 +345,9 @@ impl Instance<'_> {
                 return Err(Failure::TokenLimit);
             }
             let max_output = u64::from(settings.limit("maxOutputTokens")).min(remaining) as u32;
-            let response = self.request(turn, work, &definitions, max_output).await?;
+            let response = self.request(turn, work, &definitions, max_output).await;
+            self.persist_steer(&mut work.messages);
+            let response = response?;
             if let Some(usage) = response.usage {
                 spent = spent
                     .saturating_add(usage.prompt_tokens)
@@ -418,7 +428,7 @@ impl Instance<'_> {
                 });
             }
             let can_continue = turn < turn_limit && total.is_none_or(|limit| spent < limit);
-            if can_continue && self.consume_steer(&mut work.messages).await? {
+            if can_continue && self.collect_steer().await? {
                 continue;
             }
             if calls.is_empty() && finish == Finish::Stop {
@@ -459,21 +469,61 @@ impl Instance<'_> {
                 .await?;
         }
         self.active()?;
-        let mut stream = self
-            .harness
-            .provider
-            .stream(
-                Request {
-                    model: &work.model,
-                    reasoning_effort: work.reasoning_effort.as_deref(),
-                    messages: &messages,
-                    tools: definitions,
-                    max_output_tokens,
-                    limits: (&self.harness.settings).into(),
-                },
-                self.cancel.child_token(),
-            )
-            .await?;
+        let mut guard = None;
+        let mut index = 0;
+        while let Some(steer) = self.pending_steer.get(index) {
+            drop(guard.take());
+            match self.port.admit_steer(&steer.id, self.cancel).await? {
+                SteerAdmission::Admit(admitted) => {
+                    guard = admitted;
+                    messages.to_mut().push(Message::User(steer.message.clone()));
+                    index += 1;
+                }
+                SteerAdmission::Defer => {
+                    self.pending_steer.remove(index);
+                }
+            }
+        }
+        self.active()?;
+        let delivery = self.delivery.clone();
+        let provider = self.harness.provider.clone();
+        let request = provider.stream(
+            Request {
+                model: &work.model,
+                reasoning_effort: work.reasoning_effort.as_deref(),
+                messages: &messages,
+                tools: definitions,
+                max_output_tokens,
+                limits: (&self.harness.settings).into(),
+                delivery: delivery.clone(),
+            },
+            self.cancel.child_token(),
+        );
+        tokio::pin!(request);
+        // Start the request under admission. Waiting on HTTP while holding the
+        // gate would prevent Stop and the sender's own deadline from settling.
+        let first = futures::poll!(&mut request);
+        drop(guard);
+        let opened = match first {
+            std::task::Poll::Ready(result) => result,
+            std::task::Poll::Pending if self.pending_steer.is_empty() => request.await,
+            std::task::Poll::Pending => {
+                tokio::select! {
+                    biased;
+                    _ = delivery.accepted() => {
+                        self.settle_steer().await?;
+                        request.await
+                    }
+                    result = &mut request => result,
+                }
+            }
+        };
+        if opened.is_ok() {
+            // Providers which return a stream directly have accepted the turn.
+            delivery.report(DeliveryStatus::Accepted);
+        }
+        self.settle_steer().await?;
+        let mut stream = opened?;
         let mut text = String::new();
         let mut reasoning = String::new();
         let mut calls = Vec::new();
@@ -649,50 +699,47 @@ impl Instance<'_> {
         }
     }
 
-    async fn consume_steer(&mut self, messages: &mut Vec<Message>) -> Result<bool, Failure> {
-        let mut consumed = false;
+    async fn collect_steer(&mut self) -> Result<bool, Failure> {
+        self.delivery = DeliveryProgress::default();
         // Take a finite snapshot. Continuous arrivals cannot hold a turn open.
         for _ in 0..self.steer.len() {
             self.active()?;
             let Ok(steer) = self.steer.try_recv() else {
                 break;
             };
-            consumed |= self.insert_steer(messages, steer).await?;
+            if !steer.consumed.is_closed() {
+                self.pending_steer.push_back(steer);
+            }
         }
         if let Some(steer) = self.port.take_steer(self.cancel).await? {
-            consumed |= self.insert_steer(messages, steer).await?;
+            self.pending_steer.push_back(steer);
         }
-        Ok(consumed)
+        Ok(!self.pending_steer.is_empty())
     }
 
-    async fn insert_steer(
-        &mut self,
-        messages: &mut Vec<Message>,
-        steer: Steer,
-    ) -> Result<bool, Failure> {
-        if steer.consumed.is_closed() {
-            return Ok(false);
+    async fn settle_steer(&mut self) -> Result<(), Failure> {
+        let status = self.delivery.status();
+        while let Some(steer) = self.pending_steer.front() {
+            self.port.settle_steer(&steer.id, status).await?;
+            if let Some(steer) = self.pending_steer.pop_front() {
+                if status == DeliveryStatus::Accepted {
+                    self.accepted_steer.push(Message::User(steer.message));
+                    let _ = steer.consumed.send(());
+                    self.port
+                        .event(Event::SteerConsumed { id: &steer.id }, self.cancel)
+                        .await?;
+                }
+            }
         }
-        let SteerAdmission::Admit(guard) = self.port.admit_steer(&steer.id, self.cancel).await?
-        else {
-            return Ok(false);
-        };
-        self.active()?;
-        messages.push(Message::User(steer.message));
-        if steer.consumed.send(()).is_err() {
-            messages.pop();
-            return Ok(false);
+        Ok(())
+    }
+
+    fn persist_steer(&mut self, messages: &mut Vec<Message>) {
+        if !self.accepted_steer.is_empty() {
+            messages.truncate(self.history_end);
+            messages.append(&mut self.accepted_steer);
+            self.history_end = messages.len();
         }
-        if !self.port.confirm_steer(&steer.id, guard.as_ref())? {
-            messages.pop();
-            return Ok(false);
-        }
-        self.history_end = messages.len();
-        drop(guard);
-        self.port
-            .event(Event::SteerConsumed { id: &steer.id }, self.cancel)
-            .await?;
-        Ok(true)
     }
 
     fn active(&self) -> Result<(), Failure> {

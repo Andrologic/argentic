@@ -7,6 +7,7 @@ use axum::{
     routing::post,
     Json, Router,
 };
+use futures::StreamExt;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
@@ -32,12 +33,16 @@ impl Request {
             .is_ok());
     }
 
-    fn tool(self, call: &str, args: Value) {
+    fn tool_response(call: &str, args: Value) -> String {
         let chunk = json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"same-wire-id",
             "function":{"name":call,"arguments":args.to_string()}}]},"finish_reason":"tool_calls"}]});
+        format!("data: {chunk}\n\ndata: [DONE]\n\n")
+    }
+
+    fn tool(self, call: &str, args: Value) {
         self.send(
             StatusCode::OK,
-            format!("data: {chunk}\n\ndata: [DONE]\n\n"),
+            Self::tool_response(call, args),
             "text/event-stream",
         );
     }
@@ -465,7 +470,27 @@ async fn steers_active_shared_work_and_preserves_the_conversation() {
         assert!(request.body["messages"]
             .to_string()
             .contains("Message from watch"));
-        request.tool("agsdl_submit_result", submission.clone());
+        async fn consumed(host: &Host) -> bool {
+            let count: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM engine_flow030_runs, json_each(state_json, '$.steerDeliveries')
+                 WHERE json_extract(value, '$.status') = 'consumed'",
+            ).fetch_one(&host.pool).await.unwrap();
+            count > 0
+        }
+        assert!(
+            !consumed(&host).await,
+            "steer was consumed before response headers"
+        );
+        let (release, wait) = oneshot::channel::<()>();
+        let accepted = Request::tool_response("agsdl_submit_result", submission.clone());
+        let body = futures::stream::iter([Ok::<_, std::io::Error>(": accepted\n\n".to_owned())])
+            .chain(futures::stream::once(async move {
+                wait.await.unwrap();
+                Ok(accepted)
+            }));
+        request.send(StatusCode::OK, Body::from_stream(body), "text/event-stream");
+        until(async || consumed(&host).await).await;
+        release.send(()).unwrap();
         let followup = server.next().await;
         let messages = followup.body["messages"].to_string();
         assert!(

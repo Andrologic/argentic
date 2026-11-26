@@ -387,27 +387,8 @@ impl SteerDelivery030 {
             .map_err(|_| refused())
     }
 
-    /// An in-process recipient can prove insertion under the same admission
-    /// guard. The remote transport path still observes its separate receipt.
-    pub(crate) fn acknowledge_inserted(
-        self,
-        tasks: &StreamTasks,
-        attempt: &FlowWorkAttempt030,
-        guard: Option<&OwnedMutexGuard<()>>,
-    ) -> Result<bool> {
-        if let Some(gate) = &self.gate {
-            if !guard
-                .is_some_and(|guard| Arc::ptr_eq(OwnedMutexGuard::mutex(guard), &gate.admission))
-            {
-                return Err(refused());
-            }
-            if tokio::time::Instant::now() >= gate.deadline {
-                self.not_sent(tasks, attempt)?;
-                return Ok(false);
-            }
-        }
-        self.resolve(tasks, attempt, true)?;
-        Ok(true)
+    pub(crate) fn report_uncertain(self) {
+        let _ = self.ack.send(Err(uncertain()));
     }
 
     /// Call only after the transport has consumed the message and sender.

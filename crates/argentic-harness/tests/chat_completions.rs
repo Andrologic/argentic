@@ -5,8 +5,8 @@ use std::{
 };
 
 use argentic_harness::providers::{
-    ChatCompletions, Chunk, Finish, Message, ModelName, Provider, ProviderError, Request,
-    TurnLimits,
+    ChatCompletions, Chunk, DeliveryProgress, DeliveryStatus, Finish, Message, ModelName, Provider,
+    ProviderError, Request, TurnLimits,
 };
 use axum::{
     body::{Body, Bytes},
@@ -104,6 +104,16 @@ impl Mock {
         effort: Option<&str>,
         limits: TurnLimits,
     ) -> Result<Vec<Chunk>, ProviderError> {
+        self.request_with_delivery(effort, limits, DeliveryProgress::default())
+            .await
+    }
+
+    async fn request_with_delivery(
+        &self,
+        effort: Option<&str>,
+        limits: TurnLimits,
+        delivery: DeliveryProgress,
+    ) -> Result<Vec<Chunk>, ProviderError> {
         let model: ModelName = "openai/vendor/model#fast".parse().unwrap();
         assert_eq!(model.variant(), Some("fast"));
         self.client
@@ -115,6 +125,7 @@ impl Mock {
                     tools: &[],
                     max_output_tokens: 256,
                     limits,
+                    delivery,
                 },
                 CancellationToken::new(),
             )
@@ -221,6 +232,7 @@ async fn effort_error_after_visible_text_does_not_replay_the_turn() {
                 tools: &[],
                 max_output_tokens: 100,
                 limits: TurnLimits::default(),
+                delivery: Default::default(),
             },
             CancellationToken::new(),
         )
@@ -346,4 +358,52 @@ async fn http_and_sse_errors_redact_provider_supplied_content() {
     }
     assert!(matches!(http, ProviderError::Http { status: 401, .. }));
     assert!(matches!(sse, ProviderError::Stream { status: 200, .. }));
+}
+
+#[tokio::test]
+async fn distinguishes_explicit_refusal_from_missing_headers_after_send() {
+    let mock = Mock::start(vec![(StatusCode::FORBIDDEN, None, vec![b"refused"])]).await;
+    let delivery = DeliveryProgress::default();
+    let error = mock
+        .request_with_delivery(None, TurnLimits::default(), delivery.clone())
+        .await
+        .unwrap_err();
+    assert!(matches!(error, ProviderError::Http { status: 403, .. }));
+    assert_eq!(delivery.status(), DeliveryStatus::NotDelivered);
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(|Json(_): Json<Value>| async { std::future::pending::<Response>().await }),
+        );
+        axum::serve(listener, app).await.unwrap();
+    });
+    let stalled = Mock {
+        client: ChatCompletions::new(
+            "openai",
+            format!("http://{addr}/v1/chat/completions")
+                .parse()
+                .unwrap(),
+            None,
+        )
+        .unwrap(),
+        requests: Log::default(),
+        server,
+    };
+    let delivery = DeliveryProgress::default();
+    let error = stalled
+        .request_with_delivery(
+            None,
+            TurnLimits {
+                timeout: Duration::from_millis(300),
+                ..TurnLimits::default()
+            },
+            delivery.clone(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error, ProviderError::TurnTimeout);
+    assert_eq!(delivery.status(), DeliveryStatus::Uncertain);
 }

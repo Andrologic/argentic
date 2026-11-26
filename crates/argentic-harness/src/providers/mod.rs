@@ -96,6 +96,44 @@ pub struct Request<'a> {
     pub tools: &'a [ToolDefinition],
     pub max_output_tokens: u32,
     pub limits: TurnLimits,
+    pub delivery: DeliveryProgress,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DeliveryStatus {
+    #[default]
+    NotDelivered,
+    Uncertain,
+    Accepted,
+}
+
+/// Reports whether the provider received this turn, independently of whether
+/// the response body succeeds. Once accepted, later errors cannot undo it.
+#[derive(Clone, Default)]
+pub struct DeliveryProgress(tokio::sync::watch::Sender<DeliveryStatus>);
+
+impl DeliveryProgress {
+    pub fn report(&self, status: DeliveryStatus) {
+        self.0.send_if_modified(|current| {
+            if *current == DeliveryStatus::Accepted || *current == status {
+                return false;
+            }
+            *current = status;
+            true
+        });
+    }
+
+    pub fn status(&self) -> DeliveryStatus {
+        *self.0.borrow()
+    }
+
+    pub(crate) async fn accepted(&self) {
+        let _ = self
+            .0
+            .subscribe()
+            .wait_for(|status| *status == DeliveryStatus::Accepted)
+            .await;
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -189,7 +227,7 @@ impl ScriptedProvider {
 impl Provider for ScriptedProvider {
     async fn stream(
         &self,
-        _: Request<'_>,
+        request: Request<'_>,
         cancel: CancellationToken,
     ) -> Result<ProviderStream, ProviderError> {
         if cancel.is_cancelled() {
@@ -201,6 +239,7 @@ impl Provider for ScriptedProvider {
             .map_err(|_| ProviderError::Invalid("Script lock poisoned".into()))?
             .pop_front()
             .ok_or_else(|| ProviderError::Invalid("Script exhausted".into()))?;
+        request.delivery.report(DeliveryStatus::Accepted);
         Ok(Box::pin(stream::iter(turn)))
     }
 }

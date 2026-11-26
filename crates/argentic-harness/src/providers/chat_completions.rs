@@ -18,8 +18,8 @@ use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    Chunk, Finish, Message, Provider, ProviderError, ProviderStream, Request, ToolCall, TurnLimits,
-    Usage,
+    Chunk, DeliveryProgress, DeliveryStatus, Finish, Message, Provider, ProviderError,
+    ProviderStream, Request, ToolCall, TurnLimits, Usage,
 };
 
 const MAX_EVENT_BYTES: usize = 1024 * 1024;
@@ -94,6 +94,7 @@ impl ChatCompletions {
         mut body: Value,
         cancel: CancellationToken,
         limits: TurnLimits,
+        delivery: DeliveryProgress,
     ) -> Result<ProviderStream, ProviderError> {
         let budget = TurnBudget::new(limits);
         let mut retries = 0;
@@ -102,12 +103,21 @@ impl ChatCompletions {
             if let Some(value) = &self.authorization {
                 request = request.header(AUTHORIZATION, value.clone());
             }
+            let request = request.build().map_err(transport)?;
+            budget.check(&cancel)?;
+            delivery.report(DeliveryStatus::Uncertain);
             let mut response = budget
-                .wait(&cancel, request.send())
+                .wait(&cancel, self.client.execute(request))
                 .await?
-                .map_err(transport)?;
+                .map_err(|error| {
+                    if error.is_connect() {
+                        delivery.report(DeliveryStatus::NotDelivered);
+                    }
+                    transport(error)
+                })?;
             let status = response.status();
             if status.is_success() {
+                delivery.report(DeliveryStatus::Accepted);
                 let mut output = Box::pin(decode(response, cancel.clone(), budget.clone()));
                 let first = output.next().await;
                 if matches!(
@@ -124,6 +134,7 @@ impl ChatCompletions {
                 )));
             }
 
+            delivery.report(DeliveryStatus::NotDelivered);
             let retry_after = response.headers().get(RETRY_AFTER).and_then(retry_delay);
             let message = error_body(&mut response, &cancel, &budget).await?;
             if matches!(status.as_u16(), 400 | 422)
@@ -182,7 +193,8 @@ impl Provider for ChatCompletions {
                 "function": { "name": tool.name, "description": tool.description, "parameters": tool.parameters }
             })).collect::<Vec<_>>());
         }
-        self.open(body, cancel, request.limits).await
+        self.open(body, cancel, request.limits, request.delivery)
+            .await
     }
 }
 

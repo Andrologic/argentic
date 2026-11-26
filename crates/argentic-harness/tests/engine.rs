@@ -6,7 +6,10 @@ use std::{
 use argentic_harness::{
     config::Settings,
     policy::{Preset, ReadPolicy},
-    providers::{Chunk, Finish, Message, ScriptedProvider, ToolCall, Usage},
+    providers::{
+        Chunk, Finish, Message, Provider, ProviderError, ProviderStream, Request, ScriptedProvider,
+        ToolCall, Usage,
+    },
     r#loop::{Event, Failure, Harness, Hook, Steer, Work, WorkPort},
     tools::Registry,
 };
@@ -38,6 +41,21 @@ fn end(finish: Finish) -> Chunk {
 }
 
 fn fixture(turns: Vec<Vec<Chunk>>, project: Value) -> (tempfile::TempDir, Harness) {
+    fixture_with_provider(Arc::new(scripted(turns)), project)
+}
+
+fn scripted(turns: Vec<Vec<Chunk>>) -> ScriptedProvider {
+    ScriptedProvider::new(
+        turns
+            .into_iter()
+            .map(|turn| turn.into_iter().map(Ok).collect()),
+    )
+}
+
+fn fixture_with_provider(
+    provider: Arc<dyn Provider>,
+    project: Value,
+) -> (tempfile::TempDir, Harness) {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("notes.txt"), "result is 42\n").unwrap();
     let root = dir.path().canonicalize().unwrap();
@@ -56,16 +74,8 @@ fn fixture(turns: Vec<Vec<Chunk>>, project: Value) -> (tempfile::TempDir, Harnes
         }),
     )
     .unwrap();
-    let provider = ScriptedProvider::new(
-        turns
-            .into_iter()
-            .map(|turn| turn.into_iter().map(Ok).collect()),
-    );
     let settings = Settings::resolve(&json!({}), &json!({}), &project).unwrap();
-    (
-        dir,
-        Harness::new(Arc::new(provider), Arc::new(registry), settings),
-    )
+    (dir, Harness::new(provider, Arc::new(registry), settings))
 }
 
 fn work(submission_required: bool) -> Work {
@@ -217,21 +227,43 @@ impl Hook for PauseTool {
     }
 }
 
+struct RecordingProvider {
+    requests: Arc<Requests>,
+    provider: ScriptedProvider,
+}
+
+#[async_trait]
+impl Provider for RecordingProvider {
+    async fn stream(
+        &self,
+        request: Request<'_>,
+        cancel: CancellationToken,
+    ) -> Result<ProviderStream, ProviderError> {
+        self.requests
+            .0
+            .lock()
+            .unwrap()
+            .push(request.messages.to_vec());
+        self.provider.stream(request, cancel).await
+    }
+}
+
 #[tokio::test]
 async fn mid_tool_steer_waits_for_results() {
-    let (_dir, harness) = fixture(
-        vec![
+    let requests = Arc::new(Requests::default());
+    let provider = Arc::new(RecordingProvider {
+        requests: requests.clone(),
+        provider: scripted(vec![
             vec![
                 call("read", "read", json!({"path":"notes.txt"})),
                 end(Finish::ToolCalls),
             ],
             vec![submit("s1", json!({"answer":42})), end(Finish::ToolCalls)],
-        ],
-        json!({}),
-    );
+        ]),
+    });
+    let (_dir, harness) = fixture_with_provider(provider, json!({}));
     let pause = PauseTool::new();
-    let requests = Arc::new(Requests::default());
-    let harness = harness.with_hook(pause.clone()).with_hook(requests.clone());
+    let harness = harness.with_hook(pause.clone());
     let (send, steer) = mpsc::channel(4);
     let trace = Trace::default();
     let dispatch = async {
@@ -355,4 +387,31 @@ async fn missing_and_refused_submissions_share_the_correction_budget() {
         .run(work(true), &(), steer, CancellationToken::new())
         .await;
     assert!(matches!(report.outcome, Err(Failure::OutputInvalid(_))));
+}
+
+#[tokio::test]
+async fn steer_is_not_acknowledged_or_retained_when_the_next_request_fails() {
+    let (_dir, harness) = fixture(vec![vec![end(Finish::Stop)]], json!({}));
+    let (send, steer) = mpsc::channel(1);
+    let (consumed, receipt) = oneshot::channel();
+    send.send(Steer {
+        id: "offer".into(),
+        message: "steer to retry".into(),
+        consumed,
+    })
+    .await
+    .unwrap();
+    let trace = Trace::default();
+    let report = harness
+        .run(work(false), &trace, steer, CancellationToken::new())
+        .await;
+    assert!(matches!(
+        report.outcome,
+        Err(Failure::Provider(ProviderError::Invalid(_)))
+    ));
+    assert!(receipt.await.is_err());
+    assert!(!report
+        .messages
+        .contains(&Message::User("steer to retry".into())));
+    assert!(trace.0.lock().unwrap().is_empty());
 }
