@@ -337,8 +337,7 @@ impl Executor {
         if admission::shell_requested(&permissions) {
             registry = registry.with_shell();
         }
-        if matches!(&permissions, RequestedPermissions::Object(object) if object.reviewer == Some(Reviewer::Person))
-        {
+        if work.policy.reviewer() == Some(Reviewer::Person) {
             registry = registry.with_authorizer(Arc::new(approval::Human {
                 approvals: self.approvals.clone(),
                 attempt: work.attempt.clone(),

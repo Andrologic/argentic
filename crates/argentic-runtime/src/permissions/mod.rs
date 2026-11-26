@@ -376,6 +376,15 @@ impl EffectivePolicy {
     pub fn policies(&self) -> impl Iterator<Item = &NormalizedPolicy> {
         self.ceilings.iter().chain(std::iter::once(&self.current))
     }
+
+    pub(crate) fn reviewer(&self) -> Option<Reviewer> {
+        self.policies()
+            .filter_map(NormalizedPolicy::reviewer)
+            .fold(None, |reviewer, layer| match (reviewer, layer) {
+                (Some(Reviewer::Person), _) | (_, Reviewer::Person) => Some(Reviewer::Person),
+                _ => Some(Reviewer::Model),
+            })
+    }
 }
 
 /// Avoid discovery for servers denied by an entire ceiling. Tool-specific
@@ -464,7 +473,6 @@ fn evaluate_with(
     subject: fn(&PathContext, &ActionRequest) -> Result<paths::Subject>,
 ) -> Result<PermissionDecision> {
     let mut effect = Effect::Allow;
-    let mut reviewer = None;
     let mut resolved_path = None;
     for ceiling in policy.policies() {
         let subject = subject(&ceiling.context, request)?;
@@ -480,11 +488,6 @@ fn evaluate_with(
         }
         let decision = evaluate_subject(ceiling, request.action(), &subject)?;
         effect = effect.max(decision);
-        reviewer = match (reviewer, ceiling.reviewer) {
-            (Some(Reviewer::Person), _) | (_, Some(Reviewer::Person)) => Some(Reviewer::Person),
-            (Some(Reviewer::Model), _) | (_, Some(Reviewer::Model)) => Some(Reviewer::Model),
-            _ => None,
-        };
     }
     // The purpose can only narrow the intersection; it never grants a right.
     if (purpose == ExecutionPurpose::PlanLocked && request.action() != Action::Read)
@@ -493,9 +496,11 @@ fn evaluate_with(
     {
         effect = Effect::Deny;
     }
-    if effect != Effect::Ask {
-        reviewer = None;
-    }
+    let reviewer = if effect == Effect::Ask {
+        policy.reviewer()
+    } else {
+        None
+    };
     Ok(PermissionDecision {
         policy_digest: policy.fingerprint(),
         request: request.clone(),

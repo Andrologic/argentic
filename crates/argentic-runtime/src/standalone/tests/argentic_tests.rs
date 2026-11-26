@@ -732,6 +732,57 @@ async fn pending_ask(
 }
 
 #[tokio::test]
+async fn an_argentic_project_ceiling_can_supply_the_reviewer() {
+    let mut server = Server::start().await;
+    let mut doc = document();
+    doc["agents"]["worker"]["permissions"] = json!({"preset":"read-only"});
+    let mut f = Fixture::new(&doc.to_string());
+    let mut policy: Value = serde_json::from_slice(&std::fs::read(&f.policy).unwrap()).unwrap();
+    policy["permissions"] = json!({"preset":"read-only","reviewer":"person","rules":[
+        {"action":"read","match":"reviewed.txt","effect":"ask"}
+    ]});
+    let bytes = serde_json::to_vec(&policy).unwrap();
+    std::fs::write(&f.policy, &bytes).unwrap();
+    f.digest = digest(bytes);
+    std::fs::write(f.workspace.join("reviewed.txt"), "approved text").unwrap();
+    let host = open(&f, true)
+        .await
+        .with_argentic(server.config(None))
+        .unwrap();
+    let run = start(&host).await;
+    let scope = persistence::public030::HumanScope030 {
+        system_start_id: run.receipt.identity.system_start_id.clone(),
+        source: run.capture.source.clone(),
+    };
+    server
+        .next()
+        .await
+        .tool("read", json!({"path":"reviewed.txt"}));
+    let ask = pending_ask(&host, &scope).await;
+    host.submit_person(HumanSubmission {
+        scope,
+        request_id: ask.id,
+        expected_revision: ask.revision,
+        answer: api::HumanAnswer030::Decision {
+            decision: "yes".into(),
+            comment: String::new(),
+        },
+    })
+    .await
+    .unwrap();
+    let result = server.next().await;
+    assert!(result.body["messages"]
+        .to_string()
+        .contains("approved text"));
+    result.tool(
+        "agsdl_submit_result",
+        json!({"results":{"report":{"body":"done"}}}),
+    );
+    completed(&finish(&host, &run).await);
+    close(&host).await;
+}
+
+#[tokio::test]
 async fn a_write_approval_is_one_shot_and_stop_cancels_the_next_ask() {
     let mut server = Server::start().await;
     let mut doc = document();
