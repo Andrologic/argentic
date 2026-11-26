@@ -335,7 +335,18 @@ impl Subject {
                 subject.physical = Some(if resolve {
                     physical(&path)?
                 } else {
-                    lexical(&path)
+                    let path = lexical(&path);
+                    #[cfg(windows)]
+                    let path = if matches!(path.components().next(), Some(Component::Prefix(prefix))
+                        if matches!(prefix.kind(), std::path::Prefix::Disk(_)))
+                    {
+                        // Retained members have no live path to canonicalize.
+                        // Match the canonical drive spelling of the policy roots.
+                        PathBuf::from(format!(r"\\?\{}", text(&path)?.replace('/', "\\")))
+                    } else {
+                        path
+                    };
+                    path
                 });
             }
             ActionRequest::Shell { command } => {

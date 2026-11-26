@@ -1235,3 +1235,21 @@ fn lexical_evaluation_ignores_links_at_the_spelling() {
         Effect::Deny
     );
 }
+
+#[cfg(windows)]
+#[test]
+fn lexical_retained_member_uses_the_canonical_workspace_drive() {
+    let f = Fixture::new();
+    let policy = f.effective(json!("read-only"));
+    let member = policy
+        .policies()
+        .next()
+        .unwrap()
+        .context()
+        .workspace
+        .join("retained/absent.md");
+    let request = f.read(&native_request_path(&member).unwrap());
+    let decision = evaluate_effective_lexical(&policy, &request, ExecutionPurpose::Agent).unwrap();
+    assert_eq!(decision.effect, Effect::Allow);
+    assert_eq!(decision.resolved_path.as_deref(), member.to_str());
+}
