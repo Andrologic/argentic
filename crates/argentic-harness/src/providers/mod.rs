@@ -268,6 +268,10 @@ pub type ProviderStream = BoxStream<'static, Result<Chunk, ProviderError>>;
 /// local work. Implementations must not spawn detached work.
 #[async_trait]
 pub trait Provider: Send + Sync {
+    fn min_output_tokens(&self) -> u32 {
+        1
+    }
+
     async fn stream(
         &self,
         request: Request<'_>,

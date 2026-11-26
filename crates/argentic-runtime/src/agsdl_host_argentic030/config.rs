@@ -148,7 +148,14 @@ impl ArgenticConfig030 {
                 "Expected an existing absolute shell staging directory",
             ));
         }
-        self.settings(&empty_settings(), "settings")?;
+        let settings = self.settings(&empty_settings(), "/settings")?;
+        if self
+            .providers
+            .values()
+            .any(|p| matches!(p.protocol, Protocol::OpenAiResponses))
+        {
+            validate_responses_limits(&settings, "/settings")?;
+        }
         Ok(())
     }
 
@@ -179,7 +186,7 @@ impl ArgenticConfig030 {
         Ok(format!("sha256:{:x}", Sha256::digest(bytes)))
     }
 
-    pub(super) fn settings(&self, settings: &Value, pointer: &str) -> Result<Settings> {
+    fn settings(&self, settings: &Value, pointer: &str) -> Result<Settings> {
         Settings::resolve(&self.settings, &empty_settings(), settings).map_err(|_| {
             failure(
                 "HARNESS_SETTINGS",
@@ -187,6 +194,23 @@ impl ArgenticConfig030 {
                 "Invalid Argentic settings or a limit exceeds the host ceiling",
             )
         })
+    }
+
+    pub(super) fn settings_for_model(
+        &self,
+        model: &ModelName,
+        settings: &Value,
+        pointer: &str,
+    ) -> Result<Settings> {
+        let settings = self.settings(settings, pointer)?;
+        if self
+            .providers
+            .get(model.provider())
+            .is_some_and(|provider| matches!(provider.protocol, Protocol::OpenAiResponses))
+        {
+            validate_responses_limits(&settings, pointer)?;
+        }
+        Ok(settings)
     }
 
     pub(super) fn provider(
@@ -234,4 +258,23 @@ impl ArgenticConfig030 {
         };
         Ok((client, key))
     }
+}
+
+fn validate_responses_limits(settings: &Settings, pointer: &str) -> Result<()> {
+    for key in ["maxOutputTokens", "maxTotalTokens"] {
+        if settings
+            .get(key)
+            .is_some_and(|(value, _)| value < OpenAiResponses::MIN_OUTPUT_TOKENS)
+        {
+            return Err(failure(
+                "HARNESS_SETTINGS",
+                &format!("{pointer}/{key}"),
+                &format!(
+                    "OpenAI Responses requires {key} of at least {}",
+                    OpenAiResponses::MIN_OUTPUT_TOKENS
+                ),
+            ));
+        }
+    }
+    Ok(())
 }

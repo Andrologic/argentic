@@ -5,9 +5,15 @@ use std::{
     time::Duration,
 };
 
-use argentic_harness::providers::{
-    AnthropicMessages, Chunk, DeliveryProgress, DeliveryStatus, Finish, Message, OpenAiResponses,
-    Provider, ProviderError, Request, ToolDefinition, TurnLimits, Usage,
+use argentic_harness::{
+    config::Settings,
+    policy::{Preset, ReadPolicy},
+    providers::{
+        AnthropicMessages, Chunk, DeliveryProgress, DeliveryStatus, Finish, Message,
+        OpenAiResponses, Provider, ProviderError, Request, ToolDefinition, TurnLimits, Usage,
+    },
+    r#loop::{Failure, Harness, Work},
+    tools::Registry,
 };
 use axum::{
     body::{Body, Bytes},
@@ -174,7 +180,7 @@ type Requests = Arc<Mutex<Vec<(HeaderMap, Value, tokio::time::Instant)>>>;
 type Script = Arc<Mutex<VecDeque<Response>>>;
 
 struct Mock {
-    provider: Box<dyn Provider>,
+    provider: Arc<dyn Provider>,
     requests: Requests,
     task: tokio::task::JoinHandle<()>,
 }
@@ -216,14 +222,14 @@ impl Mock {
             .route(protocol.path(), post(send))
             .with_state((requests.clone(), Arc::new(Mutex::new(replies.into()))));
         let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let provider: Box<dyn Provider> = match protocol {
-            Protocol::Messages => Box::new(
+        let provider: Arc<dyn Provider> = match protocol {
+            Protocol::Messages => Arc::new(
                 AnthropicMessages::new("fixture", url, Some("fixture-key"))
                     .unwrap()
                     .with_prompt_caching(true)
                     .with_attempt_effort_fallback(),
             ),
-            Protocol::Responses => Box::new(
+            Protocol::Responses => Arc::new(
                 OpenAiResponses::new("fixture", url, Some("fixture-key"))
                     .unwrap()
                     .with_attempt_effort_fallback(),
@@ -614,5 +620,55 @@ async fn responses_incomplete_has_no_replay_or_tool_calls() {
                 }
             ]
         );
+    }
+}
+
+#[tokio::test]
+async fn responses_stops_locally_when_remaining_budget_is_below_provider_minimum() {
+    let protocol = Protocol::Responses;
+    for (total, expected_requests) in [(41, 1), (42, 2)] {
+        let success = sse(protocol.events(protocol.text().into_iter().chain([
+            json!({"type":"response.completed","response":{"status":"completed",
+                "usage":{"input_tokens":12,"output_tokens":4}}}),
+        ])));
+        let mock = Mock::start(protocol, vec![protocol.tool_turn(), success]).await;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let policy = ReadPolicy::compile(&root, None, Some(Preset::ReadOnly), None, &[]).unwrap();
+        let registry = Registry::new(&[root], policy, json!({"type":"object"})).unwrap();
+        let settings = Settings::resolve(
+            &json!({}),
+            &json!({}),
+            &json!({
+                "maxOutputTokens": 16, "maxTotalTokens": total
+            }),
+        )
+        .unwrap();
+        let harness = Harness::new(mock.provider.clone(), Arc::new(registry), settings);
+        let (_, steer) = tokio::sync::mpsc::channel(1);
+        let report = harness
+            .run(
+                Work {
+                    model: protocol.model().parse().unwrap(),
+                    reasoning_effort: None,
+                    messages: vec![Message::User("Read the memo".into())],
+                    submission_required: false,
+                    max_corrections: 0,
+                },
+                &(),
+                steer,
+                CancellationToken::new(),
+            )
+            .await;
+        let requests = mock.requests.lock().unwrap();
+        assert_eq!(requests.len(), expected_requests);
+        assert!(requests
+            .iter()
+            .all(|(_, body, _)| body["max_output_tokens"] == 16));
+        if total == 41 {
+            assert!(matches!(report.outcome, Err(Failure::TokenLimit)));
+        } else {
+            assert!(report.outcome.is_ok(), "{:?}", report.outcome);
+        }
     }
 }

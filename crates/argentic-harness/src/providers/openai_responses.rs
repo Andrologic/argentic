@@ -18,6 +18,8 @@ pub struct OpenAiResponses {
 }
 
 impl OpenAiResponses {
+    pub const MIN_OUTPUT_TOKENS: u32 = 16;
+
     /// The endpoint is the full Responses URL, including /responses.
     pub fn new(
         provider: impl Into<String>,
@@ -38,6 +40,10 @@ impl OpenAiResponses {
 
 #[async_trait]
 impl Provider for OpenAiResponses {
+    fn min_output_tokens(&self) -> u32 {
+        Self::MIN_OUTPUT_TOKENS
+    }
+
     async fn stream(
         &self,
         request: Request<'_>,
@@ -45,6 +51,11 @@ impl Provider for OpenAiResponses {
     ) -> Result<ProviderStream, ProviderError> {
         if request.model.provider() != self.provider {
             return Err(invalid("Model belongs to a different provider"));
+        }
+        if request.max_output_tokens < Self::MIN_OUTPUT_TOKENS {
+            return Err(invalid(
+                "Responses requires max_output_tokens of at least 16",
+            ));
         }
         let mut input = Vec::new();
         for message in request.messages {

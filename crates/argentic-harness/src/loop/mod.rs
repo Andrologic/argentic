@@ -327,6 +327,7 @@ impl Instance<'_> {
     async fn execute(&mut self, work: &mut Work) -> Result<Outcome, Failure> {
         let settings = &self.harness.settings;
         let turn_limit = settings.limit("maxTurns");
+        let min_output = self.harness.provider.min_output_tokens();
         let total = settings
             .get("maxTotalTokens")
             .filter(|(_, layer)| *layer != Layer::Default)
@@ -341,10 +342,10 @@ impl Instance<'_> {
         for turn in 1..=turn_limit {
             self.active()?;
             let remaining = total.map_or(u64::MAX, |limit| limit.saturating_sub(spent));
-            if remaining == 0 {
+            let max_output = u64::from(settings.limit("maxOutputTokens")).min(remaining) as u32;
+            if max_output < min_output {
                 return Err(Failure::TokenLimit);
             }
-            let max_output = u64::from(settings.limit("maxOutputTokens")).min(remaining) as u32;
             let response = self.request(turn, work, &definitions, max_output).await;
             self.persist_steer(&mut work.messages);
             let response = response?;
