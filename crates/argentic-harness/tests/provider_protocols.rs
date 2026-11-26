@@ -9,8 +9,9 @@ use argentic_harness::{
     config::Settings,
     policy::{Preset, ReadPolicy},
     providers::{
-        AnthropicMessages, Chunk, DeliveryProgress, DeliveryStatus, Finish, Message,
-        OpenAiResponses, Provider, ProviderError, Request, ToolDefinition, TurnLimits, Usage,
+        reasoning_capability, AnthropicMessages, Chunk, DeliveryProgress, DeliveryStatus, Finish,
+        Message, OpenAiResponses, Provider, ProviderError, Request, ToolDefinition, TurnLimits,
+        Usage,
     },
     r#loop::{Failure, Harness, Work},
     tools::Registry,
@@ -746,4 +747,10 @@ async fn responses_refusal_preserves_visible_text_and_filters_the_turn() {
         });
         assert_eq!(run(&mock, protocol, &[], &[]).await, expected);
     }
+}
+
+#[test]
+fn gpt_54_catalogue_supports_none() {
+    let capability = reasoning_capability("openai", "gpt-5.4").unwrap().unwrap();
+    assert!(capability.efforts.iter().any(|effort| effort == "none"));
 }

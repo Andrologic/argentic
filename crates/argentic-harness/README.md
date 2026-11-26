@@ -70,17 +70,22 @@ protocols.
   Requests use `store: false` and ask for encrypted reasoning. The harness
   replays encrypted reasoning items and completed output items with each
   subsequent request. Cached tokens, if reported, are already included in
-  the input total.
+  the input total. Responses requires `maxOutputTokens` and
+  `maxTotalTokens` of at least 16. The work stops at the token limit if
+  fewer than 16 tokens remain before another request.
 
-The new protocols default to the `anthropic` and `openai` reasoning catalogues
-respectively, even when configured under aliases. Responses sends the selected
-effort as `reasoning.effort`. For Claude models listed in the manual-thinking
-catalogue, `low`, `medium` and `high` request 1,024, 2,048 and 8,192 thinking
-tokens respectively. The harness caps this budget below `maxOutputTokens` and
-omits it if fewer than 1,024 tokens fit. `none` omits the thinking configuration.
-Claude models outside the manual-thinking catalogue use their server defaults.
-The harness keeps Claude's signed thinking blocks in history
-for follow-up requests. [Anthropic extended thinking](https://platform.claude.com/docs/en/build-with-claude/extended-thinking)
+Messages requires the `anthropic` reasoning catalogue, even when the provider
+uses an alias. For listed Claude models, `low`, `medium` and `high` request
+1,024, 2,048 and 8,192 thinking tokens respectively. The harness caps this
+budget below the turn's output limit and omits the thinking configuration if
+fewer than 1,024 tokens fit. `none` explicitly disables thinking. Without an
+effort selection, the provider uses its default. The harness keeps signed and
+redacted thinking blocks in order for follow-up requests.
+[Anthropic extended thinking](https://platform.claude.com/docs/en/build-with-claude/extended-thinking)
+
+Responses defaults to the `openai` reasoning catalogue and sends the selected
+effort as `reasoning.effort`. GPT-5.4 supports `none`.
+[OpenAI GPT-5.4 model documentation](https://developers.openai.com/api/docs/models/gpt-5.4)
 
 HTTP 429 and 5xx responses can be retried within the turn's time and byte
 limits. A transient error event can also be retried before any output has
