@@ -63,6 +63,10 @@ jobs:
         if: runner.os == 'macOS'
         run: swiftc --version
 
+      - name: Test argentic-harness
+        working-directory: crates/argentic-harness
+        run: cargo test --locked --all-targets
+
       - name: Test argentic-core
         if: inputs.suite != 'reader'
         working-directory: crates/argentic-core
