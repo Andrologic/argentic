@@ -237,6 +237,20 @@ impl ActionPolicySource for Policies {
                     });
                 return Ok(ActionPolicyLease::new(allowed, guard));
             }
+            if native["method"] == "argentic/tool/requestApproval" {
+                let requests: Vec<ActionRequest> =
+                    serde_json::from_value(native["params"]["actions"].clone())?;
+                let allowed = !requests.is_empty()
+                    && requests.iter().all(|request| {
+                        matches!(
+                            request.action(),
+                            Action::Read | Action::Write | Action::Shell
+                        ) && (!guard.policy.read_only || request.action() != Action::Write)
+                            && evaluate_requested(&policy, request)
+                                .is_ok_and(|effect| effect != Effect::Deny)
+                    });
+                return Ok(ActionPolicyLease::new(allowed, guard));
+            }
             let path = payload
                 .pointer("/nativeRequest/params/additionalPermissions/fileSystem/write/0")
                 .and_then(Value::as_str)
@@ -299,7 +313,7 @@ impl Host {
         self.context = self.context.with_harnesses(harnesses);
         self
     }
-    /// Configure the read-only Argentic adapter. Preflight and Start still
+    /// Configure the Argentic adapter. Preflight and Start still
     /// require an explicit "argentic" entry in the allowed harness set.
     pub fn with_argentic(mut self, config: crate::harness::ArgenticConfig030) -> Result<Self> {
         let mut registry = self.context.harnesses().clone();
@@ -1239,6 +1253,7 @@ mod tests {
                     serde_json::from_str(argentic_core::harness_module(id).unwrap()).unwrap();
                 // This test executor has no external effects. Describe the
                 // restrictions it enforces locally, in its own test module.
+                module["permissions"]["shell"]["allow"] = json!("absent");
                 module["permissions"]["write"]["deny"] = json!("harness");
                 module["permissions"]["network"]["deny"] = json!("harness");
                 module["permissions"]["read"]["outside"] = json!("harness");
