@@ -109,6 +109,13 @@ Argentic garde les quatre derniers tours par défaut.
 L’historique retenu a un plafond de 32 Mio, même si la compaction est désactivée.
 L’événement `argentic.contextCompaction` contient les compteurs de réduction.
 
+Lorsqu’un tour se termine sans la soumission requise, Argentic demande au modèle
+d’appeler `agsdl_submit_result` et impose cet outil sur la requête de correction.
+`harnessSettings.forceSubmissionOnCorrection` vaut `true` par défaut.
+Si le fournisseur refuse ce paramètre, Argentic relance la requête et omet le
+paramètre pour le reste de la tentative. Anthropic Messages conserve la sélection
+automatique des outils en mode de réflexion étendue manuelle.
+
 Les instances partagées et nommées conservent leur conversation en mémoire
 pendant le run, y compris après l’arrêt d’un travail. Un redémarrage du Host
 marque les runs actifs comme interrompus. Le journal permet de rejouer les
