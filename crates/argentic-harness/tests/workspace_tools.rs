@@ -178,6 +178,54 @@ fn bash_subcommands_use_syntax_and_original_text() {
 }
 
 #[tokio::test]
+async fn opaque_shell_commands_use_the_strictest_shell_rule() {
+    let dir = tempfile::tempdir().unwrap();
+    let commands = [
+        "eval 'printf hello'",
+        "name=printf; $name hello",
+        "$(printf printf) hello",
+        "`printf printf` hello",
+        "bash -c 'printf hello'",
+        "sh -c 'printf hello'",
+        "source helper",
+        ". helper",
+        "exec printf hello",
+        "xargs printf",
+        "find . -exec printf hello {} +",
+        "alias greet='printf hello'; greet",
+        "greet() { printf hello; }; greet",
+        "pri\\\nntf hello",
+    ];
+    for effect in [Effect::Ask, Effect::Deny] {
+        let policy = Policy::compile_rules(
+            dir.path(),
+            None,
+            Some(Preset::Workspace),
+            None,
+            &[Rule {
+                action: Action::Shell,
+                pattern: Some("printf review *".into()),
+                effect,
+            }],
+        )
+        .unwrap();
+        for command in commands {
+            assert_eq!(policy.shell_effect(command), effect, "{command}");
+        }
+        assert_eq!(policy.shell_effect("printf hello"), Effect::Allow);
+        let registry = Arc::new(
+            Registry::new(&[dir.path().to_owned()], policy, json!({}))
+                .unwrap()
+                .with_shell(),
+        );
+        let error = call(&registry, "shell", json!({"command":commands[0]}))
+            .await
+            .unwrap_err();
+        assert_eq!(error, "Shell permission denied");
+    }
+}
+
+#[tokio::test]
 async fn mutation_tools_apply_exact_edits_and_patches() {
     let dir = tempfile::tempdir().unwrap();
     let registry = Arc::new(registry(dir.path(), Some(Preset::Workspace), &[]));

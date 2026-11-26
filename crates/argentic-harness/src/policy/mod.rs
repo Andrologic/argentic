@@ -1,6 +1,7 @@
 //! AgSDL decisions. Filesystem admission is enforced independently.
 
 mod shell;
+pub(crate) use shell::parse as parse_shell;
 pub use shell::subcommands;
 
 use regex::Regex;
@@ -220,13 +221,19 @@ impl Policy {
     }
 
     pub fn shell_effect(&self, source: &str) -> Effect {
-        subcommands(source).map_or(Effect::Deny, |commands| {
-            commands
-                .into_iter()
-                .map(|command| self.decide(Action::Shell, command, Zone::Workspace))
-                .max()
-                .unwrap_or(Effect::Deny)
-        })
+        parse_shell(source).map_or(Effect::Deny, |parsed| self.parsed_shell_effect(&parsed))
+    }
+
+    pub(crate) fn parsed_shell_effect(&self, parsed: &shell::ParsedShell<'_>) -> Effect {
+        let commands = parsed
+            .commands
+            .iter()
+            .map(|command| self.decide(Action::Shell, command, Zone::Workspace));
+        let opaque = self.rules.iter().filter_map(|(action, _, effect)| {
+            (parsed.opaque && *action == Action::Shell && *effect != Effect::Allow)
+                .then_some(*effect)
+        });
+        commands.chain(opaque).max().unwrap_or(Effect::Deny)
     }
 
     /// A whole mount or network namespace needs a grant that covers every

@@ -7,6 +7,15 @@ use tree_sitter::{Node, ParseOptions, Parser};
 
 /// Match raw Bash command text, including redirections and nested commands.
 pub fn subcommands(source: &str) -> Result<Vec<&str>, String> {
+    Ok(parse(source)?.commands)
+}
+
+pub(crate) struct ParsedShell<'a> {
+    pub commands: Vec<&'a str>,
+    pub opaque: bool,
+}
+
+pub(crate) fn parse(source: &str) -> Result<ParsedShell<'_>, String> {
     if source.len() > 64 * 1024 || source.contains('\0') {
         return Err("Invalid shell command length or NUL byte".into());
     }
@@ -35,6 +44,7 @@ pub fn subcommands(source: &str) -> Result<Vec<&str>, String> {
     }
 
     let mut commands = Vec::new();
+    let mut opaque = source.contains("\\\n");
     let mut redirects = HashMap::new();
     let mut pending = vec![root];
     while let Some(node) = pending.pop() {
@@ -50,6 +60,11 @@ pub fn subcommands(source: &str) -> Result<Vec<&str>, String> {
             let end = redirects.remove(&node.id()).unwrap_or(node.end_byte());
             commands.push(&source[node.start_byte()..end]);
         }
+        opaque |= match node.kind() {
+            "command" => opaque_command(node, source),
+            "function_definition" => true,
+            _ => false,
+        };
         for i in (0..node.named_child_count()).rev() {
             pending.extend(node.named_child(i as u32));
         }
@@ -57,7 +72,41 @@ pub fn subcommands(source: &str) -> Result<Vec<&str>, String> {
     if commands.is_empty() {
         return Err("No shell commands found".into());
     }
-    Ok(commands)
+    Ok(ParsedShell { commands, opaque })
+}
+
+fn opaque_command(node: Node<'_>, source: &str) -> bool {
+    let Some(name) = node.child_by_field_name("name") else {
+        return true;
+    };
+    let name = &source[name.byte_range()];
+    if !plain_word(name) {
+        return true;
+    }
+    match name.rsplit('/').next().unwrap_or(name) {
+        "eval" | "source" | "." | "exec" | "xargs" | "bash" | "sh" | "dash" | "zsh" | "ksh"
+        | "ash" | "alias" | "unalias" | "command" | "builtin" | "enable" | "hash" | "shopt"
+        | "trap" => true,
+        "find" => {
+            let mut cursor = node.walk();
+            let opaque = node
+                .children_by_field_name("argument", &mut cursor)
+                .any(|argument| {
+                    let argument = &source[argument.byte_range()];
+                    !plain_word(argument)
+                        || matches!(argument, "-exec" | "-execdir" | "-ok" | "-okdir")
+                });
+            opaque
+        }
+        _ => false,
+    }
+}
+
+fn plain_word(word: &str) -> bool {
+    !word.is_empty()
+        && word.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'/' | b'-' | b'+' | b':')
+        })
 }
 
 fn redirection_end(node: Node<'_>) -> usize {

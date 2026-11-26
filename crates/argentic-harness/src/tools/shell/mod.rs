@@ -57,15 +57,11 @@ impl Registry {
         if !(1..=300_000).contains(&args.timeout_ms) {
             return Err("Shell timeout_ms must be between 1 and 300000".into());
         }
-        let commands = crate::policy::subcommands(&args.command)?;
+        let parsed = crate::policy::parse_shell(&args.command)?;
         let effect = self
             .policy
             .iter()
-            .flat_map(|policy| {
-                commands
-                    .iter()
-                    .map(move |command| policy.decide(Action::Shell, command, Zone::Workspace))
-            })
+            .map(|policy| policy.parsed_shell_effect(&parsed))
             .max()
             .unwrap_or(Effect::Deny);
         self.authorize(

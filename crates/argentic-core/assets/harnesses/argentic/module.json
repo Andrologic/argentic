@@ -65,7 +65,7 @@
       "allow": "harness",
       "ask": "harness",
       "deny": "harness",
-      "note": "Bash syntax is checked per sub-command. Requires system Bubblewrap and working PID and user namespaces on Linux ARM64 or x86-64. Shell is refused during qualification on other platforms, including macOS and Windows."
+      "note": "Shell rules match the command text, including each subcommand of a compound command, but not programs that a matched command starts. Dynamic command words and shell constructs that indirectly execute commands take the most restrictive explicit shell rule. Shell requires system Bubblewrap and working PID and user namespaces on Linux ARM64 or x86-64."
     },
     "network": {
       "allow": "sandbox",
