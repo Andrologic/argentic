@@ -135,6 +135,16 @@ pub trait WorkPort: Send + Sync {
         Ok(())
     }
 
+    /// Receive the complete visible assistant message before its tools run.
+    async fn assistant_message(
+        &self,
+        _turn: u32,
+        _text: &str,
+        _cancel: &CancellationToken,
+    ) -> Result<(), Failure> {
+        Ok(())
+    }
+
     /// Pull at most one host delivery at the same safe point as queued steer.
     async fn take_steer(&self, _cancel: &CancellationToken) -> Result<Option<Steer>, Failure> {
         Ok(None)
@@ -504,25 +514,30 @@ impl Instance<'_> {
                     }
                     calls.push(call);
                 }
-                Chunk::End { finish, usage } => match finish {
-                    Finish::Length => return Err(Failure::TokenLimit),
-                    Finish::Filtered => return Err(Failure::Filtered),
-                    Finish::ToolCalls if calls.is_empty() => {
-                        return Err(ProviderError::Invalid(
-                            "Tool call finish without a tool call".into(),
-                        )
-                        .into())
+                Chunk::End { finish, usage } => {
+                    self.port
+                        .assistant_message(turn, &text, self.cancel)
+                        .await?;
+                    match finish {
+                        Finish::Length => return Err(Failure::TokenLimit),
+                        Finish::Filtered => return Err(Failure::Filtered),
+                        Finish::ToolCalls if calls.is_empty() => {
+                            return Err(ProviderError::Invalid(
+                                "Tool call finish without a tool call".into(),
+                            )
+                            .into())
+                        }
+                        _ => {
+                            return Ok(Response {
+                                text,
+                                reasoning,
+                                calls,
+                                finish,
+                                usage,
+                            })
+                        }
                     }
-                    _ => {
-                        return Ok(Response {
-                            text,
-                            reasoning,
-                            calls,
-                            finish,
-                            usage,
-                        })
-                    }
-                },
+                }
             }
         }
         Err(ProviderError::Invalid("Provider ended without a terminal chunk".into()).into())

@@ -12,15 +12,12 @@ use crate::{
 };
 use argentic_harness::{
     providers::ToolCall,
-    r#loop::{Decision, Event, Failure, Hook, Proposal, Steer, SteerAdmission, WorkPort},
+    r#loop::{Decision, Failure, Hook, Proposal, Steer, SteerAdmission, WorkPort},
 };
 use serde_json::{json, Value};
-use std::{
-    borrow::Cow,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc, Mutex as SyncMutex,
-    },
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, Mutex as SyncMutex,
 };
 use tokio::sync::{oneshot, Mutex};
 use tokio_util::sync::CancellationToken;
@@ -37,7 +34,6 @@ struct PortState {
     sources: Mutex<Sources030>,
     sequence: AtomicU64,
     credential: Option<String>,
-    pending_text: Mutex<String>,
 }
 
 impl Port {
@@ -56,50 +52,7 @@ impl Port {
             sources: Mutex::new(sources),
             sequence: AtomicU64::new(0),
             credential,
-            pending_text: Mutex::default(),
         }))
-    }
-
-    async fn visible(&self, part: &str, boundary: bool, cancel: &CancellationToken) -> Result<()> {
-        let text = match self.0.credential.as_deref() {
-            Some(key) => {
-                let mut pending = self.0.pending_text.lock().await;
-                pending.push_str(part);
-                // Keep a possible credential prefix across provider chunks.
-                let replacement = if "[redacted]".contains(key) {
-                    ""
-                } else {
-                    "[redacted]"
-                };
-                let sanitized = pending.replace(key, replacement);
-                let split = if boundary {
-                    sanitized.len()
-                } else {
-                    sanitized
-                        .char_indices()
-                        .find(|(i, _)| {
-                            let tail = &sanitized[*i..];
-                            tail.len() < key.len() && key.starts_with(tail)
-                        })
-                        .map_or(sanitized.len(), |(i, _)| i)
-                };
-                *pending = sanitized[split..].into();
-                Cow::Owned(sanitized[..split].to_owned())
-            }
-            None => Cow::Borrowed(part),
-        };
-        if !text.is_empty() {
-            let sequence = self.0.sequence.fetch_add(1, Ordering::Relaxed);
-            self.0
-                .events
-                .emit(
-                    json!({"kind":"visibleText","messageId":format!("part-{sequence}"),
-                "textParts":[text]}),
-                    cancel,
-                )
-                .await?;
-        }
-        Ok(())
     }
 }
 
@@ -131,17 +84,28 @@ impl WorkPort for Port {
         true
     }
 
-    async fn event(
+    async fn assistant_message(
         &self,
-        event: Event<'_>,
+        turn: u32,
+        text: &str,
         cancel: &CancellationToken,
     ) -> std::result::Result<(), Failure> {
-        match event {
-            Event::VisibleText { text, .. } => self
-                .visible(text, false, cancel)
-                .await
-                .map_err(port_error)?,
-            Event::SteerConsumed { .. } | Event::ToolResult { .. } | Event::Reasoning { .. } => {}
+        let text = match self.0.credential.as_deref() {
+            Some(key) => {
+                let replacement = if "[redacted]".contains(key) {
+                    ""
+                } else {
+                    "[redacted]"
+                };
+                std::borrow::Cow::Owned(text.replace(key, replacement))
+            }
+            None => std::borrow::Cow::Borrowed(text),
+        };
+        if !text.is_empty() {
+            self.0.events.emit(
+                json!({"kind":"visibleText","messageId":format!("turn-{turn}"),"textParts":[text]}),
+                cancel,
+            ).await.map_err(port_error)?;
         }
         Ok(())
     }
@@ -258,7 +222,6 @@ impl WorkPort for Port {
         _: Option<&str>,
         cancel: &CancellationToken,
     ) -> std::result::Result<Decision, Failure> {
-        self.visible("", true, cancel).await.map_err(port_error)?;
         let event = match proposal {
             Proposal::Submit { turn, call } => {
                 let arguments = if self

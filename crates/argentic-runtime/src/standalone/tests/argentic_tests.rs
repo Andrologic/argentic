@@ -321,26 +321,32 @@ async fn stop_joins_the_stream_and_records_replayable_physical_end() {
             .unwrap();
         let run = start(&host).await;
         let (dropped, did_drop) = oneshot::channel::<()>();
-        let body = futures::stream::unfold((false, dropped), |(first, marker)| async move {
-            if first {
-                std::future::pending::<()>().await;
-            }
-            Some((
-                Ok::<_, std::io::Error>(
-                    "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Streaming\"}}]}\n\n",
-                ),
-                (true, marker),
-            ))
-        });
+        let (streaming, did_stream) = oneshot::channel();
+        let body = futures::stream::unfold(
+            (Some(streaming), dropped),
+            |(streaming, marker)| async move {
+                match streaming {
+                    Some(streaming) => {
+                        let _ = streaming.send(());
+                        Some((
+                        Ok::<_, std::io::Error>(
+                            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Streaming\"}}]}\n\n",
+                        ),
+                        (None, marker),
+                    ))
+                    }
+                    None => std::future::pending().await,
+                }
+            },
+        );
         server
             .next()
             .await
             .send(StatusCode::OK, Body::from_stream(body), "text/event-stream");
-        until(async || {
-            let count: i64 = sqlx::query_scalar("SELECT count(*) FROM engine_flow030_work_events WHERE ticket_json LIKE '%Streaming%' AND decision_json IS NOT NULL")
-                .fetch_one(&host.pool).await.unwrap();
-            count > 0
-        }).await;
+        tokio::time::timeout(WAIT_FOR, did_stream)
+            .await
+            .unwrap()
+            .unwrap();
         let id = &run.receipt.identity;
         host.stop(EngineStopRequest {
             request_id: "stop".into(),
@@ -560,6 +566,37 @@ async fn qualification_refuses_unregistered_opted_out_and_unsupported_permission
             "{action}: {}",
             error.message
         );
+        close(&host).await;
+    }
+}
+
+#[tokio::test]
+async fn persists_one_assistant_message_regardless_of_sse_chunking() {
+    for parts in [&["bonjour"][..], &["bon", "jour"][..]] {
+        let mut server = Server::start().await;
+        let f = Fixture::new(&document().to_string());
+        let host = open(&f, false)
+            .await
+            .with_argentic(server.config(None))
+            .unwrap();
+        let run = start(&host).await;
+        let frames = parts
+            .iter()
+            .map(|part| {
+                let frame = json!({"choices":[{"delta":{"content":part}}]});
+                format!("data: {frame}\n\n")
+            })
+            .collect::<String>();
+        let arguments = json!({"results":{"report":{"body":"done"}}}).to_string();
+        let final_frame = json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"submit",
+            "function":{"name":"agsdl_submit_result","arguments":arguments}}]},"finish_reason":"tool_calls"}]});
+        server.next().await.send(
+            StatusCode::OK,
+            format!("{frames}data: {final_frame}\n\ndata: [DONE]\n\n"),
+            "text/event-stream",
+        );
+        let output = completed(&finish(&host, &run).await);
+        assert_eq!(output["text"], "bonjour", "{output}");
         close(&host).await;
     }
 }
