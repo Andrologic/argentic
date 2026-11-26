@@ -80,6 +80,7 @@ pub enum Approval<'a> {
     Read(&'a Path),
     Write(&'a Path),
     Shell(&'a str),
+    Network(&'a str),
 }
 
 #[async_trait::async_trait]
@@ -239,7 +240,11 @@ impl Registry {
         self.shell = true;
         self.definitions.push(ToolDefinition {
             name: "shell".into(),
-            description: "Run Bash in a Linux sandbox with the admitted workspace at /workspace. Output is capped.".into(),
+            description: if cfg!(target_os = "macos") {
+                "Run Bash with the staged workspace as the current directory. Additional roots are in ARGENTIC_DIRECTORY_<index>. Output is capped."
+            } else {
+                "Run Bash in a sandbox with the admitted workspace at /workspace and additional roots under /directories. Output is capped."
+            }.into(),
             parameters: json!({"type":"object","required":["command"],"additionalProperties":false,
                 "properties":{"command":{"type":"string"},"timeout_ms":{"type":"integer","minimum":1,"maximum":300000}}}),
         });
@@ -302,6 +307,7 @@ impl Registry {
                 Approval::Read(_) => "Read",
                 Approval::Write(_) => "Write",
                 Approval::Shell(_) => "Shell",
+                Approval::Network(_) => "Network",
             };
             return Err(format!("{action} permission denied"));
         }

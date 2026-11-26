@@ -58,7 +58,7 @@ pub(super) fn qualify(agent: &Value, pointer: &str) -> Result<()> {
         }
     }
     if shell_requested(&permissions) {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64")))]
         if let RequestedPermissions::Object(object) = &permissions {
             if object.outside == Some(Outside::Deny) {
                 return Err(read_conflict(
@@ -200,7 +200,7 @@ pub(super) fn extra_roots(
             return Err(failure(
                 "HARNESS_CAPABILITY",
                 &at,
-                "Overlapping roots cannot be staged independently for Linux shell access",
+                "Overlapping roots cannot be staged independently for shell access",
             ));
         }
         roots.push(path.clone());

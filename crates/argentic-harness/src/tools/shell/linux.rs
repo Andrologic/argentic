@@ -11,8 +11,11 @@ use std::{
 use tokio_util::sync::CancellationToken;
 
 mod seccomp;
+use super::{
+    process::{nonblocking, Capture},
+    proxy::Proxy,
+};
 
-const OUTPUT_LIMIT: usize = 256 * 1024;
 const SETUP_LIMIT: Duration = Duration::from_secs(5);
 const STAGING_CHECK_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -29,7 +32,7 @@ pub(super) fn preflight() -> Result<(), String> {
     run(
         ":",
         &[(dir.path(), false)],
-        false,
+        None,
         5_000,
         &CancellationToken::new(),
     )
@@ -45,14 +48,6 @@ pub(super) fn preflight() -> Result<(), String> {
 
 fn inheritable(fd: RawFd) -> io::Result<()> {
     if unsafe { libc::fcntl(fd, libc::F_SETFD, 0) } == -1 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-fn nonblocking(fd: RawFd) -> io::Result<()> {
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    if flags == -1 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
         return Err(io::Error::last_os_error());
     }
     Ok(())
@@ -140,57 +135,22 @@ impl Drop for Sandbox {
     }
 }
 
-#[derive(Default)]
-struct Capture {
-    bytes: Vec<u8>,
-    truncated: bool,
-}
-
-impl Capture {
-    fn pump(&mut self, stream: &mut impl Read) -> io::Result<()> {
-        let mut buf = [0; 8192];
-        // Yield to the cancellation and deadline checks even when a child
-        // continuously fills a pipe.
-        for _ in 0..8 {
-            let count = match stream.read(&mut buf) {
-                Ok(0) => break,
-                Ok(count) => count,
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                Err(error) => return Err(error),
-            };
-            let available = (OUTPUT_LIMIT - self.bytes.len()).min(count);
-            self.bytes.extend_from_slice(&buf[..available]);
-            self.truncated |= available < count;
-        }
-        Ok(())
-    }
-
-    fn into_text(self) -> String {
-        let mut text = String::from_utf8_lossy(&self.bytes).into_owned();
-        if self.truncated {
-            text.push_str("\n[Shell output capture limit reached]");
-        }
-        text
-    }
-}
-
 pub(super) fn run(
     command: &str,
     mounts: &[(&Path, bool)],
-    network: bool,
+    proxy: Option<&Proxy>,
     timeout_ms: u64,
     cancel: &CancellationToken,
 ) -> Result<String, String> {
     let program = binary()?;
-    run_inner(program, command, mounts, network, timeout_ms, cancel).map_err(|e| e.to_string())
+    run_inner(program, command, mounts, proxy, timeout_ms, cancel).map_err(|e| e.to_string())
 }
 
 fn run_inner(
     program: &Path,
     command: &str,
     mounts: &[(&Path, bool)],
-    network: bool,
+    proxy: Option<&Proxy>,
     timeout_ms: u64,
     cancel: &CancellationToken,
 ) -> io::Result<String> {
@@ -201,7 +161,7 @@ fn run_inner(
         .map(|(path, _)| super::workspace::Budget::open(path))
         .collect::<io::Result<Vec<_>>>()?;
     let mut filter = tempfile::tempfile()?;
-    seccomp::write_filter(&mut filter, network)?;
+    seccomp::write_filter(&mut filter, proxy.is_some())?;
     let (mut info, info_writer) = io::pipe()?;
     let (gate_reader, mut gate) = io::pipe()?;
     nonblocking(info.as_raw_fd())?;
@@ -228,9 +188,6 @@ fn run_inner(
         "--cap-drop",
         "ALL",
     ]);
-    if network {
-        child.arg("--share-net");
-    }
     child.args([
         "--dev", "/dev", "--proc", "/proc", "--size", "67108864", "--tmpfs", "/tmp",
     ]);
@@ -239,9 +196,17 @@ fn run_inner(
     for &system in super::RUNTIME_DIRS.iter().chain(&[super::LOADER_CACHE]) {
         child.args(["--ro-bind-try", system, system]);
     }
-    if network {
+    if let Some(proxy) = proxy {
+        if !Path::new("/usr/bin/python3").is_file() {
+            return Err(io::Error::other(
+                "Argentic Linux proxy requires system Python 3.11 or later",
+            ));
+        }
+        child
+            .arg("--ro-bind")
+            .arg(&proxy.socket)
+            .arg("/run/argentic-proxy.sock");
         for &(system, _) in super::NETWORK_MOUNTS {
-            // Resolve distro-managed resolv.conf links without mounting /run.
             if let Ok(source) = fs::canonicalize(system) {
                 child.arg("--ro-bind").arg(source).arg(system);
             }
@@ -274,15 +239,29 @@ fn run_inner(
         "LANG",
         "C.UTF-8",
     ]);
+    if let Some(proxy) = proxy {
+        for (key, value) in proxy.env() {
+            child.args(["--setenv", key, value]);
+        }
+    }
     for (name, fd) in ["--seccomp", "--info-fd", "--block-fd"]
         .into_iter()
         .zip(fds)
     {
         child.arg(name).arg(fd.to_string());
     }
-    child.args(["--", "/bin/bash", "--noprofile", "--norc", "-c",
-        "if /bin/bash --noprofile --norc -n -c \"$1\"; then exec /bin/bash --noprofile --norc -c \"$1\"; else exit 2; fi",
-        "argentic-shell", command]);
+    child.arg("--");
+    if let Some(proxy) = proxy {
+        child.args([
+            "/usr/bin/python3",
+            "-I",
+            "-S",
+            "-c",
+            include_str!("linux/bridge.py"),
+            &proxy.port.to_string(),
+        ]);
+    }
+    child.args(super::BASH_ARGS).arg(command);
     // Only the execution child gets these descriptors. Ambient host fds stay
     // close-on-exec, and bwrap consumes the three sandbox setup descriptors.
     unsafe {

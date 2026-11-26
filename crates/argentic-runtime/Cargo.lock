@@ -74,10 +74,14 @@ name = "argentic-harness"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64",
  "cap-fs-ext",
  "cap-std",
  "futures",
+ "http-body-util",
  "httpdate",
+ "hyper",
+ "hyper-util",
  "jsonschema",
  "libc",
  "regex",

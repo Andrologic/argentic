@@ -1,6 +1,9 @@
 //! AgSDL decisions. Filesystem admission is enforced independently.
 
+mod network;
 mod shell;
+#[doc(hidden)]
+pub use network::matches_ipv6_spelling;
 pub(crate) use shell::parse as parse_shell;
 pub use shell::subcommands;
 
@@ -144,6 +147,7 @@ pub struct Rule {
 enum Matcher {
     Path(PathGlob),
     Text(Regex),
+    Network { glob: Regex, pattern: String },
 }
 
 impl Matcher {
@@ -151,6 +155,17 @@ impl Matcher {
         match self {
             Self::Path(glob) => glob.matches(subject),
             Self::Text(glob) => glob.is_match(subject),
+            Self::Network { glob, pattern } => {
+                use std::net::IpAddr;
+                match subject.parse::<IpAddr>().map(|ip| ip.to_canonical()) {
+                    Ok(IpAddr::V4(ip)) => {
+                        glob.is_match(&ip.to_string())
+                            || matches_ipv6_spelling(pattern, ip.to_ipv6_mapped())
+                    }
+                    Ok(IpAddr::V6(ip)) => matches_ipv6_spelling(pattern, ip),
+                    Err(_) => glob.is_match(subject),
+                }
+            }
         }
     }
 }
@@ -199,6 +214,15 @@ impl Policy {
                     .map(|pattern| match rule.action {
                         Action::Read | Action::Write => {
                             compile_rule(workspace, home, pattern, rule.effect).map(Matcher::Path)
+                        }
+                        Action::Network => {
+                            let pattern = pattern.trim_end_matches('.').to_ascii_lowercase();
+                            let pattern = pattern
+                                .parse::<std::net::IpAddr>()
+                                .map_or(pattern, |ip| ip.to_string());
+                            let glob = text_glob(Action::Network, &pattern)
+                                .map_err(|error| error.to_string())?;
+                            Ok(Matcher::Network { glob, pattern })
                         }
                         action => text_glob(action, pattern)
                             .map(Matcher::Text)
@@ -304,7 +328,7 @@ impl Policy {
                                 && glob
                                     .may_match_prefix(&format!("{}/", path.trim_end_matches('/')))
                     }
-                    Matcher::Text(_) => unreachable!("file rules use path globs"),
+                    _ => unreachable!("file rules use path globs"),
                 })
         })
     }
@@ -336,12 +360,41 @@ impl Policy {
             && self.blanket_allow(action, zone)
     }
 
-    pub(crate) fn blanket_allows(&self, action: Action, zone: Zone) -> bool {
-        !self
-            .rules
-            .iter()
-            .any(|(kind, _, effect)| *kind == action && *effect != Effect::Allow)
-            && self.blanket_allow(action, zone)
+    pub(crate) fn may_use_network(&self) -> bool {
+        let permits = |effect| effect != Effect::Deny;
+        let mut allowed = permits(self.default_effect(Action::Network, Zone::Workspace));
+        for (_, matcher, effect) in self.rules.iter().filter(|rule| rule.0 == Action::Network) {
+            if matcher.is_none() && !permits(*effect) {
+                return false;
+            }
+            allowed |= permits(*effect);
+        }
+        allowed
+    }
+
+    #[cfg(any(
+        all(
+            target_os = "linux",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ),
+        all(target_os = "macos", target_arch = "aarch64")
+    ))]
+    pub(crate) fn network_address_rules(&self, ip: std::net::IpAddr) -> (Option<Effect>, bool) {
+        let address = ip.to_canonical().to_string();
+        let mut restriction = None;
+        let mut exact_grant = false;
+        for (_, matcher, effect) in &self.rules {
+            let Some(matcher @ Matcher::Network { pattern, .. }) = matcher else {
+                continue;
+            };
+            if matcher.matches(&address) {
+                if *effect != Effect::Allow {
+                    restriction = restriction.max(Some(*effect));
+                }
+                exact_grant |= *effect != Effect::Deny && !pattern.contains('*');
+            }
+        }
+        (restriction, exact_grant)
     }
 
     fn blanket_allow(&self, action: Action, zone: Zone) -> bool {

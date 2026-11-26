@@ -26,6 +26,13 @@ tokio-util = { version = "0.7", features = ["rt"] }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+[target.'cfg(any(all(target_os = "linux", any(target_arch = "aarch64", target_arch = "x86_64")), all(target_os = "macos", target_arch = "aarch64")))'.dependencies]
+base64 = "0.22"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+tokio = { version = "1", features = ["net", "io-util"] }
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
 
