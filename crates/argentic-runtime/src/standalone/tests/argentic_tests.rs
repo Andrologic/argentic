@@ -803,6 +803,11 @@ async fn shell_executes_and_stop_reaps_the_namespace_before_physical_end() {
         .into_iter()
         .all(|path| !std::path::Path::new(path).is_file())
     {
+        assert_ne!(
+            std::env::var("ARGENTIC_REQUIRE_BWRAP").as_deref(),
+            Ok("1"),
+            "Bubblewrap is required for the Linux standalone shell test"
+        );
         eprintln!("Skipping Linux standalone shell test because system Bubblewrap is absent");
         return;
     }

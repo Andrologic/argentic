@@ -312,8 +312,15 @@ impl Target {
         self.revalidate(root)?;
         let mut file = confined::file(&root.directory, &self.relative)?;
         root.verify_location(&self.relative, confined::location(&file)?)?;
+        let before = self.before.as_ref().ok_or_else(denied)?;
+        if !same_file(before, &file.metadata()?)? {
+            return Err(io::Error::other("Mutation target changed concurrently"));
+        }
         let text = file_text(&mut file, cancel)?;
         root.verify_location(&self.relative, confined::location(&file)?)?;
+        if !same_file(before, &file.metadata()?)? {
+            return Err(io::Error::other("Mutation target changed concurrently"));
+        }
         Ok(text)
     }
 
@@ -321,10 +328,16 @@ impl Target {
         target_os = "linux",
         any(target_arch = "aarch64", target_arch = "x86_64")
     ))]
-    pub(super) fn matches(&self, meta: &Metadata) -> io::Result<bool> {
-        self.before
-            .as_ref()
-            .map_or(Ok(false), |before| same_file(before, meta))
+    pub(super) fn from_snapshot(relative: PathBuf, parent: Metadata, before: Metadata) -> Self {
+        Self {
+            relative,
+            parent,
+            before: Some(before),
+        }
+    }
+
+    fn parent_path(&self) -> io::Result<&Path> {
+        self.relative.parent().ok_or_else(denied)
     }
 
     fn change(self, content: Option<String>) -> Change {
@@ -341,10 +354,15 @@ impl Target {
     }
 
     pub(super) fn revalidate(&self, root: &Root) -> io::Result<Dir> {
-        let parent_path = self.relative.parent().ok_or_else(denied)?;
+        let parent_path = self.parent_path()?;
         let current_parent = confined::directory(&root.directory, parent_path)?;
         root.verify_location(parent_path, confined::location(&current_parent)?)?;
-        let current = metadata(&current_parent, self.name()?)?;
+        self.check_parent(&current_parent)?;
+        Ok(current_parent)
+    }
+
+    fn check_parent(&self, current_parent: &Dir) -> io::Result<()> {
+        let current = metadata(current_parent, self.name()?)?;
         let same_file = match (&self.before, &current) {
             (None, None) => true,
             (Some(before), Some(current)) => same_file(before, current)?,
@@ -353,7 +371,7 @@ impl Target {
         if !same_inode(&self.parent, &current_parent.dir_metadata()?) || !same_file {
             return Err(io::Error::other("Mutation target changed concurrently"));
         }
-        Ok(current_parent)
+        Ok(())
     }
 }
 
@@ -396,9 +414,11 @@ impl Change {
     pub(super) fn apply(&self, root: &Root, cancel: &CancellationToken) -> io::Result<()> {
         let target = &self.target;
         let name = target.name()?;
+        let parent_path = target.parent_path()?;
         check_cancel(cancel)?;
         let parent = target.revalidate(root)?;
         let Some(content) = &self.content else {
+            root.verify_location(parent_path, confined::location(&parent)?)?;
             return parent.remove_file(name);
         };
         check_size(content.len())?;
@@ -415,6 +435,7 @@ impl Change {
         let (temp, mut file) = loop {
             let seq = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
             let temp = format!(".argentic-write-{}-{seq}", std::process::id());
+            root.verify_location(parent_path, confined::location(&parent)?)?;
             match parent.open_with(&temp, &options) {
                 Ok(file) => break (temp, file),
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => check_cancel(cancel)?,
@@ -422,6 +443,8 @@ impl Change {
             }
         };
         let result = (|| {
+            let temp_path = parent_path.join(&temp);
+            root.verify_location(&temp_path, confined::location(&file)?)?;
             file.write_all(content)?;
             if let Some(mode) = &self.mode {
                 let mode = mode.clone();
@@ -433,15 +456,17 @@ impl Change {
                 file.set_permissions(mode)?;
             }
             file.sync_all()?;
-            drop(file);
-            let current_parent = target.revalidate(root)?;
+            target.check_parent(&parent)?;
             check_cancel(cancel)?;
+            root.verify_location(&temp_path, confined::location(&file)?)?;
+            root.verify_location(parent_path, confined::location(&parent)?)?;
             if target.before.is_none() {
-                parent.hard_link(&temp, &current_parent, name)
+                parent.hard_link(&temp, &parent, name)
             } else {
-                parent.rename(&temp, &current_parent, name)
+                parent.rename(&temp, &parent, name)
             }
         })();
+        drop(file);
         let cleanup = parent.remove_file(&temp);
         result?;
         if cleanup

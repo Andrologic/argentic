@@ -138,7 +138,12 @@ fn run(
         )?;
         if write {
             workspace
-                .publish(root, cancel)
+                .publish(root, cancel, |path| {
+                    let absolute = root.path.join(path);
+                    [Action::Read, Action::Write].into_iter().all(|action| {
+                        registry.path_effect(root, action, &absolute) == Effect::Allow
+                    })
+                })
                 .map_err(|e| format!("Shell workspace publication: {e}"))?;
         }
         Ok(outcome)

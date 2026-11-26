@@ -180,7 +180,8 @@ and Bash on Linux ARM64 or x86-64. The host kernel must allow unprivileged user
 and PID namespaces, seccomp filters and pidfds. The probe detects container
 or AppArmor restrictions. On Ubuntu 24.04, deploy with an AppArmor policy
 that permits user namespaces for Bubblewrap. CI disables the restriction
-on its disposable runners. macOS and Windows refuse shell at qualification.
+on its disposable runners and requires the Linux sandbox tests to run.
+macOS and Windows refuse shell at qualification.
 To use file mutations without shell, declare a global `shell` denial.
 
 The sandbox starts with a cleared environment, a private PID namespace and
@@ -191,20 +192,29 @@ kernel interfaces. Shell networking requires a blanket grant from every
 ceiling. The network-enabled profile allows IPv4 and IPv6 sockets. Per-host
 grants cannot enable networking.
 
-Bash sees a bounded copy of readable files at `/workspace`. Symlinks and
-multiply linked files are omitted. The copy is writable only when every
-ceiling grants unrestricted workspace reads and writes. The host applies
-changed regular files and deletions after the process exits, using the
-same atomic writer as the file tools. Publication requires existing parent
-directories. On timeout or Stop the host kills PID 1 through a pidfd and
-waits for it and the Bubblewrap supervisor before returning. The kernel
-terminates all processes remaining in that PID namespace.
+Bash sees a private copy at `/workspace` built from verified directory and
+file handles. A scan checks at most 20,000 entries and copies at most 64 MiB.
+Up to four workers create fresh staging files from the verified bytes.
+The scan omits paths without a read grant, private metadata, symlinks, special
+files and files with multiple hard links. Any ceiling that restricts workspace
+reads or writes makes the entire copy read-only. The direct file tools can
+still change individual paths according to the policy.
 
-Untrusted commands have no live mount of the workspace. Workspace roots
-are host capabilities and should be managed by the host. File tools check
-directory and file identity immediately before publication. A different
-host process with write access can still rename a directory between that
-check and the filesystem operation.
+After a writable run, the host compares the staged bytes and modes with the
+originals and checks read and write permission for every changed path before
+applying any change. Only regular files and deletions are published, and their
+parent directories must already exist in the workspace. Publication uses the
+same atomic file replacement as the mutation tools. On timeout or Stop the
+host kills PID 1 through a pidfd and waits for it and the Bubblewrap supervisor
+before returning. The kernel terminates all processes remaining in that PID
+namespace.
+
+The staging mount contains separate inodes from the host workspace. Workspace
+roots are host capabilities and should be managed by the host. Mutations
+check the location of the parent handle and the staged file immediately
+before publication, then replace or create the destination relative to that
+same parent handle. A different host process with write access can still
+rename an entry or directory between the final check and the operation.
 
 A preview contains up to 2,000 lines and 50 KiB of UTF-8 text. Use its
 `next_cursor` with the same tool arguments to continue. A truncated first

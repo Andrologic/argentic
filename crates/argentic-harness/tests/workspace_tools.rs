@@ -287,6 +287,11 @@ fn sandbox_present() -> bool {
         .into_iter()
         .all(|path| !Path::new(path).is_file())
     {
+        assert_ne!(
+            std::env::var("ARGENTIC_REQUIRE_BWRAP").as_deref(),
+            Ok("1"),
+            "Bubblewrap is required for the Linux sandbox integration tests"
+        );
         eprintln!("Skipping Linux sandbox integration because system Bubblewrap is absent");
         return false;
     }
@@ -386,6 +391,33 @@ async fn shell_publishes_regular_files_and_times_out_with_background_processes()
     assert!(error.contains("timed out"), "{error}");
     assert!(start.elapsed() < std::time::Duration::from_secs(5));
     assert!(!dir.path().join("late").exists());
+}
+
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "aarch64", target_arch = "x86_64")
+))]
+#[tokio::test]
+async fn shell_refuses_private_publication_before_applying_other_changes() {
+    if !sandbox_present() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("auth.json"), "private").unwrap();
+    let registry = Arc::new(registry(dir.path(), Some(Preset::Workspace), &[]).with_shell());
+    let error = call(
+        &registry,
+        "shell",
+        json!({"command": "test ! -e auth.json && printf new > auth.json && printf new > visible"}),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.starts_with("Shell workspace publication:"), "{error}");
+    assert_eq!(
+        fs::read_to_string(dir.path().join("auth.json")).unwrap(),
+        "private"
+    );
+    assert!(!dir.path().join("visible").exists());
 }
 
 #[tokio::test]
