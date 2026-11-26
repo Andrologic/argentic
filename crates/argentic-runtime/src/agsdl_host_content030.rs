@@ -1,11 +1,16 @@
 //! Recipient-scoped native content. Nothing here grants authority to resources.
+use crate::{
+    host::HostContext,
+    persistence::{failure, Result as HostResult},
+};
 use argentic_harness::tools::private_project_path;
-use crate::{host::HostContext, persistence::{failure, Result as HostResult}};
 use serde_json::{json, Value};
 use std::{path::Path, sync::Arc};
 use tokio_util::sync::CancellationToken;
 
-pub(crate) fn content_error(error: crate::content::ContentError) -> crate::persistence::dto::EngineFailure {
+pub(crate) fn content_error(
+    error: crate::content::ContentError,
+) -> crate::persistence::dto::EngineFailure {
     failure(&error.code, &error.pointer, &error.message)
 }
 
@@ -18,7 +23,10 @@ use crate::content::{
 };
 use crate::permissions::{normalize_requested, ExecutionPurpose};
 
-pub(crate) fn validate_text_sources(document: &Value, document_location: Option<&url::Url>) -> HostResult<()> {
+pub(crate) fn validate_text_sources(
+    document: &Value,
+    document_location: Option<&url::Url>,
+) -> HostResult<()> {
     use crate::agsdl_host_work_admission030::pointer_token030;
     fn visit(value: &Value, pointer: &str, document_location: Option<&url::Url>) -> HostResult<()> {
         if let Some(object) = value.as_object() {

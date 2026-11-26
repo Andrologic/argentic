@@ -446,21 +446,26 @@ mod tests {
     use crate::policy::Preset;
 
     #[test]
-    fn refuses_an_open_file_moved_after_open() {
+    fn refuses_an_open_file_at_a_different_path() {
         let temp = tempfile::tempdir().unwrap();
         let workspace = temp.path().join("workspace");
-        let relative = Path::new("allowed/memo.txt");
+        let relative = Path::new("allowed").join("memo.txt");
         std::fs::create_dir_all(workspace.join("allowed")).unwrap();
-        std::fs::write(workspace.join(relative), "memo").unwrap();
+        std::fs::write(workspace.join(&relative), "memo").unwrap();
         let workspace = workspace.canonicalize().unwrap();
         let policy =
             ReadPolicy::compile(&workspace, None, Some(Preset::ReadOnly), None, &[]).unwrap();
         let registry = Registry::new(std::slice::from_ref(&workspace), policy, json!({})).unwrap();
         let root = &registry.roots[0];
-        let file = confined::file(&root.directory, relative).unwrap();
+        let file = confined::file(&root.directory, &relative).unwrap();
+        #[cfg(unix)]
         std::fs::rename(workspace.join("allowed"), temp.path().join("moved")).unwrap();
+        // Windows directory capabilities can prevent renaming. Exercise the
+        // same post-open check by pairing the handle with a different path.
+        #[cfg(windows)]
+        let relative = Path::new("other").join("memo.txt");
         let error = registry
-            .read_open_file(root, relative, file, &CancellationToken::new())
+            .read_open_file(root, &relative, file, &CancellationToken::new())
             .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
     }
