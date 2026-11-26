@@ -356,12 +356,12 @@ fn older_ranges(
     ranges
 }
 
-// Keep the first successful activation with its assistant message and all
+// Keep the latest successful activation with its assistant message and all
 // sibling tool replies so every provider retains a valid tool exchange.
 fn loaded_skill_exchanges(messages: &[Message]) -> Vec<Range<usize>> {
     let mut loaded = HashSet::new();
     let mut exchanges = Vec::new();
-    for (index, message) in messages.iter().enumerate() {
+    for (index, message) in messages.iter().enumerate().rev() {
         let Message::Assistant { calls, .. } = message else {
             continue;
         };
@@ -391,6 +391,48 @@ fn loaded_skill_exchanges(messages: &[Message]) -> Vec<Range<usize>> {
         }
     }
     exchanges
+}
+
+#[cfg(test)]
+#[test]
+fn compaction_protects_the_latest_successful_skill_activation_and_its_siblings() {
+    use crate::providers::ToolCall;
+    let exchange = |content: &str| {
+        [
+            Message::Assistant {
+                text: String::new(),
+                reasoning: String::new(),
+                replay: None,
+                calls: vec![
+                    ToolCall {
+                        id: "activation".into(),
+                        name: crate::tools::SKILL.into(),
+                        arguments: r#"{"name":"review"}"#.into(),
+                    },
+                    ToolCall {
+                        id: "sibling".into(),
+                        name: "read".into(),
+                        arguments: "{}".into(),
+                    },
+                ],
+            },
+            Message::Tool {
+                call_id: "activation".into(),
+                content: content.into(),
+            },
+            Message::Tool {
+                call_id: "sibling".into(),
+                content: r#"{"text":"notes"}"#.into(),
+            },
+        ]
+    };
+    let messages = [
+        exchange(r#"{"text":"old instructions"}"#),
+        exchange(r#"{"text":"revised instructions"}"#),
+        exchange(r#"{"error":"activation denied"}"#),
+    ]
+    .concat();
+    assert_eq!(loaded_skill_exchanges(&messages), vec![3..6]);
 }
 
 fn paired(messages: &[Message]) -> bool {
