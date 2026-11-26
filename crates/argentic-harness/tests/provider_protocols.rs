@@ -641,8 +641,8 @@ async fn messages_forces_submission_and_falls_back() {
     assert!(first.get("tool_choice").is_none());
     assert_choice_fallback(
         &mock,
-        json!({"type":"tool","name":"agsdl_submit_result"}),
-        json!({"type":"any"}),
+        json!({"type":"tool","name":"agsdl_submit_result","disable_parallel_tool_use":true}),
+        json!({"type":"any","disable_parallel_tool_use":true}),
     );
 }
 

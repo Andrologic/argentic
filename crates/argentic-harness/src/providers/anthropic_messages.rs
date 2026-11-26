@@ -176,9 +176,12 @@ impl Provider for AnthropicMessages {
         if body["thinking"]["type"] != "enabled" {
             match request.tool_choice {
                 ToolChoice::Auto => {}
-                ToolChoice::Required => body["tool_choice"] = json!({"type":"any"}),
+                ToolChoice::Required => {
+                    body["tool_choice"] = json!({"type":"any","disable_parallel_tool_use":true});
+                }
                 ToolChoice::Named(name) => {
-                    body["tool_choice"] = json!({"type":"tool","name":name});
+                    body["tool_choice"] =
+                        json!({"type":"tool","name":name,"disable_parallel_tool_use":true});
                 }
             }
         }

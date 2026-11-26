@@ -388,7 +388,7 @@ fn downgrade_tool_choice(body: &mut Value, full_tools: &mut Option<Value>) -> Op
             fields.insert(
                 "tool_choice".into(),
                 if messages_api {
-                    serde_json::json!({"type": "any"})
+                    serde_json::json!({"type": "any", "disable_parallel_tool_use": true})
                 } else {
                     serde_json::json!("required")
                 },
