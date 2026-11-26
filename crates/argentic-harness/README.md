@@ -153,7 +153,7 @@ call order. A submission is a barrier and an accepted submission ends work.
 
 All tools use admitted directory handles. They refuse parent components,
 absolute paths and symbolic links. File reads also refuse multiply linked
-files. In no-human mode, an unmatched policy falls back to the configured
+files. Private project metadata is excluded from reads and searches. In no-human mode, an unmatched policy falls back to the configured
 preset and zone, and an `ask` whose reviewer is unavailable is denied.
 
 A preview contains up to 2,000 lines and 50 KiB of UTF-8 text. Use its
@@ -169,9 +169,9 @@ Read and scan budgets bound the work behind a preview.
 | --- | --- |
 | `prepare(PreparedEffectiveAgentWork030)` | Validate captured provider configuration and authored properties. Compile a read policy for each independent permission ceiling and attest it through the native capture and lease checks. |
 | `run(AgentWork030, WorkEventSink030, CancellationToken)` | Decode the admitted capture and start message into `Work`. Pass the attempt token as parent and keep the harness future in the runtime's ownership registry until join. |
-| Visible text | Project each `Event::VisibleText` to a `visibleText` frame with a unique message ID per part. Reasoning and tool replies belong in separate diagnostic channels. |
+| Visible text | Emit one `visibleText` frame per complete assistant message through `WorkPort::assistant_message`. Stream fragments remain available to harness consumers through `Event::VisibleText`. |
 | Submit and logical turn end | Project `Proposal::Submit` and `Proposal::EndTurn` into the native work protocol. The controller validates the raw arguments and returns acceptance or a correction in the current conversation. |
-| Steer | Pull from the admitted inbox at a safe point. Gate conversation insertion with `wire_admission` and turn consumption into a runtime receipt. The host queues a message that does not reach the active work. |
+| Steer | Pull from the admitted inbox at a safe point and gate the next request with `wire_admission`. For HTTP, acknowledge on 2xx response headers. An explicit refusal or a connection failure before sending leaves the steer eligible for queue fallback. Missing evidence after a possible send leaves delivery uncertain. |
 | Approvals | The slice denies reads that would require approval. Runtime review ports are future work. |
 | Physical termination | After `RunReport::physical_end`, return from the owned executor future. The native registry and its join generate durable `physicalEnded` evidence. |
 

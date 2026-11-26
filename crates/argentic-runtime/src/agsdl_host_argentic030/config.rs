@@ -135,7 +135,11 @@ impl ArgenticConfig030 {
     }
 
     pub(super) fn fingerprint(&self) -> Result<String> {
-        let bytes = serde_json::to_vec(&(&self.providers, &self.settings, &self.default_model))?;
+        let legacy = (&self.providers, &self.settings);
+        let bytes = match &self.default_model {
+            Some(name) => serde_json::to_vec(&(legacy.0, legacy.1, name))?,
+            None => serde_json::to_vec(&legacy)?,
+        };
         Ok(format!("sha256:{:x}", Sha256::digest(bytes)))
     }
 
