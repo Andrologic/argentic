@@ -1478,6 +1478,47 @@ async fn agent_mcp_uses_per_tool_rules_and_joins_after_stop() {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[tokio::test]
+async fn stop_committed_during_mcp_discovery_prevents_stdio_spawn() {
+    let server = Server::start().await;
+    let mut doc = document();
+    doc["mcpServers"] = json!({"local":{"command":["/bin/sh","-c","exit 0"]}});
+    doc["agents"]["worker"]["mcpServers"] = json!(["local"]);
+    doc["agents"]["worker"]["permissions"] = json!({"preset":"read-only","rules":[
+        {"action":"mcp","match":"local/check","effect":"allow"}
+    ]});
+    let f = Fixture::new(&doc.to_string());
+    let host = open(&f, false)
+        .await
+        .with_argentic(server.config(None))
+        .unwrap();
+    let flow = host.engine.flow030();
+    let prepared = flow.install_operator_test_hook("mcp.discovery.prepared");
+    let spawn = flow.install_operator_test_hook("mcp.discovery.spawn");
+    let run = start(&host).await;
+    tokio::time::timeout(WAIT_FOR, prepared.reached())
+        .await
+        .unwrap();
+    tokio::time::timeout(
+        WAIT_FOR,
+        host.stop(EngineStopRequest {
+            request_id: "stop-before-stdio-spawn".into(),
+            system_start_id: run.receipt.identity.system_start_id.clone(),
+            activation_id: None,
+        }),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    prepared.release();
+    tokio::select! {
+        _ = spawn.reached() => panic!("MCP discovery reached spawn after Stop committed"),
+        state = finish(&host, &run) => assert_eq!(state["verdict"], "cancelled"),
+    }
+    close(&host).await;
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[tokio::test]
 async fn confined_stdio_mcp_lists_and_calls_a_tool_then_joins_on_stop() {
     let mut server = Server::start().await;
     let mut doc = document();

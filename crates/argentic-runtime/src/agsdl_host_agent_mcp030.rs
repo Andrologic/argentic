@@ -120,6 +120,11 @@ impl Equipment {
                     let grant = agent_mcp_grant(context, &work.capture, scope, name, read_only)?;
                     let server =
                         mcp_server(context, grant, &work.capture, name).map_err(transport_error)?;
+                    #[cfg(test)]
+                    state.admission.test_yield("mcp.discovery.prepared").await;
+                    let _admission = state.admit(&control).await?;
+                    #[cfg(test)]
+                    state.admission.test_yield("mcp.discovery.spawn").await;
                     raw_mcp::start(server).map_err(transport_error)?
                 };
                 let upstream = Upstream::new(session, &work.attempt);
