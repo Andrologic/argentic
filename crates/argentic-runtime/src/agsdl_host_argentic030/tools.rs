@@ -2,8 +2,10 @@ use argentic_harness::{
     providers::{ToolCall, ToolDefinition},
     tools::{Extensions, Page, SKILL},
 };
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, sync::Arc};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -27,6 +29,51 @@ struct McpTool {
     server: String,
     name: String,
     definition: ToolDefinition,
+}
+
+fn mcp_alias(server: &str, tool: &str) -> String {
+    // Preserve readable aliases when neither component can contain a separator.
+    if server.len() + tool.len() <= 57
+        && server
+            .bytes()
+            .chain(tool.bytes())
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        return format!("mcp__{server}__{tool}");
+    }
+    let mut digest = Sha256::new();
+    digest.update((server.len() as u64).to_be_bytes());
+    digest.update(server.as_bytes());
+    digest.update(tool.as_bytes());
+    format!("mcp_pair_{}", URL_SAFE_NO_PAD.encode(digest.finalize()))
+}
+
+#[cfg(test)]
+#[test]
+fn mcp_aliases_distinguish_pairs_across_rediscovery() {
+    let long = "outils".repeat(40);
+    let pairs = [
+        ("a__b", "c"),
+        ("a", "b__c"),
+        ("a_", "b"),
+        ("a", "_b"),
+        ("a", long.as_str()),
+        ("a", "révision"),
+    ];
+    let first: BTreeMap<_, _> = pairs
+        .iter()
+        .map(|&(server, tool)| (mcp_alias(server, tool), (server, tool)))
+        .collect();
+    assert_eq!(first.len(), pairs.len());
+    for (server, tool) in pairs.into_iter().rev() {
+        let alias = mcp_alias(server, tool);
+        assert_eq!(first[&alias], (server, tool));
+        assert!((1..=64).contains(&alias.len()));
+        assert!(alias
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_-".contains(&byte)));
+    }
+    assert_eq!(mcp_alias("first", "check"), "mcp__first__check");
 }
 
 #[derive(Deserialize)]
@@ -53,17 +100,14 @@ impl Tools {
                     "The combined MCP tool catalogue exceeds the provider input bound",
                 ));
             }
-            let candidate = format!("mcp__{server}__{name}");
-            let alias = if candidate.len() <= 64
-                && candidate
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || b"_-".contains(&byte))
-                && !mcp.contains_key(&candidate)
-            {
-                candidate
-            } else {
-                format!("mcp_tool_{index}")
-            };
+            let alias = mcp_alias(server, name);
+            if mcp.contains_key(&alias) {
+                return Err(failure(
+                    "MCP_TOOL_LIST",
+                    "/mcpServers",
+                    "MCP tools have a conflicting provider alias",
+                ));
+            }
             let description = tool["description"].as_str().unwrap_or_default();
             mcp.insert(
                 alias.clone(),
