@@ -578,14 +578,17 @@ impl Instance<'_> {
             }
         }
         self.active()?;
-        // Force the result tool by name. The HTTP layer applies the fallback
+        // An admitted steer may request other tools. Otherwise, force the
+        // result tool by name when armed. The HTTP layer applies the fallback
         // reached in this attempt and keeps the full tool list to restore.
-        let tool_choice =
-            if self.force_submission && self.tool_choice_rejected.load(Ordering::Relaxed) < 2 {
-                ToolChoice::Named(SUBMIT_RESULT)
-            } else {
-                ToolChoice::Auto
-            };
+        let tool_choice = if index == 0
+            && self.force_submission
+            && self.tool_choice_rejected.load(Ordering::Relaxed) < 2
+        {
+            ToolChoice::Named(SUBMIT_RESULT)
+        } else {
+            ToolChoice::Auto
+        };
         let delivery = self.delivery.clone();
         let provider = self.harness.provider.clone();
         let request = provider.stream(
