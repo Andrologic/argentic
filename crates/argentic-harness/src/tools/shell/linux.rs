@@ -28,8 +28,7 @@ pub(super) fn preflight() -> Result<(), String> {
     let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
     run(
         ":",
-        dir.path(),
-        false,
+        &[(dir.path(), false)],
         false,
         5_000,
         &CancellationToken::new(),
@@ -178,32 +177,29 @@ impl Capture {
 
 pub(super) fn run(
     command: &str,
-    workspace: &Path,
-    write: bool,
+    mounts: &[(&Path, bool)],
     network: bool,
     timeout_ms: u64,
     cancel: &CancellationToken,
 ) -> Result<String, String> {
     let program = binary()?;
-    run_inner(
-        program, command, workspace, write, network, timeout_ms, cancel,
-    )
-    .map_err(|e| e.to_string())
+    run_inner(program, command, mounts, network, timeout_ms, cancel).map_err(|e| e.to_string())
 }
 
 fn run_inner(
     program: &Path,
     command: &str,
-    workspace: &Path,
-    write: bool,
+    mounts: &[(&Path, bool)],
     network: bool,
     timeout_ms: u64,
     cancel: &CancellationToken,
 ) -> io::Result<String> {
     super::super::check_cancel(cancel)?;
-    let mut budget = write
-        .then(|| super::workspace::Budget::open(workspace))
-        .transpose()?;
+    let mut budgets = mounts
+        .iter()
+        .filter(|(_, write)| *write)
+        .map(|(path, _)| super::workspace::Budget::open(path))
+        .collect::<io::Result<Vec<_>>>()?;
     let mut filter = tempfile::tempfile()?;
     seccomp::write_filter(&mut filter, network)?;
     let (mut info, info_writer) = io::pipe()?;
@@ -251,26 +247,33 @@ fn run_inner(
             }
         }
     }
-    child
-        .arg(if write { "--bind" } else { "--ro-bind" })
-        .arg(workspace)
-        .arg("/workspace")
-        .args([
-            "--remount-ro",
-            "/",
-            "--chdir",
-            "/workspace",
-            "--clearenv",
-            "--setenv",
-            "PATH",
-            "/usr/bin:/bin",
-            "--setenv",
-            "HOME",
-            "/tmp",
-            "--setenv",
-            "LANG",
-            "C.UTF-8",
-        ]);
+    for (index, (path, write)) in mounts.iter().enumerate() {
+        let destination = if index == 0 {
+            "/workspace".into()
+        } else {
+            format!("/directories/{index}")
+        };
+        child
+            .arg(if *write { "--bind" } else { "--ro-bind" })
+            .arg(path)
+            .arg(destination);
+    }
+    child.args([
+        "--remount-ro",
+        "/",
+        "--chdir",
+        "/workspace",
+        "--clearenv",
+        "--setenv",
+        "PATH",
+        "/usr/bin:/bin",
+        "--setenv",
+        "HOME",
+        "/tmp",
+        "--setenv",
+        "LANG",
+        "C.UTF-8",
+    ]);
     for (name, fd) in ["--seccomp", "--info-fd", "--block-fd"]
         .into_iter()
         .zip(fds)
@@ -371,7 +374,7 @@ fn run_inner(
     if start.elapsed() >= deadline {
         return Err(io::Error::other("Shell command timed out"));
     }
-    if let Some(budget) = &mut budget {
+    for budget in &mut budgets {
         budget.check(cancel, start + deadline)?;
     }
     gate.write_all(b"1")?;
@@ -393,17 +396,16 @@ fn run_inner(
         if start.elapsed() >= deadline {
             return Err(io::Error::other("Shell command timed out"));
         }
-        if let Some(budget) = &mut budget {
-            if Instant::now() >= next_budget_check {
-                // An error returns through Sandbox::drop, which kills PID 1
-                // via its pidfd and waits before the staging copy is removed.
+        if !budgets.is_empty() && Instant::now() >= next_budget_check {
+            // Returning here drops Sandbox, which kills PID 1 and waits.
+            for budget in &mut budgets {
                 budget.check(cancel, start + deadline)?;
-                next_budget_check = Instant::now() + STAGING_CHECK_INTERVAL;
             }
+            next_budget_check = Instant::now() + STAGING_CHECK_INTERVAL;
         }
         thread::sleep(Duration::from_millis(5));
     };
-    if let Some(budget) = &mut budget {
+    for budget in &mut budgets {
         budget.check(cancel, start + deadline)?;
     }
     out.pump(&mut stdout)?;

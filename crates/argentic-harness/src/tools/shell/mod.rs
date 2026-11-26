@@ -144,26 +144,24 @@ impl Registry {
             &cancel,
         )
         .await?;
-        let read = self
-            .policy
-            .iter()
-            .all(|policy| policy.blanket_allows(Action::Read, Zone::Workspace));
-        let write = read
-            && self.writes
-            && self
-                .policy
-                .iter()
-                .all(|policy| policy.blanket_allows(Action::Write, Zone::Workspace));
+        // Take every root's gate in path order so overlapping calls cannot
+        // deadlock. Identical roots share a gate.
+        let mut roots: Vec<_> = self.roots.iter().zip(&self.root_gates).collect();
+        roots.sort_unstable_by(|(left, _), (right, _)| left.path.cmp(&right.path));
+        roots.dedup_by(|(left, _), (right, _)| left.path == right.path);
+        let mut guards = Vec::with_capacity(roots.len());
+        for (_, gate) in roots {
+            guards.push(tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err("Shell command cancelled".into()),
+                guard = gate.clone().write_owned() => guard,
+            });
+        }
         let registry = self.clone();
-        let guard = tokio::select! {
-            biased;
-            _ = cancel.cancelled() => return Err("Shell command cancelled".into()),
-            guard = self.workspace_gate.clone().write_owned() => guard,
-        };
         tracker
             .spawn_blocking(move || {
-                let _guard = guard;
-                let text = run(&registry, &args, write, network, &cancel)?;
+                let _guards = guards;
+                let text = run(&registry, &args, network, &cancel)?;
                 // Shell output starts with its status and is retained once. Replaying
                 // a shell call to retrieve a cursor would repeat its effects.
                 let mut page =
@@ -179,7 +177,6 @@ impl Registry {
 fn run(
     registry: &Registry,
     args: &Arguments,
-    write: bool,
     network: bool,
     cancel: &CancellationToken,
 ) -> Result<String, String> {
@@ -188,31 +185,42 @@ fn run(
         any(target_arch = "aarch64", target_arch = "x86_64")
     ))]
     {
-        let root = &registry.roots[0];
-        let workspace = workspace::Snapshot::new(
-            root,
-            registry.shell_staging_directory.as_deref(),
-            cancel,
-            |path| registry.path_effect(root, Action::Read, &root.path.join(path)) == Effect::Allow,
-        )
-        .map_err(|e| e.to_string())?;
-        let outcome = linux::run(
-            &args.command,
-            workspace.path(),
-            write,
-            network,
-            args.timeout_ms,
-            cancel,
-        )?;
-        if write {
-            workspace
-                .publish(root, cancel, |path| {
-                    let absolute = root.path.join(path);
-                    [Action::Read, Action::Write].into_iter().all(|action| {
-                        registry.path_effect(root, action, &absolute) == Effect::Allow
+        let mut snapshots = Vec::with_capacity(registry.roots.len());
+        for root in &registry.roots {
+            let write = registry.writes
+                && registry.policy.iter().all(|policy| {
+                    let zone = registry.base_zone(&root.path);
+                    [Action::Read, Action::Write]
+                        .into_iter()
+                        .all(|action| policy.blanket_allows_mount(action, &root.path, zone))
+                });
+            let snapshot = workspace::Snapshot::new(
+                root,
+                registry.shell_staging_directory.as_deref(),
+                cancel,
+                |path| {
+                    registry.path_effect(root, Action::Read, &root.path.join(path)) == Effect::Allow
+                },
+            )
+            .map_err(|error| error.to_string())?;
+            snapshots.push((snapshot, write));
+        }
+        let mounts = snapshots
+            .iter()
+            .map(|(snapshot, write)| (snapshot.path(), *write))
+            .collect::<Vec<_>>();
+        let outcome = linux::run(&args.command, &mounts, network, args.timeout_ms, cancel)?;
+        for (root, (snapshot, write)) in registry.roots.iter().zip(snapshots) {
+            if write {
+                snapshot
+                    .publish(root, cancel, |path| {
+                        let absolute = root.path.join(path);
+                        [Action::Read, Action::Write].into_iter().all(|action| {
+                            registry.path_effect(root, action, &absolute) == Effect::Allow
+                        })
                     })
-                })
-                .map_err(|e| format!("Shell workspace publication: {e}"))?;
+                    .map_err(|e| format!("Shell workspace publication: {e}"))?;
+            }
         }
         Ok(outcome)
     }
@@ -221,7 +229,7 @@ fn run(
         any(target_arch = "aarch64", target_arch = "x86_64")
     )))]
     {
-        let _ = (registry, args, write, network, cancel);
+        let _ = (registry, args, network, cancel);
         preflight()?;
         unreachable!()
     }

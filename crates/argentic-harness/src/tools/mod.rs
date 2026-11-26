@@ -30,6 +30,7 @@ use crate::{
     providers::{ToolCall, ToolDefinition},
 };
 
+pub const SKILL: &str = "skill";
 pub const SUBMIT_RESULT: &str = "agsdl_submit_result";
 const MAX_FILE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_SCAN_BYTES: usize = 64 * 1024 * 1024;
@@ -66,10 +67,11 @@ pub struct Registry {
     submission: jsonschema::Validator,
     definitions: Vec<ToolDefinition>,
     authorizer: Option<Arc<dyn Authorizer>>,
+    extensions: Option<Arc<dyn Extensions>>,
     writes: bool,
     shell: bool,
     shell_staging_directory: Option<PathBuf>,
-    workspace_gate: Arc<tokio::sync::RwLock<()>>,
+    root_gates: Vec<Arc<tokio::sync::RwLock<()>>>,
 }
 
 /// An approval belongs to this tool call and this action only.
@@ -88,6 +90,12 @@ pub trait Authorizer: Send + Sync {
         action: Approval<'_>,
         cancel: &CancellationToken,
     ) -> Result<bool, String>;
+}
+
+/// Per-work tools supplied by the embedding host.
+#[async_trait::async_trait]
+pub trait Extensions: Send + Sync {
+    async fn execute(&self, call: &ToolCall, cancel: &CancellationToken) -> Result<Page, String>;
 }
 
 impl Registry {
@@ -121,7 +129,10 @@ impl Registry {
         if roots.is_empty() || policy.is_empty() {
             return Err("At least one workspace root and read ceiling are required".into());
         }
-        let workspace_gate = workspace_gate(&roots[0].0)?;
+        let root_gates = roots
+            .iter()
+            .map(|(path, _)| workspace_gate(path))
+            .collect::<Result<_, _>>()?;
         let roots = roots
             .into_iter()
             .map(|(path, directory)| Root { path, directory })
@@ -178,16 +189,36 @@ impl Registry {
             submission,
             definitions,
             authorizer: None,
+            extensions: None,
             writes: false,
             shell: false,
             shell_staging_directory: None,
-            workspace_gate,
+            root_gates,
         })
+    }
+
+    pub fn with_extensions(
+        mut self,
+        definitions: Vec<ToolDefinition>,
+        tools: Arc<dyn Extensions>,
+    ) -> Result<Self, String> {
+        for definition in definitions {
+            if self
+                .definitions
+                .iter()
+                .any(|tool| tool.name == definition.name)
+            {
+                return Err("Duplicate tool name".into());
+            }
+            self.definitions.push(definition);
+        }
+        self.extensions = Some(tools);
+        Ok(self)
     }
 
     pub fn with_writes(mut self) -> Self {
         self.writes = true;
-        for (name, description, required, properties) in [
+        for (name, description, required, mut properties) in [
             ("write", "Create or atomically replace a workspace file. Its parent directory must exist.",
                 json!(["path","content"]), json!({"path":{"type":"string"},"content":{"type":"string"}})),
             ("edit", "Replace one exact match in a workspace file, or all matches when requested.",
@@ -195,6 +226,7 @@ impl Registry {
             ("apply_patch", "Apply a patch with Begin Patch and End Patch markers and Add File, Update File, Move to, or Delete File sections.",
                 json!(["patch_text"]), json!({"patch_text":{"type":"string"}})),
         ] {
+            properties["root"] = json!({"type":"integer","minimum":0});
             self.definitions.push(ToolDefinition {
                 name: name.into(), description: description.into(),
                 parameters: json!({"type":"object","required":required,"properties":properties,"additionalProperties":false}),
@@ -233,11 +265,20 @@ impl Registry {
         if private_project_path(&root.path, path) {
             return Effect::Deny;
         }
+        let zone = self.base_zone(path);
         self.policy
             .iter()
-            .map(|policy| policy.path_effect(action, path, Zone::Workspace))
+            .map(|policy| policy.path_effect(action, path, zone))
             .max()
             .unwrap_or(Effect::Deny)
+    }
+
+    fn base_zone(&self, path: &Path) -> Zone {
+        if path.starts_with(&self.roots[0].path) {
+            Zone::Workspace
+        } else {
+            Zone::Outside
+        }
     }
 
     async fn authorize(
@@ -303,6 +344,13 @@ impl Registry {
         if matches!(call.name.as_str(), "write" | "edit" | "apply_patch") {
             return self.mutate(call, cancel, tracker).await;
         }
+        if !matches!(call.name.as_str(), "read" | "list" | "glob" | "grep") {
+            check_cancel(&cancel).map_err(|error| error.to_string())?;
+            if let Some(tools) = &self.extensions {
+                return tools.execute(&call, &cancel).await;
+            }
+            return Err("Unknown tool".into());
+        }
         let args: Arguments = serde_json::from_str(&call.arguments).map_err(|e| e.to_string())?;
         let root = self.roots.get(args.root).ok_or("Unknown workspace root")?;
         let path = model_path(args.path.as_deref().unwrap_or(".")).map_err(|e| e.to_string())?;
@@ -334,12 +382,13 @@ impl Registry {
         if !self.writes {
             return Err("Mutation tools are disabled".into());
         }
-        let mutation = mutation::Mutation::parse(&call.name, &call.arguments)?;
+        let (index, mutation) = mutation::Mutation::parse(&call.name, &call.arguments)?;
+        let root = self.roots.get(index).ok_or("Unknown workspace root")?;
         let mut requests = Vec::new();
         let mut locks = std::collections::BTreeSet::new();
         for (path, action) in mutation.requests()? {
-            let absolute = self.roots[0].path.join(path);
-            let effect = self.path_effect(&self.roots[0], action, &absolute);
+            let absolute = root.path.join(path);
+            let effect = self.path_effect(root, action, &absolute);
             if effect == Effect::Deny {
                 return Err(format!("{action:?} permission denied"));
             }
@@ -359,14 +408,14 @@ impl Registry {
         let workspace = tokio::select! {
             biased;
             _ = cancel.cancelled() => return Err("Mutation cancelled".into()),
-            guard = self.workspace_gate.clone().read_owned() => guard,
+            guard = self.root_gates[index].clone().read_owned() => guard,
         };
         let guards = mutation::lock_paths(locks, &cancel).await?;
         let registry = self.clone();
         tracker
             .spawn_blocking(move || {
                 let (_guards, _workspace) = (guards, workspace);
-                let text = mutation.run(&registry.roots[0], &cancel)?;
+                let text = mutation.run(&registry.roots[index], &cancel)?;
                 output::paginate(&text, &call.id, None, None).map_err(|error| error.to_string())
             })
             .await

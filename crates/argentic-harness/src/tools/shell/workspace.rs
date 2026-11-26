@@ -33,17 +33,17 @@ impl Snapshot {
         cancel: &CancellationToken,
         readable: impl FnMut(&Path) -> bool,
     ) -> io::Result<Self> {
-        let staging = if let Some(parent) = staging_parent {
-            let parent = parent.canonicalize()?;
-            if parent.starts_with(&root.path) {
-                return Err(io::Error::other(
-                    "Shell staging directory must be outside the workspace",
-                ));
-            }
-            tempfile::tempdir_in(parent)?
-        } else {
-            tempfile::tempdir()?
-        };
+        let staging_parent = match staging_parent {
+            Some(parent) => parent.to_owned(),
+            None => std::env::temp_dir(),
+        }
+        .canonicalize()?;
+        if staging_parent.starts_with(&root.path) {
+            return Err(io::Error::other(
+                "Shell staging directory must be outside every admitted root",
+            ));
+        }
+        let staging = tempfile::tempdir_in(staging_parent)?;
         let mut original = BTreeMap::new();
         walk(root, cancel, readable, false, |path, entry| {
             match entry {

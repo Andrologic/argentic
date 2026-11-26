@@ -15,6 +15,15 @@ pub struct Page {
     pub overflow: Option<NamedTempFile>,
 }
 
+impl Page {
+    /// Bound a tool response without a cursor that would repeat the action.
+    pub fn one_shot(text: &str, scope: &str) -> io::Result<Self> {
+        let mut page = paginate(text, scope, None, None)?;
+        page.next_cursor = None;
+        Ok(page)
+    }
+}
+
 fn fingerprint(scope: &str) -> u64 {
     scope.bytes().fold(0xcbf29ce484222325, |hash, byte| {
         (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)

@@ -1,4 +1,4 @@
-use std::{cmp::Reverse, ops::Range, time::Duration};
+use std::{cmp::Reverse, collections::HashSet, ops::Range, time::Duration};
 
 use futures::StreamExt;
 
@@ -72,7 +72,7 @@ impl Instance<'_> {
         let steer_bytes: usize = self
             .pending_steer
             .iter()
-            .map(|s| s.message.len() + 32)
+            .map(|s| s.message.len() + s.reference.as_ref().map_or(0, String::len) + 32)
             .sum();
         let fixed_bytes = tool_bytes.saturating_add(steer_bytes);
         let estimate = |messages: &[Message]| {
@@ -332,9 +332,18 @@ fn older_ranges(
     }
     let end = end.min(correction.unwrap_or(messages.len()));
     let mut ranges = Vec::new();
+    let skills = loaded_skill_exchanges(messages);
     let mut start = prefix;
     for (index, message) in messages.iter().enumerate().take(end).skip(prefix) {
-        if Some(index) == mission || matches!(message, Message::System(_)) {
+        if index < start {
+            continue;
+        }
+        if let Some(exchange) = skills.iter().find(|range| range.start == index) {
+            if start < index {
+                ranges.push(start..index);
+            }
+            start = exchange.end;
+        } else if Some(index) == mission || matches!(message, Message::System(_)) {
             if start < index {
                 ranges.push(start..index);
             }
@@ -345,6 +354,43 @@ fn older_ranges(
         ranges.push(start..end);
     }
     ranges
+}
+
+// Keep the first successful activation with its assistant message and all
+// sibling tool replies so every provider retains a valid tool exchange.
+fn loaded_skill_exchanges(messages: &[Message]) -> Vec<Range<usize>> {
+    let mut loaded = HashSet::new();
+    let mut exchanges = Vec::new();
+    for (index, message) in messages.iter().enumerate() {
+        let Message::Assistant { calls, .. } = message else {
+            continue;
+        };
+        let mut protect = false;
+        for (offset, call) in calls.iter().enumerate() {
+            if call.name != crate::tools::SKILL {
+                continue;
+            }
+            let Ok(arguments) = serde_json::from_str::<serde_json::Value>(&call.arguments) else {
+                continue;
+            };
+            let Some(name) = arguments["name"]
+                .as_str()
+                .filter(|_| arguments["path"].is_null())
+            else {
+                continue;
+            };
+            if matches!(messages.get(index + 1 + offset), Some(Message::Tool { call_id, content })
+                if call_id == &call.id && serde_json::from_str::<serde_json::Value>(content)
+                    .is_ok_and(|page| page["text"].is_string()))
+            {
+                protect |= loaded.insert(name.to_owned());
+            }
+        }
+        if protect {
+            exchanges.push(index..index + 1 + calls.len());
+        }
+    }
+    exchanges
 }
 
 fn paired(messages: &[Message]) -> bool {
