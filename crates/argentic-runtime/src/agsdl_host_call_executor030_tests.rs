@@ -1438,3 +1438,56 @@ async fn direct_remote_mcp_does_not_dispatch_after_durable_stop_during_initializ
     assert_eq!(finish(&f).await.state.verdict.as_deref(), Some("cancelled"));
     server.abort();
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn shutdown_attests_expired_remote_call_deadlines_for_replay() {
+    use std::time::Duration;
+    for timeout in [Some(25), None] {
+        let (f, tasks, _, clock, server) = start_initializing_call(timeout).await;
+        let (dispatch, _) = f
+            .host
+            .flow030()
+            .supervisors
+            .dispatcher(&f.owner.system_start_id)
+            .unwrap();
+        let guard = dispatch.lock().await;
+        clock.advance_to(timeout.unwrap_or(50) + 1).unwrap();
+        let approved = f.host.shutdown_active_runs(&f.pool).await.unwrap();
+        let shutdown = f.host.prepare_shutdown(&f.pool, &tasks, &approved);
+        let stopping = async {
+            while !sqlx::query_scalar::<_, bool>(
+                "SELECT json_extract(state_json,'$.stopping') FROM engine_flow030_runs",
+            )
+            .fetch_one(&f.pool)
+            .await
+            .unwrap()
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            drop(guard);
+        };
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(15), async {
+            tokio::join!(shutdown, stopping)
+        })
+        .await
+        .unwrap();
+        result.unwrap();
+        let joined: i64 = sqlx::query_scalar(
+            "SELECT joined FROM engine_flow030_clock_controls WHERE reason='TIMEOUT'",
+        )
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+        assert_eq!(joined, 1);
+        f.pool.close().await;
+        let replay = crate::persistence::replay_verify030::verify_path030(
+            &f._temp.path().join("run.db"),
+            &f.identity.system_start_id,
+            &f.identity.flow_invocation_id,
+        )
+        .await;
+        assert!(replay.ok, "{replay:?}");
+        server.abort();
+    }
+}

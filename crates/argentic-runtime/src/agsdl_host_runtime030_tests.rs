@@ -1048,7 +1048,7 @@ async fn shutdown_failed_stop_does_not_commit_an_interruption_marker() {
     let f = Fixture::new(false).await;
     assert!(!f.host.shutdown_started());
     let approved = f.host.shutdown_active_runs(&f.pool).await.unwrap();
-    query("CREATE TRIGGER reject_shutdown_stop BEFORE INSERT ON engine_flow030_events WHEN NEW.event_id LIKE 'retire:%' BEGIN SELECT RAISE(ABORT, 'synthetic Stop persistence failure'); END")
+    query("CREATE TRIGGER reject_shutdown_stop BEFORE INSERT ON engine_flow030_events WHEN NEW.event_id LIKE 'system-stop:retire:%' BEGIN SELECT RAISE(ABORT, 'synthetic Stop persistence failure'); END")
         .execute(&f.pool).await.unwrap();
     assert!(f
         .host

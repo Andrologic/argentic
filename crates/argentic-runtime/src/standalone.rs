@@ -1504,7 +1504,7 @@ mod tests {
         })
         .await
         .unwrap();
-        sqlx::query("CREATE TRIGGER reject_standalone_stop BEFORE INSERT ON engine_flow030_events WHEN NEW.event_id LIKE 'retire:%' BEGIN SELECT RAISE(ABORT, 'synthetic storage failure'); END")
+        sqlx::query("CREATE TRIGGER reject_standalone_stop BEFORE INSERT ON engine_flow030_events WHEN NEW.event_id LIKE 'system-stop:retire:%' BEGIN SELECT RAISE(ABORT, 'synthetic storage failure'); END")
             .execute(&host.pool).await.unwrap();
         let active = host.active_runs().await.unwrap();
         assert!(host.shutdown(&active).await.is_err());

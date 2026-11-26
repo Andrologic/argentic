@@ -97,13 +97,8 @@ impl RuntimeClock030 for HumanClockRuntime030 {
                     .broker(&host, &self.pool, &self.identity)
                     .await?;
                 let _operation = broker.operation.lock().await;
-                broker.pump(&host, &CancellationToken::new()).await?;
-                // Timers are wake hints. Journal only actual deadlines, rather
-                // than appending unbounded periodic ticks during a person's wait.
-                if broker.next_wake_ms().await? == Some(0) {
-                    broker.tick(&host).await?;
-                    broker.pump(&host, &CancellationToken::new()).await?;
-                }
+                // Timers are wake hints. Journal only actual deadlines.
+                broker.observe_deadlines(&host).await?;
                 for request in broker.pending_resolutions().await? {
                     // Protocol questions are consumed by their native transport.
                     if broker.request_kind(&request).await? != "approval" {

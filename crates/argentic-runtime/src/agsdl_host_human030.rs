@@ -911,6 +911,17 @@ impl HumanBroker030 {
         .fetch_one(db)
         .await?)
     }
+    /// The caller holds the broker operation lock through any dependent Stop.
+    pub(crate) async fn observe_deadlines(&self, host: &HostState) -> Result<()> {
+        let cancel = CancellationToken::new();
+        self.pump(host, &cancel).await?;
+        if self.next_wake_ms().await? == Some(0) {
+            self.tick(host).await?;
+            self.pump(host, &cancel).await?;
+        }
+        Ok(())
+    }
+
     pub(crate) async fn tick(&self, host: &HostState) -> Result<()> {
         self.event(host, json!({"kind":"tick"})).await
     }

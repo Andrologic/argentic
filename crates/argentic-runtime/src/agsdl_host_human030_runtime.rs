@@ -35,20 +35,26 @@ impl HumanRuntime030 {
         Ok(clock)
     }
     pub(crate) async fn next_wake_ms(&self, identity: &FlowIdentity030) -> Result<Option<u64>> {
-        let broker = self
-            .brokers
+        match self.existing_broker(identity).await {
+            Some(broker) => broker.next_wake_ms().await,
+            None => Ok(None),
+        }
+    }
+
+    pub(crate) async fn existing_broker(
+        &self,
+        identity: &FlowIdentity030,
+    ) -> Option<Arc<HumanBroker030>> {
+        self.brokers
             .lock()
             .await
             .get(&(
                 identity.system_start_id.clone(),
                 identity.flow_invocation_id.clone(),
             ))
-            .cloned();
-        match broker {
-            Some(broker) => broker.next_wake_ms().await,
-            None => Ok(None),
-        }
+            .cloned()
     }
+
     pub(crate) async fn broker(
         &self,
         host: &HostState,

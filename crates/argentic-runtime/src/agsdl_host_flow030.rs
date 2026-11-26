@@ -3174,6 +3174,28 @@ pub(crate) async fn request_system_stop030(
     pool: &SqlitePool,
     request: &EngineStopRequest,
 ) -> Result<NativeSystemStop030> {
+    commit_system_stop030(runtime, pool, request, false).await
+}
+
+pub(crate) async fn request_shutdown_stop030(
+    runtime: &FlowHost030,
+    pool: &SqlitePool,
+    identity: &FlowIdentity030,
+) -> Result<NativeSystemStop030> {
+    let request = EngineStopRequest {
+        system_start_id: identity.system_start_id.clone(),
+        activation_id: None,
+        request_id: format!("retire:{:x}", Sha256::digest(serde_json::to_vec(identity)?)),
+    };
+    commit_system_stop030(runtime, pool, &request, true).await
+}
+
+async fn commit_system_stop030(
+    runtime: &FlowHost030,
+    pool: &SqlitePool,
+    request: &EngineStopRequest,
+    interrupted: bool,
+) -> Result<NativeSystemStop030> {
     let control = system_stop_control(runtime, request)?;
     #[cfg(test)]
     runtime.operator_test_yield("stop.admission").await;
@@ -3216,6 +3238,14 @@ pub(crate) async fn request_system_stop030(
     };
     let marker = stop_marker(&receipt);
     if !receipt.stopping && receipt.verdict.is_none() {
+        if interrupted {
+            mark_interrupted_tx(
+                &mut tx,
+                Some(&control.generation),
+                Some(&control.identity.system_start_id),
+            )
+            .await?;
+        }
         let outcome = flow_store030::apply_tx(&mut tx, control.as_ref(), &marker)
             .await
             .map_err(store_error)?;
@@ -3950,28 +3980,6 @@ impl FlowControl030 {
     /// Cleanup is allowed after live=false; re-admission is not. The caller
     /// constructs physical evidence from the native supervisor, never model IPC.
     pub(crate) async fn apply(&self, pool: &SqlitePool, event: &FlowEvent030) -> Result<Apply030> {
-        self.apply_cleanup(pool, event, false).await
-    }
-
-    /// Record interruption only on the same successful Stop transaction. A
-    /// failed/diagnostic Stop and a natural completion must not publish it.
-    pub(crate) async fn apply_shutdown_stop(
-        &self,
-        pool: &SqlitePool,
-        event: &FlowEvent030,
-    ) -> Result<Apply030> {
-        if !matches!(event.kind, FlowEventKind030::Stop) {
-            return Err(refused());
-        }
-        self.apply_cleanup(pool, event, true).await
-    }
-
-    async fn apply_cleanup(
-        &self,
-        pool: &SqlitePool,
-        event: &FlowEvent030,
-        interrupted: bool,
-    ) -> Result<Apply030> {
         if event.identity != self.identity
             || !matches!(
                 &event.kind,
@@ -3986,20 +3994,9 @@ impl FlowControl030 {
             .execute(&mut *db)
             .await?;
         let mut tx = db.begin_with("BEGIN IMMEDIATE").await?;
-        if interrupted {
-            mark_interrupted_tx(
-                &mut tx,
-                Some(&self.generation),
-                Some(&self.identity.system_start_id),
-            )
-            .await?;
-        }
         let result = flow_store030::apply_tx(&mut tx, self, event)
             .await
             .map_err(store_error)?;
-        if interrupted && matches!(result, Apply030::Diagnostic(_)) {
-            return Err(refused());
-        }
         tx.commit().await.map_err(|_| uncertain())?;
         Ok(result)
     }

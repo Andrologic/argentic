@@ -528,7 +528,8 @@ impl HostState {
         // Revoking live leases first would prevent supervisors from persisting
         // their joined call receipts. Stop under existing controls, drain, then
         // revoke the incarnation. A cancelled waiter leaves those owners intact.
-        if let Err(error) = stop_retired_flows(self.flow030(), pool, tasks, &host.generation).await
+        if let Err(error) =
+            stop_retired_flows(self.flow030(), pool, tasks, &host.generation, Some(self)).await
         {
             if error.code != "STOP_PENDING" {
                 return Err(error);
@@ -541,7 +542,7 @@ impl HostState {
                 self.flow030().supervisors.wait(system).await?;
             }
         }
-        stop_retired_flows(self.flow030(), pool, tasks, &host.generation).await?;
+        stop_retired_flows(self.flow030(), pool, tasks, &host.generation, Some(self)).await?;
         self.revoke_native(pool, tasks).await
     }
 
@@ -573,7 +574,7 @@ impl HostState {
         fence_generation(pool, &owners, &host.generation).await?;
         drop(admission);
         drop(lifecycle);
-        stop_retired_flows(self.flow030(), pool, tasks, &host.generation).await
+        stop_retired_flows(self.flow030(), pool, tasks, &host.generation, None).await
     }
 
     pub(crate) fn flow030(&self) -> &crate::agsdl_host_flow030::FlowHost030 {
@@ -774,8 +775,8 @@ async fn stop_retired_flows(
     pool: &SqlitePool,
     tasks: &stream_tasks::StreamTasks,
     generation: &str,
+    live_host: Option<&HostState>,
 ) -> Result<()> {
-    use repository::flow030::{FlowEvent030, FlowEventKind030};
     let mut pending = false;
     for control in runtime.retiring_controls(generation)? {
         let identity = control.identity();
@@ -792,17 +793,26 @@ async fn stop_retired_flows(
         }
         let view = control.read(pool).await?;
         if !view.state.stopping && view.state.verdict.is_none() {
-            control
-                .apply_shutdown_stop(
-                    pool,
-                    &FlowEvent030 {
-                        identity: identity.clone(),
-                        event_id: format!("retire:{}", uuid::Uuid::new_v4()),
-                        expected_revision: view.state.revision,
-                        kind: FlowEventKind030::Stop,
-                    },
-                )
-                .await?;
+            let broker = match live_host {
+                Some(_) => runtime.humans.existing_broker(identity).await,
+                None => None,
+            };
+            let _operation = match &broker {
+                Some(broker) => Some(broker.operation.lock().await),
+                None => None,
+            };
+            if let (Some(host), Some(broker)) = (live_host, broker.as_ref()) {
+                let fresh = control.read(pool).await?;
+                if !fresh.state.stopping && fresh.state.verdict.is_none() {
+                    if let Err(error) = broker.observe_deadlines(host).await {
+                        let fresh = control.read(pool).await?;
+                        if !fresh.state.stopping && fresh.state.verdict.is_none() {
+                            return Err(error);
+                        }
+                    }
+                }
+            }
+            crate::agsdl_host_flow030::request_shutdown_stop030(runtime, pool, identity).await?;
         }
         pending |= crate::agsdl_host_stop030::reconcile(runtime, pool, tasks, &control).await?;
     }
