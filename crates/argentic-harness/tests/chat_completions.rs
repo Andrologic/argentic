@@ -6,6 +6,7 @@ use std::{
 
 use argentic_harness::providers::{
     ChatCompletions, Chunk, Finish, Message, ModelName, Provider, ProviderError, Request,
+    TurnLimits,
 };
 use axum::{
     body::{Body, Bytes},
@@ -94,6 +95,15 @@ impl Mock {
     }
 
     async fn request(&self, effort: Option<&str>) -> Result<Vec<Chunk>, ProviderError> {
+        self.request_with_limits(effort, TurnLimits::default())
+            .await
+    }
+
+    async fn request_with_limits(
+        &self,
+        effort: Option<&str>,
+        limits: TurnLimits,
+    ) -> Result<Vec<Chunk>, ProviderError> {
         let model: ModelName = "openai/vendor/model#fast".parse().unwrap();
         assert_eq!(model.variant(), Some("fast"));
         self.client
@@ -104,6 +114,7 @@ impl Mock {
                     reasoning_effort: effort,
                     tools: &[],
                     max_output_tokens: 256,
+                    limits,
                 },
                 CancellationToken::new(),
             )
@@ -209,6 +220,7 @@ async fn effort_error_after_visible_text_does_not_replay_the_turn() {
                 reasoning_effort: Some("high"),
                 tools: &[],
                 max_output_tokens: 100,
+                limits: TurnLimits::default(),
             },
             CancellationToken::new(),
         )
@@ -220,4 +232,87 @@ async fn effort_error_after_visible_text_does_not_replay_the_turn() {
     );
     assert!(output.next().await.unwrap().is_err());
     assert_eq!(mock.requests.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn comment_bytes_count_toward_the_turn_budget() {
+    let mock = Mock::start(vec![(
+        StatusCode::OK,
+        None,
+        vec![b": keepalive\n\n", b": keepalive\n\n", b": keepalive\n\n"],
+    )])
+    .await;
+    let error = mock
+        .request_with_limits(
+            None,
+            TurnLimits {
+                response_bytes: 25,
+                ..TurnLimits::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error, ProviderError::ResponseTooLarge);
+}
+
+#[tokio::test]
+async fn turn_deadline_covers_retry_delays_and_keepalive_bodies() {
+    let mock = Mock::start(vec![(
+        StatusCode::TOO_MANY_REQUESTS,
+        Some("2"),
+        vec![b"retry later"],
+    )])
+    .await;
+    let error = mock
+        .request_with_limits(
+            None,
+            TurnLimits {
+                timeout: Duration::from_millis(300),
+                ..TurnLimits::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error, ProviderError::TurnTimeout);
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(|| async {
+                Response::new(Body::from_stream(stream::repeat(()).then(|()| async {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    Ok::<_, std::convert::Infallible>(Bytes::from_static(b": keepalive\n\n"))
+                })))
+            }),
+        );
+        axum::serve(listener, app).await.unwrap();
+    });
+    let mock = Mock {
+        client: ChatCompletions::new(
+            "openai",
+            format!("http://{addr}/v1/chat/completions")
+                .parse()
+                .unwrap(),
+            None,
+        )
+        .unwrap(),
+        requests: Log::default(),
+        server,
+    };
+    let error = tokio::time::timeout(
+        Duration::from_secs(3),
+        mock.request_with_limits(
+            None,
+            TurnLimits {
+                timeout: Duration::from_millis(300),
+                ..TurnLimits::default()
+            },
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert_eq!(error, ProviderError::TurnTimeout);
 }

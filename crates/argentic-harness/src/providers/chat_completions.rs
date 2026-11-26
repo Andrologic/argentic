@@ -1,5 +1,9 @@
 use std::{
     collections::{BTreeMap, VecDeque},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
     time::{Duration, SystemTime},
 };
 
@@ -14,7 +18,8 @@ use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    Chunk, Finish, Message, Provider, ProviderError, ProviderStream, Request, ToolCall, Usage,
+    Chunk, Finish, Message, Provider, ProviderError, ProviderStream, Request, ToolCall, TurnLimits,
+    Usage,
 };
 
 const MAX_EVENT_BYTES: usize = 1024 * 1024;
@@ -88,19 +93,22 @@ impl ChatCompletions {
         &self,
         mut body: Value,
         cancel: CancellationToken,
+        limits: TurnLimits,
     ) -> Result<ProviderStream, ProviderError> {
+        let budget = TurnBudget::new(limits);
         let mut retries = 0;
         loop {
             let mut request = self.client.post(self.endpoint.clone()).json(&body);
             if let Some(value) = &self.authorization {
                 request = request.header(AUTHORIZATION, value.clone());
             }
-            let mut response = cancellable(&cancel, request.send())
+            let mut response = budget
+                .wait(&cancel, request.send())
                 .await?
                 .map_err(transport)?;
             let status = response.status();
             if status.is_success() {
-                let mut output = Box::pin(decode(response, cancel.clone()));
+                let mut output = Box::pin(decode(response, cancel.clone(), budget.clone()));
                 let first = output.next().await;
                 if matches!(&first, Some(Err(ProviderError::Invalid(message))) if rejects_effort(message))
                     && self.drop_effort(&mut body)
@@ -111,7 +119,7 @@ impl ChatCompletions {
             }
 
             let retry_after = response.headers().get(RETRY_AFTER).and_then(retry_delay);
-            let message = cancellable(&cancel, error_body(&mut response)).await??;
+            let message = error_body(&mut response, &cancel, &budget).await?;
             if matches!(status.as_u16(), 400 | 422)
                 && rejects_effort(&message)
                 && self.drop_effort(&mut body)
@@ -123,7 +131,7 @@ impl ChatCompletions {
                 let delay = retry_after.map_or(backoff, |delay| delay.max(backoff));
                 if delay <= Duration::from_secs(60) {
                     drop(response);
-                    cancellable(&cancel, tokio::time::sleep(delay)).await?;
+                    budget.wait(&cancel, tokio::time::sleep(delay)).await?;
                     retries += 1;
                     continue;
                 }
@@ -168,7 +176,7 @@ impl Provider for ChatCompletions {
                 "function": { "name": tool.name, "description": tool.description, "parameters": tool.parameters }
             })).collect::<Vec<_>>());
         }
-        self.open(body, cancel).await
+        self.open(body, cancel, request.limits).await
     }
 }
 
@@ -195,14 +203,61 @@ fn message_json(message: &Message) -> Value {
     }
 }
 
-async fn cancellable<T>(
-    cancel: &CancellationToken,
-    future: impl std::future::Future<Output = T>,
-) -> Result<T, ProviderError> {
-    tokio::select! {
-        biased;
-        _ = cancel.cancelled() => Err(ProviderError::Cancelled),
-        value = future => Ok(value),
+#[derive(Clone)]
+struct TurnBudget {
+    deadline: tokio::time::Instant,
+    bytes_left: Arc<AtomicUsize>,
+}
+
+impl TurnBudget {
+    fn new(limits: TurnLimits) -> Self {
+        Self {
+            deadline: tokio::time::Instant::now() + limits.timeout,
+            bytes_left: Arc::new(AtomicUsize::new(limits.response_bytes)),
+        }
+    }
+
+    fn check(&self, cancel: &CancellationToken) -> Result<(), ProviderError> {
+        if cancel.is_cancelled() {
+            return Err(ProviderError::Cancelled);
+        }
+        if tokio::time::Instant::now() >= self.deadline {
+            return Err(ProviderError::TurnTimeout);
+        }
+        Ok(())
+    }
+
+    async fn wait<T>(
+        &self,
+        cancel: &CancellationToken,
+        future: impl std::future::Future<Output = T>,
+    ) -> Result<T, ProviderError> {
+        self.check(cancel)?;
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => Err(ProviderError::Cancelled),
+            _ = tokio::time::sleep_until(self.deadline) => Err(ProviderError::TurnTimeout),
+            value = future => Ok(value),
+        }
+    }
+
+    async fn chunk(
+        &self,
+        cancel: &CancellationToken,
+        response: &mut Response,
+    ) -> Result<Option<impl AsRef<[u8]>>, ProviderError> {
+        let chunk = self
+            .wait(cancel, response.chunk())
+            .await?
+            .map_err(transport)?;
+        if let Some(bytes) = &chunk {
+            self.bytes_left
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
+                    left.checked_sub(bytes.len())
+                })
+                .map_err(|_| ProviderError::ResponseTooLarge)?;
+        }
+        Ok(chunk)
     }
 }
 
@@ -223,9 +278,14 @@ fn retry_delay(value: &HeaderValue) -> Option<Duration> {
     )
 }
 
-async fn error_body(response: &mut Response) -> Result<String, ProviderError> {
+async fn error_body(
+    response: &mut Response,
+    cancel: &CancellationToken,
+    budget: &TurnBudget,
+) -> Result<String, ProviderError> {
     let mut bytes = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(transport)? {
+    while let Some(chunk) = budget.chunk(cancel, response).await? {
+        let chunk = chunk.as_ref();
         let take = chunk.len().min(8192 - bytes.len());
         bytes.extend_from_slice(&chunk[..take]);
         if bytes.len() == 8192 {
@@ -482,16 +542,15 @@ struct Decoder {
 fn decode(
     response: Response,
     cancel: CancellationToken,
+    budget: TurnBudget,
 ) -> impl futures::Stream<Item = Result<Chunk, ProviderError>> + Send {
     stream::try_unfold(
-        (response, cancel, Decoder::default()),
-        |(mut response, cancel, mut state)| async move {
+        (response, cancel, budget, Decoder::default()),
+        |(mut response, cancel, budget, mut state)| async move {
             loop {
-                if cancel.is_cancelled() {
-                    return Err(ProviderError::Cancelled);
-                }
+                budget.check(&cancel)?;
                 if let Some(chunk) = state.output.pop_front() {
-                    return Ok(Some((chunk, (response, cancel, state))));
+                    return Ok(Some((chunk, (response, cancel, budget, state))));
                 }
                 if let Some(error) = state.error.take() {
                     return Err(error);
@@ -500,12 +559,10 @@ fn decode(
                     return Ok(None);
                 }
 
-                let next = cancellable(&cancel, response.chunk())
-                    .await?
-                    .map_err(transport)?;
+                let next = budget.chunk(&cancel, &mut response).await?;
                 let eof = next.is_none();
                 let frames = match next {
-                    Some(bytes) => state.sse.push(&bytes)?,
+                    Some(bytes) => state.sse.push(bytes.as_ref())?,
                     None => state.sse.finish()?,
                 };
                 for frame in frames {

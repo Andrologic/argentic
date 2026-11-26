@@ -95,6 +95,28 @@ pub struct Request<'a> {
     pub messages: &'a [Message],
     pub tools: &'a [ToolDefinition],
     pub max_output_tokens: u32,
+    pub limits: TurnLimits,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct TurnLimits {
+    pub timeout: std::time::Duration,
+    pub response_bytes: usize,
+}
+
+impl Default for TurnLimits {
+    fn default() -> Self {
+        Self::from(&crate::config::Settings::default())
+    }
+}
+
+impl From<&crate::config::Settings> for TurnLimits {
+    fn from(settings: &crate::config::Settings) -> Self {
+        Self {
+            timeout: std::time::Duration::from_millis(u64::from(settings.limit("maxTurnMs"))),
+            response_bytes: settings.limit("maxTurnBytes") as usize,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
@@ -130,6 +152,10 @@ pub enum ProviderError {
     Transport(String),
     #[error("Provider HTTP {status}: {message}")]
     Http { status: u16, message: String },
+    #[error("Provider turn deadline exceeded")]
+    TurnTimeout,
+    #[error("Provider turn response byte budget exceeded")]
+    ResponseTooLarge,
     #[error("Provider request cancelled")]
     Cancelled,
 }

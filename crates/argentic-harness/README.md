@@ -99,12 +99,14 @@ EOF requests Stop for active runs.
 
 `providers.json` can include a top-level `settings` object. An agent's
 `harnessSettings` can lower those ceilings. See [the host guide](../argentic-runtime/HOST.md)
-for the inspection commands.
+for the inspection commands. `maxTurnMs` defaults to 600,000 ms and covers
+requests, retries and body reads. `maxTurnBytes` defaults to 16 MiB of
+response data per provider turn, including error bodies and SSE comments.
 
 ## Running a work
 
 1. Resolve settings with `Settings::resolve(host, user, project)`. Pass an
-   empty object for an omitted layer. All five settings are ceilings. A project
+   empty object for an omitted layer. All settings are ceilings. A project
    can lower inherited values, including the cancellation grace period.
    `Settings::get` returns the effective value and its source.
 2. Compile `ReadPolicy` against the canonical workspace path and open a

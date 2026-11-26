@@ -459,6 +459,7 @@ impl Instance<'_> {
                     messages: &messages,
                     tools: definitions,
                     max_output_tokens,
+                    limits: (&self.harness.settings).into(),
                 },
                 self.cancel.child_token(),
             )

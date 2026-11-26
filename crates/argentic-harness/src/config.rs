@@ -15,12 +15,14 @@ pub struct Settings {
     limits: BTreeMap<&'static str, (u32, Layer)>,
 }
 
-const DEFAULTS: [(&str, u32); 5] = [
+const DEFAULTS: [(&str, u32); 7] = [
     ("maxTurns", 32),
     ("maxOutputTokens", 4096),
     ("maxTotalTokens", u32::MAX),
     ("cancelGraceMs", 250),
     ("maxParallelReads", 4),
+    ("maxTurnMs", 600_000),
+    ("maxTurnBytes", 16 * 1024 * 1024),
 ];
 
 static SCHEMA: LazyLock<Result<jsonschema::Validator, String>> = LazyLock::new(|| {

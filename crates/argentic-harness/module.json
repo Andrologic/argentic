@@ -101,6 +101,14 @@
       },
       "maxParallelReads": {
         "type": "integer"
+      },
+      "maxTurnMs": {
+        "type": "integer",
+        "minimum": 1
+      },
+      "maxTurnBytes": {
+        "type": "integer",
+        "minimum": 1
       }
     }
   }
