@@ -1363,6 +1363,60 @@ async fn additional_directory_is_indexed_and_enforces_read_rules() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn agent_mcp_stops_discovery_when_the_combined_catalogue_is_too_large() {
+    use axum::response::IntoResponse;
+    use std::sync::Mutex;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let router = axum::Router::new().route(
+        "/{server}",
+        axum::routing::post(|axum::Json(request): axum::Json<Value>| async move {
+            let result = match request["method"].as_str().unwrap() {
+                "initialize" => json!({"protocolVersion":"2025-03-26","capabilities":{"tools":{}}}),
+                "notifications/initialized" => return StatusCode::ACCEPTED.into_response(),
+                "tools/list" => json!({"tools":[{
+                    "name":"check","description":"a".repeat(550_000),"inputSchema":{"type":"object"}
+                }]}),
+                method => panic!("unexpected MCP request {method}"),
+            };
+            axum::Json(json!({"jsonrpc":"2.0","id":request["id"],"result":result})).into_response()
+        }),
+    );
+    let upstream = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let chat = Server::start().await;
+    let mut doc = document();
+    doc["mcpServers"] = json!({
+        "first":{"url":format!("http://{address}/first")},
+        "second":{"url":format!("http://{address}/second")},
+        "third":{"url":format!("http://{address}/third")}
+    });
+    doc["agents"]["worker"]["mcpServers"] = json!(["first", "second", "third"]);
+    doc["agents"]["worker"]["permissions"] = json!({"preset":"read-only","rules":[
+        {"action":"mcp","match":"*/check","effect":"allow"}
+    ]});
+    let f = Fixture::new(&doc.to_string());
+    let mut host = open(&f, false)
+        .await
+        .with_argentic(chat.config(None))
+        .unwrap();
+    let admitted = Arc::new(Mutex::new(Vec::new()));
+    let log = admitted.clone();
+    host.context = host
+        .context
+        .with_mcp_http(Arc::new(move |_, server, _, _, _| {
+            log.lock().unwrap().push(server.to_owned());
+            Some(Default::default())
+        }));
+    let run = start(&host).await;
+    assert_eq!(finish(&host, &run).await["verdict"], "failed");
+    assert_eq!(*admitted.lock().unwrap(), ["first", "second"]);
+    close(&host).await;
+    upstream.abort();
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn agent_mcp_uses_per_tool_rules_and_joins_after_stop() {
     use crate::test_context::mcp::{Peer, REQUIREMENTS};
     for person in [true, false] {

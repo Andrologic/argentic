@@ -90,16 +90,7 @@ impl Tools {
         equipment: Arc<Equipment>,
     ) -> HostResult<Self> {
         let mut mcp = BTreeMap::new();
-        let mut bytes = 0;
-        for (index, (server, name, tool)) in equipment.tools().enumerate() {
-            bytes += tool.to_string().len();
-            if index >= 256 || bytes > 1_000_000 {
-                return Err(failure(
-                    "MCP_TOOL_LIST",
-                    "/mcpServers",
-                    "The combined MCP tool catalogue exceeds the provider input bound",
-                ));
-            }
+        for (server, name, tool) in equipment.tools() {
             let alias = mcp_alias(server, name);
             if mcp.contains_key(&alias) {
                 return Err(failure(

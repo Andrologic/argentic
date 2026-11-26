@@ -34,6 +34,8 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 pub(crate) const TOKEN_ENV: &str = "ARGENTIC_MCP_BRIDGE_TOKEN";
+const MAX_CATALOGUE_TOOLS: usize = 256;
+const MAX_CATALOGUE_BYTES: usize = 1_000_000;
 
 #[derive(Clone, Copy)]
 pub(crate) enum MissingApproval {
@@ -104,6 +106,8 @@ impl Equipment {
             String::new(),
         );
         let result = async {
+            let mut catalogue_tools = 0;
+            let mut catalogue_bytes = 0;
             for name in agent["mcpServers"].as_array().into_iter().flatten() {
                 let name = name.as_str().ok_or_else(|| {
                     mcp_error("MCP_CORRELATION", "Invalid captured MCP server name")
@@ -173,6 +177,16 @@ impl Equipment {
                             }
                         },
                         Effect::Allow | Effect::Ask => {}
+                    }
+                    catalogue_tools += 1;
+                    catalogue_bytes += tool.to_string().len();
+                    if catalogue_tools > MAX_CATALOGUE_TOOLS
+                        || catalogue_bytes > MAX_CATALOGUE_BYTES
+                    {
+                        return Err(mcp_error(
+                            "MCP_TOOL_LIST",
+                            "The combined MCP tool catalogue exceeds the provider input bound",
+                        ));
                     }
                     upstream
                         .tools
