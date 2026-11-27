@@ -389,7 +389,7 @@ impl ContainedBackgroundProcess {
     }
 
     #[cfg(unix)]
-    fn stop_unix_workload(&self) -> (Vec<u32>, Option<io::Error>) {
+    fn stop_unix_workload(&self) -> (Vec<UnixProcessTarget>, Option<io::Error>) {
         #[cfg(target_os = "linux")]
         let supervisor = match self.child.id() {
             Some(pid) => Some(pid),
@@ -398,19 +398,12 @@ impl ContainedBackgroundProcess {
         };
         #[cfg(not(target_os = "linux"))]
         let supervisor = None;
-        let (process_ids, inspection_error) = suspend_unix_process_tree(
+        terminate_unix_process_tree(
             self.process_group_id,
             &self.containment_id,
             self.containment_marker_path(),
             supervisor,
-        );
-        for process_id in &process_ids {
-            signal_process(*process_id, libc::SIGKILL);
-        }
-        if let Some(process_group_id) = self.process_group_id {
-            signal_process_group(process_group_id, libc::SIGKILL);
-        }
-        (process_ids, inspection_error)
+        )
     }
 
     #[cfg(unix)]
@@ -418,7 +411,7 @@ impl ContainedBackgroundProcess {
         if self.process_group_id.is_none() {
             return self.wait().await;
         }
-        let (process_ids, inspection_error) = self.stop_unix_workload();
+        let (targets, inspection_error) = self.stop_unix_workload();
         let reap_timeout = if grace_period.is_zero() {
             HARD_REAP_TIMEOUT
         } else {
@@ -444,7 +437,7 @@ impl ContainedBackgroundProcess {
                 };
                 // SIGKILL delivery and the leader's reap do not establish
                 // that descendants with detached streams have exited.
-                wait_for_processes_exit(&process_ids, deadline).await?;
+                wait_for_processes_exit(&targets, deadline).await?;
                 // Retire only after all observed processes disappeared.
                 // Drop must not scan the machine again or signal a reused PID.
                 self.process_group_id = None;
@@ -481,22 +474,11 @@ impl ContainedBackgroundProcess {
 /// inspector. Failure or expiry keeps the containment identity unresolved.
 #[cfg(unix)]
 async fn wait_for_processes_exit(
-    process_ids: &[u32],
+    targets: &[UnixProcessTarget],
     deadline: tokio::time::Instant,
 ) -> io::Result<()> {
     loop {
-        let mut pending = false;
-        for process_id in process_ids {
-            if unsafe { libc::kill(*process_id as libc::pid_t, 0) } == 0 {
-                pending = true;
-            } else {
-                let error = io::Error::last_os_error();
-                if error.raw_os_error() != Some(libc::ESRCH) {
-                    return Err(error);
-                }
-            }
-        }
-        if !pending {
+        if process_targets_exited(targets)? {
             return Ok(());
         }
         if tokio::time::Instant::now() >= deadline {
@@ -510,6 +492,44 @@ async fn wait_for_processes_exit(
         )
         .await;
     }
+}
+
+#[cfg(unix)]
+fn process_targets_exited(targets: &[UnixProcessTarget]) -> io::Result<bool> {
+    let mut all_exited = true;
+    for target in targets {
+        #[cfg(target_os = "linux")]
+        let exited = target.exited()?;
+        #[cfg(not(target_os = "linux"))]
+        let exited = {
+            if unsafe { libc::kill(*target as libc::pid_t, 0) } == 0 {
+                false
+            } else {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::ESRCH) {
+                    return Err(error);
+                }
+                true
+            }
+        };
+        all_exited &= exited;
+    }
+    Ok(all_exited)
+}
+
+#[cfg(target_os = "linux")]
+fn wait_for_terminal_targets(targets: &[UnixProcessTarget]) -> io::Result<()> {
+    let deadline = std::time::Instant::now() + DEFAULT_TERMINATION_GRACE_PERIOD;
+    while !process_targets_exited(targets)? {
+        if std::time::Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "contained descendants did not disappear after SIGKILL",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -535,7 +555,7 @@ fn signal_process_group(process_group_id: u32, signal: i32) {
     let _ = unsafe { libc::kill(-(process_group_id as libc::pid_t), signal) };
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, any(not(target_os = "linux"), test)))]
 fn signal_process(process_id: u32, signal: i32) {
     let _ = unsafe { libc::kill(process_id as libc::pid_t, signal) };
 }
@@ -796,6 +816,8 @@ enum ProcessInspector {
     Marker,
     ProcessTable,
     Descendants,
+    #[cfg(target_os = "linux")]
+    ProcessHandle,
 }
 
 #[cfg(unix)]
@@ -934,13 +956,17 @@ fn bounded_process_inspection(
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                 Err(error) => return Err(error),
             }
-            if let Some(status) = child.try_wait()? {
-                if eof {
-                    return Ok(std::process::Output {
-                        status,
-                        stdout: output,
-                        stderr: Vec::new(),
-                    });
+            // On Linux, keep the helper PID reserved while a descendant
+            // might still own the pipe and require group cleanup.
+            if eof || cfg!(not(target_os = "linux")) {
+                if let Some(status) = child.try_wait()? {
+                    if eof {
+                        return Ok(std::process::Output {
+                            status,
+                            stdout: output,
+                            stderr: Vec::new(),
+                        });
+                    }
                 }
             }
             if eof {
@@ -960,7 +986,10 @@ fn bounded_process_inspection(
         }
     })();
     // Include descendants holding stdout open, including after the helper exits.
-    signal_process_group(process_group, libc::SIGKILL);
+    // On Linux a successful inspection already reaped the helper.
+    if result.is_err() || cfg!(not(target_os = "linux")) {
+        signal_process_group(process_group, libc::SIGKILL);
+    }
     let reap_deadline = std::time::Instant::now() + Duration::from_millis(100);
     while matches!(child.try_wait(), Ok(None)) && std::time::Instant::now() < reap_deadline {
         std::thread::sleep(Duration::from_millis(5));
@@ -1040,7 +1069,7 @@ fn processes_with_containment_id(
     containment_id: &str,
     deadline: std::time::Instant,
 ) -> io::Result<HashSet<u32>> {
-    let expected = format!("{CONTAINMENT_ID_ENV}={containment_id}").into_bytes();
+    let expected = format!("{CONTAINMENT_ID_ENV}={containment_id}");
     let own_process_id = std::process::id();
     let processes = std::fs::read_dir("/proc")
         .into_iter()
@@ -1052,11 +1081,7 @@ fn processes_with_containment_id(
             if process_id == own_process_id {
                 return None;
             }
-            let environment = std::fs::read(entry.path().join("environ")).ok()?;
-            environment
-                .split(|byte| *byte == 0)
-                .any(|value| value == expected)
-                .then_some(process_id)
+            has_linux_containment_env(&entry.path(), expected.as_bytes()).then_some(process_id)
         })
         .collect();
     if std::time::Instant::now() >= deadline {
@@ -1107,7 +1132,6 @@ fn processes_with_containment_marker(
     marker_path: Option<&Path>,
     deadline: std::time::Instant,
 ) -> io::Result<HashSet<u32>> {
-    use std::os::unix::fs::MetadataExt;
     let Some(marker) = marker_path.and_then(|path| std::fs::metadata(path).ok()) else {
         return Ok(HashSet::new());
     };
@@ -1121,16 +1145,7 @@ fn processes_with_containment_marker(
             if pid == std::process::id() {
                 return None;
             }
-            let owns_marker = std::fs::read_dir(entry.path().join("fd"))
-                .into_iter()
-                .flatten()
-                .flatten()
-                .any(|descriptor| {
-                    std::fs::metadata(descriptor.path()).is_ok_and(|metadata| {
-                        metadata.dev() == marker.dev() && metadata.ino() == marker.ino()
-                    })
-                });
-            owns_marker.then_some(pid)
+            has_linux_containment_marker(&entry.path(), &marker).then_some(pid)
         })
         .collect();
     if std::time::Instant::now() >= deadline {
@@ -1243,23 +1258,19 @@ impl TerminalProcessTree {
         if self.process_group_id.is_none() {
             return Ok(());
         }
-        let (process_ids, error) = suspend_unix_process_tree(
+        let (_targets, error) = terminate_unix_process_tree(
             self.process_group_id,
             &self.containment_id,
             Some(&self.marker.path),
             None,
         );
-        for process_id in process_ids {
-            signal_process(process_id, libc::SIGKILL);
-        }
-        if let Some(id) = self.process_group_id {
-            signal_process_group(id, libc::SIGKILL);
-        }
         if let Some(error) = error {
             // Keep the identity and marker so Drop or the next explicit call
             // can retry discovery of descendants outside the original group.
             return Err(error);
         }
+        #[cfg(target_os = "linux")]
+        wait_for_terminal_targets(&_targets)?;
         self.process_group_id = None;
         Ok(())
     }
@@ -1272,113 +1283,412 @@ impl Drop for TerminalProcessTree {
     }
 }
 
+#[cfg(all(unix, not(target_os = "linux")))]
+type UnixProcessTarget = u32;
+
+#[cfg(target_os = "linux")]
+type UnixProcessTarget = LinuxPidFd;
+
+#[cfg(unix)]
+fn terminate_unix_process_tree(
+    root_id: Option<u32>,
+    containment_id: &str,
+    marker_path: Option<&Path>,
+    supervisor: Option<u32>,
+) -> (Vec<UnixProcessTarget>, Option<io::Error>) {
+    let (targets, error) =
+        suspend_unix_process_tree(root_id, containment_id, marker_path, supervisor);
+    #[cfg(target_os = "linux")]
+    let mut error = error;
+    for target in &targets {
+        #[cfg(target_os = "linux")]
+        if let Err(cause) = target.signal(libc::SIGKILL) {
+            error.get_or_insert(cause);
+        }
+        #[cfg(not(target_os = "linux"))]
+        signal_process(*target, libc::SIGKILL);
+    }
+    if let Some(group) = signalable_unix_group(root_id, supervisor) {
+        signal_process_group(group, libc::SIGKILL);
+    }
+    (targets, error)
+}
+
+#[cfg(target_os = "linux")]
+struct LinuxPidFd(std::os::fd::OwnedFd);
+
+#[cfg(target_os = "linux")]
+impl LinuxPidFd {
+    fn open(pid: u32) -> io::Result<Self> {
+        use std::os::fd::FromRawFd;
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0_u32) };
+        if fd == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        // pidfd_open returns a new close-on-exec descriptor.
+        Ok(Self(unsafe {
+            std::os::fd::OwnedFd::from_raw_fd(fd as i32)
+        }))
+    }
+
+    fn signal(&self, signal: i32) -> io::Result<()> {
+        use std::os::fd::AsRawFd;
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                self.0.as_raw_fd(),
+                signal,
+                std::ptr::null::<libc::siginfo_t>(),
+                0_u32,
+            )
+        };
+        if result == -1 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ESRCH) {
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    fn exited(&self) -> io::Result<bool> {
+        use std::os::fd::AsRawFd;
+        let mut poll = libc::pollfd {
+            fd: self.0.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        loop {
+            if unsafe { libc::poll(&mut poll, 1, 0) } == -1 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error);
+            }
+            return Ok(poll.revents & (libc::POLLIN | libc::POLLHUP) != 0);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_record(pid: u32, entry: &Path) -> io::Result<UnixProcessRecord> {
+    let stat = std::fs::read(entry.join("stat"))?;
+    // The command name can contain whitespace and closing parentheses.
+    let fields = stat
+        .rsplitn(2, |&byte| byte == b')')
+        .next()
+        .unwrap_or_default();
+    let mut fields = std::str::from_utf8(fields)
+        .unwrap_or_default()
+        .split_whitespace()
+        .skip(1)
+        .map(str::parse);
+    let mut next_id = || {
+        fields.next().and_then(Result::ok).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "invalid Linux process identity")
+        })
+    };
+    Ok(UnixProcessRecord {
+        process_id: pid,
+        parent_id: next_id()?,
+        process_group_id: next_id()?,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn has_linux_containment_env(entry: &Path, expected: &[u8]) -> bool {
+    std::fs::read(entry.join("environ"))
+        .is_ok_and(|env| env.split(|byte| *byte == 0).any(|value| value == expected))
+}
+
+#[cfg(target_os = "linux")]
+fn has_linux_containment_marker(entry: &Path, marker: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::read_dir(entry.join("fd"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .any(|descriptor| {
+            std::fs::metadata(descriptor.path()).is_ok_and(|metadata| {
+                metadata.dev() == marker.dev() && metadata.ino() == marker.ino()
+            })
+        })
+}
+
+#[cfg(target_os = "linux")]
+fn suspend_linux_candidates(
+    candidates: HashSet<u32>,
+    targets: &mut HashMap<u32, LinuxPidFd>,
+    root_id: Option<u32>,
+    supervisor: Option<u32>,
+    containment_id: &str,
+    marker_path: Option<&Path>,
+    deadline: std::time::Instant,
+) -> io::Result<bool> {
+    let own_pid = std::process::id();
+    let mut opened = Vec::new();
+    for pid in candidates {
+        check_process_inspection_deadline(deadline)?;
+        if pid == own_pid {
+            continue;
+        }
+        if let Some(target) = targets.get(&pid) {
+            if !target.exited()? {
+                target.signal(libc::SIGSTOP)?;
+                continue;
+            }
+            targets.remove(&pid);
+        }
+        match LinuxPidFd::open(pid) {
+            Ok(target) => opened.push((pid, target)),
+            Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {}
+            Err(error) => return Err(error),
+        }
+    }
+
+    // The inventory only suggests candidates. Read the containment evidence
+    // after opening each pidfd, then check that its process survived the read.
+    let expected = format!("{CONTAINMENT_ID_ENV}={containment_id}");
+    let marker = marker_path.and_then(|path| std::fs::metadata(path).ok());
+    let mut verified = Vec::new();
+    for (pid, target) in opened {
+        check_process_inspection_deadline(deadline)?;
+        let entry = PathBuf::from("/proc").join(pid.to_string());
+        let record = match linux_process_record(pid, &entry) {
+            Ok(record) => record,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        let tagged = has_linux_containment_env(&entry, expected.as_bytes())
+            || marker
+                .as_ref()
+                .is_some_and(|marker| has_linux_containment_marker(&entry, marker));
+        verified.push((record, target, tagged));
+    }
+
+    // Check each pidfd after every ancestry read. A recycled parent PID
+    // cannot admit children through a relationship observed after it died.
+    let mut live = Vec::new();
+    for (record, target, tagged) in verified {
+        if !target.exited()? {
+            live.push((record, target, tagged));
+        }
+    }
+    let verified = live;
+
+    // For PTYs, a live, attested group leader anchors its numerical PGID.
+    // For background commands that PGID is reserved by the supervisor.
+    let mut owned_group = root_id.filter(|_| supervisor.is_some());
+    if let Some(group) = root_id.filter(|_| supervisor.is_none()) {
+        let leader = targets.get(&group).or_else(|| {
+            verified.iter().find_map(|(record, target, tagged)| {
+                (*tagged && record.process_id == group && record.process_group_id == group)
+                    .then_some(target)
+            })
+        });
+        if let Some(leader) = leader {
+            if !leader.exited()? {
+                owned_group = Some(group);
+            }
+        }
+    }
+
+    let roots = verified.iter().filter_map(|(record, _, tagged)| {
+        (*tagged || owned_group == Some(record.process_group_id)).then_some(record.process_id)
+    });
+    let mut live_parents = Vec::new();
+    for (&pid, target) in targets.iter() {
+        if !target.exited()? {
+            live_parents.push(pid);
+        }
+    }
+    let records: Vec<_> = verified.iter().map(|(record, _, _)| *record).collect();
+    let roots: HashSet<_> = roots.chain(live_parents).chain(supervisor).collect();
+    let descendants = descendant_process_ids(roots.iter().copied(), &records, deadline)?;
+    let previous_len = targets.len();
+    for (record, target, _) in verified {
+        check_process_inspection_deadline(deadline)?;
+        if roots.contains(&record.process_id) || descendants.contains(&record.process_id) {
+            target.signal(libc::SIGSTOP)?;
+            targets.insert(record.process_id, target);
+        }
+    }
+
+    Ok(targets.len() != previous_len)
+}
+
+#[cfg(unix)]
+fn signalable_unix_group(root_id: Option<u32>, _supervisor: Option<u32>) -> Option<u32> {
+    // On Linux the unreaped background supervisor pins the workload PGID.
+    // A PTY stores only a numeric group ID, which may have been recycled.
+    #[cfg(target_os = "linux")]
+    _supervisor?;
+    root_id
+}
+
 #[cfg(unix)]
 fn suspend_unix_process_tree(
     root_id: Option<u32>,
     containment_id: &str,
     containment_marker_path: Option<&Path>,
     supervisor: Option<u32>,
-) -> (Vec<u32>, Option<io::Error>) {
-    suspend_unix_process_tree_using(root_id, supervisor, |process_ids, deadline| {
-        let mut failures = ProcessInspectionFailures::default();
-        // On macOS both searches inventory the machine. They are independent,
-        // so share the same budget instead of spending it serially.
-        #[cfg(target_os = "macos")]
-        let discoveries = std::thread::scope(|scope| {
-            let marker = std::thread::Builder::new()
-                .name("containment-marker".into())
-                .spawn_scoped(scope, || {
-                    processes_with_containment_marker(containment_marker_path, deadline)
-                });
-            let environment = processes_with_containment_id(containment_id, deadline);
-            let marker = match marker {
-                Ok(handle) => handle.join().unwrap_or_else(|_| {
-                    Err(io::Error::other("process marker inspection panicked"))
-                }),
-                Err(error) => Err(error),
-            };
-            [environment, marker]
-        });
-        #[cfg(not(target_os = "macos"))]
-        let discoveries = [
-            processes_with_containment_id(containment_id, deadline),
-            processes_with_containment_marker(containment_marker_path, deadline),
-        ];
-        for (inspector, discovered) in [ProcessInspector::Environment, ProcessInspector::Marker]
-            .into_iter()
-            .zip(discoveries)
-        {
-            match discovered {
-                Ok(ids) => process_ids.extend(ids),
-                Err(error) => failures.record(inspector, &error),
-            }
-        }
-        match read_unix_process_table(deadline) {
-            Ok(table) => {
-                if let Some(process_group_id) = root_id {
-                    process_ids.extend(
-                        table
-                            .iter()
-                            .filter(|record| record.process_group_id == process_group_id)
-                            .map(|record| record.process_id),
-                    );
-                }
-                let roots = process_ids.iter().copied().chain(supervisor);
-                match descendant_process_ids(roots, &table, deadline) {
-                    Ok(descendants) => process_ids.extend(descendants),
-                    Err(error) => failures.record(ProcessInspector::Descendants, &error),
-                }
-            }
-            Err(error) => failures.record(ProcessInspector::ProcessTable, &error),
-        }
-        (!failures.0.is_empty()).then_some(failures)
-    })
-}
-
-#[cfg(unix)]
-fn suspend_unix_process_tree_using(
-    root_id: Option<u32>,
-    supervisor: Option<u32>,
-    mut inspect: impl FnMut(&mut HashSet<u32>, std::time::Instant) -> Option<ProcessInspectionFailures>,
-) -> (Vec<u32>, Option<io::Error>) {
-    let deadline = std::time::Instant::now() + PROCESS_TREE_INSPECTION_TIMEOUT;
-    let mut failures = ProcessInspectionFailures::default();
-    let mut deadline_expired = false;
-    if let Some(root_id) = root_id {
-        signal_process_group(root_id, libc::SIGSTOP);
+) -> (Vec<UnixProcessTarget>, Option<io::Error>) {
+    if let Some(group) = signalable_unix_group(root_id, supervisor) {
+        signal_process_group(group, libc::SIGSTOP);
     }
+    #[cfg(target_os = "linux")]
+    let mut targets = HashMap::new();
+    #[cfg(not(target_os = "linux"))]
     let mut process_ids = root_id
         .filter(|id| Some(*id) != supervisor)
         .into_iter()
         .collect::<HashSet<_>>();
+    let error = suspend_unix_process_tree_using(|deadline| {
+        #[cfg(target_os = "linux")]
+        let mut process_ids = targets.keys().copied().collect::<HashSet<_>>();
+        #[cfg(not(target_os = "linux"))]
+        let previous_len = process_ids.len();
+        let failures = discover_unix_process_tree(
+            &mut process_ids,
+            root_id,
+            containment_id,
+            containment_marker_path,
+            supervisor,
+            deadline,
+        );
+        #[cfg(target_os = "linux")]
+        {
+            let mut failures = failures;
+            let changed = match suspend_linux_candidates(
+                process_ids,
+                &mut targets,
+                root_id,
+                supervisor,
+                containment_id,
+                containment_marker_path,
+                deadline,
+            ) {
+                Ok(changed) => changed,
+                Err(error) => {
+                    failures.record(ProcessInspector::ProcessHandle, &error);
+                    false
+                }
+            };
+            (changed, (!failures.0.is_empty()).then_some(failures))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            for &process_id in &process_ids {
+                if check_process_inspection_deadline(deadline).is_err() {
+                    break;
+                }
+                signal_process(process_id, libc::SIGSTOP);
+            }
+            (
+                process_ids.len() != previous_len,
+                (!failures.0.is_empty()).then_some(failures),
+            )
+        }
+    });
+    #[cfg(target_os = "linux")]
+    let targets = targets.into_values().collect();
+    #[cfg(not(target_os = "linux"))]
+    let targets = process_ids.into_iter().collect();
+    (targets, error)
+}
+
+#[cfg(unix)]
+fn discover_unix_process_tree(
+    process_ids: &mut HashSet<u32>,
+    root_id: Option<u32>,
+    containment_id: &str,
+    containment_marker_path: Option<&Path>,
+    supervisor: Option<u32>,
+    deadline: std::time::Instant,
+) -> ProcessInspectionFailures {
+    let mut failures = ProcessInspectionFailures::default();
+    // On macOS both searches inventory the machine. They are independent,
+    // so share the same budget instead of spending it serially.
+    #[cfg(target_os = "macos")]
+    let discoveries = std::thread::scope(|scope| {
+        let marker = std::thread::Builder::new()
+            .name("containment-marker".into())
+            .spawn_scoped(scope, || {
+                processes_with_containment_marker(containment_marker_path, deadline)
+            });
+        let environment = processes_with_containment_id(containment_id, deadline);
+        let marker = match marker {
+            Ok(handle) => handle
+                .join()
+                .unwrap_or_else(|_| Err(io::Error::other("process marker inspection panicked"))),
+            Err(error) => Err(error),
+        };
+        [environment, marker]
+    });
+    #[cfg(not(target_os = "macos"))]
+    let discoveries = [
+        processes_with_containment_id(containment_id, deadline),
+        processes_with_containment_marker(containment_marker_path, deadline),
+    ];
+    for (inspector, discovered) in [ProcessInspector::Environment, ProcessInspector::Marker]
+        .into_iter()
+        .zip(discoveries)
+    {
+        match discovered {
+            Ok(ids) => process_ids.extend(ids),
+            Err(error) => failures.record(inspector, &error),
+        }
+    }
+    match read_unix_process_table(deadline) {
+        Ok(table) => {
+            if let Some(process_group_id) = root_id {
+                process_ids.extend(
+                    table
+                        .iter()
+                        .filter(|record| record.process_group_id == process_group_id)
+                        .map(|record| record.process_id),
+                );
+            }
+            let roots = process_ids.iter().copied().chain(supervisor);
+            match descendant_process_ids(roots, &table, deadline) {
+                Ok(descendants) => process_ids.extend(descendants),
+                Err(error) => failures.record(ProcessInspector::Descendants, &error),
+            }
+        }
+        Err(error) => failures.record(ProcessInspector::ProcessTable, &error),
+    }
+    if let Some(supervisor) = supervisor {
+        process_ids.remove(&supervisor);
+    }
+    failures
+}
+
+#[cfg(unix)]
+fn suspend_unix_process_tree_using(
+    mut inspect: impl FnMut(std::time::Instant) -> (bool, Option<ProcessInspectionFailures>),
+) -> Option<io::Error> {
+    let deadline = std::time::Instant::now() + PROCESS_TREE_INSPECTION_TIMEOUT;
+    let mut failures = ProcessInspectionFailures::default();
+    let mut deadline_expired = false;
     for _ in 0..8 {
         if check_process_inspection_deadline(deadline).is_err() {
             deadline_expired = true;
             break;
         }
-        let previous_len = process_ids.len();
         // Only a fully successful round can establish convergence. A partial
         // inventory may look unchanged; retry it within the original deadline.
-        let inspection_error = inspect(&mut process_ids, deadline);
-        if let Some(supervisor) = supervisor {
-            process_ids.remove(&supervisor);
-        }
+        let (changed, inspection_error) = inspect(deadline);
         let round_complete = inspection_error.is_none();
         if let Some(inspection_error) = inspection_error {
             failures.extend(inspection_error);
-        }
-        for &process_id in &process_ids {
-            if check_process_inspection_deadline(deadline).is_err() {
-                break;
-            }
-            signal_process(process_id, libc::SIGSTOP);
         }
         if check_process_inspection_deadline(deadline).is_err() {
             deadline_expired = true;
             break;
         }
-        if process_ids.len() == previous_len && round_complete {
-            return (process_ids.into_iter().collect(), None);
+        if !changed && round_complete {
+            return None;
         }
         std::thread::yield_now();
     }
@@ -1393,14 +1703,13 @@ fn suspend_unix_process_tree_using(
             "process tree inspection did not converge (pass limit reached)",
         )
     };
-    let error = io::Error::new(
+    Some(io::Error::new(
         kind,
         ProcessTreeInspectionDiagnostic {
             failures,
             end_reason,
         },
-    );
-    (process_ids.into_iter().collect(), Some(error))
+    ))
 }
 
 #[cfg(windows)]
@@ -1468,27 +1777,59 @@ mod tests {
     #[cfg(unix)]
     use std::fs;
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn terminal_termination_ignores_a_recycled_group_id() {
+        use std::os::unix::process::CommandExt;
+
+        // A new child stands in for an unrelated process that acquired the
+        // retired PTY leader's numeric PID and process group.
+        let mut replacement = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let mut tree = super::TerminalProcessTree::new().unwrap();
+        tree.process_group_id = Some(replacement.id());
+        let (targets, error) = super::suspend_unix_process_tree(
+            tree.process_group_id,
+            &tree.containment_id,
+            Some(&tree.marker.path),
+            None,
+        );
+        replacement.kill().unwrap();
+        replacement.wait().unwrap();
+        tree.process_group_id = None;
+        assert!(error.is_none(), "{error:?}");
+        assert!(
+            targets.is_empty(),
+            "stale group ID selected an unrelated child"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn tree_inspection_retries_a_partial_round_with_the_original_deadline() {
         let mut calls = 0;
         let mut first_deadline = None;
-        let (ids, error) = super::suspend_unix_process_tree_using(None, None, |_, deadline| {
+        let error = super::suspend_unix_process_tree_using(|deadline| {
             calls += 1;
             assert_eq!(*first_deadline.get_or_insert(deadline), deadline);
-            (calls == 1).then(|| {
-                let mut failures = super::ProcessInspectionFailures::default();
-                failures.record(
-                    super::ProcessInspector::Environment,
-                    &std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "process inspection timed out",
-                    ),
-                );
-                failures
-            })
+            (
+                false,
+                (calls == 1).then(|| {
+                    let mut failures = super::ProcessInspectionFailures::default();
+                    failures.record(
+                        super::ProcessInspector::Environment,
+                        &std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "process inspection timed out",
+                        ),
+                    );
+                    failures
+                }),
+            )
         });
-        assert!(ids.is_empty());
         assert!(error.is_none(), "{error:?}");
         assert_eq!(
             calls, 2,
@@ -1501,7 +1842,7 @@ mod tests {
     fn tree_inspection_rejects_rounds_that_never_complete() {
         let mut calls = 0;
         let mut first_deadline = None;
-        let (_, error) = super::suspend_unix_process_tree_using(None, None, |_, deadline| {
+        let error = super::suspend_unix_process_tree_using(|deadline| {
             calls += 1;
             assert_eq!(*first_deadline.get_or_insert(deadline), deadline);
             // Success from different sources on different rounds must not be
@@ -1516,7 +1857,7 @@ mod tests {
                 source,
                 &std::io::Error::other("process containment inspection failed"),
             );
-            Some(failures)
+            (false, Some(failures))
         });
         assert!(error.is_some());
         assert!(calls > 1 && calls <= 8, "retries must be bounded: {calls}");
@@ -1526,7 +1867,7 @@ mod tests {
     #[test]
     fn tree_inspection_preserves_first_cause_and_all_failed_inspectors_across_rounds() {
         let mut calls = 0;
-        let (_, error) = super::suspend_unix_process_tree_using(None, None, |_, _| {
+        let error = super::suspend_unix_process_tree_using(|_| {
             calls += 1;
             let mut failures = super::ProcessInspectionFailures::default();
             if calls == 1 {
@@ -1551,7 +1892,7 @@ mod tests {
                     &std::io::Error::other("ps failed while reading process descendants"),
                 );
             }
-            Some(failures)
+            (false, Some(failures))
         });
         let message = error.expect("partial rounds must stay failed").to_string();
         assert_eq!(calls, 8);
@@ -2151,14 +2492,18 @@ mod tests {
             .stderr(std::process::Stdio::null())
             .kill_on_drop(true);
         let mut child = command.spawn().unwrap();
-        let process_ids = [child.id().unwrap()];
+        let pid = child.id().unwrap();
+        #[cfg(target_os = "linux")]
+        let targets = [super::LinuxPidFd::open(pid).unwrap()];
+        #[cfg(not(target_os = "linux"))]
+        let targets = [pid];
         let expired = super::wait_for_processes_exit(
-            &process_ids,
+            &targets,
             tokio::time::Instant::now() + Duration::from_millis(20),
         )
         .await;
         let waiting = super::wait_for_processes_exit(
-            &process_ids,
+            &targets,
             tokio::time::Instant::now() + Duration::from_secs(2),
         );
         tokio::pin!(waiting);
