@@ -516,6 +516,14 @@ impl ContainedBackgroundProcess {
         {
             return Err(io::Error::last_os_error());
         }
+        self.wait_for_windows_job_exit(deadline).await
+    }
+
+    #[cfg(windows)]
+    async fn wait_for_windows_job_exit(
+        &mut self,
+        deadline: tokio::time::Instant,
+    ) -> io::Result<ExitStatus> {
         match tokio::time::timeout_at(deadline, async {
             let status = self.child.wait().await?;
             while windows_job_active_processes(&self.job_object)? != 0 {
@@ -525,8 +533,10 @@ impl ContainedBackgroundProcess {
         })
         .await
         {
-            Ok(status) => status,
-            Err(_) => Err(io::Error::new(
+            // Tokio can poll a ready inner future after its timer expires.
+            Ok(Ok(status)) if tokio::time::Instant::now() < deadline => Ok(status),
+            Ok(Err(error)) => Err(error),
+            _ => Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "contained process tree did not exit after job termination",
             )),
@@ -2658,6 +2668,36 @@ mod tests {
             0,
             "cleanup returned with a live job member"
         );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_cleanup_rejects_an_empty_job_at_an_expired_deadline() {
+        use super::{
+            background_contained_tokio_command, windows_job_active_processes,
+            ContainedBackgroundProcess,
+        };
+        use std::{io, time::Duration};
+        use tokio::time::Instant;
+
+        let mut command = background_contained_tokio_command("cmd.exe");
+        command.args(["/C", "exit", "0"]);
+        let mut process = ContainedBackgroundProcess::spawn(command).unwrap();
+        assert!(process.wait().await.unwrap().success());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while windows_job_active_processes(&process.job_object).unwrap() != 0 {
+            assert!(
+                Instant::now() < deadline,
+                "job still reports an active process"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let error = process
+            .wait_for_windows_job_exit(Instant::now() - Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
     }
 
     #[cfg(windows)]
