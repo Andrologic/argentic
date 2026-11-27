@@ -1667,7 +1667,9 @@ async fn pending_human_generation_loss_is_interrupted_and_never_replayed() {
         .await
         .unwrap();
     assert_eq!(before, after);
-    let page = crate::agsdl_host_human_projection030::read(&f.broker.pool, f.scope.clone(), None)
+    let page = f
+        .host
+        .human_page(&f.broker.pool, f.scope.clone(), None)
         .await
         .unwrap();
     assert_eq!(page.requests[0].id, request);

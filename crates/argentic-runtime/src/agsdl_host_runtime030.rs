@@ -781,6 +781,12 @@ impl RuntimeRegistry030 {
         assert!(task.await.unwrap_err().is_cancelled());
     }
 
+    pub(crate) fn mcp_termination_uncertain(&self, system: &str) -> bool {
+        self.outcome(system).is_some_and(|outcome| {
+            outcome.is_err_and(|error| error.code == "MCP_TERMINATION_UNCERTAIN")
+        })
+    }
+
     pub(crate) fn outcome(&self, system: &str) -> Option<Result<()>> {
         self.0.lock().ok()?.get(system)?.outcome.clone()
     }

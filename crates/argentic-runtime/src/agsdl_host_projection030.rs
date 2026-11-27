@@ -253,10 +253,7 @@ pub(crate) async fn read(
         && host
             .flow030()
             .supervisor_registry()
-            .outcome(&scope.system_start_id)
-            .is_some_and(|outcome| {
-                outcome.is_err_and(|error| error.code == "MCP_TERMINATION_UNCERTAIN")
-            });
+            .mcp_termination_uncertain(&scope.system_start_id);
     let snapshot_version = current
         .then(|| snapshot_version(&handoffs, interrupted, revoked, mcp_uncertain))
         .transpose()?;

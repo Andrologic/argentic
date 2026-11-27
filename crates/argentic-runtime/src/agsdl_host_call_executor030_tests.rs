@@ -523,10 +523,11 @@ async fn native_mcp_question_answers_and_expires_while_machine_time_is_paused() 
         };
         let page = tokio::time::timeout(std::time::Duration::from_secs(10), async {
             loop {
-                let page =
-                    crate::agsdl_host_human_projection030::read(&f.pool, scope.clone(), None)
-                        .await
-                        .unwrap();
+                let page = f
+                    .host
+                    .human_page(&f.pool, scope.clone(), None)
+                    .await
+                    .unwrap();
                 if !page.requests.is_empty() {
                     break page;
                 }
@@ -602,7 +603,9 @@ async fn nested_entry_approval_keeps_host_prompt_provenance_through_its_output()
     };
     let page = tokio::time::timeout(std::time::Duration::from_secs(10), async {
         loop {
-            let page = crate::agsdl_host_human_projection030::read(&f.pool, scope.clone(), None)
+            let page = f
+                .host
+                .human_page(&f.pool, scope.clone(), None)
                 .await
                 .unwrap();
             if !page.requests.is_empty() {
@@ -814,7 +817,9 @@ printf '%s\n' '{"jsonrpc":"2.0","id":"person","method":"elicitation/create","par
     };
     let request_id = tokio::time::timeout(std::time::Duration::from_secs(10), async {
         loop {
-            let page = crate::agsdl_host_human_projection030::read(&f.pool, scope.clone(), None)
+            let page = f
+                .host
+                .human_page(&f.pool, scope.clone(), None)
                 .await
                 .unwrap();
             if let Some(request) = page.requests.first() {
@@ -1204,6 +1209,105 @@ async fn native_remote_mcp_routes_safe_budget_expiration_and_honors_authored_tim
         assert!(replay.ok, "{:?}", replay.divergence);
         server.abort();
     }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn lost_http_answer_response_projects_human_termination_uncertainty() {
+    use crate::test_context::mcp::*;
+    let peer = Peer::start().await;
+    let project = tempfile::tempdir().unwrap();
+    let doc = json!({
+        "projectFormat":"agsdl-project-1","contract":"agsdl-0.4.0","id":"lost-answer","agents":{},
+        "mcpServers":peer.servers(),"secrets":{"file":"requirements.json"},
+        "flow":{"entry":"first","steps":{
+            "first":{"type":"call","mcp":{"server":"first","tool":"form-lost"}}
+        }}
+    });
+    std::fs::write(project.path().join("agsdl.json"), doc.to_string()).unwrap();
+    std::fs::write(project.path().join("requirements.json"), REQUIREMENTS).unwrap();
+    let f = Fixture::new_with_project(r#"{"entry":{},"timeline":[]}"#, false, Some(project.path()))
+        .await;
+    let config = peer.configure(f.config.clone());
+    let _tasks = start_calls(
+        &f,
+        config.clone(),
+        Arc::new(crate::agsdl_host_call_executor030::NativeCallTransport030 {
+            config,
+            humans: Some(
+                Arc::new(crate::agsdl_host_human_executor030::CallHumans030 {
+                    app: f.host.clone(),
+                    pool: f.pool.clone(),
+                    identity: f.identity.clone(),
+                }) as Arc<dyn crate::agsdl_host_calls::HostPort>,
+            ),
+        }),
+    );
+    let scope = crate::persistence::public030::HumanScope030 {
+        system_start_id: f.identity.system_start_id.clone(),
+        source: serde_json::from_value(f.plan.source.clone()).unwrap(),
+    };
+    let request_id = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let page = f
+                .host
+                .human_page(&f.pool, scope.clone(), None)
+                .await
+                .unwrap();
+            if let Some(request) = page.requests.first() {
+                break request.id.clone();
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    f.host
+        .submit_person(
+            &f.pool,
+            crate::api::HumanSubmission {
+                scope: scope.clone(),
+                request_id: request_id.clone(),
+                expected_revision: "0".into(),
+                answer: crate::api::HumanAnswer030::Question {
+                    answer_json: r#"{"action":"accept","content":{}}"#.into(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let error = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        f.host.flow030().supervisors.wait(&f.owner.system_start_id),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert_eq!(error.code, "MCP_TERMINATION_UNCERTAIN");
+    let delivery: String =
+        sqlx::query_scalar("SELECT delivery FROM engine_flow030_human_requests WHERE request_id=?")
+            .bind(&request_id)
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+    assert_eq!(delivery, "reserved");
+    let run = f
+        .host
+        .runtime_projection(
+            &f.pool,
+            crate::api::RuntimeProjectionQuery030 {
+                system_start_id: f.owner.system_start_id.clone(),
+                source: serde_json::from_value(f.plan.source.clone()).unwrap(),
+                snapshot_id: Some(f.identity.snapshot_id.clone()),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(run.termination_uncertain);
+    let page = f.host.human_page(&f.pool, scope, None).await.unwrap();
+    assert_eq!(page.requests[0].status, "terminationUncertain");
+    assert_no_secrets(&f._temp.path().join("run.db"));
 }
 
 #[cfg(unix)]

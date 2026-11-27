@@ -696,7 +696,10 @@ After a crash, an ordinary unfinished 0.4.0 run reports
 `verdict: "interrupted"` in `inspect`. The `runs` list also reports
 `interrupted: true`. The host fences the old owner and does not retry its work
 or adopt its session. `terminationUncertain` indicates that activity may have
-survived the interruption.
+survived the interruption. A remote MCP question whose answer was sent without
+a confirmed response stays reserved; while its call's termination is uncertain,
+the human projection reports that request as `terminationUncertain` rather
+than `resolved`.
 
 An explicit 0.4.0 whole-run stop survives reopening the file. Recovery can
 settle a Start that never crossed the executor boundary and a local approval

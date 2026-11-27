@@ -174,7 +174,7 @@ impl HostState {
         scope: persistence::public030::HumanScope030,
         continuation: Option<persistence::public030::HumanContinuation030>,
     ) -> Result<persistence::public030::HumanPage030> {
-        crate::agsdl_host_human_projection030::read(pool, scope, continuation).await
+        crate::agsdl_host_human_projection030::read(self, pool, scope, continuation).await
     }
     pub async fn submit_person(&self, pool: &SqlitePool, input: HumanSubmission) -> Result<String> {
         let owner = {

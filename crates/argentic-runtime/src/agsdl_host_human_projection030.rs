@@ -7,12 +7,14 @@ use sha2::{Digest, Sha256};
 use sqlx::{Row, SqlitePool};
 
 pub(crate) async fn read(
+    host: &crate::agsdl_host::HostState,
     pool: &SqlitePool,
     scope: HumanScope030,
     continuation: Option<HumanContinuation030>,
 ) -> Result<HumanPage030> {
     let mut tx = pool.begin().await?;
-    let row = sqlx::query("SELECT c.capture_json,r.state_json,i.interrupted_at FROM engine_start030_requests c JOIN engine_flow030_runs r USING(system_id,invocation_id) LEFT JOIN engine_flow030_interruptions i USING(system_id) WHERE c.system_id=?")
+    let row = sqlx::query("SELECT c.capture_json,r.state_json,i.interrupted_at,
+        EXISTS(SELECT 1 FROM engine_flow030_owners o WHERE o.system_id=r.system_id AND o.status='revoked') AS revoked FROM engine_start030_requests c JOIN engine_flow030_runs r USING(system_id,invocation_id) LEFT JOIN engine_flow030_interruptions i USING(system_id) WHERE c.system_id=?")
         .bind(&scope.system_start_id).fetch_optional(&mut *tx).await?
         .ok_or_else(|| failure("NOT_FOUND", "scope", "Flow capture not found"))?;
     let capture: StartCapture030 = serde_json::from_str(row.try_get("capture_json")?)?;
@@ -23,6 +25,13 @@ pub(crate) async fn read(
     let interrupted = row
         .try_get::<Option<String>, _>("interrupted_at")?
         .is_some();
+    let termination_uncertain = interrupted
+        || (state.verdict.is_none()
+            && (row.try_get::<bool, _>("revoked")?
+                || host
+                    .flow030()
+                    .supervisor_registry()
+                    .mcp_termination_uncertain(&scope.system_start_id)));
     let clock = sqlx::query("SELECT revision,receipt_json,observed_ms FROM engine_flow030_clock WHERE system_id=? AND invocation_id=?")
         .bind(&scope.system_start_id).bind(&capture.identity.flow_invocation_id).fetch_optional(&mut *tx).await?;
     let observed: Option<String> = clock
@@ -86,6 +95,15 @@ pub(crate) async fn read(
             let delivery: &str = row.try_get("delivery")?;
             status = if resolution["operatorCancelled"] == true || resolution["withdrawn"] == true {
                 json!({"kind":"cancelled","resolution":{"receiptId":format!("human:{id}:closed"),"resolvedAtMs":resolution["resolvedAtMs"],"accepted":false,"reason":"workEnded","answer":null}})
+            } else if kind == "question"
+                && delivery == "reserved"
+                && termination_uncertain
+                && state
+                    .activations
+                    .iter()
+                    .any(|activation| activation.physical && work_ids.contains(&activation.id))
+            {
+                json!({"kind":"terminationUncertain","receiptId":receipt,"resolution":resolved})
             } else if expired {
                 json!({"kind":"expired","resolution":resolved})
             } else if delivery == "acknowledged" {
