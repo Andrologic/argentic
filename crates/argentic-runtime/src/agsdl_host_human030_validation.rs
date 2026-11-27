@@ -36,13 +36,13 @@ async fn facts(
         .iter()
         .map(|r| {
             Ok(Work {
-                id: r.get("activation_id"),
-                kind: r.get("kind"),
-                start: ms(r.get("admitted_ms"))?,
-                timeout: r.get("timeout_json"),
-                answer_timeout: r.get("answer_timeout_json"),
-                snapshot: serde_json::from_str(r.get("snapshot_json"))?,
-                retired: r.get::<i64, _>("retired") != 0,
+                id: r.try_get("activation_id")?,
+                kind: r.try_get("kind")?,
+                start: ms(r.try_get("admitted_ms")?)?,
+                timeout: r.try_get("timeout_json")?,
+                answer_timeout: r.try_get("answer_timeout_json")?,
+                snapshot: serde_json::from_str(r.try_get("snapshot_json")?)?,
+                retired: r.try_get::<i64, _>("retired")? != 0,
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -52,20 +52,20 @@ async fn facts(
         .iter()
         .map(|r| {
             Ok(Request {
-                id: r.get("request_id"),
-                kind: r.get("kind"),
-                works: serde_json::from_str(r.get("work_ids_json"))?,
-                opened: ms(r.get("opened_ms"))?,
+                id: r.try_get("request_id")?,
+                kind: r.try_get("kind")?,
+                works: serde_json::from_str(r.try_get("work_ids_json")?)?,
+                opened: ms(r.try_get("opened_ms")?)?,
                 duration: None,
                 resolution: r
-                    .get::<Option<String>, _>("resolution_json")
+                    .try_get::<Option<String>, _>("resolution_json")?
                     .map(|s| serde_json::from_str(&s).map(strip_reason))
                     .transpose()?,
-                acknowledged: r.get::<&str, _>("delivery") == "acknowledged",
-                proven: r.get::<Option<String>, _>("resolution_json").is_some()
-                    && r.get::<Option<String>, _>("proof_json")
-                        == r.get::<Option<String>, _>("resolution_json")
-                    && r.get::<Option<String>, _>("proof_output").is_some(),
+                acknowledged: r.try_get::<&str, _>("delivery")? == "acknowledged",
+                proven: r.try_get::<Option<String>, _>("resolution_json")?.is_some()
+                    && r.try_get::<Option<String>, _>("proof_json")?
+                        == r.try_get::<Option<String>, _>("resolution_json")?
+                    && r.try_get::<Option<String>, _>("proof_output")?.is_some(),
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -78,11 +78,11 @@ async fn facts(
         .iter()
         .map(|r| {
             Ok(Submission {
-                id: r.get("receipt_id"),
-                request: r.get("request_id"),
-                received: ms(r.get("received_ms"))?,
-                answer: serde_json::from_str(r.get("answer_json"))?,
-                accepted: r.get("accepted"),
+                id: r.try_get("receipt_id")?,
+                request: r.try_get("request_id")?,
+                received: ms(r.try_get("received_ms")?)?,
+                answer: serde_json::from_str(r.try_get("answer_json")?)?,
+                accepted: r.try_get("accepted")?,
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -112,7 +112,7 @@ pub(super) async fn validate(
     receipt: &Value,
 ) -> Result<()> {
     let row = broker.clock_row(db).await?;
-    let previous = ms(row.get("observed_ms"))?;
+    let previous = ms(row.try_get("observed_ms")?)?;
     let (works, requests, submissions) = facts(broker, db).await?;
     validate_projection(works, requests, submissions, previous, envelope, receipt)
         .map_err(Into::into)

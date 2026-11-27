@@ -127,8 +127,8 @@ impl HumanBroker030 {
         validation::validate_stored(self, &mut tx, &decision.request_id).await?;
         let row = self.request_row(&mut tx, &decision.request_id).await?;
         require(
-            row.get::<&str, _>("delivery") == "reserved"
-                && row.get::<&str, _>("resolution_json") == decision.resolution.to_string(),
+            row.try_get::<&str, _>("delivery")? == "reserved"
+                && row.try_get::<&str, _>("resolution_json")? == decision.resolution.to_string(),
             "Approval resolution changed",
         )?;
         use crate::persistence::flow030::{

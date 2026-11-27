@@ -186,7 +186,7 @@ async fn lookup_tx<A: StartAuthority030, H: StartIntentHook + ?Sized>(
     hook.reserve(db, request).await?;
     let Some(row) = sqlx::query("SELECT request_json,capture_json,receipt_json,system_id,invocation_id,snapshot_id,capture_epoch FROM engine_start030_requests WHERE request_id=?")
         .bind(&request.request_id).fetch_optional(&mut *db).await? else { return Ok(None); };
-    let prior: EngineStartRequest = serde_json::from_str(row.get("request_json"))?;
+    let prior: EngineStartRequest = serde_json::from_str(row.try_get("request_json")?)?;
     if prior != *request {
         return Err(failure(
             "CORRELATION",
@@ -194,13 +194,13 @@ async fn lookup_tx<A: StartAuthority030, H: StartIntentHook + ?Sized>(
             "Conflicting Start request",
         ));
     }
-    let capture: StartCapture030 = serde_json::from_str(row.get("capture_json"))?;
-    let receipt: StartReceipt030 = serde_json::from_str(row.get("receipt_json"))?;
+    let capture: StartCapture030 = serde_json::from_str(row.try_get("capture_json")?)?;
+    let receipt: StartReceipt030 = serde_json::from_str(row.try_get("receipt_json")?)?;
     if capture.identity != receipt.identity
-        || row.get::<&str, _>("system_id") != capture.identity.system_start_id
-        || row.get::<&str, _>("invocation_id") != capture.identity.flow_invocation_id
-        || row.get::<&str, _>("snapshot_id") != capture.identity.snapshot_id
-        || row.get::<&str, _>("capture_epoch") != capture.identity.epoch
+        || row.try_get::<&str, _>("system_id")? != capture.identity.system_start_id
+        || row.try_get::<&str, _>("invocation_id")? != capture.identity.flow_invocation_id
+        || row.try_get::<&str, _>("snapshot_id")? != capture.identity.snapshot_id
+        || row.try_get::<&str, _>("capture_epoch")? != capture.identity.epoch
     {
         return Err(failure(
             "CORRELATION",

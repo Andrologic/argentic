@@ -222,13 +222,13 @@ pub(crate) async fn admit_agent_work_tx(
     let row = sqlx::query("SELECT invocation_id,snapshot_id,capture_epoch,owner_epoch,generation,status,capture_sha256 FROM engine_flow030_owners WHERE system_id=?")
         .bind(&id.system_start_id).fetch_optional(&mut *db).await?
         .ok_or_else(|| failure("AUTHORITY", "work", "Native owner is absent"))?;
-    if row.get::<&str, _>("invocation_id") != id.flow_invocation_id
-        || row.get::<&str, _>("snapshot_id") != id.snapshot_id
-        || row.get::<&str, _>("capture_epoch") != id.epoch
-        || row.get::<&str, _>("owner_epoch") != attempt.owner().owner_epoch
-        || row.get::<&str, _>("generation") != attempt.generation()
-        || row.get::<&str, _>("status") != "live"
-        || row.get::<&str, _>("capture_sha256") != prepared.capture_sha256
+    if row.try_get::<&str, _>("invocation_id")? != id.flow_invocation_id
+        || row.try_get::<&str, _>("snapshot_id")? != id.snapshot_id
+        || row.try_get::<&str, _>("capture_epoch")? != id.epoch
+        || row.try_get::<&str, _>("owner_epoch")? != attempt.owner().owner_epoch
+        || row.try_get::<&str, _>("generation")? != attempt.generation()
+        || row.try_get::<&str, _>("status")? != "live"
+        || row.try_get::<&str, _>("capture_sha256")? != prepared.capture_sha256
     {
         return Err(failure("AUTHORITY", "work", "Native owner changed"));
     }
@@ -260,14 +260,14 @@ pub(crate) async fn admit_agent_work_tx(
     let run = sqlx::query("SELECT snapshot_id,epoch,plan_json,state_json FROM engine_flow030_runs WHERE system_id=? AND invocation_id=?")
         .bind(&id.system_start_id).bind(&id.flow_invocation_id).fetch_optional(&mut *db).await?
         .ok_or_else(|| failure("CORRELATION", "work", "Flow is absent"))?;
-    if run.get::<&str, _>("snapshot_id") != id.snapshot_id
-        || run.get::<&str, _>("epoch") != id.epoch
-        || run.get::<&str, _>("plan_json") != capture.compiled_plan_json
+    if run.try_get::<&str, _>("snapshot_id")? != id.snapshot_id
+        || run.try_get::<&str, _>("epoch")? != id.epoch
+        || run.try_get::<&str, _>("plan_json")? != capture.compiled_plan_json
     {
         return Err(failure("CORRELATION", "work", "Flow capture differs"));
     }
     let state: crate::persistence::flow030::FlowState030 =
-        serde_json::from_str(run.get("state_json"))?;
+        serde_json::from_str(run.try_get("state_json")?)?;
     let activation = state
         .activations
         .iter()
@@ -290,14 +290,14 @@ pub(crate) async fn admit_agent_work_tx(
     let outbox = sqlx::query("SELECT effect_json,status,owner_epoch FROM engine_flow030_outbox WHERE system_id=? AND invocation_id=? AND effect_id=?")
         .bind(&id.system_start_id).bind(&id.flow_invocation_id).bind(attempt.start_effect_id())
         .fetch_optional(&mut *db).await?.ok_or_else(|| failure("CORRELATION", "work", "Start effect is absent"))?;
-    let effect: FlowEffect030 = serde_json::from_str(outbox.get("effect_json"))?;
+    let effect: FlowEffect030 = serde_json::from_str(outbox.try_get("effect_json")?)?;
     let matches_effect = matches!(&effect.kind, FlowEffectKind030::Start { work, step, agent: Some(agent), .. }
         if work.activation_id == attempt.work().activation_id
             && work.start_effect_id == attempt.start_effect_id()
             && work.agent_instance_id == attempt.work().agent_instance_id
             && step == &attempt.work().step && agent == attempt.agent());
-    if outbox.get::<&str, _>("status") != "uncertain"
-        || outbox.get::<&str, _>("owner_epoch") != attempt.owner().owner_epoch
+    if outbox.try_get::<&str, _>("status")? != "uncertain"
+        || outbox.try_get::<&str, _>("owner_epoch")? != attempt.owner().owner_epoch
         || effect.identity != *id
         || effect.id != attempt.start_effect_id()
         || !matches_effect

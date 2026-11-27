@@ -401,14 +401,14 @@ pub(crate) async fn record_handoff_clock_tx(
     let owner = lease.owner(&id.system_start_id)?;
     let row = sqlx::query("SELECT o.owner_epoch,o.generation,o.snapshot_id,o.capture_epoch,o.status,e.effect_json,e.status AS effect_status,h.receipt_json FROM engine_flow030_owners o JOIN engine_flow030_outbox e ON e.system_id=o.system_id AND e.invocation_id=o.invocation_id JOIN engine_flow030_handoffs h ON h.system_id=e.system_id AND h.invocation_id=e.invocation_id AND h.effect_id=e.effect_id WHERE o.system_id=? AND o.invocation_id=? AND e.effect_id=? AND h.owner_epoch=o.owner_epoch AND h.generation=o.generation")
         .bind(&id.system_start_id).bind(&id.flow_invocation_id).bind(&effect.id).fetch_one(&mut *db).await?;
-    let handoff: serde_json::Value = serde_json::from_str(row.get("receipt_json"))?;
-    if row.get::<&str, _>("status") != "live"
-        || row.get::<&str, _>("owner_epoch") != owner.owner_epoch
-        || row.get::<&str, _>("generation") != lease.generation()
-        || row.get::<&str, _>("snapshot_id") != id.snapshot_id
-        || row.get::<&str, _>("capture_epoch") != id.epoch
-        || row.get::<&str, _>("effect_status") != "uncertain"
-        || serde_json::from_str::<serde_json::Value>(row.get("effect_json"))?
+    let handoff: serde_json::Value = serde_json::from_str(row.try_get("receipt_json")?)?;
+    if row.try_get::<&str, _>("status")? != "live"
+        || row.try_get::<&str, _>("owner_epoch")? != owner.owner_epoch
+        || row.try_get::<&str, _>("generation")? != lease.generation()
+        || row.try_get::<&str, _>("snapshot_id")? != id.snapshot_id
+        || row.try_get::<&str, _>("capture_epoch")? != id.epoch
+        || row.try_get::<&str, _>("effect_status")? != "uncertain"
+        || serde_json::from_str::<serde_json::Value>(row.try_get("effect_json")?)?
             != serde_json::to_value(effect)?
         || handoff["kind"] != "nativeOwnedHandoff030"
         || handoff["identity"] != serde_json::to_value(id)?

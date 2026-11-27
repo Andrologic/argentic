@@ -203,8 +203,8 @@ impl HumanBroker030 {
             .bind(&broker.owner.owner_epoch).bind(&broker.generation).bind(broker.clock.now_ms().to_string()).execute(&mut *tx).await?;
         let row = broker.clock_row(&mut tx).await?;
         require(
-            row.get::<&str, _>("owner_epoch") == broker.owner.owner_epoch
-                && row.get::<&str, _>("generation") == broker.generation,
+            row.try_get::<&str, _>("owner_epoch")? == broker.owner.owner_epoch
+                && row.try_get::<&str, _>("generation")? == broker.generation,
             "Clock generation was lost; no automatic replay",
         )?;
         tx.commit().await?;
@@ -224,12 +224,12 @@ impl HumanBroker030 {
         let row = sqlx::query("SELECT invocation_id,snapshot_id,capture_epoch,owner_epoch,generation,status,capture_sha256 FROM engine_flow030_owners WHERE system_id=?")
             .bind(&self.identity.system_start_id).fetch_one(&mut *db).await?;
         require(
-            row.get::<&str, _>("invocation_id") == self.identity.flow_invocation_id
-                && row.get::<&str, _>("snapshot_id") == self.identity.snapshot_id
-                && row.get::<&str, _>("capture_epoch") == self.identity.epoch
-                && row.get::<&str, _>("owner_epoch") == self.owner.owner_epoch
-                && row.get::<&str, _>("generation") == self.generation
-                && row.get::<&str, _>("status") == "live",
+            row.try_get::<&str, _>("invocation_id")? == self.identity.flow_invocation_id
+                && row.try_get::<&str, _>("snapshot_id")? == self.identity.snapshot_id
+                && row.try_get::<&str, _>("capture_epoch")? == self.identity.epoch
+                && row.try_get::<&str, _>("owner_epoch")? == self.owner.owner_epoch
+                && row.try_get::<&str, _>("generation")? == self.generation
+                && row.try_get::<&str, _>("status")? == "live",
             "Foreign or revoked flow owner",
         )?;
         let raw: String = sqlx::query_scalar("SELECT capture_json FROM engine_start030_requests WHERE system_id=? AND invocation_id=?")
@@ -238,7 +238,7 @@ impl HumanBroker030 {
         require(
             capture.identity == self.identity
                 && format!("{:x}", Sha256::digest(raw.as_bytes()))
-                    == row.get::<&str, _>("capture_sha256"),
+                    == row.try_get::<&str, _>("capture_sha256")?,
             "Capture changed",
         )?;
         let raw: String = sqlx::query_scalar(
@@ -664,10 +664,10 @@ impl HumanBroker030 {
         )?;
         let row = self.request_row(&mut tx, &input.request_id).await?;
         require(
-            row.get::<&str, _>("revision") == input.expected_revision,
+            row.try_get::<&str, _>("revision")? == input.expected_revision,
             "Stale human revision",
         )?;
-        let work_ids: Vec<String> = serde_json::from_str(row.get("work_ids_json"))?;
+        let work_ids: Vec<String> = serde_json::from_str(row.try_get("work_ids_json")?)?;
         let raw_state: String = sqlx::query_scalar(
             "SELECT state_json FROM engine_flow030_runs WHERE system_id=? AND invocation_id=?",
         )
@@ -690,8 +690,8 @@ impl HumanBroker030 {
                 }),
             "Human answer targets a stale visit",
         )?;
-        let kind: &str = row.get("kind");
-        let payload: Value = serde_json::from_str(row.get("payload_json"))?;
+        let kind: &str = row.try_get("kind")?;
+        let payload: Value = serde_json::from_str(row.try_get("payload_json")?)?;
         let receipt_id = uuid();
         let event = match &input.answer {
             HumanAnswer030::Approval { choice, comment } => {
@@ -766,7 +766,7 @@ impl HumanBroker030 {
     async fn reserve(&self, db: &mut SqliteConnection, event: Value, now: &str) -> Result<()> {
         let row = self.clock_row(db).await?;
         require(
-            now.parse::<u64>().ok() >= row.get::<&str, _>("observed_ms").parse::<u64>().ok(),
+            now.parse::<u64>().ok() >= row.try_get::<&str, _>("observed_ms")?.parse::<u64>().ok(),
             "Native time moved backwards",
         )?;
         let event_id = uuid();
@@ -774,8 +774,8 @@ impl HumanBroker030 {
             identity: self.identity.clone(),
             owner: self.owner.clone(),
             event_id: event_id.clone(),
-            expected_revision: row.get("revision"),
-            state_json: row.get("state_json"),
+            expected_revision: row.try_get("revision")?,
+            state_json: row.try_get("state_json")?,
             event_json: json!({"owner":self.owner,"eventId":event_id,"nowMs":now,"event":event})
                 .to_string(),
             options_json: json!({"maxSliceMs":2147483647}).to_string(),
@@ -822,10 +822,13 @@ impl HumanBroker030 {
         let mut cancel_asks = Vec::new();
         let mut close_asks = Vec::new();
         for request in requests {
-            let works: Vec<String> = serde_json::from_str(request.get("work_ids_json"))?;
+            let works: Vec<String> = serde_json::from_str(request.try_get("work_ids_json")?)?;
             if works.iter().any(|id| held.contains(id)) {
-                let request_id: String = request.get("request_id");
-                if request.get::<Option<&str>, _>("resolution_json").is_some() {
+                let request_id: String = request.try_get("request_id")?;
+                if request
+                    .try_get::<Option<&str>, _>("resolution_json")?
+                    .is_some()
+                {
                     self.reserve_resolution(db, &request_id).await?;
                 } else {
                     cancel_asks.push(request_id.clone());
@@ -1157,8 +1160,8 @@ impl HumanBroker030 {
     pub(crate) async fn next_wake_ms(&self) -> Result<Option<u64>> {
         let mut db = self.pool.acquire().await?;
         let row = self.clock_row(&mut db).await?;
-        let receipt: Value = serde_json::from_str(row.get("receipt_json"))?;
-        let observed = validation::ms(row.get("observed_ms"))?;
+        let receipt: Value = serde_json::from_str(row.try_get("receipt_json")?)?;
+        let observed = validation::ms(row.try_get("observed_ms")?)?;
         let now = self.clock.now_ms();
         require(now >= observed, "Native wake time moved backwards")?;
         // The pure delay is relative to its captured observation, not the
@@ -1192,15 +1195,15 @@ impl HumanBroker030 {
             self.guard(&mut tx, &lease).await?;
             self.verify_work(&mut tx, work).await?;
             let row = self.request_row(&mut tx, request_id).await?;
-            let works: Vec<String> = serde_json::from_str(row.get("work_ids_json"))?;
+            let works: Vec<String> = serde_json::from_str(row.try_get("work_ids_json")?)?;
             require(
-                row.get::<&str, _>("kind") == "ask" && works == [work.work_id()],
+                row.try_get::<&str, _>("kind")? == "ask" && works == [work.work_id()],
                 "Foreign action withdrawal",
             )?;
-            if row.get::<&str, _>("delivery") != "pending" {
+            if row.try_get::<&str, _>("delivery")? != "pending" {
                 return Ok(());
             }
-            if row.get::<Option<&str>, _>("resolution_json").is_none() {
+            if row.try_get::<Option<&str>, _>("resolution_json")?.is_none() {
                 let event =
                     json!({"kind":"withdrawAsk","requestId":request_id,"workId":work.work_id()});
                 self.reserve(&mut tx, event, &self.clock.now_ms().to_string())
@@ -1234,9 +1237,9 @@ impl HumanBroker030 {
             "Foreign request lookup",
         )?;
         for row in rows {
-            let works: Vec<String> = serde_json::from_str(row.get("work_ids_json"))?;
+            let works: Vec<String> = serde_json::from_str(row.try_get("work_ids_json")?)?;
             if works.contains(&work.work_id().into()) {
-                return Ok(Some(row.get("request_id")));
+                return Ok(Some(row.try_get("request_id")?));
             }
         }
         Ok(None)
@@ -1275,10 +1278,10 @@ impl HumanBroker030 {
         let row = self.request_row(&mut tx, request_id).await?;
         if !reserve {
             require(
-                row.get::<&str, _>("kind") == "ask",
+                row.try_get::<&str, _>("kind")? == "ask",
                 "Expected action request",
             )?;
-            let work_ids: Vec<String> = serde_json::from_str(row.get("work_ids_json"))?;
+            let work_ids: Vec<String> = serde_json::from_str(row.try_get("work_ids_json")?)?;
             if let [id] = work_ids.as_slice() {
                 if self.operator_held(&mut tx, id).await? {
                     return Err(failure(
@@ -1289,9 +1292,9 @@ impl HumanBroker030 {
                 }
             }
         }
-        let raw: Option<String> = row.get("resolution_json");
+        let raw: Option<String> = row.try_get("resolution_json")?;
         require(
-            raw.is_some() && row.get::<&str, _>("delivery") == "pending",
+            raw.is_some() && row.try_get::<&str, _>("delivery")? == "pending",
             "Resolution absent or already reserved; inspect instead of replay",
         )?;
         validation::validate_stored(self, &mut tx, request_id).await?;
@@ -1300,9 +1303,9 @@ impl HumanBroker030 {
             owner: self.owner.clone(),
             generation: self.generation.clone(),
             request_id: request_id.into(),
-            work_ids: serde_json::from_str(row.get("work_ids_json"))?,
-            kind: row.get("kind"),
-            payload: serde_json::from_str(row.get("payload_json"))?,
+            work_ids: serde_json::from_str(row.try_get("work_ids_json")?)?,
+            kind: row.try_get("kind")?,
+            payload: serde_json::from_str(row.try_get("payload_json")?)?,
             resolution: serde_json::from_str(raw.as_deref().unwrap())?,
         };
         if reserve {
@@ -1410,7 +1413,8 @@ impl HumanBroker030 {
         )?;
         let row = self.request_row(&mut tx, &decision.request_id).await?;
         require(
-            row.get::<Option<String>, _>("resolution_json").as_deref()
+            row.try_get::<Option<String>, _>("resolution_json")?
+                .as_deref()
                 == Some(decision.resolution.to_string().as_str()),
             "Action decision is stale",
         )?;
@@ -1441,10 +1445,10 @@ impl HumanBroker030 {
             self.settle_pending_flow_clock(host).await?;
             let row = sqlx::query("SELECT work_json,retired FROM engine_flow030_clock_works WHERE system_id=? AND invocation_id=? AND activation_id=?")
                 .bind(&self.identity.system_start_id).bind(&self.identity.flow_invocation_id).bind(id).fetch_one(&self.pool).await?;
-            if row.get::<bool, _>("retired") {
+            if row.try_get::<bool, _>("retired")? {
                 return Ok(());
             }
-            let work: OwnedHumanWork030 = serde_json::from_str(row.get("work_json"))?;
+            let work: OwnedHumanWork030 = serde_json::from_str(row.try_get("work_json")?)?;
             self.retire(host, &work).await?;
             self.pump(host, &CancellationToken::new()).await?;
             Ok(())
@@ -1508,12 +1512,13 @@ impl HumanBroker030 {
     pub(crate) async fn timeout_controls(&self) -> Result<Vec<TimeoutControl030>> {
         let rows = sqlx::query("SELECT activation_id,receipt_id FROM engine_flow030_clock_controls WHERE system_id=? AND invocation_id=? AND joined=0")
             .bind(&self.identity.system_start_id).bind(&self.identity.flow_invocation_id).fetch_all(&self.pool).await?;
-        Ok(rows
-            .iter()
-            .map(|r| TimeoutControl030 {
-                work_id: r.get("activation_id"),
+        rows.iter()
+            .map(|r| {
+                Ok(TimeoutControl030 {
+                    work_id: r.try_get("activation_id")?,
+                })
             })
-            .collect())
+            .collect()
     }
 }
 

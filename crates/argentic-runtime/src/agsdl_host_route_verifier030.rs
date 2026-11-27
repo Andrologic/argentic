@@ -140,10 +140,10 @@ impl SqlRouteMaterialVerifier030 {
         let row = sqlx::query("SELECT owner_epoch,generation,status,capture_sha256 FROM engine_flow030_owners WHERE system_id=? AND invocation_id=? AND snapshot_id=? AND capture_epoch=?")
             .bind(&id.system_start_id).bind(&id.flow_invocation_id).bind(&id.snapshot_id).bind(&id.epoch).fetch_optional(&mut *db).await?.ok_or(StoreError030::Authority)?;
         require(
-            row.get::<&str, _>("owner_epoch") == self.owner.owner_epoch
-                && row.get::<&str, _>("generation") == self.generation
-                && row.get::<&str, _>("status") == "live"
-                && row.get::<&str, _>("capture_sha256") == capture_sha,
+            row.try_get::<&str, _>("owner_epoch")? == self.owner.owner_epoch
+                && row.try_get::<&str, _>("generation")? == self.generation
+                && row.try_get::<&str, _>("status")? == "live"
+                && row.try_get::<&str, _>("capture_sha256")? == capture_sha,
         )?;
         for text in [&material.source_json, &material.content_receipts_json] {
             argentic_core::durable_json::validate(text)?;
@@ -158,17 +158,17 @@ impl SqlRouteMaterialVerifier030 {
         let row = sqlx::query("SELECT preparation_effect_id,owner_epoch,generation,capture_sha256,native_receipt_id,receipt_kind,work_event_id,producer_json,source_json FROM engine_flow030_route_source_attestations WHERE system_id=? AND invocation_id=? AND prepare_id=?")
             .bind(&id.system_start_id).bind(&id.flow_invocation_id).bind(&reference.prepare_id).fetch_optional(&mut *db).await?.ok_or(StoreError030::Authority)?;
         require(
-            row.get::<&str, _>("owner_epoch") == self.owner.owner_epoch
-                && row.get::<&str, _>("generation") == self.generation
-                && row.get::<&str, _>("capture_sha256") == capture_sha
-                && !row.get::<&str, _>("native_receipt_id").is_empty(),
+            row.try_get::<&str, _>("owner_epoch")? == self.owner.owner_epoch
+                && row.try_get::<&str, _>("generation")? == self.generation
+                && row.try_get::<&str, _>("capture_sha256")? == capture_sha
+                && !row.try_get::<&str, _>("native_receipt_id")?.is_empty(),
         )?;
         require(
-            serde_json::from_str::<Producer030>(row.get("producer_json"))? == *producer
-                && exact(row.get("source_json"), &material.source_json)?,
+            serde_json::from_str::<Producer030>(row.try_get("producer_json")?)? == *producer
+                && exact(row.try_get("source_json")?, &material.source_json)?,
         )?;
         let encoded: String = sqlx::query_scalar("SELECT effect_json FROM engine_flow030_outbox WHERE system_id=? AND invocation_id=? AND effect_id=? AND owner_epoch=?")
-            .bind(&id.system_start_id).bind(&id.flow_invocation_id).bind(row.get::<&str,_>("preparation_effect_id")).bind(&self.owner.owner_epoch).fetch_optional(&mut *db).await?.ok_or(StoreError030::Authority)?;
+            .bind(&id.system_start_id).bind(&id.flow_invocation_id).bind(row.try_get::<&str,_>("preparation_effect_id")?).bind(&self.owner.owner_epoch).fetch_optional(&mut *db).await?.ok_or(StoreError030::Authority)?;
         let effect: FlowEffect030 = serde_json::from_str(&encoded)?;
         require(
             effect.identity == *id
@@ -188,7 +188,7 @@ impl SqlRouteMaterialVerifier030 {
             }
         };
         require(
-            row.get::<&str, _>("receipt_kind") == kind
+            row.try_get::<&str, _>("receipt_kind")? == kind
                 && string(&source, "kind")?
                     == if kind == "error" {
                         "error"
@@ -198,7 +198,7 @@ impl SqlRouteMaterialVerifier030 {
         )?;
         if kind == "agentWork" {
             let event_id: &str = row
-                .get::<Option<&str>, _>("work_event_id")
+                .try_get::<Option<&str>, _>("work_event_id")?
                 .ok_or(StoreError030::Authority)?;
             verify_accepted_work(
                 db,
@@ -212,7 +212,7 @@ impl SqlRouteMaterialVerifier030 {
             .await?;
         } else {
             require(
-                row.get::<Option<&str>, _>("work_event_id").is_none()
+                row.try_get::<Option<&str>, _>("work_event_id")?.is_none()
                     && source.get("producerAgent") == Some(&Value::Null)
                     && source.pointer("/provenance/instructions") == Some(&json!([])),
             )?;
@@ -402,13 +402,13 @@ pub(crate) async fn unique_agent_work_event_tx(
         .await?;
     let mut terminals = Vec::new();
     for row in rows {
-        let decision: Value = serde_json::from_str(row.get("decision_json"))?;
+        let decision: Value = serde_json::from_str(row.try_get("decision_json")?)?;
         let receipt: Value = serde_json::from_str(string(&decision, "receiptJson")?)?;
         let decision = receipt.get("decision").ok_or(StoreError030::Authority)?;
         if decision.get("kind").and_then(Value::as_str) == Some("finished")
             && decision.get("outcome").and_then(Value::as_str) == Some("success")
         {
-            terminals.push(row.get::<String, _>("event_id"));
+            terminals.push(row.try_get::<String, _>("event_id")?);
         }
     }
     require(terminals.len() == 1)?;
@@ -423,8 +423,8 @@ pub(crate) async fn unique_agent_work_event_tx(
         .fetch_optional(&mut *db)
         .await?
         .ok_or(StoreError030::Authority)?;
-    let context: EngineContext = serde_json::from_str(row.get("context_json"))?;
-    let event: Value = serde_json::from_str(row.get("event_json"))?;
+    let context: EngineContext = serde_json::from_str(row.try_get("context_json")?)?;
+    let event: Value = serde_json::from_str(row.try_get("event_json")?)?;
     let result = event
         .pointer("/kind/WorkResult")
         .ok_or(StoreError030::Authority)?;
@@ -438,7 +438,7 @@ pub(crate) async fn unique_agent_work_event_tx(
             && result.get("work")
                 == Some(&json!({
                     "activationId": producer.activation_id,
-                    "startEffectId": row.get::<&str, _>("start_effect_id"),
+                    "startEffectId": row.try_get::<&str, _>("start_effect_id")?,
                     "agentInstanceId": context.work.agent_instance_id,
                 }))
             && result.get("physical")
@@ -533,12 +533,12 @@ pub(crate) async fn verify_join_error_source_tx(
         .bind(&id.system_start_id).bind(&id.flow_invocation_id).bind(&owner.owner_epoch).fetch_all(&mut *db).await?;
     let mut effects = Vec::new();
     for row in pending {
-        let effect: FlowEffect030 = serde_json::from_str(row.get("effect_json"))?;
+        let effect: FlowEffect030 = serde_json::from_str(row.try_get("effect_json")?)?;
         if effect.identity == *id
             && matches!(&effect.kind, FlowEffectKind030::PrepareRoute { reference:r, producer:p } if r == reference && p == producer)
         {
-            require(effect.id == row.get::<&str, _>("effect_id"))?;
-            effects.push((row.get::<String, _>("event_id"), effect.id));
+            require(effect.id == row.try_get::<&str, _>("effect_id")?)?;
+            effects.push((row.try_get::<String, _>("event_id")?, effect.id));
         }
     }
     require(effects.len() == 1)?;
@@ -547,7 +547,7 @@ pub(crate) async fn verify_join_error_source_tx(
         .bind(&id.system_start_id).bind(&id.flow_invocation_id).fetch_all(&mut *db).await?;
     let mut matches = Vec::new();
     for row in rows {
-        let event_json: &str = row.get("event_json");
+        let event_json: &str = row.try_get("event_json")?;
         let Some(error) = argentic_core::durable_json::at_path(
             event_json,
             &["kind", "Prepared", "result", "Failed", "error"],
@@ -563,9 +563,9 @@ pub(crate) async fn verify_join_error_source_tx(
             continue;
         }
         matches.push((
-            row.get::<String, _>("event_id"),
+            row.try_get::<String, _>("event_id")?,
             event_json.to_owned(),
-            row.get::<String, _>("receipt_json"),
+            row.try_get::<String, _>("receipt_json")?,
             event,
         ));
     }
@@ -637,8 +637,8 @@ pub(crate) async fn verify_join_error_source_tx(
     let prep = sqlx::query("SELECT reference_json,result_json FROM engine_flow030_preparations WHERE system_id=? AND invocation_id=? AND prepare_id=? AND native_receipt_id=? AND owner_epoch=? AND generation=?")
         .bind(&id.system_start_id).bind(&id.flow_invocation_id).bind(&previous.prepare_id).bind(native_receipt).bind(&owner.owner_epoch).bind(generation)
         .fetch_optional(&mut *db).await?.ok_or(StoreError030::Authority)?;
-    require(serde_json::from_str::<PrepareRef030>(prep.get("reference_json"))? == previous)?;
-    let result_json: &str = prep.get("result_json");
+    require(serde_json::from_str::<PrepareRef030>(prep.try_get("reference_json")?)? == previous)?;
+    let result_json: &str = prep.try_get("result_json")?;
     let result: Value = serde_json::from_str(result_json)?;
     let result_error = argentic_core::durable_json::at_path(result_json, &["error"])?
         .ok_or(StoreError030::Authority)?;
@@ -651,7 +651,7 @@ pub(crate) async fn verify_join_error_source_tx(
         .bind(&id.system_start_id).bind(&id.flow_invocation_id).bind(event_id).bind(&owner.owner_epoch).fetch_all(&mut *db).await?;
     let mut failures = 0;
     for row in rows {
-        let effect_json: &str = row.get("effect_json");
+        let effect_json: &str = row.try_get("effect_json")?;
         let effect: FlowEffect030 = serde_json::from_str(effect_json)?;
         if let FlowEffectKind030::Failure {
             activation_id,
@@ -665,7 +665,7 @@ pub(crate) async fn verify_join_error_source_tx(
                     .ok_or(StoreError030::Authority)?;
                 require(
                     effect.identity == *id
-                        && effect.id == row.get::<&str, _>("effect_id")
+                        && effect.id == row.try_get::<&str, _>("effect_id")?
                         && receipt
                             .effect_ids
                             .iter()
@@ -750,7 +750,7 @@ async fn verify_failure_effect_tx(
     let mut join_failures = 0;
     let mut join_failure_rowid = None;
     for row in rows {
-        let effect: FlowEffect030 = serde_json::from_str(row.get("effect_json"))?;
+        let effect: FlowEffect030 = serde_json::from_str(row.try_get("effect_json")?)?;
         if let FlowEffectKind030::Failure {
             activation_id,
             step,
@@ -761,7 +761,7 @@ async fn verify_failure_effect_tx(
         {
             if activation_id == &producer.activation_id && step == &producer.step {
                 join_failures += 1;
-                let event_id: &str = row.get("event_id");
+                let event_id: &str = row.try_get("event_id")?;
                 let event_json: &str = row
                     .try_get::<Option<&str>, _>("event_json")?
                     .ok_or(StoreError030::Authority)?;
@@ -775,7 +775,7 @@ async fn verify_failure_effect_tx(
                 require(
                     *counted
                         && effect.identity == *id
-                        && effect.id == row.get::<&str, _>("effect_id")
+                        && effect.id == row.try_get::<&str, _>("effect_id")?
                         && effect_error == error
                         && row.try_get::<Option<&str>, _>("diagnostic_json")?.is_none()
                         && event.get("identity") == Some(&serde_json::to_value(id)?)
@@ -875,20 +875,20 @@ async fn verify_failed_group_source_tx(
         .bind(&id.system_start_id).bind(&id.flow_invocation_id).bind(&owner.owner_epoch).fetch_all(&mut *db).await?;
     let mut source_effects = Vec::new();
     for row in pending {
-        let effect: FlowEffect030 = serde_json::from_str(row.get("effect_json"))?;
+        let effect: FlowEffect030 = serde_json::from_str(row.try_get("effect_json")?)?;
         if effect.identity == *id
             && matches!(&effect.kind, FlowEffectKind030::PrepareRoute {reference:r,producer:p} if r == reference && p == producer)
         {
-            require(effect.id == row.get::<&str, _>("effect_id"))?;
-            source_effects.push((row.get::<String, _>("event_id"), effect.id));
+            require(effect.id == row.try_get::<&str, _>("effect_id")?)?;
+            source_effects.push((row.try_get::<String, _>("event_id")?, effect.id));
         }
     }
     require(source_effects.len() == 1)?;
     let release = sqlx::query("SELECT rowid,event_json,receipt_json FROM engine_flow030_events WHERE system_id=? AND invocation_id=? AND event_id=? AND receipt_json IS NOT NULL AND diagnostic_json IS NULL")
         .bind(&id.system_start_id).bind(&id.flow_invocation_id).bind(&source_effects[0].0).fetch_optional(&mut *db).await?.ok_or(StoreError030::Authority)?;
-    let release_event: Value = serde_json::from_str(release.get("event_json"))?;
+    let release_event: Value = serde_json::from_str(release.try_get("event_json")?)?;
     let release_receipt: crate::persistence::flow030::FlowReceipt030 =
-        serde_json::from_str(release.get("receipt_json"))?;
+        serde_json::from_str(release.try_get("receipt_json")?)?;
     require(
         release_event.get("identity") == Some(&serde_json::to_value(id)?)
             && release_receipt.event_id == source_effects[0].0
@@ -905,12 +905,12 @@ async fn verify_failed_group_source_tx(
         .get(&source_effects[0].0)
         .ok_or(StoreError030::Authority)?;
     require(
-        release_record.event_json == release.get::<&str, _>("event_json")
+        release_record.event_json == release.try_get::<&str, _>("event_json")?
             && release_record.receipt == release_receipt,
     )?;
     let rowid =
         verify_failed_group_tx(db, capture, producer, owner, generation, state, plan, 0).await?;
-    require(rowid == release.get::<i64, _>("rowid"))
+    require(rowid == release.try_get::<i64, _>("rowid")?)
 }
 
 // Bound native proof recursion independently of authored nesting and SQL data.
@@ -1013,7 +1013,7 @@ fn verify_failed_group_tx<'a>(
             .bind(&id.system_start_id).bind(&id.flow_invocation_id).bind(&owner.owner_epoch).fetch_all(&mut *db).await?;
             let mut found = Vec::new();
             for row in rows {
-                let effect: FlowEffect030 = serde_json::from_str(row.get("effect_json"))?;
+                let effect: FlowEffect030 = serde_json::from_str(row.try_get("effect_json")?)?;
                 let FlowEffectKind030::Failure {
                     activation_id,
                     step,
@@ -1039,9 +1039,9 @@ fn verify_failed_group_tx<'a>(
                 ) {
                     continue;
                 }
-                let event: Value = serde_json::from_str(row.get("event_json"))?;
+                let event: Value = serde_json::from_str(row.try_get("event_json")?)?;
                 let receipt: crate::persistence::flow030::FlowReceipt030 =
-                    serde_json::from_str(row.get("receipt_json"))?;
+                    serde_json::from_str(row.try_get("receipt_json")?)?;
                 let event_id = event
                     .get("eventId")
                     .and_then(Value::as_str)
@@ -1049,7 +1049,7 @@ fn verify_failed_group_tx<'a>(
                 require(
                     event.get("identity") == Some(&serde_json::to_value(id)?)
                         && effect.identity == *id
-                        && effect.id == row.get::<&str, _>("effect_id")
+                        && effect.id == row.try_get::<&str, _>("effect_id")?
                         && receipt.event_id == event_id
                         && receipt
                             .effect_ids
@@ -1060,7 +1060,7 @@ fn verify_failed_group_tx<'a>(
                 )?;
                 let record = state.events.get(event_id).ok_or(StoreError030::Authority)?;
                 require(
-                    record.event_json == row.get::<&str, _>("event_json")
+                    record.event_json == row.try_get::<&str, _>("event_json")?
                         && record.receipt == receipt,
                 )?;
                 // Only the nearest path may consume this failure. A nested branch's
@@ -1178,7 +1178,7 @@ fn verify_failed_group_tx<'a>(
                             depth + 1,
                         )
                         .await?;
-                        require(nested_rowid == row.get::<i64, _>("rowid"))?;
+                        require(nested_rowid == row.try_get::<i64, _>("rowid")?)?;
                     }
                     // If resume itself admits queued work, the exact reducer replay
                     // below proves that admission reached its visit limit.
@@ -1201,7 +1201,7 @@ fn verify_failed_group_tx<'a>(
                 }
                 verify_reduced_failure_tx(db, capture, state, &effect).await?;
                 found.push((
-                    row.get::<i64, _>("rowid"),
+                    row.try_get::<i64, _>("rowid")?,
                     receipt
                         .effect_ids
                         .iter()
@@ -1287,12 +1287,12 @@ async fn verify_accepted_work(
     let row = sqlx::query("SELECT e.ticket_json,e.decision_json,a.context_json,a.contract_json,a.owner_epoch,a.generation,a.capture_sha256 FROM engine_flow030_work_events e JOIN engine_flow030_work_admissions a USING(system_id,invocation_id,activation_id) WHERE e.system_id=? AND e.invocation_id=? AND e.event_id=? AND e.activation_id=?")
         .bind(&id.system_start_id).bind(&id.flow_invocation_id).bind(event_id).bind(&producer.activation_id).fetch_optional(&mut *db).await?.ok_or(StoreError030::Authority)?;
     require(
-        row.get::<&str, _>("owner_epoch") == owner.owner_epoch
-            && row.get::<&str, _>("generation") == generation
-            && row.get::<&str, _>("capture_sha256") == sha(&serde_json::to_vec(capture)?),
+        row.try_get::<&str, _>("owner_epoch")? == owner.owner_epoch
+            && row.try_get::<&str, _>("generation")? == generation
+            && row.try_get::<&str, _>("capture_sha256")? == sha(&serde_json::to_vec(capture)?),
     )?;
-    let context: EngineContext = serde_json::from_str(row.get("context_json"))?;
-    let ticket: Value = serde_json::from_str(row.get("ticket_json"))?;
+    let context: EngineContext = serde_json::from_str(row.try_get("context_json")?)?;
+    let ticket: Value = serde_json::from_str(row.try_get("ticket_json")?)?;
     require(
         context.owner == *owner
             && context.work.system_start_id == id.system_start_id
@@ -1305,7 +1305,7 @@ async fn verify_accepted_work(
             && ticket.pointer("/input/context") == Some(&serde_json::to_value(&context)?),
     )?;
     let decision: Value = serde_json::from_str(
-        row.get::<Option<&str>, _>("decision_json")
+        row.try_get::<Option<&str>, _>("decision_json")?
             .ok_or(StoreError030::Authority)?,
     )?;
     let receipt: Value = serde_json::from_str(string(&decision, "receiptJson")?)?;
@@ -1321,7 +1321,7 @@ async fn verify_accepted_work(
         &accepted_output_json(output)?,
         &producer.output_json,
     )?)?;
-    let contract: Value = serde_json::from_str(row.get("contract_json"))?;
+    let contract: Value = serde_json::from_str(row.try_get("contract_json")?)?;
     let agent: Value = serde_json::from_str(string(&contract, "agentJson")?)?;
     let plan: FlowPlan030 = serde_json::from_str(&capture.compiled_plan_json)?;
     let name = producer
@@ -1416,23 +1416,23 @@ async fn verify_content(
         let row=sqlx::query("SELECT context_id,owner_epoch,generation,capture_sha256,target_address_json,recipient_kind,recipient_agent,identity_json,policy_evidence_json,status FROM engine_flow030_route_content_contexts WHERE system_id=? AND invocation_id=? AND prepare_id=? AND target_ordinal=? AND item_index=?")
             .bind(&id.system_start_id).bind(&id.flow_invocation_id).bind(&reference.prepare_id).bind(i64::try_from(use_.target_ordinal).map_err(|_| StoreError030::Authority)?).bind(&use_.item_index).fetch_optional(&mut *db).await?.ok_or(StoreError030::Authority)?;
         require(
-            row.get::<&str, _>("context_id") == use_.context_id
-                && row.get::<&str, _>("owner_epoch") == owner.owner_epoch
-                && row.get::<&str, _>("generation") == generation
-                && row.get::<&str, _>("capture_sha256") == capture_sha
-                && row.get::<&str, _>("status") == "live"
-                && row.get::<&str, _>("recipient_kind") == step.r#type
-                && row.get::<Option<String>, _>("recipient_agent") == step.agent
+            row.try_get::<&str, _>("context_id")? == use_.context_id
+                && row.try_get::<&str, _>("owner_epoch")? == owner.owner_epoch
+                && row.try_get::<&str, _>("generation")? == generation
+                && row.try_get::<&str, _>("capture_sha256")? == capture_sha
+                && row.try_get::<&str, _>("status")? == "live"
+                && row.try_get::<&str, _>("recipient_kind")? == step.r#type
+                && row.try_get::<Option<String>, _>("recipient_agent")? == step.agent
                 && exact(
-                    row.get("target_address_json"),
+                    row.try_get("target_address_json")?,
                     &serde_json::to_string(address)?,
                 )?
                 && value_equal(
-                    &serde_json::from_str::<Value>(row.get("identity_json"))?,
+                    &serde_json::from_str::<Value>(row.try_get("identity_json")?)?,
                     &use_.identity,
                 )?,
         )?;
-        argentic_core::durable_json::validate(row.get("policy_evidence_json"))?;
+        argentic_core::durable_json::validate(row.try_get("policy_evidence_json")?)?;
         if let Some(agent) = &step.agent {
             require(string(&use_.identity, "agent")? == agent)?;
         }
@@ -1447,14 +1447,14 @@ async fn verify_content(
             let row=sqlx::query("SELECT source_json,native_receipt_json,transport_receipt_json FROM engine_flow030_route_content_receipts WHERE system_id=? AND invocation_id=? AND context_id=? AND receipt_sha256=?")
                 .bind(&id.system_start_id).bind(&id.flow_invocation_id).bind(&use_.context_id).bind(&digest).fetch_optional(&mut *db).await?.ok_or(StoreError030::Authority)?;
             require(value_equal(
-                &serde_json::from_str::<Value>(row.get("transport_receipt_json"))?,
+                &serde_json::from_str::<Value>(row.try_get("transport_receipt_json")?)?,
                 &receipt,
             )?)?;
             let native: ResolvedContentReceipt =
-                serde_json::from_str(row.get("native_receipt_json"))?;
+                serde_json::from_str(row.try_get("native_receipt_json")?)?;
             verify_native_content(
                 &native,
-                row.get("source_json"),
+                row.try_get("source_json")?,
                 &receipt,
                 &use_.identity,
                 &plan.document_json,

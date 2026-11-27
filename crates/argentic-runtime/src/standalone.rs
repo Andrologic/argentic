@@ -1931,6 +1931,27 @@ mod tests {
         .unwrap()
         .unwrap();
         assert!(child.status.success(), "{child:?}");
+        // Recovery reads persisted Stop columns; a wrongly typed value must
+        // refuse opening with a storage error instead of panicking.
+        let path = f.data.join("engine.sqlite");
+        let pool = crate::sqlite::open_file(&path).await.unwrap();
+        let generation: String = sqlx::query_scalar("SELECT generation FROM engine_flow030_owners")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE engine_flow030_owners SET generation=x'00'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+        assert_eq!(f.open().await.err().unwrap().code, "STORAGE");
+        let pool = crate::sqlite::open_file(&path).await.unwrap();
+        sqlx::query("UPDATE engine_flow030_owners SET generation=?")
+            .bind(generation)
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
         for reopening in 0..2 {
             let host = f.open().await.unwrap();
             let runs = host.runs().await.unwrap();

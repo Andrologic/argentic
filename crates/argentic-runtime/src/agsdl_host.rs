@@ -479,16 +479,17 @@ impl HostState {
             .map_err(|_| failure("RUNTIME_UNAVAILABLE", "", "Host ownership unavailable"))?;
         let mut active = Vec::new();
         for row in rows {
+            let owner_epoch: &str = row.try_get("owner_epoch")?;
             let system: String = row.try_get("system_id")?;
             let state: repository::flow030::FlowState030 =
                 serde_json::from_str(row.try_get("state_json")?)?;
             if state.identity.system_start_id != system
-                || state.identity.flow_invocation_id != row.get::<String, _>("invocation_id")
-                || state.identity.snapshot_id != row.get::<String, _>("snapshot_id")
-                || state.identity.epoch != row.get::<String, _>("capture_epoch")
+                || state.identity.flow_invocation_id != row.try_get::<String, _>("invocation_id")?
+                || state.identity.snapshot_id != row.try_get::<String, _>("snapshot_id")?
+                || state.identity.epoch != row.try_get::<String, _>("capture_epoch")?
                 || !owners
                     .get(&system)
-                    .is_some_and(|owner| owner.owner_epoch == row.get::<String, _>("owner_epoch"))
+                    .is_some_and(|owner| owner.owner_epoch == owner_epoch)
             {
                 return Err(failure("CORRELATION", "", "Native shutdown owner differs"));
             }

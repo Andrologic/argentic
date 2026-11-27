@@ -303,13 +303,13 @@ impl RouteAttestor030 {
             .fetch_optional(&mut *db).await?.ok_or_else(|| failure("AUTHORITY", "route", "Native route owner is absent"))?;
         let capture_json = serde_json::to_string(capture)?;
         require(
-            row.get::<&str, _>("owner_epoch") == self.owner.owner_epoch
-                && row.get::<&str, _>("generation") == self.generation
-                && row.get::<&str, _>("status") == "live"
-                && row.get::<&str, _>("capture_sha256") == sha(capture_json.as_bytes())
-                && row.get::<&str, _>("capture_json") == capture_json,
+            row.try_get::<&str, _>("owner_epoch")? == self.owner.owner_epoch
+                && row.try_get::<&str, _>("generation")? == self.generation
+                && row.try_get::<&str, _>("status")? == "live"
+                && row.try_get::<&str, _>("capture_sha256")? == sha(capture_json.as_bytes())
+                && row.try_get::<&str, _>("capture_json")? == capture_json,
         )?;
-        let state: FlowState030 = serde_json::from_str(row.get("state_json"))?;
+        let state: FlowState030 = serde_json::from_str(row.try_get("state_json")?)?;
         require(state.identity == *id && state.entered && !state.stopping)?;
         let retained_plan = state
             .plan_json
@@ -334,11 +334,11 @@ impl RouteAttestor030 {
             .bind(&id.system_start_id).bind(&id.flow_invocation_id).bind(&self.owner.owner_epoch).fetch_all(&mut *db).await?;
         let mut matching = Vec::new();
         for row in effects {
-            let effect: FlowEffect030 = serde_json::from_str(row.get("effect_json"))?;
+            let effect: FlowEffect030 = serde_json::from_str(row.try_get("effect_json")?)?;
             if effect.identity == *id
                 && matches!(&effect.kind, FlowEffectKind030::PrepareRoute {reference:r,producer:p} if r==reference && p==&preparation.producer)
             {
-                require(effect.id == row.get::<&str, _>("effect_id"))?;
+                require(effect.id == row.try_get::<&str, _>("effect_id")?)?;
                 matching.push(effect.id);
             }
         }
@@ -663,17 +663,17 @@ impl RouteAttestor030 {
         )
         .await?;
         let source_json = self.source_json_tx(tx, capture, &producer, &kind).await?;
-        let native_receipt_id: String = row.get("native_receipt_id");
+        let native_receipt_id: String = row.try_get("native_receipt_id")?;
         require(
-            row.get::<&str, _>("preparation_effect_id") == effect_id
-                && row.get::<&str, _>("owner_epoch") == self.owner.owner_epoch
-                && row.get::<&str, _>("generation") == self.generation
-                && row.get::<&str, _>("capture_sha256") == sha(&serde_json::to_vec(capture)?)
+            row.try_get::<&str, _>("preparation_effect_id")? == effect_id
+                && row.try_get::<&str, _>("owner_epoch")? == self.owner.owner_epoch
+                && row.try_get::<&str, _>("generation")? == self.generation
+                && row.try_get::<&str, _>("capture_sha256")? == sha(&serde_json::to_vec(capture)?)
                 && !native_receipt_id.is_empty()
-                && row.get::<&str, _>("receipt_kind") == kind.receipt_kind()
-                && row.get::<Option<&str>, _>("work_event_id") == kind.work_event_id()
-                && row.get::<&str, _>("producer_json") == serde_json::to_string(&producer)?
-                && row.get::<&str, _>("source_json") == source_json,
+                && row.try_get::<&str, _>("receipt_kind")? == kind.receipt_kind()
+                && row.try_get::<Option<&str>, _>("work_event_id")? == kind.work_event_id()
+                && row.try_get::<&str, _>("producer_json")? == serde_json::to_string(&producer)?
+                && row.try_get::<&str, _>("source_json")? == source_json,
         )?;
         let source = AttestedRouteSource030 {
             kind,
