@@ -144,7 +144,7 @@ pub(crate) struct CallHumans030 {
 }
 struct McpAnswer030;
 impl crate::agsdl_host_human030::QuestionValidator030 for McpAnswer030 {
-    fn validate(&self, _: &serde_json::Value, answer: &str) -> Result<()> {
+    fn validate(&self, payload: &serde_json::Value, answer: &str) -> Result<()> {
         let value: serde_json::Value = serde_json::from_str(answer)?;
         if !matches!(
             value["action"].as_str(),
@@ -156,6 +156,20 @@ impl crate::agsdl_host_human030::QuestionValidator030 for McpAnswer030 {
                 "answer",
                 "Expected an MCP form response",
             ));
+        }
+        if value["action"] == "accept" {
+            let schema = &payload["protocolRequest"]["params"]["requestedSchema"];
+            let validator = jsonschema::options()
+                .should_validate_formats(true)
+                .build(schema)
+                .map_err(|_| failure("INPUT_CONSTRAINT", "answer", "Invalid MCP form schema"))?;
+            if !validator.is_valid(&value["content"]) {
+                return Err(failure(
+                    "INPUT_CONSTRAINT",
+                    "answer",
+                    "MCP form content does not match the requested schema",
+                ));
+            }
         }
         Ok(())
     }
@@ -305,5 +319,38 @@ impl crate::agsdl_host_calls::HostPort for CallHumans030 {
         _: &crate::agsdl_host_calls::Result<String>,
     ) -> crate::agsdl_host_calls::Result<()> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agsdl_host_human030::QuestionValidator030;
+    use serde_json::json;
+
+    #[test]
+    fn mcp_form_acceptance_checks_retained_schema() {
+        let payload = json!({"protocolRequest":{"params":{"requestedSchema":{
+            "type":"object","properties":{"text":{"type":"string","minLength":2}},
+            "required":["text"],"additionalProperties":false
+        }}}});
+        for answer in [
+            r#"{"action":"accept","content":{}}"#,
+            r#"{"action":"accept","content":{"text":1}}"#,
+            r#"{"action":"accept","content":{"text":"x"}}"#,
+            r#"{"action":"accept","content":{"text":"valid","extra":true}}"#,
+        ] {
+            assert_eq!(
+                McpAnswer030.validate(&payload, answer).unwrap_err().code,
+                "INPUT_CONSTRAINT"
+            );
+        }
+        for answer in [
+            r#"{"action":"accept","content":{"text":"valid"}}"#,
+            r#"{"action":"decline"}"#,
+            r#"{"action":"cancel"}"#,
+        ] {
+            McpAnswer030.validate(&payload, answer).unwrap();
+        }
     }
 }
