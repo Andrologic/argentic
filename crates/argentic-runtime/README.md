@@ -33,14 +33,18 @@ resolves real paths and links. Its TypeScript wire mirrors remain in Macro.
 
 The reader opens regular files relative to an admitted directory handle on
 Linux, Windows and macOS ARM64 14.4 or later. Linux relaunches the running image
-through procfs. macOS uses the Swift launcher to check the helper's code identity.
+through procfs. On macOS, the Swift launcher starts the helper suspended and
+uses Security.framework to compare the loaded child's code directory hash with
+the running host's. It resumes a matching child and kills and reaps a rejected
+child before returning a launch error. Checking the loaded process closes the
+race between checking a path and executing it. This protects against replacement
+of the executable at its path and assumes other processes cannot interfere with
+the suspended child, for example by sending it `SIGCONT`.
 On both systems the host calls `content_io::file_helper::initialize` before
 normal startup so the child can dispatch. On Windows the runtime opens the file
 without following reparse points and waits for its I/O thread to exit on Stop.
 
-macOS builds must preserve the weak link to LightweightCodeRequirements
-(`-Wl,-weak_framework,LightweightCodeRequirements`) when targeting versions
-before 14.4. The explicit `agsdl-content-qa` feature enables debug QA hooks.
+The explicit `agsdl-content-qa` feature enables debug QA hooks on macOS.
 
 ## Host and test boundaries
 

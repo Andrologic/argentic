@@ -63,6 +63,9 @@ fn rejects_substituted_content_helper_image() {
     let helper = root.join("helper");
     let source = root.join("probe.c");
     let adhoc = root.join("adhoc");
+    let resigned = root.join("resigned");
+    let fixture = b"helper fixture\n";
+    fs::write(root.join("fixture.txt"), fixture).unwrap();
     fs::write(
         &source,
         "#include <stdio.h>\nint main(void) { puts(\"qa probe\"); }\n",
@@ -73,31 +76,74 @@ fn rejects_substituted_content_helper_image() {
         .status()
         .unwrap()
         .success());
+    // The same helper code under a new ad hoc signature has another code
+    // directory hash. If launched, it would read the fixture like the real one.
+    fs::copy(std::env::current_exe().unwrap(), &resigned).unwrap();
+    assert!(Command::new("/usr/bin/codesign")
+        .args(["-s", "-", "-f"])
+        .arg(&resigned)
+        .status()
+        .unwrap()
+        .success());
     let directory = Dir::open_ambient_dir(&root, ambient_authority()).unwrap();
 
+    let read_launch = |mut launch: Launch| {
+        let exit = launch.wait(Duration::from_secs(5)).unwrap();
+        launch.cancel();
+        let exit = match exit {
+            Some(exit) => exit,
+            None => launch.wait(Duration::from_secs(5)).unwrap().unwrap(),
+        };
+        let mut bytes = Vec::new();
+        fs::File::from(launch.output)
+            .read_to_end(&mut bytes)
+            .unwrap();
+        (exit, bytes)
+    };
+
+    // A byte-identical copy keeps the code identity and must still launch.
+    fs::copy(std::env::current_exe().unwrap(), &helper).unwrap();
+    let launch = Launch::start(&helper, Path::new("fixture.txt"), directory.as_raw_fd()).unwrap();
+    let (exit, bytes) = read_launch(launch);
+    assert!(!exit.signal && exit.status == 0, "copied helper failed");
+    assert_eq!(bytes, fixture);
+    fs::remove_file(&helper).unwrap();
+
     let mut failures = Vec::new();
-    for image in [Path::new("/bin/echo"), adhoc.as_path()] {
+    // The first two replacements run on their own. The re-signed helper needs
+    // the launcher's descriptors, so its new signature is verified instead.
+    for (image, runnable) in [
+        (Path::new("/bin/echo"), true),
+        (adhoc.as_path(), true),
+        (resigned.as_path(), false),
+    ] {
         let replacement = root.join("replacement");
         fs::copy(std::env::current_exe().unwrap(), &helper).unwrap();
         fs::copy(image, &replacement).unwrap();
-        let probe = Command::new(&replacement).arg("qa probe").output().unwrap();
-        assert!(probe.status.success());
-        assert_eq!(probe.stdout, b"qa probe\n");
+        if runnable {
+            let probe = Command::new(&replacement).arg("qa probe").output().unwrap();
+            assert!(probe.status.success());
+            assert_eq!(probe.stdout, b"qa probe\n");
+        } else {
+            assert!(Command::new("/usr/bin/codesign")
+                .args(["--verify", "--strict"])
+                .arg(&replacement)
+                .status()
+                .unwrap()
+                .success());
+        }
 
         arm_image_swap(&helper, &replacement).unwrap();
         let result = Launch::start(&helper, Path::new("fixture.txt"), directory.as_raw_fd());
         match result {
-            Err(error) if error.to_string().ends_with("(4)") => {}
+            // The bridge refuses before resuming the child, so it never ran
+            // and the output pipe was closed without a byte.
+            Err(error) if error.to_string().ends_with("(7)") => {}
             Err(error) => {
                 failures.push(format!("{}: unexpected refusal: {error}", image.display()))
             }
-            Ok(mut launch) => {
-                launch.cancel();
-                let exit = launch.wait(Duration::from_secs(5)).unwrap().unwrap();
-                let mut bytes = Vec::new();
-                fs::File::from(launch.output)
-                    .read_to_end(&mut bytes)
-                    .unwrap();
+            Ok(launch) => {
+                let (exit, bytes) = read_launch(launch);
                 failures.push(format!(
                     "{}: substituted helper was launched (status {}, signal {}, output {:?})",
                     image.display(),
