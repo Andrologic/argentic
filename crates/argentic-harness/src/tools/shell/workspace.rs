@@ -358,73 +358,80 @@ fn walk(
 ) -> io::Result<()> {
     let mut entries = 0;
     let mut bytes = 0;
-    let mut pending = vec![(PathBuf::new(), root.directory.try_clone()?, 0)];
-    while let Some((parent, directory, depth)) = pending.pop() {
-        root.verify_location(&parent, confined::location(&directory)?)?;
-        let parent_metadata = directory.dir_metadata()?;
-        for entry in directory.entries()? {
-            check_cancel(cancel)?;
-            entries += 1;
-            if entries > MAX_ENTRIES || depth > MAX_DEPTH {
-                return Err(io::Error::other(
-                    "Shell workspace entry or depth budget exceeded",
-                ));
-            }
-            let entry = entry?;
-            let name = entry.file_name();
-            let Some(name) = name.to_str().and_then(|name| relative_path(name).ok()) else {
-                if strict {
-                    return Err(io::Error::other(
-                        "Cannot publish an unsupported shell workspace filename",
-                    ));
-                }
-                continue;
-            };
-            let path = parent.join(&name);
-            if !include(&path) {
-                continue;
-            }
-            let kind = entry.file_type()?;
-            if kind.is_dir() {
-                let child = confined::directory(&directory, Path::new(&name))?;
-                root.verify_location(&path, confined::location(&child)?)?;
-                visit(&path, None)?;
-                pending.push((path, child, depth + 1));
-            } else if kind.is_file() {
-                let meta = directory.symlink_metadata(&name)?;
-                if !meta.is_file() || meta.nlink() != 1 {
-                    if strict {
-                        return Err(io::Error::other("Cannot publish multiplied hard links"));
-                    }
-                    continue;
-                }
-                let mut options = OpenOptions::new();
-                options
-                    .read(true)
-                    .follow(FollowSymlinks::No)
-                    .custom_flags(libc::O_NONBLOCK);
-                let file = directory.open_with(&name, &options)?;
-                root.verify_location(&path, confined::location(&file)?)?;
-                let opened = file.metadata()?;
-                if !opened.is_file()
-                    || opened.nlink() != 1
-                    || opened.dev() != meta.dev()
-                    || opened.ino() != meta.ino()
-                {
-                    return Err(denied());
-                }
-                bytes = u64::saturating_add(bytes, opened.len());
-                if opened.len() > MAX_FILE_BYTES as u64 || bytes > MAX_SCAN_BYTES {
-                    return Err(io::Error::other("Shell workspace byte budget exceeded"));
-                }
-                visit(&path, Some((file, opened, &parent_metadata)))?;
-            } else if strict {
-                return Err(io::Error::other(
-                    "Cannot publish symlinks or special files from shell",
-                ));
-            }
+    let directory = root.directory.try_clone()?;
+    let metadata = directory.dir_metadata()?;
+    let mut stack = vec![(PathBuf::new(), directory.entries()?, directory, metadata)];
+    while !stack.is_empty() {
+        let depth = stack.len() - 1;
+        let Some((parent, iter, directory, parent_metadata)) = stack.last_mut() else {
+            break;
+        };
+        check_cancel(cancel)?;
+        root.verify_location(parent, confined::location(directory)?)?;
+        let Some(entry) = iter.next() else {
+            stack.pop();
+            continue;
+        };
+        entries += 1;
+        if entries > MAX_ENTRIES || depth > MAX_DEPTH {
+            return Err(io::Error::other(
+                "Shell workspace entry or depth budget exceeded",
+            ));
         }
-        root.verify_location(&parent, confined::location(&directory)?)?;
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str().and_then(|name| relative_path(name).ok()) else {
+            if strict {
+                return Err(io::Error::other(
+                    "Cannot publish an unsupported shell workspace filename",
+                ));
+            }
+            continue;
+        };
+        let path = parent.join(&name);
+        if !include(&path) {
+            continue;
+        }
+        let kind = entry.file_type()?;
+        if kind.is_dir() {
+            let child = confined::directory(directory, Path::new(&name))?;
+            root.verify_location(&path, confined::location(&child)?)?;
+            visit(&path, None)?;
+            let metadata = child.dir_metadata()?;
+            stack.push((path, child.entries()?, child, metadata));
+        } else if kind.is_file() {
+            let meta = directory.symlink_metadata(&name)?;
+            if !meta.is_file() || meta.nlink() != 1 {
+                if strict {
+                    return Err(io::Error::other("Cannot publish multiplied hard links"));
+                }
+                continue;
+            }
+            let mut options = OpenOptions::new();
+            options
+                .read(true)
+                .follow(FollowSymlinks::No)
+                .custom_flags(libc::O_NONBLOCK);
+            let file = directory.open_with(&name, &options)?;
+            root.verify_location(&path, confined::location(&file)?)?;
+            let opened = file.metadata()?;
+            if !opened.is_file()
+                || opened.nlink() != 1
+                || opened.dev() != meta.dev()
+                || opened.ino() != meta.ino()
+            {
+                return Err(denied());
+            }
+            bytes = u64::saturating_add(bytes, opened.len());
+            if opened.len() > MAX_FILE_BYTES as u64 || bytes > MAX_SCAN_BYTES {
+                return Err(io::Error::other("Shell workspace byte budget exceeded"));
+            }
+            visit(&path, Some((file, opened, parent_metadata)))?;
+        } else if strict {
+            return Err(io::Error::other(
+                "Cannot publish symlinks or special files from shell",
+            ));
+        }
     }
     Ok(())
 }
@@ -433,6 +440,65 @@ fn walk(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn shell_snapshot_walk_bounds_open_sibling_directories() {
+        const CHILD: &str = "ARGENTIC_TEST_SNAPSHOT_FD_LIMIT";
+        if std::env::var_os(CHILD).is_none() {
+            use std::os::unix::process::CommandExt;
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "tools::shell::workspace::tests::shell_snapshot_walk_bounds_open_sibling_directories",
+                ])
+                .env(CHILD, "1");
+            // Limit only the child test process. Other tests can open files concurrently.
+            unsafe {
+                command.pre_exec(|| {
+                    let limit = libc::rlimit {
+                        rlim_cur: 64,
+                        rlim_max: 64,
+                    };
+                    if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) == -1 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            return;
+        }
+
+        let fixture = tempfile::tempdir().unwrap();
+        let path = fixture.path().canonicalize().unwrap();
+        for i in 0..128 {
+            fs::create_dir(path.join(format!("child-{i}"))).unwrap();
+        }
+        let root = Root {
+            directory: Dir::open_ambient_dir(&path, ambient_authority()).unwrap(),
+            path,
+        };
+        let mut visited = 0;
+        walk(
+            &root,
+            &CancellationToken::new(),
+            |_| true,
+            true,
+            |_, _| {
+                visited += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(visited, 128);
+    }
 
     #[test]
     fn publication_rejects_a_host_edit_with_restored_mtime() {
