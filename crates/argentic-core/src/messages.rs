@@ -443,22 +443,6 @@ impl Resolver<'_, '_, '_> {
         )?))
     }
 }
-pub(crate) fn resolve_route_message(
-    document_json: &str,
-    target: &RouteTarget,
-    source: &RouteSource,
-    item: &ItemContext,
-    content: &mut CapturedContent<'_>,
-) -> Result<ResolvedMessage> {
-    resolve_route_message_using(
-        DeliveryDocument::Encoded(document_json),
-        target,
-        source,
-        item,
-        content,
-    )
-}
-
 pub(crate) fn resolve_route_message_in_document(
     document: &Object,
     target: &RouteTarget,
@@ -475,9 +459,31 @@ pub(crate) fn resolve_route_message_in_document(
     )
 }
 
+/// Resolve with a document and source output already decoded by the caller,
+/// so a fan-out decodes each of them once per batch rather than once per item.
+pub(crate) fn resolve_route_message_decoded(
+    document: &Object,
+    output: &Value,
+    target: &RouteTarget,
+    source: &RouteSource,
+    item: &ItemContext,
+    content: &mut CapturedContent<'_>,
+) -> Result<ResolvedMessage> {
+    resolve_route_message_using(
+        DeliveryDocument::Decoded { document, output },
+        target,
+        source,
+        item,
+        content,
+    )
+}
+
 enum DeliveryDocument<'a> {
-    Encoded(&'a str),
     Parsed(&'a Object),
+    Decoded {
+        document: &'a Object,
+        output: &'a Value,
+    },
 }
 
 fn resolve_route_message_using(
@@ -505,21 +511,24 @@ fn resolve_route_message_using(
     if !["agent", "approval", "compose"].contains(&exact::text(step.get("type"), "")?) {
         return fail("ROUTES", "", "This target receives no message.");
     }
-    let decoded;
-    let document = match document {
-        DeliveryDocument::Encoded(json) => {
-            decoded = exact::decode(json)?;
-            exact::record(Some(&decoded), "")?
-        }
-        DeliveryDocument::Parsed(document) => document,
+    let (document, supplied_output) = match document {
+        DeliveryDocument::Parsed(document) => (document, None),
+        DeliveryDocument::Decoded { document, output } => (document, Some(output)),
     };
-    let output_value = exact::decode(&source.output_json)?;
-    let output = exact::record(Some(&output_value), "")?;
+    let decoded_output;
+    let output_value = match supplied_output {
+        Some(output) => output,
+        None => {
+            decoded_output = exact::decode(&source.output_json)?;
+            &decoded_output
+        }
+    };
+    let output = exact::record(Some(output_value), "")?;
     let metadata = result_metadata(document, source)?;
     let mut r = Resolver {
         document,
         source,
-        output: &output_value,
+        output: output_value,
         item,
         each: each_path_json.as_deref(),
         metadata: &metadata,
@@ -689,7 +698,7 @@ fn resolve_route_message_using(
                 "resources".to_owned(),
                 object([(
                     "result",
-                    object([("value", read_path(&output_value, &object_path(&["data"]))?)]),
+                    object([("value", read_path(output_value, &object_path(&["data"]))?)]),
                 )]),
             )]),
             SourceKind::Join => {
@@ -703,7 +712,7 @@ fn resolve_route_message_using(
                 "resources".to_owned(),
                 object([(
                     "error",
-                    object([("value", read_path(&output_value, &object_path(&["error"]))?)]),
+                    object([("value", read_path(output_value, &object_path(&["error"]))?)]),
                 )]),
             )]),
         }
