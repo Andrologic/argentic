@@ -187,3 +187,78 @@ fn fanout_preparation_refuses_a_deep_item_without_recursing() {
     assert_eq!(report["kind"], "failed", "{report}");
     assert_eq!(report["code"], "INPUT_LIMIT", "{report}");
 }
+
+const CLOCK_OPTIONS: &str = r#"{"maxSliceMs":1000}"#;
+
+fn clock_owner() -> Value {
+    json!({"systemStartId": "system", "ownerEpoch": "epoch"})
+}
+
+fn clock_input(state: &str, revision: usize, event_json: &str) -> String {
+    let event: Value = serde_json::from_str(event_json).unwrap();
+    json!({"operation": "humanClock", "input": {
+        "owner": clock_owner(), "eventId": event["eventId"],
+        "expectedRevision": revision.to_string(), "stateJson": state,
+        "eventJson": event_json, "optionsJson": CLOCK_OPTIONS,
+    }})
+    .to_string()
+}
+
+/// The calculation envelope and, when ready, its `stateJson` and `receiptJson`.
+fn clock_step(state: &str, revision: usize, event_json: &str) -> (Value, Option<(String, String)>) {
+    let report: Value = serde_json::from_str(
+        &calculation::route(&clock_input(state, revision, event_json), number).unwrap(),
+    )
+    .unwrap();
+    let output = report["resultJson"].as_str().map(|raw| {
+        let result: Value = serde_json::from_str(raw).unwrap();
+        (
+            result["stateJson"].as_str().unwrap().to_owned(),
+            result["receiptJson"].as_str().unwrap().to_owned(),
+        )
+    });
+    (report, output)
+}
+
+#[test]
+fn human_clock_reproduces_a_journal_written_by_the_previous_engine() {
+    // Written by main at 629f525: admissions, questions, actions, plans,
+    // approvals, expiries, operator holds, withdrawal, acks and retirements.
+    let stored = include_str!("fixtures/human-clock-journal-1.json").trim_end();
+    let journal: Value = serde_json::from_str(stored).unwrap();
+    let entries = journal["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 30);
+    let mut state = String::new();
+    for (revision, entry) in entries.iter().enumerate() {
+        let event = entry["eventJson"].as_str().unwrap();
+        let (report, output) = clock_step(&state, revision, event);
+        let (next, receipt) = output.unwrap_or_else(|| panic!("{revision}: {report}"));
+        assert_eq!(
+            receipt,
+            entry["receiptJson"].as_str().unwrap(),
+            "{revision}"
+        );
+        state = next;
+    }
+    assert_eq!(state, stored);
+    // The stored journal still replays: a repeated event returns its receipt,
+    // and a new event extends it.
+    let last = entries.last().unwrap();
+    let (_, repeated) = clock_step(stored, entries.len(), last["eventJson"].as_str().unwrap());
+    assert_eq!(
+        repeated.unwrap(),
+        (
+            stored.to_owned(),
+            last["receiptJson"].as_str().unwrap().to_owned()
+        )
+    );
+    let tick = json!({"owner": clock_owner(), "eventId": "next", "nowMs": "100001",
+        "event": {"kind": "tick"}});
+    let (report, extended) = clock_step(stored, entries.len(), &tick.to_string());
+    assert_eq!(report["kind"], "ready", "{report}");
+    let extended: Value = serde_json::from_str(&extended.unwrap().0).unwrap();
+    assert_eq!(
+        extended["entries"].as_array().unwrap().len(),
+        entries.len() + 1
+    );
+}
