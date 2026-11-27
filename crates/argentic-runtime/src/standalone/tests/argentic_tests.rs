@@ -453,8 +453,8 @@ async fn stop_joins_the_stream_and_records_replayable_physical_end() {
 async fn steers_active_shared_work_and_preserves_the_conversation() {
     for memory in [false, true] {
         let mut server = Server::start().await;
-        let mut doc = document();
-        doc["agents"]["watcher"] = doc["agents"]["worker"].clone();
+        let (mut doc, cfg) = reviewer_fixture(&server);
+        doc["agents"]["watcher"] = document()["agents"]["worker"].clone();
         doc["flow"] = json!({"entry":"lead","steps":{
             "lead":{"type":"agent","agent":"watcher","instance":"new","prompt":"Lead mission","next":["work","watch"]},
             "work":{"type":"agent","agent":"worker","delivery":"queue","prompt":"Worker mission","next":"gather"},
@@ -467,7 +467,7 @@ async fn steers_active_shared_work_and_preserves_the_conversation() {
         let f = Fixture::new(&doc.to_string());
         let host = open(&f, memory)
             .await
-            .with_argentic(server.config(None))
+            .with_argentic(serde_json::from_value(cfg).unwrap())
             .unwrap();
         let run = start(&host).await;
         let submission = json!({"results":{"report":{"body":"done"}}});
@@ -543,7 +543,8 @@ async fn steers_active_shared_work_and_preserves_the_conversation() {
             "steer was consumed before response headers"
         );
         let (release, wait) = oneshot::channel::<()>();
-        let accepted = Request::tool_response("agsdl_submit_result", submission.clone());
+        let accepted =
+            Request::tool_response("write", json!({"path":"memo.txt","content":"approved"}));
         let body = futures::stream::iter([Ok::<_, std::io::Error>(": accepted\n\n".to_owned())])
             .chain(futures::stream::once(async move {
                 wait.await.unwrap();
@@ -552,6 +553,22 @@ async fn steers_active_shared_work_and_preserves_the_conversation() {
         request.send(StatusCode::OK, Body::from_stream(body), "text/event-stream");
         until(async || consumed(&host).await).await;
         release.send(()).unwrap();
+        let review = server.next().await;
+        assert_eq!(review.body["model"], "reviewer");
+        let context: Value =
+            serde_json::from_str(review.body["messages"][1]["content"].as_str().unwrap()).unwrap();
+        assert!(context["activeMission"]
+            .as_str()
+            .is_some_and(|mission| mission.ends_with("\nWorker mission")));
+        let steer = context["deliveredSteer"].as_array().unwrap();
+        assert_eq!(steer.len(), 1);
+        let message = steer[0]["message"].as_str().unwrap();
+        assert!(
+            message.contains("Message from watch") && message.contains("Steer mission fixture"),
+            "{message}"
+        );
+        send_text(review, r#"{"verdict":"DENY"}"#);
+        submit_done(server.next().await);
         let followup = server.next().await;
         let messages = followup.body["messages"].to_string();
         assert!(

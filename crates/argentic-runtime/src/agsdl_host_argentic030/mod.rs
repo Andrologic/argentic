@@ -513,6 +513,8 @@ impl Executor {
                     .collect(),
                 recent: Mutex::default(),
                 budget: Mutex::default(),
+                mission: mission.clone(),
+                delivered_steer: Mutex::default(),
             }))
         } else {
             None

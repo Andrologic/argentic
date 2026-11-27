@@ -250,6 +250,9 @@ pub trait Hook: Send + Sync {
     /// Called after charging the agent response and before running its tools.
     fn begin_tool_batch(&self, _budget: &ReviewBudget) {}
 
+    /// Called only when the provider accepted the request carrying the steer.
+    fn steer_delivered(&self, _id: &str, _message: &str) {}
+
     async fn before_tool_call(
         &self,
         _turn: u32,
@@ -1143,6 +1146,9 @@ impl Instance<'_> {
             self.port.settle_steer(&steer.id, status).await?;
             if let Some(steer) = self.pending_steer.pop_front() {
                 if status == DeliveryStatus::Accepted {
+                    for hook in &self.harness.hooks {
+                        hook.steer_delivered(&steer.id, &steer.message);
+                    }
                     if let Some(reference) = steer.reference {
                         self.accepted_steer.push(Message::User(reference));
                     }

@@ -247,7 +247,8 @@ Stop.
 For `"reviewer": "model"`, set `"reviewerModel": "local/reviewer-model"` at the
 top level of the Host's provider configuration and list `reviewer-model` in
 that provider's `models`. The reviewer receives the exact action and arguments,
-the policy context and bounded excerpts from the recent conversation. It has
+the policy context, the active mission, delivered steer messages and bounded
+excerpts from the recent conversation. It has
 no tools and must return a JSON object such as `{"verdict":"APPROVE"}`. The
 Host records `APPROVE`, `DENY` or `ESCALATE` as a `reviewerDecision` work event.
 The Host rechecks policy before delivering an approval. Provider errors, invalid
