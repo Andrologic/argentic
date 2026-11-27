@@ -1497,8 +1497,18 @@ impl HumanBroker030 {
         cancel: &CancellationToken,
     ) -> Result<tokio::sync::MutexGuard<'_, ()>> {
         let operation = self.operation.lock().await;
-        self.ignore_if_stopping(self.pump(host, cancel).await.map(|_| ()))
-            .await?;
+        let pending: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM engine_flow030_clock_events
+              WHERE system_id=? AND invocation_id=? AND output_json IS NULL)",
+        )
+        .bind(&self.identity.system_start_id)
+        .bind(&self.identity.flow_invocation_id)
+        .fetch_one(&self.pool)
+        .await?;
+        if pending {
+            self.ignore_if_stopping(self.pump(host, cancel).await.map(|_| ()))
+                .await?;
+        }
         Ok(operation)
     }
 

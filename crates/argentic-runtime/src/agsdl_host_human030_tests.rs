@@ -5,6 +5,26 @@ use crate::agsdl_host_clock030::{HostClockCompletion030, HostClockJob030};
 use tokio::io::AsyncWriteExt;
 
 #[tokio::test]
+async fn call_settlement_with_no_clock_ticket_needs_no_admission_or_writer_lock() {
+    let f = fixture("call", Some(60000), Some(600000)).await;
+    let admission = f.host.admission_lock();
+    let _gate = admission.lock().await;
+    let mut db = f.broker.pool.acquire().await.unwrap();
+    let tx = db.begin_with("BEGIN IMMEDIATE").await.unwrap();
+
+    let cancel = CancellationToken::new();
+    let _operation = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        f.broker.lock_call_settlement(&f.host, &cancel),
+    )
+    .await
+    .expect("an empty queue only needs a read")
+    .unwrap();
+    assert!(f.broker.operation.try_lock().is_err());
+    tx.rollback().await.unwrap();
+}
+
+#[tokio::test]
 async fn diagnostic_action_broker_keeps_attach_admit_open_and_pump_failures_distinct() {
     use crate::agsdl_host_action_approval030::CommandApprovals030;
     struct UnusedPolicy;
