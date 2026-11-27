@@ -833,6 +833,11 @@ pub(super) async fn verify(
                     .is_none(),
                 "Invented resolution",
             )?;
+            require(
+                row.try_get::<&str, _>("revision")? == "0"
+                    && row.try_get::<&str, _>("delivery")? == "pending",
+                "Unresolved request must have initial revision and pending delivery",
+            )?;
         }
     }
     let controls = sqlx::query(

@@ -1745,3 +1745,38 @@ async fn replay_rejects_a_second_acknowledgment_of_one_resolution() {
     .await;
     assert_eq!(replay.unwrap_err(), "Invalid request acknowledgment");
 }
+
+#[tokio::test]
+async fn replay_rejects_non_initial_unresolved_requests() {
+    let f = fixture("approval", None, None).await;
+    f.broker
+        .admit_host_work(&f.host, f.attempt.start_effect_id())
+        .await
+        .unwrap();
+    pump(&f).await;
+    let id = f.attempt.identity();
+    let path = f._tmp.path().join("human.db");
+    let replay = || {
+        crate::persistence::replay_verify030::verify_human_path030(
+            &path,
+            &id.system_start_id,
+            &id.flow_invocation_id,
+        )
+    };
+    assert!(replay().await.is_ok());
+    for (revision, delivery) in [("1", "pending"), ("0", "reserved"), ("0", "acknowledged")] {
+        let updated = sqlx::query(
+            "UPDATE engine_flow030_human_requests SET revision=?,delivery=? WHERE resolution_json IS NULL",
+        )
+        .bind(revision)
+        .bind(delivery)
+        .execute(&f.broker.pool)
+        .await
+        .unwrap();
+        assert_eq!(updated.rows_affected(), 1);
+        assert_eq!(
+            replay().await.unwrap_err(),
+            "Unresolved request must have initial revision and pending delivery"
+        );
+    }
+}
