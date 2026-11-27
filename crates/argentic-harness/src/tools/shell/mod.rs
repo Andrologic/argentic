@@ -332,10 +332,17 @@ fn run(
             .iter()
             .map(|(snapshot, write)| (snapshot.path(), *write))
             .collect::<Vec<_>>();
-        let live = admission.policy.clone();
         drop(admission);
         let proxy = network
-            .then(|| proxy::Proxy::start(registry.clone(), live, call.clone(), cancel))
+            .then(|| {
+                proxy::Proxy::start(
+                    registry.clone(),
+                    args.command.clone(),
+                    approved_by,
+                    call.clone(),
+                    cancel,
+                )
+            })
             .transpose()
             .map_err(|error| format!("Argentic proxy is unavailable: {error}"))?;
         #[cfg(target_os = "linux")]

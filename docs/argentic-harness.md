@@ -242,12 +242,19 @@ par hôte, déchiffre HTTPS avec une autorité de certification propre à
 l’invocation et vérifie la correspondance entre l’hôte du CONNECT, le SNI
 et l’autorité des requêtes HTTP.
 
-Le proxy applique chaque politique effective à l’hôte demandé. Un refus
-renvoie une erreur HTTP 403. Une demande `ask` passe par le port partagé
+Le proxy vérifie l’hôte demandé et les adresses résolues dans la politique
+en vigueur avant chaque connexion sortante. Un refus renvoie une erreur HTTP
+403. Le proxy actualise toutes les 250 ms la politique commune aux tunnels
+opaques de l’invocation. En cas de révocation, la fermeture prend environ
+un intervalle, auquel s’ajoutent le délai de planification et le temps de
+consultation de la politique. Les octets déjà transmis à la socket peuvent
+encore arriver. Une demande `ask` passe par le port partagé
 d’approbation humaine en mode `intercept` et est refusée en l’absence de
-relecteur. Le proxy demande une décision par hôte et par invocation, suspend
-les délais machine pendant l’attente et retire la demande si le client se
-déconnecte. Chaque requête issue d’une redirection repasse par les contrôles.
+relecteur. Le proxy mémorise la décision par hôte pour la durée de
+l’invocation. Un refus dans la politique en vigueur prime sur une approbation
+mémorisée. Le proxy suspend les délais machine pendant l’attente et retire
+la demande si le client se déconnecte. Chaque requête issue d’une
+redirection repasse par les contrôles.
 Le proxy résout lui-même le nom, contrôle les adresses obtenues et se
 connecte à l’adresse vérifiée.
 Une adresse privée, de loopback ou de lien local exige une règle IP exacte.
@@ -305,8 +312,10 @@ sont refusées dans le sous-agent, qui n’a accès ni au shell ni au réseau.
 Une délégation est synchrone, avec un seul niveau et un maximum de huit
 tours par enfant. Les tours et les
 jetons facturés à l’enfant sont décomptés du budget du parent. Le parent
-reçoit la réponse finale de l’enfant ou une erreur d’outil. Stop annule le
-flux du fournisseur et attend les lecteurs de fichiers de l’enfant avant de
+reçoit la réponse finale de l’enfant ou une erreur d’outil. Si l’enfant épuise
+son budget, le parent s’arrête avant tout autre appel du lot, y compris une
+soumission de résultat. Stop annule le flux du fournisseur et attend les
+lecteurs de fichiers de l’enfant avant de
 confirmer la fin physique. La restriction à la lecture seule évite toute
 publication de changements ou copie du workspace.
 [AgSDL 0.4.0, règles des hôtes](https://github.com/Andrologic/AgSDL/blob/v0.4.0/spec/agents.md#rules-for-hosts) et [arrêt d’un travail](https://github.com/Andrologic/AgSDL/blob/v0.4.0/spec/flow.md)
@@ -352,12 +361,16 @@ moins 16 octets. Une clé plus courte comme `lm-studio` peut servir à
 l’authentification locale et reste hors du filtre. Le harnais masque les
 échos dans le texte et le raisonnement, y compris entre deux fragments.
 Le budget de réponse du harnais compte les octets après filtrage. Pour les
-données JSON, le filtre examine les valeurs textuelles décodées. Les
-identifiants, les noms d’outils et la syntaxe du protocole restent intacts.
-Des arguments refusés donnent lieu à une correction dans la même instance,
-y compris pour `agsdl_submit_result`. Un écho dans les données signées de
-reprise invalide la réponse. Les résultats d’outils sont filtrés avant la
-pagination et l’écriture des fichiers de débordement.
+données JSON, le filtre examine les valeurs textuelles décodées et les noms
+des membres. Des arguments refusés donnent lieu à une correction dans la
+même instance, y compris pour `agsdl_submit_result`. Les données de reprise
+natives conservent les identifiants et les noms d’outils. Le filtre masque
+les échos dans le texte modifiable des réponses Anthropic et Responses. Un
+écho dans un nom de membre ou dans des données de reprise signées ou opaques
+invalide la réponse. Le harnais filtre les résultats d’outils avant la
+pagination et l’écriture des fichiers de débordement. Les adaptateurs Chat
+Completions et Responses affichent le texte d’un refus explicite et
+signalent une fin de réponse filtrée.
 
 Entre deux travaux, le Host compresse l’historique d’une instance continue
 à partir de 64 Kio si cela économise au moins un quart de sa taille estimée.
