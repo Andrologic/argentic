@@ -79,6 +79,13 @@ jobs:
         working-directory: crates/argentic-harness
         run: cargo test --locked --all-targets
 
+      - name: Measure Argentic staging and turn latency
+        if: runner.os == 'Linux'
+        working-directory: crates/argentic-harness
+        run: |
+          cargo test --locked --lib shell_staging -- --ignored --nocapture
+          cargo test --locked --test engine scripted_turn_overhead -- --ignored --nocapture
+
       - name: Test argentic-core
         if: inputs.suite != 'reader'
         working-directory: crates/argentic-core
@@ -106,6 +113,11 @@ jobs:
           fi
           cargo test "${cargo_args[@]}" -- "${test_args[@]}"
           cargo test --locked --doc
+
+      - name: Measure idle Argentic instance memory
+        if: runner.os == 'Linux' && inputs.suite != 'reader'
+        working-directory: crates/argentic-runtime
+        run: cargo test --locked --features agsdl-engine-qa --lib idle_history_round_trips_provider_replay -- --nocapture
 
       - name: Build standalone host
         if: inputs.suite != 'reader'
