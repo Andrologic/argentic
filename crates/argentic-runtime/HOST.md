@@ -510,8 +510,12 @@ helpers and binds their digests to the capture. An incomplete package
 reports `CODEX_PACKAGE_INCOMPLETE` before a model thread.
 
 Before launching the app-server for a work, Argentic compares the current
-package and profile digest with the Start capture. It verifies the active
-ChatGPT account and routing before it starts or resumes a thread.
+package and profile digest with the Start capture. The account digest binds
+the active ChatGPT user's email to the workspace ID, backend origin and
+routing override. Argentic keeps only the digest in the capture. A missing
+email, a user or routing change, or an older digest without a user binding
+blocks both thread start and resume. Older captures require a fresh Start
+capture.
 
 Argentic holds non-final agent text until the turn ends. A turn that queues
 more than 1,000 items or 4,000,000 encoded bytes fails with `NATIVE_UNCERTAIN`.

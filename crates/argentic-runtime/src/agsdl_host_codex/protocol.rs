@@ -330,13 +330,15 @@ impl Client {
         let account_digest = account_digest(&account)?;
         if let Some(auth) = &self.external_auth {
             let state = auth.lock_current().await?;
-            if state.routing_digest.as_deref() != Some(&account_digest) {
+            if state.account_digest.as_deref() != Some(&account_digest) {
                 return Err(auth::error("CODEX_AUTH_ACCOUNT_CHANGED"));
             }
         }
         Ok(account_digest)
     }
 }
+
+pub(crate) const ACCOUNT_DIGEST_PREFIX: &str = "sha256:chatgpt-user-v1:";
 
 fn account_digest(account: &Value) -> Result<String> {
     if account["account"]["type"] != "chatgpt" {
@@ -346,10 +348,18 @@ fn account_digest(account: &Value) -> Result<String> {
             "Codex account identity cannot be attested for this profile",
         ));
     }
+    let email = required(&account["account"], "email").map_err(|_| {
+        failure(
+            "CODEX_ACCOUNT_UNQUALIFIED",
+            "authentication",
+            "Codex did not provide the active ChatGPT user's email",
+        )
+    })?;
     let routing = &account["workspaceRouting"];
     Ok(format!(
-        "sha256:{:x}",
+        "{ACCOUNT_DIGEST_PREFIX}{:x}",
         Sha256::digest(serde_json::to_vec(&(
+            email,
             required(routing, "chatgptAccountId")?,
             required(routing, "backendOrigin")?,
             required(routing, "accountRoutingOverride")?
@@ -389,7 +399,7 @@ impl Client {
                 read_only,
                 account_id: credential.account_id.clone(),
                 token_fingerprint: credential.fingerprint(),
-                routing_digest: None,
+                account_digest: None,
                 valid: false,
             },
         )));
@@ -463,7 +473,7 @@ impl Client {
         if account["workspaceRouting"]["chatgptAccountId"].as_str() != Some(&state.account_id)
             || expected.is_some_and(|expected| expected != digest)
             || state
-                .routing_digest
+                .account_digest
                 .as_ref()
                 .is_some_and(|old| old != &digest)
         {
@@ -504,7 +514,7 @@ impl Client {
         if auth::read(&state.source).await?.account_id != state.account_id {
             return Err(auth::error("CODEX_AUTH_ACCOUNT_CHANGED"));
         }
-        state.routing_digest = Some(digest);
+        state.account_digest = Some(digest);
         Ok(())
     }
 

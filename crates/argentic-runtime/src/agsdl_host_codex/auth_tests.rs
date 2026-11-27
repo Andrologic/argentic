@@ -46,7 +46,8 @@ for line in sys.stdin:
   routing={'chatgptAccountId':account,'backendOrigin':'https://chatgpt.com','accountRoutingOverride':'NO_CONSTRAINT'}
   if refreshed and mode=='route-change': routing['backendOrigin']='https://changed.invalid'
   if mode=='missing-routing': routing={}
-  result={'account':{'type':'chatgpt'},'workspaceRouting':routing}
+  email='other@example.invalid' if refreshed and mode=='user-change' else 'synthetic@example.invalid'
+  result={'account':{'type':'chatgpt','email':email},'workspaceRouting':routing}
  elif method=='exercise':
   if mode=='rpc-unsupported':
    emit({'id':'unknown','method':'item/commandExecution/requestApproval','params':{'message':'SYNTHETIC_NATIVE_SECRET'}}); continue
@@ -283,6 +284,7 @@ async fn external_auth_refresh_refuses_rejected_tokens_foreign_callbacks_and_acc
         ("foreign-callback", "CODEX_AUTH_ACCOUNT_CHANGED"),
         ("source-change", "CODEX_AUTH_ACCOUNT_CHANGED"),
         ("route-change", "CODEX_AUTH_ACCOUNT_CHANGED"),
+        ("user-change", "CODEX_AUTH_ACCOUNT_CHANGED"),
         ("expired-token", "CODEX_AUTH_EXPIRED"),
         ("post-refresh-config", "CODEX_PROFILE_UNQUALIFIED"),
     ] {

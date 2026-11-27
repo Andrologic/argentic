@@ -182,7 +182,7 @@ pub(super) struct Session {
     pub read_only: bool,
     pub account_id: String,
     pub token_fingerprint: [u8; 32],
-    pub routing_digest: Option<String>,
+    pub account_digest: Option<String>,
     pub valid: bool,
 }
 #[derive(Clone)]

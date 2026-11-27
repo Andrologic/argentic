@@ -1066,7 +1066,7 @@ impl CodexExecutor030 {
             return Err(failure(
                 "CODEX_ACCOUNT_UNQUALIFIED",
                 "authentication",
-                "The private Codex account or routing differs from the capture",
+                "The private Codex user, workspace or routing differs from the capture",
             ));
         }
         let previous = self.threads.lock().await.get(key).cloned();
@@ -1634,7 +1634,15 @@ fn captured_account(
             "The native binary or isolated profile differs from the capture",
         ));
     }
-    required(&evidence, "accountDigest")
+    let digest = required(&evidence, "accountDigest")?;
+    if !digest.starts_with(crate::agsdl_host_codex::protocol::ACCOUNT_DIGEST_PREFIX) {
+        return Err(failure(
+            "CODEX_ACCOUNT_UNQUALIFIED",
+            "authentication",
+            "Capture native Codex account evidence again to bind the active ChatGPT user",
+        ));
+    }
+    Ok(digest)
 }
 
 #[cfg(test)]
@@ -1836,7 +1844,8 @@ for line in sys.stdin:
   if auth_refreshed:
    open(sys.argv[5]+'.attested','w').write('yes')
    if mode=='cancel-auth': continue
-  result={'account':{'type':'chatgpt'},'workspaceRouting':{'chatgptAccountId':'different-account' if mode=='private-account-changed' else 'synthetic-account','backendOrigin':'https://different.invalid' if mode=='private-routing-changed' else 'https://chatgpt.com','accountRoutingOverride':'NO_CONSTRAINT'}}
+  email='other@example.invalid' if mode=='private-user-changed' else None if mode=='private-user-missing' else 'synthetic@example.invalid'
+  result={'account':{'type':'chatgpt','email':email},'workspaceRouting':{'chatgptAccountId':'different-account' if mode=='private-account-changed' else 'synthetic-account','backendOrigin':'https://different.invalid' if mode=='private-routing-changed' else 'https://chatgpt.com','accountRoutingOverride':'NO_CONSTRAINT'}}
  elif method in ('thread/start','thread/resume'):
   assert not mode.startswith('private-'), 'thread request before account attestation'
   assert p['cwd']==bootstrap
@@ -2049,12 +2058,18 @@ for line in sys.stdin:
     }
 
     pub(crate) fn fixture_account_digest() -> String {
+        use crate::agsdl_host_codex::protocol::ACCOUNT_DIGEST_PREFIX;
         use sha2::{Digest, Sha256};
         format!(
-            "sha256:{:x}",
+            "{ACCOUNT_DIGEST_PREFIX}{:x}",
             Sha256::digest(
-                serde_json::to_vec(&("synthetic-account", "https://chatgpt.com", "NO_CONSTRAINT"))
-                    .unwrap()
+                serde_json::to_vec(&(
+                    "synthetic@example.invalid",
+                    "synthetic-account",
+                    "https://chatgpt.com",
+                    "NO_CONSTRAINT",
+                ))
+                .unwrap()
             )
         )
     }
@@ -2070,6 +2085,24 @@ for line in sys.stdin:
             let (result, seen) = fake_session(mode, true).await;
             assert_eq!(result.unwrap_err().code, "CODEX_ACCOUNT_UNQUALIFIED");
             assert!(seen.is_empty());
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn private_codex_refuses_resume_without_the_captured_user() {
+        for mode in [
+            "private-user-changed",
+            "private-user-missing",
+            "private-legacy-capture",
+        ] {
+            let (result, seen) = fake_session(mode, true).await;
+            assert_eq!(
+                result.unwrap_err().code,
+                "CODEX_ACCOUNT_UNQUALIFIED",
+                "{mode}"
+            );
+            assert!(seen.is_empty(), "{mode}");
         }
     }
 
@@ -2138,7 +2171,29 @@ for line in sys.stdin:
                 json!(json!({"version":"0.167.0","profileDigest":"different-binary"}).to_string());
         }
         let executor = CodexExecutor030::new(config);
-        if matches!(mode, "inject_error" | "private-routing-changed") {
+        if mode == "private-legacy-capture" {
+            use sha2::{Digest, Sha256};
+            let legacy = format!(
+                "sha256:{:x}",
+                Sha256::digest(
+                    serde_json::to_vec(&(
+                        "synthetic-account",
+                        "https://chatgpt.com",
+                        "NO_CONSTRAINT"
+                    ))
+                    .unwrap()
+                )
+            );
+            frozen = frozen_account("fixture", &legacy);
+        }
+        if matches!(
+            mode,
+            "inject_error"
+                | "private-routing-changed"
+                | "private-user-changed"
+                | "private-user-missing"
+                | "private-legacy-capture"
+        ) {
             executor
                 .threads
                 .lock()
