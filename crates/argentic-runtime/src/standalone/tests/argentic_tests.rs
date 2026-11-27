@@ -1278,6 +1278,49 @@ async fn shell_executes_and_stop_reaps_the_namespace_before_physical_end() {
         "sandboxed"
     );
 
+    // Disconnect a native client while approval is open. The broker must
+    // close the ticket and let the work continue with no upstream connection.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let scope = persistence::public030::HumanScope030 {
+        system_start_id: run.receipt.identity.system_start_id.clone(),
+        source: run.capture.source.clone(),
+    };
+    request.tool(
+        "shell",
+        json!({"command":format!(
+            "curl -sS --max-time 2 http://127.0.0.1:{port}/; sleep 2"
+        )}),
+    );
+    let withdrawn = pending_ask(&host, &scope).await;
+    let stored: String = tokio::time::timeout(WAIT_FOR, async {
+        loop {
+            let stored = sqlx::query_scalar(
+                "SELECT resolution_json FROM engine_flow030_human_requests WHERE request_id=?",
+            )
+            .bind(&withdrawn.id)
+            .fetch_one(&host.pool)
+            .await
+            .unwrap();
+            if let Some(stored) = stored {
+                break stored;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("The disconnected shell client left an open approval");
+    let request = server.next().await;
+    assert_eq!(
+        serde_json::from_str::<Value>(&stored).unwrap()["withdrawn"],
+        true
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), listener.accept())
+            .await
+            .is_err()
+    );
+
     // Hold an approved connection until Stop. The target must see no connection
     // before the shared approval port authorizes this destination.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

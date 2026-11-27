@@ -50,6 +50,13 @@ impl CommandApprovals030 for AgentActionHumans030 {
                 // Legacy RPC payloads carry the title in the native reason field.
                 payload["title"] = payload["nativeRequest"]["params"]["reason"].clone();
             }
+            let withdraw_on_cancel = payload
+                .pointer("/nativeRequest/method")
+                .is_some_and(|method| method == "argentic/tool/requestApproval")
+                && payload
+                    .pointer("/nativeRequest/params/actions/0/action")
+                    .is_some_and(|action| action == "network");
+            let stopped = || failure("STOP_PENDING", "approval", "Native action was stopped");
             let (work, ticket) = {
                 let _operation = broker.operation.lock().await;
                 let work = diagnostics::at(
@@ -71,12 +78,25 @@ impl CommandApprovals030 for AgentActionHumans030 {
                 // A first ask can admit its own work. Settle that clock
                 // event before open reserves the next one.
                 diagnostics::at(attempt, Stage::BrokerPump, broker.pump(host, cancel).await)?;
+                if cancel.is_cancelled() {
+                    return Err(stopped());
+                }
                 let ticket = diagnostics::at(
                     attempt,
                     Stage::BrokerOpen,
                     broker.open(host, &work, "ask", payload.clone()).await,
                 )?;
-                diagnostics::at(attempt, Stage::BrokerPump, broker.pump(host, cancel).await)?;
+                let publication = CancellationToken::new();
+                let publication = if withdraw_on_cancel {
+                    &publication
+                } else {
+                    cancel
+                };
+                diagnostics::at(
+                    attempt,
+                    Stage::BrokerPump,
+                    broker.pump(host, publication).await,
+                )?;
                 (work, ticket)
             };
             host.flow030()
@@ -88,7 +108,15 @@ impl CommandApprovals030 for AgentActionHumans030 {
                 broker.resolution_ready(&ticket).await,
             )? {
                 tokio::select! {
-                    _ = cancel.cancelled() => return diagnostics::at(attempt, Stage::BrokerWait, Err(failure("STOP_PENDING", "approval", "Native action was stopped"))),
+                    _ = cancel.cancelled() => {
+                        if withdraw_on_cancel {
+                            diagnostics::at(
+                                attempt, Stage::BrokerWait,
+                                broker.withdraw_ask(host, &work, &ticket).await,
+                            )?;
+                        }
+                        return diagnostics::at(attempt, Stage::BrokerWait, Err(stopped()));
+                    },
                     _ = tokio::time::sleep(Duration::from_millis(25)) => {}
                 }
             }

@@ -144,6 +144,13 @@ fn event(raw: &Value, expected_owner: &Value, decoder: &impl JsonDecoder) -> Res
             ("choice", id(b.get("choice"))?),
             ("comment", b.get("comment").clone()),
         ])
+    } else if kind.eq_str("withdrawAsk") {
+        keys(b, &["kind", "requestId", "workId"])?;
+        o([
+            ("kind", kind.clone()),
+            ("requestId", id(b.get("requestId"))?),
+            ("workId", id(b.get("workId"))?),
+        ])
     } else if kind.eq_str("operatorHold") {
         keys(b, &["kind", "held", "released", "cancelAsks", "closedAsks"])?;
         let mut body = o([
