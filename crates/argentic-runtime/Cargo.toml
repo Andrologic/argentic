@@ -29,6 +29,8 @@ thiserror = "2"
 url = "2"
 # Maintained successor of the deprecated serde_yaml, kept under its old name.
 serde_yaml = { package = "yaml_serde", version = "0.10.7" }
+# Scan skill front matter with the same tokenizer before deserializing it.
+libyaml-rs = "0.3"
 unicode-normalization = "0.1"
 tracing = "0.1"
 portable-pty = "0.8"
