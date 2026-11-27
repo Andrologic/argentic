@@ -327,7 +327,12 @@ impl Sandbox {
     fn terminate(&mut self) -> io::Result<ExitStatus> {
         let group = self.process.id() as libc::pid_t;
         if !self.reaped {
-            signal(-group)?;
+            // Darwin can return EPERM when signalling a process group
+            // whose only member is its unreaped leader. Signal the leader
+            // directly, then drain every other member of its session.
+            if !self.exited()? {
+                signal(group)?;
+            }
             // Keep the session leader unreaped to retain its PID while other
             // groups are discovered and signalled.
             let deadline = Instant::now() + REAP_LIMIT;
