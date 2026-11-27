@@ -244,26 +244,48 @@ impl ContainedBackgroundProcess {
             marker
         };
         #[cfg(target_os = "linux")]
-        let (status_writer, command_status) = {
+        let (status_writer, command_status, mut startup_reader, startup_writer) = {
             use std::os::fd::AsRawFd;
-            use std::os::unix::process::CommandExt;
+            use std::os::unix::{net::UnixStream, process::CommandExt};
             let (writer, reader) = tokio::net::unix::pipe::pipe()?;
             let descriptor = writer.as_raw_fd();
+            let (startup_reader, startup_writer) = UnixStream::pair()?;
+            let startup_descriptor = startup_writer.as_raw_fd();
+            #[cfg(test)]
+            let fail_after_sweep = FAIL_LINUX_SETUP_AFTER_SWEEP.take();
             // Drop signals the workload. The reaper must survive long enough
             // to wait for any children it adopts.
             command.kill_on_drop(false);
             unsafe {
-                command
-                    .as_std_mut()
-                    .pre_exec(move || install_linux_process_supervisor(descriptor));
+                command.as_std_mut().pre_exec(move || {
+                    install_linux_process_supervisor(
+                        descriptor,
+                        startup_descriptor,
+                        #[cfg(test)]
+                        fail_after_sweep,
+                    )
+                });
             }
-            (writer, reader)
+            (writer, reader, startup_reader, startup_writer)
         };
         #[cfg(windows)]
         command.creation_flags(CREATE_NO_WINDOW | CREATE_SUSPENDED);
         let child = command.spawn()?;
         #[cfg(target_os = "linux")]
-        drop(status_writer);
+        {
+            use std::io::Read;
+
+            drop(status_writer);
+            drop(startup_writer);
+            // The descriptor sweep closes Rust's exec-error descriptor.
+            // Require a complete, explicit acknowledgement from the supervisor.
+            let mut status = [0; std::mem::size_of::<i32>()];
+            startup_reader.read_exact(&mut status)?;
+            let status = i32::from_ne_bytes(status);
+            if status != 0 {
+                return Err(io::Error::from_raw_os_error(status));
+            }
+        }
         #[cfg(unix)]
         let process_group_id = child.id();
         #[cfg(windows)]
@@ -629,8 +651,46 @@ fn next_containment_id() -> String {
     )
 }
 
+#[cfg(all(test, target_os = "linux"))]
+thread_local! {
+    static FAIL_LINUX_SETUP_AFTER_SWEEP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 #[cfg(target_os = "linux")]
-fn install_linux_process_supervisor(status_descriptor: i32) -> io::Result<()> {
+fn install_linux_process_supervisor(
+    status_descriptor: i32,
+    startup_descriptor: i32,
+    #[cfg(test)] fail_after_sweep: bool,
+) -> io::Result<()> {
+    match setup_linux_supervisor(
+        status_descriptor,
+        startup_descriptor,
+        #[cfg(test)]
+        fail_after_sweep,
+    ) {
+        Ok(None) => Ok(()),
+        Ok(Some(command_process_id)) => {
+            write_linux_status(startup_descriptor, 0);
+            unsafe { libc::close(startup_descriptor) };
+            supervise_linux_command(command_process_id, status_descriptor)
+        }
+        Err(error) => {
+            write_linux_status(
+                startup_descriptor,
+                error.raw_os_error().unwrap_or(libc::EIO),
+            );
+            // The descriptor sweep may have closed Rust's exec-error channel.
+            unsafe { libc::_exit(1) }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn setup_linux_supervisor(
+    status_descriptor: i32,
+    startup_descriptor: i32,
+    #[cfg(test)] fail_after_sweep: bool,
+) -> io::Result<Option<libc::pid_t>> {
     if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) } == -1 {
         return Err(io::Error::last_os_error());
     }
@@ -643,22 +703,25 @@ fn install_linux_process_supervisor(status_descriptor: i32) -> io::Result<()> {
         0 => unsafe { libc::_exit(0) },
         _ => {}
     }
-    match start_linux_workload(supervisor_group, status_descriptor) {
-        Ok(None) => Ok(()),
-        Ok(Some(command_process_id)) => {
-            supervise_linux_command(command_process_id, status_descriptor)
-        }
-        Err(error) => {
-            reap_linux_setup_child(supervisor_group);
-            Err(error)
-        }
+    let result = start_linux_workload(
+        supervisor_group,
+        status_descriptor,
+        startup_descriptor,
+        #[cfg(test)]
+        fail_after_sweep,
+    );
+    if result.is_err() {
+        reap_linux_setup_child(supervisor_group);
     }
+    result
 }
 
 #[cfg(target_os = "linux")]
 fn start_linux_workload(
     supervisor_group: libc::pid_t,
     status_descriptor: i32,
+    startup_descriptor: i32,
+    #[cfg(test)] fail_after_sweep: bool,
 ) -> io::Result<Option<libc::pid_t>> {
     use std::{
         io::{Read, Write},
@@ -676,7 +739,10 @@ fn start_linux_workload(
     }
     if pid == 0 {
         drop(ready_writer);
-        unsafe { libc::close(status_descriptor) };
+        unsafe {
+            libc::close(status_descriptor);
+            libc::close(startup_descriptor);
+        };
         // Do not exec until the supervisor is in its own group and has
         // closed its unrelated descriptors.
         if ready_reader.read_exact(&mut [0]).is_err() {
@@ -690,7 +756,15 @@ fn start_linux_workload(
         if unsafe { libc::setpgid(0, supervisor_group) } == -1 {
             return Err(io::Error::last_os_error());
         }
-        close_linux_file_descriptors_except([status_descriptor, ready_writer.as_raw_fd()])?;
+        close_linux_file_descriptors_except([
+            status_descriptor,
+            startup_descriptor,
+            ready_writer.as_raw_fd(),
+        ])?;
+        #[cfg(test)]
+        if fail_after_sweep {
+            return Err(io::Error::from_raw_os_error(libc::EIO));
+        }
         ready_writer.write_all(&[1])
     })();
     drop(ready_writer);
@@ -718,7 +792,7 @@ fn supervise_linux_command(command_process_id: libc::pid_t, status_descriptor: i
         let mut status = 0;
         let waited = unsafe { libc::waitpid(-1, &mut status, 0) };
         if waited == command_process_id {
-            write_linux_command_status(status_descriptor, status);
+            write_linux_status(status_descriptor, status);
             unsafe {
                 libc::close(status_descriptor);
             }
@@ -739,7 +813,7 @@ fn supervise_linux_command(command_process_id: libc::pid_t, status_descriptor: i
 }
 
 #[cfg(target_os = "linux")]
-fn write_linux_command_status(descriptor: i32, status: i32) {
+fn write_linux_status(descriptor: i32, status: i32) {
     let mut written_bytes = 0_usize;
     while written_bytes < std::mem::size_of::<i32>() {
         let result = unsafe {
@@ -761,11 +835,11 @@ fn write_linux_command_status(descriptor: i32, status: i32) {
 }
 
 #[cfg(target_os = "linux")]
-fn close_linux_file_descriptors_except(preserved: [i32; 2]) -> io::Result<()> {
+fn close_linux_file_descriptors_except<const N: usize>(preserved: [i32; N]) -> io::Result<()> {
     let mut first = 0_u32;
     let mut sorted = preserved.map(|fd| fd as u32);
     sorted.sort_unstable();
-    for next in [sorted[0], sorted[1], u32::MAX] {
+    for next in sorted.into_iter().chain([u32::MAX]) {
         if first < next
             && unsafe { libc::syscall(libc::SYS_close_range, first, next - 1, 0_u32) } != 0
         {
@@ -777,7 +851,7 @@ fn close_linux_file_descriptors_except(preserved: [i32; 2]) -> io::Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn close_linux_file_descriptors_fallback(preserved: [i32; 2]) -> io::Result<()> {
+fn close_linux_file_descriptors_fallback<const N: usize>(preserved: [i32; N]) -> io::Result<()> {
     use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
 
     // This runs after fork, so avoid allocating or acquiring libc/Rust locks.
@@ -1965,6 +2039,14 @@ mod tests {
     };
     #[cfg(unix)]
     use std::fs;
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn linux_spawn_reports_setup_failure_after_descriptor_sweep() {
+        super::FAIL_LINUX_SETUP_AFTER_SWEEP.set(true);
+        let error = super::ContainedBackgroundProcess::spawn_background("/bin/true").unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EIO));
+    }
 
     #[cfg(target_os = "linux")]
     #[test]
