@@ -206,6 +206,8 @@ async fn write_output(output: &Output, value: Value) -> bool {
     output.send((value, written)).await.is_ok() && receipt.await.unwrap_or(false)
 }
 
+// The final drain or quit response is best-effort. A blocked stdout write can
+// leave a partial record when the process exits.
 async fn write_final_output(output: &Output, value: Value) {
     let _ = tokio::time::timeout(Duration::from_secs(1), write_output(output, value)).await;
 }

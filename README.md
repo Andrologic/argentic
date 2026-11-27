@@ -81,6 +81,8 @@ cargo test --locked --manifest-path crates/argentic-runtime/Cargo.toml \
   --features agsdl-engine-qa --lib -- --test-threads=1
 ```
 
+À la fermeture d’`argentic-host`, y compris après `quit`, l’hôte accorde une seconde à l’écriture de la dernière réponse sur stdout. Cette réponse peut manquer ou être tronquée. Le client doit lire jusqu’à la fin du flux et ignorer une dernière ligne incomplète.
+
 **Recettes des lots 3 à 5.** Utiliser les fixtures `human-only.json`, `write-review.json` et `policy.json` du dossier `crates/argentic-runtime/examples/fixtures`. Le protocole et les formes exactes des messages figurent dans le `HOST.md` importé.
 
 1. Démarrer avec un répertoire de données privé distinct du workspace et le condensat SHA-256 de la politique examinée. Sur macOS ARM64, exécuter le flux humain sans fournisseur. Lire `ready`, appeler `preflight` puis `start`, lire la demande via `humans`, répondre avec son identifiant et sa révision, puis vérifier le résultat par `inspect`. Réutiliser la même clé Start après une réponse perdue et vérifier qu’il existe une seule exécution.
