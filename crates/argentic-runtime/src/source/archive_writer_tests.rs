@@ -119,7 +119,7 @@ fn selected_files_and_archive_keep_the_opened_snapshot() {
 }
 
 #[test]
-fn a_failed_flush_is_reported() {
+fn archive_write_and_flush_failures_are_storage_errors() {
     struct Rejects;
     impl std::io::Write for Rejects {
         fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
@@ -132,8 +132,28 @@ fn a_failed_flush_is_reported() {
     let temp = tempfile::tempdir().unwrap();
     project(temp.path());
     let source = OpenedSource::open_path(temp.path()).unwrap();
+    let write = source.write_archive(&mut Rejects).unwrap_err();
     let mut output = std::io::BufWriter::with_capacity(1 << 20, Rejects);
-    assert!(source.write_archive(&mut output).is_err());
+    let flush = source.write_archive(&mut output).unwrap_err();
+    for error in [write, flush] {
+        assert_eq!(error.code, "STORAGE");
+        assert_eq!(error.pointer, "archive");
+    }
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn a_multiply_linked_project_member_is_refused() {
+    let temp = tempfile::tempdir().unwrap();
+    project(temp.path());
+    let original = temp.path().join("skills/review/notes.md");
+    let alias = temp.path().join("skills/review/duplicate.md");
+    fs::write(&original, "Shared file").unwrap();
+    fs::hard_link(&original, &alias).unwrap();
+    let error = OpenedSource::open_path(temp.path()).err().unwrap();
+    assert_eq!(error.code, "PROJECT");
+    fs::remove_file(alias).unwrap();
+    assert!(OpenedSource::open_path(temp.path()).is_ok());
 }
 
 #[cfg(unix)]

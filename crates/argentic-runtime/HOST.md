@@ -81,8 +81,8 @@ before writing. The host owns the output. When saving to disk, write to a
 private temporary file, flush it and publish the completed file at a new
 `.agsdl` path. Discard the temporary file on failure.
 
-The writer flushes the output before reporting success. A flush or write
-error returns an error, and the partial output must be discarded.
+The writer flushes the output before reporting success. A write or flush
+failure returns `STORAGE` with pointer `archive`. Discard any partial output.
 
 Path checks use the Unicode tables of this crate's dependencies. The AgSDL
 v0.5.0 reference tool uses the tables of its Python runtime, so on Python 3.9
@@ -123,6 +123,8 @@ A folder and its archive select the same project files. Both apply the
 archive name rules, including the refusal of `.git`, `.env` and `.env.*`
 in skill trees. Opening a folder or its `agsdl.json` pins the root directory
 before reading the manifest. Members are opened relative to that handle.
+Folder members and native local content must have exactly one hard link
+when opened and after reading.
 Unix opens the root with no-follow flags. Windows opens the root without
 following reparse points and keeps the handle open without delete sharing.
 A reference can pass through `..` lexically. Any component traversed on
@@ -506,6 +508,30 @@ supplies `codex-code-mode-host` as a sibling. Argentic checks the expected
 helpers and binds their digests to the capture. An incomplete package
 reports `CODEX_PACKAGE_INCOMPLETE` before a model thread.
 
+Before launching the app-server for a work, Argentic compares the current
+package and profile digest with the Start capture. The account digest binds
+the active ChatGPT user to the workspace ID, backend origin and routing
+override. Argentic uses the user ID from Codex's `account/read` when present.
+For managed logins on older servers such as 0.167.0, when Codex omits the
+user ID in `account/read`, Argentic checks the active `accountSession/list`
+session for the selected workspace. When Codex returns an active session,
+both responses must include the same non-empty email to bind that session
+to the login. Argentic then uses the session's user ID when available.
+If the listing is unsupported, disabled by the server's experimental
+capability check, or empty with no active session, Argentic uses only the
+identity reported by `account/read`.
+Argentic keeps only the digest in the capture. Missing identity or a change
+in the bound identity or routing blocks thread start and resume. Run Start
+again to recapture account evidence from earlier digest formats.
+
+Argentic holds non-final agent text until the turn ends. A turn that queues
+more than 1,000 items or 4,000,000 encoded bytes fails with `NATIVE_UNCERTAIN`.
+
+Linux process containment requires the `pidfd_open` and `pidfd_send_signal`
+system calls: Linux 5.3 or later, with any seccomp or container syscall filter
+allowing both. Argentic checks them before launch and waits for the background
+process supervisor to reap its adopted children before confirming Stop.
+
 For Codex 0.171.0 on macOS ARM64 or Linux ARM64, use the read-only host
 profile and the private login. On Linux, provision the login outside
 `/tmp`. The app-server gets a private temporary runtime directory for its
@@ -517,10 +543,18 @@ to the operator, or call `Host::with_codex_auth_file` before preflight/Start.
 Embedding hosts use `HostContext::with_codex_auth_file`. Construction still
 starts no provider and reads no credentials. This experimental opt-in uses the
 internal app-server external-auth API, limited to the exact official 0.167.0
-execution binary. It reads only a private, owned, regular ChatGPT file session,
+execution binary. Codex 0.167.0 exposes no user ID for external logins and its
+access token might omit email. If neither identity is available, login or
+refresh fails with `CODEX_AUTH_IDENTITY_UNAVAILABLE`. Before forwarding a
+replacement token, Argentic checks the token's identity against the
+identity reported at login. Sign in again with a session that supplies an
+email, or use the private Codex login. Argentic
+reads only a private, owned, regular ChatGPT file session,
 never its configuration or refresh mechanism. The default private login remains
-unchanged. Keep the file outside the workspace and execution profile, and use a
-private execution profile without stored auth. See [authentication limits and
+unchanged. Keep the file outside the workspace, execution profile, bootstrap
+directory and Codex package directory. Argentic includes an explicit denial
+for the auth file in the attested native sandbox policy. Use a private execution
+profile without stored auth. See [authentication limits and
 diagnostics](https://github.com/Andrologic/Macro/blob/develop/docs/agsdl-codex-native.md#explicit-existing-file-authentication).
 Do not expose credentials in operator input/output, logs or evidence. A status
 login or synthetic peer does not qualify this opt-in for product use.

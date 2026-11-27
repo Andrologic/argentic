@@ -22,12 +22,13 @@ const FILE_LIMIT: u64 = 128 * 1024;
 
 pub(super) fn error(code: &str) -> EngineFailure {
     failure(code, "authentication", match code {
+        "CODEX_AUTH_IDENTITY_UNAVAILABLE" => "Codex did not provide a ChatGPT user ID or email. Sign in again in the selected session with an account that supplies an email, or use a private Codex login",
         "CODEX_AUTH_EXPIRED" => "The selected ChatGPT access token has expired; this host never renews the ordinary session",
         "CODEX_AUTH_ACCOUNT_CHANGED" => "The selected ChatGPT account or attested routing differs from the capture",
         "CODEX_AUTH_REFRESH_REQUIRED" => "Codex rejected the access token and no renewed token for the same account is available",
         "CODEX_AUTH_TIMEOUT" => "Native authentication did not complete within its deadline",
         "CODEX_AUTH_PROFILE_CONFLICT" => "External authentication requires a private execution profile without stored auth",
-        "CODEX_AUTH_SOURCE_UNSUPPORTED" => "Expected an explicitly selected private ChatGPT file session outside the workspace and execution profile",
+        "CODEX_AUTH_SOURCE_UNSUPPORTED" => "Expected an explicitly selected private ChatGPT file session outside the execution profile and native read grants",
         "CODEX_AUTH_SOURCE_UNAVAILABLE" => "The explicitly selected ChatGPT file session is unavailable",
         _ => "Native external ChatGPT authentication was refused",
     })
@@ -55,13 +56,43 @@ struct Tokens {
     access_token: String,
     account_id: String,
 }
+pub(super) enum Identity {
+    Email(String),
+    UserId(String),
+}
+impl Identity {
+    pub fn parts(&self) -> (&'static str, &str) {
+        match self {
+            Self::Email(email) => ("email", email),
+            Self::UserId(id) => ("userId", id),
+        }
+    }
+}
+
 pub(super) struct Credentials {
     pub access_token: String,
     pub account_id: String,
+    email: Option<String>,
+    user_id: Option<String>,
 }
 impl Credentials {
     pub fn fingerprint(&self) -> [u8; 32] {
         Sha256::digest(self.access_token.as_bytes()).into()
+    }
+
+    pub fn check_identity(&self, expected: &Identity) -> Result<()> {
+        let observed = match expected {
+            Identity::Email(_) => &self.email,
+            Identity::UserId(_) => &self.user_id,
+        };
+        let observed = observed
+            .as_deref()
+            .filter(|claim| !claim.trim().is_empty())
+            .ok_or_else(|| error("CODEX_AUTH_IDENTITY_UNAVAILABLE"))?;
+        if observed != expected.parts().1 {
+            return Err(error("CODEX_AUTH_ACCOUNT_CHANGED"));
+        }
+        Ok(())
     }
 }
 
@@ -125,8 +156,22 @@ async fn read_file(source: &Path) -> Result<Credentials> {
         return Err(error("CODEX_AUTH_SOURCE_UNSUPPORTED"));
     }
     #[derive(Deserialize)]
-    struct Expiry {
+    struct Claims {
         exp: u64,
+        email: Option<String>,
+        #[serde(rename = "https://api.openai.com/profile")]
+        profile: Option<ProfileClaims>,
+        #[serde(rename = "https://api.openai.com/auth")]
+        auth: Option<AuthClaims>,
+    }
+    #[derive(Deserialize)]
+    struct ProfileClaims {
+        email: Option<String>,
+    }
+    #[derive(Deserialize)]
+    struct AuthClaims {
+        chatgpt_user_id: Option<String>,
+        user_id: Option<String>,
     }
     let parts: Vec<_> = tokens.access_token.split('.').collect();
     if parts.len() != 3 || parts.iter().any(|part| part.is_empty()) {
@@ -135,19 +180,26 @@ async fn read_file(source: &Path) -> Result<Credentials> {
     let payload = URL_SAFE_NO_PAD
         .decode(parts[1])
         .map_err(|_| error("CODEX_AUTH_SOURCE_UNSUPPORTED"))?;
-    let expiry: Expiry =
+    let claims: Claims =
         serde_json::from_slice(&payload).map_err(|_| error("CODEX_AUTH_SOURCE_UNSUPPORTED"))?;
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|_| error("CODEX_AUTH_EXPIRED"))?
         .as_secs();
-    if expiry.exp <= now {
+    if claims.exp <= now {
         return Err(error("CODEX_AUTH_EXPIRED"));
     }
-    // JWT expiry is a refusal check, never an identity or execution authority.
+    // Follow Codex's claim precedence. The claims can reject a replacement
+    // against a server-attested identity. They never grant initial authority.
     Ok(Credentials {
         access_token: tokens.access_token,
         account_id: tokens.account_id,
+        email: claims
+            .email
+            .or_else(|| claims.profile.and_then(|profile| profile.email)),
+        user_id: claims
+            .auth
+            .and_then(|auth| auth.chatgpt_user_id.or(auth.user_id)),
     })
 }
 
@@ -182,7 +234,8 @@ pub(super) struct Session {
     pub read_only: bool,
     pub account_id: String,
     pub token_fingerprint: [u8; 32],
-    pub routing_digest: Option<String>,
+    pub account_digest: Option<String>,
+    pub account_identity: Option<Identity>,
     pub valid: bool,
 }
 #[derive(Clone)]

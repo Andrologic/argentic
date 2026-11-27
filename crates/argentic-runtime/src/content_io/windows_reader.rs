@@ -74,8 +74,8 @@ fn read_file(parent: Dir, name: &Path, cancel: &CancellationToken) -> io::Result
     if cancel.is_cancelled() {
         return Err(cancelled());
     }
-    let file = open_relative(&parent, name, false)?;
-    let metadata = file.metadata()?;
+    let mut file = open_relative(&parent, name, false)?;
+    let metadata = super::single_link_metadata(&file)?;
     if !metadata.is_file()
         || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
         || unsafe { GetFileType(file.as_raw_handle()) } != FILE_TYPE_DISK
@@ -92,10 +92,11 @@ fn read_file(parent: Dir, name: &Path, cancel: &CancellationToken) -> io::Result
         return Err(cancelled());
     }
     let mut bytes = Vec::new();
-    file.take(MAX_BYTES + 1).read_to_end(&mut bytes)?;
+    file.by_ref().take(MAX_BYTES + 1).read_to_end(&mut bytes)?;
     if bytes.len() as u64 > MAX_BYTES {
         return Err(io::Error::other("File exceeds limit"));
     }
+    super::single_link_metadata(&file)?;
     Ok(bytes)
 }
 

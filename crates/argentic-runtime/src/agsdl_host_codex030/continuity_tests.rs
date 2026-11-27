@@ -214,6 +214,25 @@ fn executor(f: &Fixture, trace: &Path, previous: Option<&CodexExecutor030>) -> C
     executor_access(f, trace, previous, true)
 }
 
+#[tokio::test]
+async fn private_codex_rejects_a_changed_profile_before_spawn() {
+    let document = json!({"contract":"agsdl-0.3.0","id":"profile-change","agents":{
+        "worker":{"harness":"codex","permissions":"read-only"}},
+        "flow":{"entry":"work","steps":{"work":{"type":"agent","agent":"worker"}}}});
+    let f = Fixture::with_document(document).await;
+    let trace = f._temp.path().join("requests.jsonl");
+    std::fs::write(
+        trace.with_extension("jsonl.script"),
+        serde_json::to_vec(&[envelope(json!({}))]).unwrap(),
+    )
+    .unwrap();
+    let mut executor = executor(&f, &trace, None);
+    executor.test_profile.as_mut().unwrap().digest = "changed-package".into();
+    let view = run(&f, Arc::new(executor)).await;
+    assert_eq!(view.state.verdict.as_deref(), Some("failed"));
+    assert!(!trace.exists(), "the changed package was launched");
+}
+
 fn executor_access(
     f: &Fixture,
     trace: &Path,

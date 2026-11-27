@@ -421,7 +421,7 @@ fn read(args: &[OsString]) -> std::io::Result<()> {
     }
     let pinned = unsafe { OwnedFd::from_raw_fd(fd) };
     let stat = std::fs::File::from(pinned);
-    let metadata = stat.metadata()?;
+    let metadata = super::single_link_metadata(&stat)?;
     if !metadata.is_file() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
@@ -448,6 +448,7 @@ fn read(args: &[OsString]) -> std::io::Result<()> {
     if bytes.len() as u64 > MAX_BYTES {
         return Err(std::io::Error::other("File exceeds limit"));
     }
+    super::single_link_metadata(&file)?;
     std::io::stdout().lock().write_all(&bytes)
 }
 

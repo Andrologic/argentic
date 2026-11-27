@@ -36,15 +36,18 @@ pub(crate) async fn profile_status(manager: &HostContext) -> CodexStatus {
             .map_err(|_| failure("STORAGE", "scope", "Cannot create native diagnostic scope"))?;
         let auth_source = manager.codex_auth_file().map(std::path::Path::to_path_buf);
         tokio::spawn(async move {
-            let mut process =
-                ContainedBackgroundProcess::spawn(profile.app_server_command(&root, true)?)
-                    .map_err(|_| {
-                        failure(
-                            "CODEX_PROFILE_UNQUALIFIED",
-                            "engine",
-                            "Cannot start isolated Codex host",
-                        )
-                    })?;
+            let mut process = ContainedBackgroundProcess::spawn(profile.app_server_command(
+                &root,
+                true,
+                auth_source.as_deref(),
+            )?)
+            .map_err(|_| {
+                failure(
+                    "CODEX_PROFILE_UNQUALIFIED",
+                    "engine",
+                    "Cannot start isolated Codex host",
+                )
+            })?;
             let result = tokio::time::timeout(std::time::Duration::from_secs(15), async {
                 let mut client = Client::new(
                     process.take_stdin().ok_or_else(|| {
@@ -139,15 +142,18 @@ pub(crate) async fn observe_catalogue030(
     );
     let auth_source = manager.codex_auth_file().map(std::path::Path::to_path_buf);
     tokio::spawn(async move {
-        let mut process =
-            ContainedBackgroundProcess::spawn(profile.app_server_command(&root, read_only)?)
-                .map_err(|_| {
-                    failure(
-                        "CODEX_PROFILE_UNQUALIFIED",
-                        "engine",
-                        "Codex app-server could not start",
-                    )
-                })?;
+        let mut process = ContainedBackgroundProcess::spawn(profile.app_server_command(
+            &root,
+            read_only,
+            auth_source.as_deref(),
+        )?)
+        .map_err(|_| {
+            failure(
+                "CODEX_PROFILE_UNQUALIFIED",
+                "engine",
+                "Codex app-server could not start",
+            )
+        })?;
         let result = async {
             let mut client = Client::new(
                 process.take_stdin().ok_or_else(|| {
@@ -259,7 +265,7 @@ mod tests {
         let ready = workspace.join(format!("{name}-ready"));
         let late = workspace.join(format!("{name}-late"));
         let mut process = ContainedBackgroundProcess::spawn(
-            profile.app_server_command(workspace, false).unwrap(),
+            profile.app_server_command(workspace, false, None).unwrap(),
         )
         .unwrap();
         let mut client = Client::new(
@@ -381,8 +387,10 @@ time.sleep(30)
             runtime.path().metadata().unwrap().permissions().mode() & 0o777,
             0o700
         );
-        assert!(profile.app_server_command(&workspace, false).is_err());
-        assert!(profile.app_server_command(runtime.path(), true).is_err());
+        assert!(profile.app_server_command(&workspace, false, None).is_err());
+        assert!(profile
+            .app_server_command(runtime.path(), true, None)
+            .is_err());
         let private = profile.directory.join("private-guard");
         std::fs::write(&private, "private").unwrap();
         let socket = runtime.path().join("probe.sock");
@@ -393,7 +401,7 @@ time.sleep(30)
         let port = tcp_listener.local_addr().unwrap().port().to_string();
 
         let mut process = ContainedBackgroundProcess::spawn(
-            profile.app_server_command(&workspace, true).unwrap(),
+            profile.app_server_command(&workspace, true, None).unwrap(),
         )
         .unwrap();
         let result = tokio::time::timeout(std::time::Duration::from_secs(15), async {
@@ -459,7 +467,7 @@ printf '%s' confined
         assert_eq!(status.code, "CODEX_LOGIN_REQUIRED");
         assert!(!status.available);
         let profile = profile::prepare(&manager, VERSION).unwrap();
-        let mut command = profile.app_server_command(&workspace, false).unwrap();
+        let mut command = profile.app_server_command(&workspace, false, None).unwrap();
         command.stderr(std::process::Stdio::inherit());
         let mut process = ContainedBackgroundProcess::spawn(command).unwrap();
         let result = tokio::time::timeout(std::time::Duration::from_secs(15), async {
@@ -474,7 +482,7 @@ printf '%s' confined
                     json!({"includeLayers":true,"cwd":profile.bootstrap}),
                 )
                 .await?;
-            profile::verify_layers(&config, &profile, &workspace, false)?;
+            profile::verify_layers(&config, &profile, &workspace, false, None)?;
             client.preflight(&profile,&workspace.to_string_lossy(),false).await?;
             let guard=profile.directory.join("private-guard");
             std::fs::write(&guard,"synthetic").unwrap();
@@ -528,7 +536,7 @@ print(json.dumps(rows))
         // Read-only mode is a distinct effective profile, exercised with a real
         // native command rather than inferred from the serialized permission.
         let mut readonly_process = ContainedBackgroundProcess::spawn(
-            profile.app_server_command(&workspace, true).unwrap(),
+            profile.app_server_command(&workspace, true, None).unwrap(),
         )
         .unwrap();
         let readonly = tokio::time::timeout(std::time::Duration::from_secs(15),async {

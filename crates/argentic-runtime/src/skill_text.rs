@@ -315,6 +315,18 @@ pub fn parse_admitted_skill_text(
     Ok((parsed.name, parsed.description, parsed.body))
 }
 
+#[cfg(test)]
+#[test]
+fn empty_skill_frontmatter_reports_validation_error() {
+    let path = Path::new("review/SKILL.md");
+    for input in ["---\n---", "---\n---\n", "---\r\n---", "---\r\n---\r\n"] {
+        let parsed = parse_skill_text(path, input);
+        assert!(!parsed.is_valid);
+        assert!(parsed.body.is_empty());
+        assert!(parse_admitted_skill_text(path, input).is_err());
+    }
+}
+
 pub fn parse_skill_text(skill_file: &Path, raw: &str) -> ParsedSkillFile {
     let used_lowercase_file = skill_file
         .file_name()
@@ -338,17 +350,18 @@ pub fn parse_skill_text(skill_file: &Path, raw: &str) -> ParsedSkillFile {
     let mut body = normalized.clone();
 
     if let Some(after_opening) = normalized.strip_prefix("---\n") {
-        let frontmatter_range = after_opening
-            .find("\n---\n")
-            .map(|end_index| (4 + end_index, 4 + end_index + "\n---\n".len()))
+        let fenced = after_opening
+            .strip_prefix("---\n")
+            .map(|body| ("", body))
+            .or_else(|| (after_opening == "---").then_some(("", "")))
+            .or_else(|| after_opening.split_once("\n---\n"))
             .or_else(|| {
-                normalized
-                    .ends_with("\n---")
-                    .then_some((normalized.len() - "\n---".len(), normalized.len()))
+                after_opening
+                    .strip_suffix("\n---")
+                    .map(|header| (header, ""))
             });
-        if let Some((frontmatter_end, body_start)) = frontmatter_range {
-            let frontmatter = &after_opening[..frontmatter_end - 4];
-            body = normalized[body_start..].to_string();
+        if let Some((frontmatter, rest)) = fenced {
+            body = rest.to_string();
             if let Some(mapping) = parse_frontmatter_mapping(frontmatter, &mut diagnostics) {
                 validate_frontmatter_fields(&mapping, &mut diagnostics);
                 name = required_string_field(&mapping, "name", &mut diagnostics)

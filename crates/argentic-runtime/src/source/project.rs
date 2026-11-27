@@ -157,7 +157,7 @@ fn restore_executable_modes(dir: &Dir, files: &mut Files, budget: &SourceBudget)
             .map_err(|e| io(path, e))?
             .len()
             .saturating_sub(MODE_HEADER.len() as u64);
-        let bytes = bounded_read(input, size, archive::INDEX_LIMIT, budget).map_err(|e| {
+        let bytes = bounded_read(&mut input, size, archive::INDEX_LIMIT, budget).map_err(|e| {
             if let Some(error) = read_limit(name, &e) {
                 error
             } else if e.kind() == std::io::ErrorKind::FileTooLarge {
@@ -166,6 +166,7 @@ fn restore_executable_modes(dir: &Dir, files: &mut Files, budget: &SourceBudget)
                 io(path, e)
             }
         })?;
+        crate::content_io::single_link_metadata(&input).map_err(|e| io(path, e))?;
         budget
             .work(bytes.len().div_ceil(8), "")
             .map_err(|e| source_limit(name, e))?;
