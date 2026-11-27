@@ -511,11 +511,14 @@ reports `CODEX_PACKAGE_INCOMPLETE` before a model thread.
 
 Before launching the app-server for a work, Argentic compares the current
 package and profile digest with the Start capture. The account digest binds
-the active ChatGPT user's email to the workspace ID, backend origin and
-routing override. Argentic keeps only the digest in the capture. A missing
-email, a user or routing change, or an older digest without a user binding
-blocks both thread start and resume. Older captures require a fresh Start
-capture.
+the active ChatGPT user to the workspace ID, backend origin and routing
+override. Argentic uses the user ID from Codex's `account/read` when present.
+For managed logins on older servers, Argentic checks for a user ID in the
+active `accountSession/list` session for the selected workspace. If Codex
+exposes no user ID, Argentic falls back to the email from `account/read`.
+Argentic keeps only the digest in the capture. Missing identity or a change
+in the bound identity or routing blocks thread start and resume. Run Start
+again to recapture account evidence from earlier digest formats.
 
 Argentic holds non-final agent text until the turn ends. A turn that queues
 more than 1,000 items or 4,000,000 encoded bytes fails with `NATIVE_UNCERTAIN`.
@@ -534,7 +537,11 @@ to the operator, or call `Host::with_codex_auth_file` before preflight/Start.
 Embedding hosts use `HostContext::with_codex_auth_file`. Construction still
 starts no provider and reads no credentials. This experimental opt-in uses the
 internal app-server external-auth API, limited to the exact official 0.167.0
-execution binary. It reads only a private, owned, regular ChatGPT file session,
+execution binary. Codex 0.167.0 exposes no user ID for external logins and its
+access token might omit email. If neither identity is available, login or
+refresh fails with `CODEX_AUTH_IDENTITY_UNAVAILABLE`. Sign in again with a
+session that supplies an email, or use the private Codex login. Argentic
+reads only a private, owned, regular ChatGPT file session,
 never its configuration or refresh mechanism. The default private login remains
 unchanged. Keep the file outside the workspace, execution profile, bootstrap
 directory and Codex package directory. Argentic includes an explicit denial

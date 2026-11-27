@@ -22,6 +22,7 @@ const FILE_LIMIT: u64 = 128 * 1024;
 
 pub(super) fn error(code: &str) -> EngineFailure {
     failure(code, "authentication", match code {
+        "CODEX_AUTH_IDENTITY_UNAVAILABLE" => "Codex did not provide a ChatGPT user ID or email. Sign in again in the selected session with an account that supplies an email, or use a private Codex login",
         "CODEX_AUTH_EXPIRED" => "The selected ChatGPT access token has expired; this host never renews the ordinary session",
         "CODEX_AUTH_ACCOUNT_CHANGED" => "The selected ChatGPT account or attested routing differs from the capture",
         "CODEX_AUTH_REFRESH_REQUIRED" => "Codex rejected the access token and no renewed token for the same account is available",

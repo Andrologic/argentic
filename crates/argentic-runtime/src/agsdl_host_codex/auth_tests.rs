@@ -47,7 +47,22 @@ for line in sys.stdin:
   if refreshed and mode=='route-change': routing['backendOrigin']='https://changed.invalid'
   if mode=='missing-routing': routing={}
   email='other@example.invalid' if refreshed and mode=='user-change' else 'synthetic@example.invalid'
+  if mode in ('no-email','user-id-no-email') or (refreshed and mode=='refresh-no-email'): email=None
+  if mode=='user-id-email-change' and refreshed: email='new@example.invalid'
   result={'account':{'type':'chatgpt','email':email},'workspaceRouting':routing}
+  if mode.startswith('user-id-'):
+   result['userId']='other-user' if refreshed and mode=='user-id-change' else 'synthetic-user'
+ elif method=='accountSession/list':
+  assert p=={'refreshWorkspaceMetadata':False}
+  if mode=='managed-unsupported':
+   emit({'id':i,'error':{'code':-32601,'message':'unsupported method'}}); continue
+  if mode=='managed-failed':
+   emit({'id':i,'error':{'code':-32603,'message':'failed'}}); continue
+  assert mode.startswith('managed-')
+  result={'activeSessionId':'active','sessions':[
+   {'sessionId':'inactive','isActive':False,'selectedWorkspaceAccountId':account,'userId':'ignored-user'},
+   {'sessionId':'active','isActive':True,'selectedWorkspaceAccountId':'other-account' if mode=='managed-other-workspace' else account,'email':'synthetic@example.invalid','userId':None if mode=='managed-null' else 'synthetic-user'}
+  ]}
  elif method=='exercise':
   if mode=='rpc-unsupported':
    emit({'id':'unknown','method':'item/commandExecution/requestApproval','params':{'message':'SYNTHETIC_NATIVE_SECRET'}}); continue
@@ -360,6 +375,73 @@ async fn external_auth_wait_rechecks_stop_before_physical_approval() {
     let event = f.client.notification().await.unwrap();
     assert_eq!(event["params"]["decision"], "decline");
     f.end().await;
+}
+
+#[tokio::test]
+async fn managed_account_uses_direct_or_active_session_user_id() {
+    let mut direct = Fixture::new("user-id-no-email");
+    direct.client.use_auth_source(None, None);
+    direct.client.initialize().await.unwrap();
+    let stable = direct.client.current_account_digest().await.unwrap();
+    direct.end().await;
+
+    for mode in ["managed-user-id", "managed-null", "managed-unsupported"] {
+        let mut f = Fixture::new(mode);
+        f.client.use_auth_source(None, None);
+        f.client.initialize().await.unwrap();
+        let digest = f.client.current_account_digest().await.unwrap();
+        assert_eq!(digest == stable, mode == "managed-user-id", "{mode}");
+        f.end().await;
+    }
+
+    for (mode, code) in [
+        ("managed-other-workspace", "CODEX_ACCOUNT_UNQUALIFIED"),
+        ("managed-failed", "CODEX_REQUEST_FAILED"),
+    ] {
+        let mut f = Fixture::new(mode);
+        f.client.use_auth_source(None, None);
+        f.client.initialize().await.unwrap();
+        assert_eq!(
+            f.client.current_account_digest().await.unwrap_err().code,
+            code
+        );
+        f.end().await;
+    }
+}
+
+#[tokio::test]
+async fn external_auth_binds_user_id_even_without_email_or_when_email_changes() {
+    for mode in ["user-id-no-email", "user-id-email-change", "user-id-change"] {
+        let mut f = Fixture::new(mode);
+        f.bootstrap().await.unwrap();
+        let digest = f.client.current_account_digest().await.unwrap();
+        let result = f.client.request("exercise", json!({})).await;
+        if mode == "user-id-change" {
+            assert_eq!(result.unwrap_err().code, "CODEX_AUTH_ACCOUNT_CHANGED");
+        } else {
+            assert_eq!(result.unwrap(), json!({"ok":true}));
+            assert_eq!(f.client.current_account_digest().await.unwrap(), digest);
+        }
+        f.end().await;
+    }
+}
+
+#[tokio::test]
+async fn external_auth_reports_missing_identity_at_login_and_refresh() {
+    for mode in ["no-email", "refresh-no-email"] {
+        let mut f = Fixture::new(mode);
+        let result = if mode == "no-email" {
+            f.bootstrap().await
+        } else {
+            f.bootstrap().await.unwrap();
+            f.client.request("exercise", json!({})).await.map(|_| ())
+        };
+        let error = result.unwrap_err();
+        assert_eq!(error.code, "CODEX_AUTH_IDENTITY_UNAVAILABLE");
+        assert!(error.message.contains("Sign in again"), "{error:?}");
+        assert!(f.client.check_auth_current().await.is_err());
+        f.end().await;
+    }
 }
 
 #[tokio::test]

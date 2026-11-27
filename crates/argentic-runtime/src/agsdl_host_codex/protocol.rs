@@ -217,6 +217,10 @@ impl Client {
         }
     }
     pub(crate) async fn response(&mut self, id: u64) -> Result<Value> {
+        let frame = self.response_frame(id).await?;
+        self.response_value030(&frame)
+    }
+    async fn response_frame(&mut self, id: u64) -> Result<Value> {
         loop {
             let value = self.next().await?;
             if self.handle_auth_request(&value).await? {
@@ -224,7 +228,7 @@ impl Client {
             }
             if value.get("method").is_none() && value.get("id").and_then(Value::as_u64) == Some(id)
             {
-                return self.response_value030(&value);
+                return Ok(value);
             }
             if self.is_reply(&value) {
                 continue;
@@ -327,7 +331,14 @@ impl Client {
                 "Connect a test account in the private Codex profile",
             ));
         }
-        let account_digest = account_digest(&account)?;
+        let mut user_id = required(&account, "userId").ok();
+        if user_id.is_none()
+            && self.external_auth.is_none()
+            && account["account"]["type"] == "chatgpt"
+        {
+            user_id = self.managed_user_id(&account).await?;
+        }
+        let account_digest = account_digest(&account, user_id, self.external_auth.is_some())?;
         if let Some(auth) = &self.external_auth {
             let state = auth.lock_current().await?;
             if state.account_digest.as_deref() != Some(&account_digest) {
@@ -336,11 +347,60 @@ impl Client {
         }
         Ok(account_digest)
     }
+
+    async fn managed_user_id(&mut self, account: &Value) -> Result<Option<String>> {
+        const METHOD: &str = "accountSession/list";
+        let id = self
+            .begin_request(METHOD, json!({"refreshWorkspaceMetadata":false}))
+            .await?;
+        let frame = self.response_frame(id).await?;
+        let error = &frame["error"];
+        let code = error["code"].as_i64();
+        // Older Codex releases can report unknown RPC methods as a
+        // deserialization error. Other RPC errors block account attestation.
+        if code == Some(-32601)
+            || (code == Some(-32600)
+                && error["message"].as_str().is_some_and(|message| {
+                    message.contains(METHOD)
+                        && (message.contains("unknown method")
+                            || message.contains("unknown variant"))
+                }))
+        {
+            return Ok(None);
+        }
+        let sessions = self.response_value030(&frame)?;
+        let inconsistent = || {
+            failure(
+                "CODEX_ACCOUNT_UNQUALIFIED",
+                "authentication",
+                "Codex did not report a consistent active ChatGPT session and workspace",
+            )
+        };
+        let entries = sessions["sessions"].as_array().ok_or_else(inconsistent)?;
+        if entries.is_empty() && sessions.get("activeSessionId").is_some_and(Value::is_null) {
+            return Ok(None);
+        }
+        let active = required(&sessions, "activeSessionId").map_err(|_| inconsistent())?;
+        let workspace = required(&account["workspaceRouting"], "chatgptAccountId")?;
+        let mut matches = entries
+            .iter()
+            .filter(|session| session["sessionId"] == active);
+        let session = matches.next().ok_or_else(inconsistent)?;
+        if matches.next().is_some()
+            || session["isActive"] != true
+            || session["selectedWorkspaceAccountId"] != workspace
+            || matches!((session["email"].as_str(), account["account"]["email"].as_str()),
+                (Some(session_email), Some(read_email)) if session_email != read_email)
+        {
+            return Err(inconsistent());
+        }
+        Ok(required(session, "userId").ok())
+    }
 }
 
-pub(crate) const ACCOUNT_DIGEST_PREFIX: &str = "sha256:chatgpt-user-v1:";
+pub(crate) const ACCOUNT_DIGEST_PREFIX: &str = "sha256:chatgpt-user-v2:";
 
-fn account_digest(account: &Value) -> Result<String> {
+fn account_digest(account: &Value, user_id: Option<String>, external: bool) -> Result<String> {
     if account["account"]["type"] != "chatgpt" {
         return Err(failure(
             "CODEX_ACCOUNT_UNQUALIFIED",
@@ -348,18 +408,29 @@ fn account_digest(account: &Value) -> Result<String> {
             "Codex account identity cannot be attested for this profile",
         ));
     }
-    let email = required(&account["account"], "email").map_err(|_| {
-        failure(
-            "CODEX_ACCOUNT_UNQUALIFIED",
-            "authentication",
-            "Codex did not provide the active ChatGPT user's email",
-        )
-    })?;
+    let (identity_kind, identity) = match user_id {
+        Some(user_id) => ("userId", user_id),
+        None => (
+            "email",
+            required(&account["account"], "email").map_err(|_| {
+                if external {
+                    auth::error("CODEX_AUTH_IDENTITY_UNAVAILABLE")
+                } else {
+                    failure(
+                        "CODEX_ACCOUNT_UNQUALIFIED",
+                        "authentication",
+                        "Codex did not provide a user ID or email for the active ChatGPT user",
+                    )
+                }
+            })?,
+        ),
+    };
     let routing = &account["workspaceRouting"];
     Ok(format!(
         "{ACCOUNT_DIGEST_PREFIX}{:x}",
         Sha256::digest(serde_json::to_vec(&(
-            email,
+            identity_kind,
+            identity,
             required(routing, "chatgptAccountId")?,
             required(routing, "backendOrigin")?,
             required(routing, "accountRoutingOverride")?
@@ -469,7 +540,14 @@ impl Client {
         let account = self
             .auth_response("account/read", json!({"refreshToken":false}))
             .await?;
-        let digest = account_digest(&account).map_err(|_| auth::error("CODEX_AUTH_FAILED"))?;
+        let digest =
+            account_digest(&account, required(&account, "userId").ok(), true).map_err(|error| {
+                if error.code == "CODEX_AUTH_IDENTITY_UNAVAILABLE" {
+                    error
+                } else {
+                    auth::error("CODEX_AUTH_FAILED")
+                }
+            })?;
         if account["workspaceRouting"]["chatgptAccountId"].as_str() != Some(&state.account_id)
             || expected.is_some_and(|expected| expected != digest)
             || state
