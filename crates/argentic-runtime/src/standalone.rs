@@ -354,8 +354,24 @@ impl Host {
         approved_sha256: &str,
     ) -> Result<Self> {
         let workspace = workspace.canonicalize().map_err(io_error)?;
-        std::fs::create_dir_all(data).map_err(io_error)?;
+        let mut directory = std::fs::DirBuilder::new();
+        directory.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            directory.mode(0o700);
+        }
+        directory.create(data).map_err(io_error)?;
         let data = data.canonicalize().map_err(io_error)?;
+        #[cfg(unix)]
+        crate::sqlite::require_private(&std::fs::metadata(&data).map_err(io_error)?, 0o700)
+            .map_err(|_| {
+                failure(
+                    "PERMISSION",
+                    "data",
+                    "Host data directory must be owned by the effective user and have mode 0700",
+                )
+            })?;
         if data.starts_with(&workspace) || workspace.starts_with(&data) {
             return Err(failure(
                 "PERMISSION",
@@ -434,19 +450,7 @@ impl Host {
             policy_digest,
         };
         inputs.verify()?;
-        let database = data.join("engine.sqlite");
-        if std::fs::symlink_metadata(&database).is_ok_and(|m| !m.file_type().is_file()) {
-            return Err(failure(
-                "STORAGE",
-                "data",
-                "Database must be a regular file",
-            ));
-        }
-        let pool = if database.exists() {
-            crate::sqlite::open_file(&database).await?
-        } else {
-            crate::sqlite::create_file(&database).await?
-        };
+        let pool = crate::sqlite::open_standalone(&data.join("engine.sqlite")).await?;
         api::interrupt_previous_runs(&pool).await?;
         let engine = Engine::new();
         crate::agsdl_host_flow030::recover_pending_stops030(&engine, &pool).await?;
@@ -1062,6 +1066,67 @@ mod tests {
             message_json: "{}".into(),
         })
     }
+    #[tokio::test]
+    async fn opens_storage_after_first_schema_transaction_rolls_back() {
+        use sqlx::Connection;
+        let f = Fixture::new(WAIT);
+        let mut builder = std::fs::DirBuilder::new();
+        let mut file = std::fs::OpenOptions::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+            builder.mode(0o700);
+            file.mode(0o600);
+        }
+        builder.create(&f.data).unwrap();
+        let db = f.data.join("engine.sqlite");
+        file.write(true).create_new(true).open(&db).unwrap();
+        let mut connection =
+            SqliteConnection::connect_with(&sqlx::sqlite::SqliteConnectOptions::new().filename(db))
+                .await
+                .unwrap();
+        let mut tx = connection.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        sqlx::query("CREATE TABLE initialization_probe (id INTEGER)")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tx.rollback().await.unwrap();
+        connection.close().await.unwrap();
+        let host = f.open().await.unwrap();
+        host.shutdown(&[]).await.unwrap();
+        host.close().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn standalone_storage_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let f = Fixture::new(WAIT);
+        let host = f.open().await.unwrap();
+        for (path, mode) in [
+            ("", 0o700),
+            ("engine.sqlite", 0o600),
+            ("engine.sqlite-wal", 0o600),
+            ("engine.sqlite-shm", 0o600),
+        ] {
+            let metadata = std::fs::metadata(f.data.join(path)).unwrap();
+            assert_eq!(metadata.permissions().mode() & 0o777, mode, "{path}");
+        }
+        host.shutdown(&[]).await.unwrap();
+        host.close().await.unwrap();
+        let db = f.data.join("engine.sqlite");
+        std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(f.open().await.is_err());
+        std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let wal = f.data.join("engine.sqlite-wal");
+        std::fs::write(&wal, []).unwrap();
+        std::fs::set_permissions(&wal, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(f.open().await.is_err());
+        std::fs::remove_file(wal).unwrap();
+        std::fs::set_permissions(&f.data, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(f.open().await.is_err());
+    }
+
     #[test]
     fn operational_write_review_fixture_stays_inside_the_existing_codex_slice() {
         let raw = include_str!("../examples/fixtures/write-review.json");
