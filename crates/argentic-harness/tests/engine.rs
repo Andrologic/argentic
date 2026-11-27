@@ -1072,8 +1072,7 @@ async fn editable_native_replay_masks_assistant_text() {
     }
 }
 
-#[tokio::test]
-async fn child_budget_exhaustion_stops_the_parent_tool_batch() {
+fn delegation_fixture(turns: Vec<Vec<Chunk>>, limits: Value) -> (tempfile::TempDir, Harness) {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().canonicalize().unwrap();
     let policy = ReadPolicy::compile_rules(
@@ -1089,17 +1088,84 @@ async fn child_budget_exhaustion_stops_the_parent_tool_batch() {
     )
     .unwrap();
     let registry = Registry::new(&[root], policy, json!(true)).unwrap();
-    let provider = scripted(vec![
-        vec![
-            call("child", "delegate", json!({"task":"Inspect the workspace"})),
-            submit("submit", json!({"answer":42})),
+    let settings = Settings::resolve(&json!({}), &json!({}), &limits).unwrap();
+    let harness =
+        Harness::new(Arc::new(scripted(turns)), Arc::new(registry), settings).with_delegation();
+    (dir, harness)
+}
+
+#[tokio::test]
+async fn child_budget_exhaustion_stops_the_parent_tool_batch() {
+    for token_limit in [29, 30] {
+        let (_dir, harness) = delegation_fixture(
+            vec![
+                vec![
+                    call("child", "delegate", json!({"task":"Inspect the workspace"})),
+                    submit("submit", json!({"answer":42})),
+                    end(Finish::ToolCalls),
+                ],
+                vec![Chunk::Text("Child reply".into()), end(Finish::Stop)],
+            ],
+            json!({"maxTotalTokens":token_limit}),
+        );
+        let trace = Trace::default();
+        let (_, steer) = mpsc::channel(1);
+        let report = harness
+            .run(work(true), &trace, steer, CancellationToken::new())
+            .await;
+        assert!(matches!(report.outcome, Err(Failure::TokenLimit)));
+        assert!(trace.0.lock().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn child_local_turn_limit_is_a_recoverable_tool_error() {
+    let mut turns = vec![vec![
+        call("child", "delegate", json!({"task":"Inspect the workspace"})),
+        end(Finish::ToolCalls),
+    ]];
+    for turn in 1..=8 {
+        turns.push(vec![
+            call(&format!("read-{turn}"), "list", json!({})),
             end(Finish::ToolCalls),
-        ],
-        vec![Chunk::Text("Child reply".into()), end(Finish::Stop)],
+        ]);
+    }
+    turns.push(vec![
+        submit("submit", json!({"answer":42})),
+        end(Finish::ToolCalls),
     ]);
-    let settings =
-        Settings::resolve(&json!({}), &json!({}), &json!({"maxTotalTokens":29})).unwrap();
-    let harness = Harness::new(Arc::new(provider), Arc::new(registry), settings).with_delegation();
+    let (_dir, harness) = delegation_fixture(turns, json!({"maxTurns":10, "maxTotalTokens":200}));
+    let trace = Trace::default();
+    let (_, steer) = mpsc::channel(1);
+    let report = harness
+        .run(work(true), &trace, steer, CancellationToken::new())
+        .await;
+    assert_eq!(
+        report.outcome.unwrap().submission,
+        Some(json!({"results":{"answer":42}}))
+    );
+    assert_eq!(
+        *trace.0.lock().unwrap(),
+        [
+            r#"child {"error":"Sub-agent failed"}"#,
+            "submit Result accepted.",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn child_provider_failure_that_exhausts_tokens_blocks_parent_submission() {
+    let (_dir, harness) = delegation_fixture(
+        vec![
+            vec![
+                call("child", "delegate", json!({"task":"Inspect the workspace"})),
+                submit("submit", json!({"answer":42})),
+                end(Finish::ToolCalls),
+            ],
+            vec![end(Finish::Filtered)],
+        ],
+        json!({"maxTotalTokens":100}),
+    );
     let trace = Trace::default();
     let (_, steer) = mpsc::channel(1);
     let report = harness

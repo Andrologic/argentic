@@ -55,15 +55,8 @@ impl Instance<'_> {
                 "Supply a task between 1 and 8192 bytes".into(),
             ));
         }
-        {
-            let budget = self.budget().map_err(DelegateError::Budget)?;
-            if budget.tokens == Some(0) {
-                return Err(DelegateError::Budget(Failure::TokenLimit));
-            }
-            if budget.turns == 0 {
-                return Err(DelegateError::Budget(Failure::TurnLimit));
-            }
-        }
+        self.check_delegate_budget()
+            .map_err(DelegateError::Budget)?;
         self.harness
             .registry
             .authorize_delegate(call, self.cancel)
@@ -101,14 +94,23 @@ impl Instance<'_> {
                     .run_with_budget(child, &(), inbox, cancel, budget, MAX_CHILD_TURNS)
                     .await
             })
-            .await
-            .map_err(|_| "Sub-agent task failed".to_owned())?;
-        result.outcome.map_err(|error| match error {
-            Failure::TokenLimit | Failure::MissingUsage | Failure::TurnLimit => {
-                DelegateError::Budget(error)
+            .await;
+        if let Err(limit) = self.check_delegate_budget() {
+            let failure = match &result {
+                Ok(report) if matches!(report.outcome, Err(Failure::MissingUsage)) => {
+                    Failure::MissingUsage
+                }
+                _ => limit,
+            };
+            return Err(DelegateError::Budget(failure));
+        }
+        let result = result.map_err(|_| "Sub-agent task failed".to_owned())?;
+        result.outcome.map_err(|error| {
+            match error {
+                Failure::Cancelled => "Sub-agent cancelled",
+                _ => "Sub-agent failed",
             }
-            Failure::Cancelled => "Sub-agent cancelled".to_owned().into(),
-            _ => "Sub-agent failed".to_owned().into(),
+            .to_owned()
         })?;
         let text = result
             .messages
@@ -120,6 +122,21 @@ impl Instance<'_> {
             })
             .unwrap_or_default();
         Page::one_shot(text, &call.id).map_err(|error| error.to_string().into())
+    }
+
+    fn check_delegate_budget(&self) -> Result<(), Failure> {
+        let min_output = self.harness.provider.min_output_tokens();
+        let budget = self.budget()?;
+        if budget
+            .tokens
+            .is_some_and(|tokens| tokens == 0 || tokens < u64::from(min_output))
+        {
+            return Err(Failure::TokenLimit);
+        }
+        if budget.turns == 0 {
+            return Err(Failure::TurnLimit);
+        }
+        Ok(())
     }
 }
 
