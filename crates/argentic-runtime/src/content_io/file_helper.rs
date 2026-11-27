@@ -65,6 +65,8 @@ pub fn initialize() -> std::io::Result<Option<i32>> {
     if let Some(code) = dispatch(&args) {
         return Ok(Some(code));
     }
+    #[cfg(target_os = "macos")]
+    super::macos_launcher::require_child_exit_status()?;
     register_host_executable(std::env::current_exe()?)?;
     Ok(None)
 }
@@ -96,17 +98,19 @@ pub async fn read_confined(
     let child_cancel = cancel.child_token();
     let guard = child_cancel.clone().drop_guard();
     let (sender, receiver) = tokio::sync::oneshot::channel();
-    let worker = tokio::task::spawn_blocking(move || {
-        super::macos_launcher::read_supervised(&executable, &name, directory, child_cancel, sender)
-    });
-    if let Some(owner) = owner {
-        let cleanup = tokio::spawn(async move {
-            worker
-                .await
-                .map_err(|error| format!("Content reader owner failed: {error}"))
-        });
-        owner(cleanup).map_err(std::io::Error::other)?;
-    }
+    start_owned_reader(owner, async move {
+        tokio::task::spawn_blocking(move || {
+            super::macos_launcher::read_supervised(
+                &executable,
+                &name,
+                directory,
+                child_cancel,
+                sender,
+            )
+        })
+        .await
+        .map_err(|error| format!("Content reader owner failed: {error}"))
+    })?;
     let result = receiver
         .await
         .map_err(|_| std::io::Error::other("Content helper worker stopped"))?;
@@ -225,6 +229,26 @@ pub use super::windows_reader::read_confined;
 
 /// Attach cleanup before starting I/O. If the caller times out or is dropped,
 /// the worker receives cancellation and the work owner still joins it.
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+fn start_owned_reader(
+    owner: Option<super::ContentResourceOwner>,
+    read: impl std::future::Future<Output = Result<(), String>> + Send + 'static,
+) -> std::io::Result<()> {
+    let (start, admitted) = tokio::sync::oneshot::channel();
+    let worker = tokio::spawn(async move {
+        if admitted.await.is_ok() {
+            read.await?;
+        }
+        Ok(())
+    });
+    if let Some(owner) = owner {
+        owner(worker).map_err(std::io::Error::other)?;
+    }
+    start
+        .send(())
+        .map_err(|_| std::io::Error::other("Content reader stopped"))
+}
+
 #[cfg(any(target_os = "linux", windows))]
 pub(super) async fn supervise_read<F>(
     cancel: &tokio_util::sync::CancellationToken,
@@ -242,21 +266,12 @@ where
     }
     let cancel = cancel.child_token();
     let _cancel_on_drop = cancel.clone().drop_guard();
-    let (start, admitted) = oneshot::channel();
     let (done, result) = oneshot::channel();
     let worker_cancel = cancel.clone();
-    let worker = tokio::spawn(async move {
-        if admitted.await.is_ok() {
-            let _ = done.send(read(worker_cancel).await);
-        }
+    start_owned_reader(owner, async move {
+        let _ = done.send(read(worker_cancel).await);
         Ok(())
-    });
-    if let Some(owner) = owner {
-        owner(worker).map_err(std::io::Error::other)?;
-    }
-    start
-        .send(())
-        .map_err(|_| std::io::Error::other("Content reader stopped"))?;
+    })?;
     tokio::select! {
         biased;
         _ = cancel.cancelled() => Err(cancelled()),
@@ -631,5 +646,25 @@ mod tests {
         assert!(!cleanup.is_finished());
         release.send(()).unwrap();
         cleanup.await.unwrap().unwrap();
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+    #[tokio::test]
+    async fn rejected_reader_owner_prevents_worker_start() {
+        use std::sync::{Arc, Mutex};
+
+        let cleanup = Arc::new(Mutex::new(None));
+        let attached = Arc::clone(&cleanup);
+        let owner = Arc::new(move |worker| {
+            *attached.lock().unwrap() = Some(worker);
+            Err("owner is shutting down".into())
+        });
+        let error = super::start_owned_reader(Some(owner), async {
+            panic!("reader started without an owner");
+        })
+        .unwrap_err();
+        assert_eq!(error.to_string(), "owner is shutting down");
+        let worker = cleanup.lock().unwrap().take().unwrap();
+        worker.await.unwrap().unwrap();
     }
 }

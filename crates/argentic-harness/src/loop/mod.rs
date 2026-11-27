@@ -1113,7 +1113,11 @@ impl Instance<'_> {
                 self.before(turn, call).await?;
             }
             let outputs = if call.name == delegate::TOOL {
-                vec![self.delegate(work, call).await]
+                vec![match self.delegate(work, call).await {
+                    Ok(page) => Ok(page),
+                    Err(delegate::DelegateError::Tool(error)) => Err(error),
+                    Err(delegate::DelegateError::Budget(error)) => return Err(error),
+                }]
             } else {
                 stream::iter(batch.iter().cloned())
                     .map(|call| {

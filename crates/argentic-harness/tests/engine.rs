@@ -5,7 +5,7 @@ use std::{
 
 use argentic_harness::{
     config::Settings,
-    policy::{Preset, ReadPolicy},
+    policy::{Action, Effect, Preset, ReadPolicy, Rule},
     providers::{
         Chunk, Finish, Message, Provider, ProviderError, ProviderStream, Request, ScriptedProvider,
         ToolCall, ToolChoice, Usage,
@@ -978,6 +978,204 @@ async fn response_budget_counts_screened_stream_bytes() {
 }
 
 #[tokio::test]
+async fn native_replay_rejects_credential_member_names() {
+    const KEY: &str = "provider-fixture-key";
+    for (format, item) in [
+        (
+            "Anthropic",
+            json!({"type":"thinking",(KEY):"opaque metadata"}),
+        ),
+        (
+            "Anthropic",
+            json!({"type":"thinking","extra":[{(KEY):"opaque metadata"}]}),
+        ),
+        ("Anthropic", json!({"type":"thinking","id":KEY})),
+        (
+            "Responses",
+            json!({"type":"function_call","status":{(KEY):"malformed metadata"}}),
+        ),
+        (
+            "Responses",
+            json!({"type":"function_call","arguments":{(KEY):"malformed arguments"}}),
+        ),
+    ] {
+        let work = work(false);
+        let replay = serde_json::from_value(json!({
+            "format": format,
+            "model": work.model,
+            "items": [item],
+        }))
+        .unwrap();
+        let (_dir, harness) = fixture(
+            vec![vec![Chunk::Replay(replay), end(Finish::Stop)]],
+            json!({}),
+        );
+        let (_, steer) = mpsc::channel(1);
+        let report = harness
+            .with_provider_credential(Some(KEY.into()))
+            .run(work, &(), steer, CancellationToken::new())
+            .await;
+        assert!(matches!(
+            report.outcome,
+            Err(Failure::Provider(ProviderError::Invalid(_)))
+        ));
+        assert_eq!(report.messages.len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn editable_native_replay_masks_assistant_text() {
+    const KEY: &str = "provider-fixture-key";
+    for (format, item, screened) in [
+        (
+            "Anthropic",
+            json!({"type":"text","text":KEY}),
+            json!({"type":"text","text":"[redacted]"}),
+        ),
+        (
+            "Responses",
+            json!({"type":"message","role":"assistant","id":"msg_1","content":[
+                {"type":"output_text","text":KEY,"annotations":[]},
+                {"type":"refusal","refusal":KEY}
+            ]}),
+            json!({"type":"message","role":"assistant","id":"msg_1","content":[
+                {"type":"output_text","text":"[redacted]","annotations":[]},
+                {"type":"refusal","refusal":"[redacted]"}
+            ]}),
+        ),
+    ] {
+        let work = work(false);
+        let replay = serde_json::from_value(json!({
+            "format": format,
+            "model": work.model,
+            "items": [item],
+        }))
+        .unwrap();
+        let (_dir, harness) = fixture(
+            vec![vec![
+                Chunk::Text(KEY.into()),
+                Chunk::Replay(replay),
+                end(Finish::Stop),
+            ]],
+            json!({}),
+        );
+        let (_, steer) = mpsc::channel(1);
+        let report = harness
+            .with_provider_credential(Some(KEY.into()))
+            .run(work, &(), steer, CancellationToken::new())
+            .await;
+        assert_eq!(report.outcome.unwrap().text, "[redacted]");
+        assert_eq!(
+            serde_json::to_value(&report.messages[1]).unwrap()["Assistant"]["replay"]["items"],
+            json!([screened])
+        );
+    }
+}
+
+fn delegation_fixture(turns: Vec<Vec<Chunk>>, limits: Value) -> (tempfile::TempDir, Harness) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let policy = ReadPolicy::compile_rules(
+        &root,
+        None,
+        Some(Preset::ReadOnly),
+        None,
+        &[Rule {
+            action: Action::Delegate,
+            pattern: None,
+            effect: Effect::Allow,
+        }],
+    )
+    .unwrap();
+    let registry = Registry::new(&[root], policy, json!(true)).unwrap();
+    let settings = Settings::resolve(&json!({}), &json!({}), &limits).unwrap();
+    let harness =
+        Harness::new(Arc::new(scripted(turns)), Arc::new(registry), settings).with_delegation();
+    (dir, harness)
+}
+
+#[tokio::test]
+async fn child_budget_exhaustion_stops_the_parent_tool_batch() {
+    for token_limit in [29, 30] {
+        let (_dir, harness) = delegation_fixture(
+            vec![
+                vec![
+                    call("child", "delegate", json!({"task":"Inspect the workspace"})),
+                    submit("submit", json!({"answer":42})),
+                    end(Finish::ToolCalls),
+                ],
+                vec![Chunk::Text("Child reply".into()), end(Finish::Stop)],
+            ],
+            json!({"maxTotalTokens":token_limit}),
+        );
+        let trace = Trace::default();
+        let (_, steer) = mpsc::channel(1);
+        let report = harness
+            .run(work(true), &trace, steer, CancellationToken::new())
+            .await;
+        assert!(matches!(report.outcome, Err(Failure::TokenLimit)));
+        assert!(trace.0.lock().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn child_local_turn_limit_is_a_recoverable_tool_error() {
+    let mut turns = vec![vec![
+        call("child", "delegate", json!({"task":"Inspect the workspace"})),
+        end(Finish::ToolCalls),
+    ]];
+    for turn in 1..=8 {
+        turns.push(vec![
+            call(&format!("read-{turn}"), "list", json!({})),
+            end(Finish::ToolCalls),
+        ]);
+    }
+    turns.push(vec![
+        submit("submit", json!({"answer":42})),
+        end(Finish::ToolCalls),
+    ]);
+    let (_dir, harness) = delegation_fixture(turns, json!({"maxTurns":10, "maxTotalTokens":200}));
+    let trace = Trace::default();
+    let (_, steer) = mpsc::channel(1);
+    let report = harness
+        .run(work(true), &trace, steer, CancellationToken::new())
+        .await;
+    assert_eq!(
+        report.outcome.unwrap().submission,
+        Some(json!({"results":{"answer":42}}))
+    );
+    assert_eq!(
+        *trace.0.lock().unwrap(),
+        [
+            r#"child {"error":"Sub-agent failed"}"#,
+            "submit Result accepted.",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn child_provider_failure_that_exhausts_tokens_blocks_parent_submission() {
+    let (_dir, harness) = delegation_fixture(
+        vec![
+            vec![
+                call("child", "delegate", json!({"task":"Inspect the workspace"})),
+                submit("submit", json!({"answer":42})),
+                end(Finish::ToolCalls),
+            ],
+            vec![end(Finish::Filtered)],
+        ],
+        json!({"maxTotalTokens":100}),
+    );
+    let trace = Trace::default();
+    let (_, steer) = mpsc::channel(1);
+    let report = harness
+        .run(work(true), &trace, steer, CancellationToken::new())
+        .await;
+    assert!(matches!(report.outcome, Err(Failure::TokenLimit)));
+    assert!(trace.0.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn credential_in_signed_replay_rejects_the_reply() {
     const KEY: &str = "provider-fixture-key";
     let work = work(false);
@@ -1194,5 +1392,8 @@ async fn scripted_turn_overhead() {
     samples.sort_unstable();
     let median = samples[TURNS / 2];
     println!("scripted harness turn: {median:?} median over {TURNS} turns");
-    assert!(median < Duration::from_millis(5));
+    // Hosted CI runners only report timings; controlled runners enforce them.
+    if std::env::var_os("ARGENTIC_PERF_REPORT_ONLY").is_none() {
+        assert!(median < Duration::from_millis(5));
+    }
 }

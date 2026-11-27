@@ -164,6 +164,26 @@ async fn assembles_tool_deltas_and_accepts_unknown_frame_fields() {
 }
 
 #[tokio::test]
+async fn streamed_refusal_is_visible_and_finishes_filtered() {
+    let mock = Mock::start(vec![(StatusCode::OK, None, vec![
+        b"data: {\"choices\":[{\"delta\":{\"refusal\":\"I cannot\"}}]}\n\n",
+        b"data: {\"choices\":[{\"delta\":{\"refusal\":\" help.\"},\"finish_reason\":\"stop\"}]}\n\n",
+        b"data: [DONE]\n\n",
+    ])]).await;
+    assert_eq!(
+        mock.request(None).await.unwrap(),
+        vec![
+            Chunk::Text("I cannot".into()),
+            Chunk::Text(" help.".into()),
+            Chunk::End {
+                finish: Finish::Filtered,
+                usage: None
+            },
+        ]
+    );
+}
+
+#[tokio::test]
 async fn effort_rejection_only_changes_the_current_request() {
     let mock = Mock::start(vec![
         (

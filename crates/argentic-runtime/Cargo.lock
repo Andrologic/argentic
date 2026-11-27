@@ -109,6 +109,7 @@ dependencies = [
  "flate2",
  "futures",
  "libc",
+ "libyaml-rs",
  "percent-encoding",
  "portable-pty",
  "regex",

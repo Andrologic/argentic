@@ -122,10 +122,19 @@ impl std::fmt::Debug for Replay {
 }
 
 impl Replay {
-    /// Strip rejected tool inputs while retaining replayable protocol identifiers.
-    /// Signed reasoning must remain intact, so an echo there rejects the reply.
+    /// Mask editable text and strip rejected tool inputs. An echo in
+    /// opaque data rejects the reply because those fields must stay intact.
     pub(crate) fn screen(&mut self, key: &str) -> bool {
-        use credential::value_contains_credential;
+        use credential::{redact, value_contains_credential};
+
+        fn mask_text(value: &mut Value, key: &str) {
+            if let Some(text) = value.as_str() {
+                if let std::borrow::Cow::Owned(text) = redact(text, key) {
+                    *value = Value::String(text);
+                }
+            }
+        }
+
         for item in &mut self.items {
             let Some(fields) = item.as_object_mut() else {
                 if value_contains_credential(item, key) {
@@ -134,26 +143,56 @@ impl Replay {
                 continue;
             };
             let kind = fields.get("type").and_then(Value::as_str);
-            let arguments = match kind {
-                Some("tool_use") => Some("input"),
-                Some("function_call") => Some("arguments"),
+            let arguments = match (self.format, kind) {
+                (WireFormat::Anthropic, Some("tool_use")) => Some("input"),
+                (WireFormat::Responses, Some("function_call")) => Some("arguments"),
                 _ => None,
             };
+            match (self.format, kind) {
+                (WireFormat::Anthropic, Some("text")) => {
+                    if let Some(text) = fields.get_mut("text") {
+                        mask_text(text, key);
+                    }
+                }
+                (WireFormat::Responses, Some("message"))
+                    if fields.get("role").and_then(Value::as_str) == Some("assistant") =>
+                {
+                    if let Some(parts) = fields.get_mut("content").and_then(Value::as_array_mut) {
+                        for part in parts {
+                            let field = match part["type"].as_str() {
+                                Some("output_text") => "text",
+                                Some("refusal") => "refusal",
+                                _ => continue,
+                            };
+                            if let Some(text) = part.get_mut(field) {
+                                mask_text(text, key);
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
             for (name, value) in fields {
-                if matches!(name.as_str(), "id" | "call_id" | "type" | "status" | "role")
-                    || (arguments.is_some() && name == "name")
+                if name.contains(key) {
+                    return false;
+                }
+                if arguments.is_some()
+                    && matches!(name.as_str(), "id" | "call_id" | "name")
+                    && value.is_string()
                 {
                     continue;
                 }
                 if Some(name.as_str()) == arguments {
                     if name == "input" && value_contains_credential(value, key) {
                         *value = serde_json::json!({});
-                    } else if name == "arguments"
-                        && value
-                            .as_str()
-                            .is_some_and(|raw| contains_credential(raw, key))
-                    {
-                        *value = Value::String("{}".into());
+                    } else if name == "arguments" {
+                        if let Some(raw) = value.as_str() {
+                            if contains_credential(raw, key) {
+                                *value = Value::String("{}".into());
+                            }
+                        } else if value_contains_credential(value, key) {
+                            return false;
+                        }
                     }
                 } else if value_contains_credential(value, key) {
                     return false;
