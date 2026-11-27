@@ -498,15 +498,15 @@ async fn shell_stops_on_staging_budget_during_execution() {
     assert!(output.starts_with("Exit status: 0"), "{output}");
     for (command, expected) in [
         (
-            "for i in 1 2 3 4 5; do truncate -s 14M part-$i; done; sleep 15",
+            "for i in {1..19}; do truncate -s 14M part-$i; done; sleep 15",
             "byte budget",
         ),
-        ("touch item-{1..20001}; sleep 15", "entry or depth budget"),
+        ("touch item-{1..50001}; sleep 15", "entry or depth budget"),
     ] {
         let error = call(
             &registry,
             "shell",
-            json!({"command":command,"timeout_ms":5000}),
+            json!({"command":command,"timeout_ms":10000}),
         )
         .await
         .unwrap_err();

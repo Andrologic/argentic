@@ -274,6 +274,7 @@ fn run(
                 root,
                 registry.shell_staging_directory.as_deref(),
                 cancel,
+                write,
                 |path| {
                     registry.path_effect(root, Action::Read, &root.path.join(path)) == Effect::Allow
                 },

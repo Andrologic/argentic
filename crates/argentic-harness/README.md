@@ -319,9 +319,9 @@ over TLS. Redirects that clients follow go through the same checks as new
 requests. Rules and request hosts use the same IDNA normalization. Use a host
 pattern without a scheme, path, or port.
 
-The OS blocks direct egress in both modes. On Linux, a relay using system
-Python 3.11 or later starts inside the private network namespace and forwards
-to a read-only-mounted Unix socket. Seatbelt restricts outbound TCP to the
+The OS blocks direct egress in both modes. On Linux, Bubblewrap installs the
+embedded Rust relay on its read-only root. The relay forwards private loopback
+traffic to the mounted Unix socket and exits with the sandbox namespace. Seatbelt restricts outbound TCP to the
 invocation's local proxy port. Argentic sets proxy environment variables and
 clears both forms of `NO_PROXY`. Clients that ignore the proxy cannot reach
 the network directly.
@@ -346,8 +346,12 @@ or any read denial or approval rule that overlaps a required runtime mount.
 The executor checks all effective policy layers before enabling shell.
 
 Bash starts in a private copy built from verified directory and file handles.
-On Linux the copy is mounted at `/workspace`. A scan checks at most 20,000 entries and copies at most 64 MiB.
-Up to four workers create fresh staging files from the verified bytes.
+On Linux the copy is mounted at `/workspace`. Each staged root can contain up
+to 50,000 entries and 256 MiB, with an 8 MiB limit per source or published file.
+Up to four workers create fresh inodes. Linux shares data blocks through
+copy-on-write when the source and staging filesystems support reflinks. Other
+filesystems use bounded copies. Writable staging keeps SHA-256 digests for
+publication checks.
 The scan omits paths without a read grant, private metadata, symlinks, special
 files and files with multiple hard links. Any ceiling that restricts workspace
 reads or writes makes the entire copy read-only. The direct file tools can
@@ -355,7 +359,7 @@ still change individual paths according to the policy.
 
 For a writable shell, the launcher checks the staging tree before starting
 Bash, approximately every 50 ms during execution, and after all sandbox
-processes exit. A sample exceeding 64 MiB, 20,000 directory entries, or the
+processes exit. A sample exceeding 256 MiB, 50,000 directory entries, or the
 depth budget aborts the call without publishing. It counts the greater of
 logical size and allocated blocks per regular file, and allocated blocks
 for other entries. The kernel also limits each file to 16 MiB and open file

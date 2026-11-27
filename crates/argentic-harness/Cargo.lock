@@ -58,6 +58,7 @@ dependencies = [
  "rcgen",
  "regex",
  "reqwest",
+ "ring",
  "rustls",
  "rustls-native-certs",
  "serde",

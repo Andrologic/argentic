@@ -292,10 +292,7 @@ fn run_inner(
     }
     child.arg("--");
     if socket.is_some() {
-        child.args([
-            "/run/argentic-shell-relay",
-            &RELAY_PORT.to_string(),
-        ]);
+        child.args(["/run/argentic-shell-relay", &RELAY_PORT.to_string()]);
     }
     child.args(super::BASH_ARGS).arg(command);
     // Only the execution child gets these descriptors. Ambient host fds stay
