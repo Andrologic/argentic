@@ -3,7 +3,7 @@ use crate::{
     agsdl_host::HostState,
     agsdl_host_diagnostics030::{self as diagnostics, Stage},
     agsdl_host_flow030 as flow,
-    host::ActionPolicySource,
+    host::{ActionPolicyLease, ActionPolicySource},
     persistence::{failure, Result},
 };
 use futures::future::BoxFuture;
@@ -16,6 +16,12 @@ pub(crate) struct AgentActionHumans030 {
     pub policy: Arc<dyn ActionPolicySource>,
 }
 pub type Respond030<'a> = Box<dyn FnOnce(bool) -> BoxFuture<'a, Result<()>> + Send + 'a>;
+
+pub type RespondArgentic030<'a> = Box<
+    dyn FnOnce(Option<argentic_harness::tools::ApprovalSource>) -> BoxFuture<'a, Result<()>>
+        + Send
+        + 'a,
+>;
 
 pub(crate) fn permits_model_review(native: &serde_json::Value) -> bool {
     native["method"] == "argentic/tool/requestApproval"
@@ -64,6 +70,32 @@ pub trait CommandApprovals030: Send + Sync {
         respond(false)
     }
 
+    /// Hold the live policy across Argentic file I/O or shell staging/publication.
+    fn lock_argentic_dispatch<'a>(
+        &'a self,
+        _work: &'a flow::FlowWorkAttempt030,
+        _payload: &'a serde_json::Value,
+    ) -> BoxFuture<'a, Result<Option<ActionPolicyLease>>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    fn answer_argentic<'a>(
+        &'a self,
+        work: &'a flow::FlowWorkAttempt030,
+        payload: serde_json::Value,
+        cancel: &'a CancellationToken,
+        respond: RespondArgentic030<'a>,
+    ) -> BoxFuture<'a, Result<()>> {
+        self.answer(
+            work,
+            payload,
+            cancel,
+            Box::new(move |yes| {
+                respond(yes.then_some(argentic_harness::tools::ApprovalSource::Person))
+            }),
+        )
+    }
+
     fn answer<'a>(
         &'a self,
         work: &'a flow::FlowWorkAttempt030,
@@ -74,6 +106,20 @@ pub trait CommandApprovals030: Send + Sync {
 }
 
 impl CommandApprovals030 for AgentActionHumans030 {
+    fn lock_argentic_dispatch<'a>(
+        &'a self,
+        attempt: &'a flow::FlowWorkAttempt030,
+        payload: &'a serde_json::Value,
+    ) -> BoxFuture<'a, Result<Option<ActionPolicyLease>>> {
+        Box::pin(async move {
+            let view =
+                flow::inspect_run(self.host.flow030(), &self.host, &self.pool, attempt.owner())
+                    .await?;
+            let policy = self.policy.lock_current(&view.capture, payload).await?;
+            Ok(policy.allows().then_some(policy))
+        })
+    }
+
     fn answer_model<'a>(
         &'a self,
         attempt: &'a flow::FlowWorkAttempt030,

@@ -312,7 +312,9 @@ impl ArgenticConfig030 {
                     .with_attempt_effort_fallback(),
             ),
         };
-        Ok((client, key))
+        let screened = key
+            .filter(|key| key.len() >= argentic_harness::providers::MIN_SCREENED_CREDENTIAL_BYTES);
+        Ok((client, screened))
     }
 
     pub(super) fn context_window(&self, model: &ModelName) -> Option<u32> {

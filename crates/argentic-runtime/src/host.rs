@@ -197,15 +197,27 @@ pub trait ActionPolicySource: Send + Sync {
 /// Owns the host's real guards through native delivery and acknowledgement.
 pub struct ActionPolicyLease {
     allowed: bool,
+    pub(crate) argentic: Option<(crate::permissions::NormalizedPolicy, bool)>,
     _guard: Box<dyn Send + Sync>,
 }
 impl ActionPolicyLease {
     pub fn new(allowed: bool, guard: impl Send + Sync + 'static) -> Self {
         Self {
             allowed,
+            argentic: None,
             _guard: Box::new(guard),
         }
     }
+    /// Supply the locked policy for Argentic to apply to dynamically discovered paths.
+    pub fn with_argentic_policy(
+        mut self,
+        policy: crate::permissions::NormalizedPolicy,
+        read_only: bool,
+    ) -> Self {
+        self.argentic = Some((policy, read_only));
+        self
+    }
+
     pub(crate) fn allows(&self) -> bool {
         self.allowed
     }

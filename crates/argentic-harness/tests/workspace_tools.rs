@@ -1033,3 +1033,17 @@ async fn blanket_shell_refuses_a_host_rule_before_launching_the_command() {
         "{error}"
     );
 }
+
+#[tokio::test]
+async fn grep_counts_bytes_from_files_that_fail_utf8_decoding() {
+    let fixture = tempfile::tempdir().unwrap();
+    let binary = vec![0xff; 8 * 1024 * 1024];
+    for i in 0..9 {
+        fs::write(fixture.path().join(format!("binary-{i}")), &binary).unwrap();
+    }
+    let registry = Arc::new(registry(fixture.path(), Some(Preset::ReadOnly), &[]));
+    let error = call(&registry, "grep", json!({"pattern":"absent"}))
+        .await
+        .unwrap_err();
+    assert!(error.contains("Search byte budget exceeded"), "{error}");
+}

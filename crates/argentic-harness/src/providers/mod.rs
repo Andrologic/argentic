@@ -1,5 +1,9 @@
 //! Provider-independent conversation and streaming response types.
 
+pub(crate) mod credential;
+pub use credential::{
+    contains_credential, redact_credential_values, MIN_SCREENED_CREDENTIAL_BYTES,
+};
 mod anthropic_messages;
 mod chat_completions;
 mod http;
@@ -118,6 +122,47 @@ impl std::fmt::Debug for Replay {
 }
 
 impl Replay {
+    /// Strip rejected tool inputs while retaining replayable protocol identifiers.
+    /// Signed reasoning must remain intact, so an echo there rejects the reply.
+    pub(crate) fn screen(&mut self, key: &str) -> bool {
+        use credential::value_contains_credential;
+        for item in &mut self.items {
+            let Some(fields) = item.as_object_mut() else {
+                if value_contains_credential(item, key) {
+                    return false;
+                }
+                continue;
+            };
+            let kind = fields.get("type").and_then(Value::as_str);
+            let arguments = match kind {
+                Some("tool_use") => Some("input"),
+                Some("function_call") => Some("arguments"),
+                _ => None,
+            };
+            for (name, value) in fields {
+                if matches!(name.as_str(), "id" | "call_id" | "type" | "status" | "role")
+                    || (arguments.is_some() && name == "name")
+                {
+                    continue;
+                }
+                if Some(name.as_str()) == arguments {
+                    if name == "input" && value_contains_credential(value, key) {
+                        *value = serde_json::json!({});
+                    } else if name == "arguments"
+                        && value
+                            .as_str()
+                            .is_some_and(|raw| contains_credential(raw, key))
+                    {
+                        *value = Value::String("{}".into());
+                    }
+                } else if value_contains_credential(value, key) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
     /// Approximate serialized size, for history budgets and compaction.
     pub(crate) fn byte_len(&self) -> usize {
         self.items.iter().map(|item| item.to_string().len()).sum()

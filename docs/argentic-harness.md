@@ -285,8 +285,15 @@ et des extraits bornés de la conversation. Sa réponse JSON est limitée à
 `APPROVE`, `DENY` ou `ESCALATE`. Une erreur, un délai dépassé ou une réponse
 invalide produit un refus. Le Host exige une personne pour les demandes
 `ask` du shell, du réseau via le proxy et de MCP. Il vérifie la politique
-courante avant d’appliquer une acceptation. Le journal conserve le verdict
-et sa provenance. Les arguments bruts transmis au relecteur ne figurent pas
+courante avant d’appliquer une acceptation. Après la prise des verrous de
+l’outil, il revérifie chaque action sur un fichier, même si la politique
+capturée l’autorisait sans approbation. Si la politique courante exige une
+approbation, le Host vérifie qu’elle couvre cette action et qu’elle émane
+d’un relecteur habilité. Une personne qui accepte une demande après
+escalade satisfait à l’exigence d’une approbation humaine. Le verrou de
+politique reste actif pendant les lectures et la publication. Les outils
+`list`, `glob` et `grep` appliquent cette politique à chaque chemin
+rencontré. Le journal conserve le verdict et sa provenance. Les arguments bruts transmis au relecteur ne figurent pas
 dans `reviewerDecision`.
 [AgSDL 0.4.0, reviewer](https://github.com/Andrologic/AgSDL/blob/v0.4.0/spec/agents.md#reviewer)
 
@@ -321,6 +328,11 @@ Unix du proxy hôte. La fin du namespace ferme les connexions restantes.
 Chaque commande reçoit des inodes privés. Linux utilise `FICLONE` quand le
 système de fichiers permet de partager les blocs avec la source. Le repli
 copie les données avec jusqu’à quatre travailleurs et une file bornée.
+Pour le shell, le Host revérifie la commande après la prise des verrous
+des racines et maintient le verrou de politique pendant la préparation des
+copies. Il le libère pendant l’exécution de Bash. Avant la publication, il
+prend un nouveau verrou et revérifie la commande et chaque changement.
+
 Le contrôle de publication conserve les empreintes des fichiers au lieu
 de leur contenu initial. Avant chaque écriture, il compare aussi le `ctime`
 et le SHA-256 du fichier hôte. Une écriture d’un autre processus entre ce
@@ -335,7 +347,17 @@ refus d’un réglage par le fournisseur. Un run partage
 ses politiques compilées et ses définitions d’outils par contrat. Le
 catalogue de raisonnement est chargé une fois par processus. Dans les
 requêtes, le plan et le steer peuvent être ajoutés temporairement sans
-dupliquer l’historique.
+dupliquer l’historique. Le harnais filtre les clés de fournisseur d’au
+moins 16 octets. Une clé plus courte comme `lm-studio` peut servir à
+l’authentification locale et reste hors du filtre. Le harnais masque les
+échos dans le texte et le raisonnement, y compris entre deux fragments.
+Le budget de réponse du harnais compte les octets après filtrage. Pour les
+données JSON, le filtre examine les valeurs textuelles décodées. Les
+identifiants, les noms d’outils et la syntaxe du protocole restent intacts.
+Des arguments refusés donnent lieu à une correction dans la même instance,
+y compris pour `agsdl_submit_result`. Un écho dans les données signées de
+reprise invalide la réponse. Les résultats d’outils sont filtrés avant la
+pagination et l’écriture des fichiers de débordement.
 
 Entre deux travaux, le Host compresse l’historique d’une instance continue
 à partir de 64 Kio si cela économise au moins un quart de sa taille estimée.

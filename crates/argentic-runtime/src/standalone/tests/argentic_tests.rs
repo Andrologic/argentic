@@ -874,6 +874,8 @@ async fn provider_failure_does_not_persist_the_echoed_credential() {
     );
     request.send(StatusCode::OK, stream, "text/event-stream");
     let request = server.next().await;
+    assert!(!request.body.to_string().contains(&credential));
+    assert!(request.body.to_string().contains("[redacted]"));
     request.send(
         StatusCode::UNAUTHORIZED,
         json!({"error":{"message":credential}}).to_string(),
@@ -895,6 +897,33 @@ async fn provider_failure_does_not_persist_the_echoed_credential() {
     assert!(!bytes
         .windows(credential.len())
         .any(|window| window == credential.as_bytes()));
+}
+
+#[tokio::test]
+async fn credential_in_submission_arguments_allows_a_native_correction() {
+    const KEY_ENV: &str = "CARGO_PKG_DESCRIPTION";
+    let credential = std::env::var(KEY_ENV).unwrap();
+    let mut server = Server::start().await;
+    let f = Fixture::new(&document().to_string());
+    let host = f
+        .open()
+        .await
+        .unwrap()
+        .with_argentic(server.config(Some(KEY_ENV)))
+        .unwrap();
+    let run = start(&host).await;
+    server.next().await.tool(
+        "agsdl_submit_result",
+        json!({"results":{"report":{"body":credential}}}),
+    );
+    let next = server.next().await;
+    let messages = next.body["messages"].to_string();
+    assert!(messages.contains("Correct the result arguments"));
+    assert!(!messages.contains(&credential));
+    submit_done(next);
+    completed(&finish(&host, &run).await);
+    assert!(!decisions(&host).await.join("").contains(&credential));
+    close(&host).await;
 }
 
 #[tokio::test]
@@ -1214,6 +1243,98 @@ async fn a_write_approval_is_one_shot_and_stop_cancels_the_next_ask() {
     );
     let page = host.humans(scope, None).await.unwrap();
     assert!(page.requests.iter().all(|request| request.status != "open"));
+    close(&host).await;
+}
+
+#[tokio::test]
+async fn revoking_the_first_patch_path_while_the_second_awaits_review_prevents_publication() {
+    let mut server = Server::start().await;
+    let mut doc = document();
+    doc["agents"]["worker"]["permissions"] = json!({
+        "preset":"workspace", "reviewer":"person", "rules":[forbid_shell(),
+            {"action":"write","match":"first","effect":"ask"},
+            {"action":"write","match":"second","effect":"ask"}
+        ]
+    });
+    let f = Fixture::new(&doc.to_string());
+    let host = open(&f, true)
+        .await
+        .with_argentic(server.config(None))
+        .unwrap();
+    let run = start(&host).await;
+    let scope = persistence::public030::HumanScope030 {
+        system_start_id: run.receipt.identity.system_start_id.clone(),
+        source: run.capture.source.clone(),
+    };
+    let patch =
+        "*** Begin Patch\n*** Add File: first\n+one\n*** Add File: second\n+two\n*** End Patch";
+    server
+        .next()
+        .await
+        .tool("apply_patch", json!({"patch_text":patch}));
+
+    for path in ["first", "second"] {
+        let ask = tokio::time::timeout(WAIT_FOR, async {
+            loop {
+                let page = host.humans(scope.clone(), None).await.unwrap();
+                if let Some(request) = page.requests.into_iter().find(|r| r.status == "open") {
+                    break request;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let payload: String = sqlx::query_scalar(
+            "SELECT payload_json FROM engine_flow030_human_requests WHERE request_id=?",
+        )
+        .bind(&ask.id)
+        .fetch_one(&host.pool)
+        .await
+        .unwrap();
+        let payload: Value = serde_json::from_str(&payload).unwrap();
+        assert!(
+            payload["title"].as_str().unwrap().ends_with(path),
+            "{payload}"
+        );
+        if path == "second" {
+            let mut policy = host.policies.0.write().await;
+            policy.policy.permissions = serde_json::from_value(json!({
+                "preset": "workspace",
+                "rules": [{"action":"write","match":"first","effect":"deny"}]
+            }))
+            .unwrap();
+        }
+        host.submit_person(HumanSubmission {
+            scope: scope.clone(),
+            request_id: ask.id,
+            expected_revision: ask.revision,
+            answer: api::HumanAnswer030::Decision {
+                decision: "yes".into(),
+                comment: String::new(),
+            },
+        })
+        .await
+        .unwrap();
+    }
+
+    let next = server.next().await;
+    assert!(
+        !f.workspace.join("first").exists(),
+        "revoked path was published"
+    );
+    assert!(
+        !f.workspace.join("second").exists(),
+        "the rejected patch was partially published"
+    );
+    assert!(next.body["messages"]
+        .to_string()
+        .contains("permission denied"));
+    next.tool(
+        "agsdl_submit_result",
+        json!({"results":{"report":{"body":"done"}}}),
+    );
+    completed(&finish(&host, &run).await);
     close(&host).await;
 }
 
@@ -1653,6 +1774,83 @@ async fn agent_mcp_stops_discovery_when_the_combined_catalogue_is_too_large() {
     assert_eq!(*admitted.lock().unwrap(), ["first", "second"]);
     close(&host).await;
     upstream.abort();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn provider_credential_in_mcp_arguments_never_reaches_approval_or_upstream() {
+    use crate::test_context::mcp::{Peer, REQUIREMENTS};
+    const KEY_ENV: &str = "CARGO_PKG_DESCRIPTION";
+    let credential = std::env::var(KEY_ENV).unwrap();
+    for tool in ["check", "approve"] {
+        let peer = Peer::start().await;
+        let mut server = Server::start().await;
+        let mut doc = document();
+        doc["projectFormat"] = json!("agsdl-project-1");
+        doc["mcpServers"] = peer.servers();
+        doc["secrets"] = json!({"file":"requirements.json"});
+        let worker = &mut doc["agents"]["worker"];
+        worker["mcpServers"] = json!(["first"]);
+        worker["permissions"] = json!({"preset":"read-only", "reviewer":"person", "rules":[
+            {"action":"mcp","match":"first/check","effect":"allow"},
+            {"action":"mcp","match":"first/approve","effect":"ask"}
+        ]});
+        let mut f = Fixture::new("");
+        f.source = f.workspace.with_file_name("project");
+        std::fs::create_dir(&f.source).unwrap();
+        std::fs::write(f.source.join("agsdl.json"), doc.to_string()).unwrap();
+        std::fs::write(f.source.join("requirements.json"), REQUIREMENTS).unwrap();
+        let mut host = open(&f, false)
+            .await
+            .with_argentic(server.config(Some(KEY_ENV)))
+            .unwrap();
+        host.context = peer.configure(host.context);
+        let run = start(&host).await;
+        let request = server.next().await;
+        let alias = format!("mcp__first__{tool}");
+        assert!(has_tool(&request, &alias));
+        let arguments = if tool == "check" {
+            json!({"nested":[{"value":credential}]}).to_string()
+        } else {
+            // Keep the first letter JSON-escaped inside the arguments string.
+            let quoted = json!(credential).to_string();
+            format!(
+                r#"{{"nested":[{{"value":"\u{:04x}{}}}]}}"#,
+                quoted.as_bytes()[1],
+                &quoted[2..]
+            )
+        };
+        assert_eq!(
+            serde_json::from_str::<Value>(&arguments).unwrap()["nested"][0]["value"],
+            credential
+        );
+        let call = json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,
+            "id":"mcp","function":{"name":alias,"arguments":arguments}}]},
+            "finish_reason":"tool_calls"}]});
+        request.send(
+            StatusCode::OK,
+            format!("data: {call}\n\ndata: [DONE]\n\n"),
+            "text/event-stream",
+        );
+
+        let next = server.next().await;
+        let messages = next.body["messages"].to_string();
+        assert!(messages.contains("Tool arguments contain a configured provider credential"));
+        assert!(!messages.contains(&credential));
+        assert!(peer.calls().is_empty());
+        let asks: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM engine_flow030_human_requests")
+            .fetch_one(&host.pool)
+            .await
+            .unwrap();
+        assert_eq!(asks, 0);
+        submit_done(next);
+        completed(&finish(&host, &run).await);
+        close(&host).await;
+        let bytes = std::fs::read(f.data.join("engine.sqlite")).unwrap();
+        assert!(!bytes
+            .windows(credential.len())
+            .any(|window| window == credential.as_bytes()));
+    }
 }
 
 #[cfg(unix)]
@@ -2291,6 +2489,156 @@ async fn argentic_review_caps_requests_per_turn_and_work() {
     submit_done(next);
     completed(&finish(&host, &run).await);
     assert!(!f.workspace.join("memo.txt").exists());
+    close(&host).await;
+}
+
+async fn answer_next_argentic_ask(host: &Host, run: &RetainedStart030) {
+    let scope = persistence::public030::HumanScope030 {
+        system_start_id: run.receipt.identity.system_start_id.clone(),
+        source: run.capture.source.clone(),
+    };
+    let ask = pending_ask(host, &scope).await;
+    host.submit_person(HumanSubmission {
+        scope,
+        request_id: ask.id,
+        expected_revision: ask.revision,
+        answer: api::HumanAnswer030::Decision {
+            decision: "yes".into(),
+            comment: String::new(),
+        },
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn mixed_patch_revalidation_requires_proof_for_each_new_ask() {
+    let mut server = Server::start().await;
+    let mut doc = document();
+    doc["agents"]["worker"]["permissions"] = json!({
+        "preset":"workspace", "reviewer":"person", "rules":[forbid_shell(),
+            {"action":"write","match":"first","effect":"ask"}
+        ]
+    });
+    let f = Fixture::new(&doc.to_string());
+    let host = open(&f, true)
+        .await
+        .with_argentic(server.config(None))
+        .unwrap();
+    let run = start(&host).await;
+    let patch =
+        "*** Begin Patch\n*** Add File: first\n+one\n*** Add File: second\n+two\n*** End Patch";
+    let request = server.next().await;
+    host.policies.0.write().await.policy.permissions = serde_json::from_value(json!({
+        "preset":"workspace", "rules":[{"action":"write","match":"second","effect":"ask"}]
+    }))
+    .unwrap();
+    request.tool("apply_patch", json!({"patch_text":patch}));
+    answer_next_argentic_ask(&host, &run).await;
+    let next = server.next().await;
+    assert!(next.body["messages"]
+        .to_string()
+        .contains("permission denied"));
+    assert!(!f.workspace.join("first").exists());
+    assert!(!f.workspace.join("second").exists());
+    submit_done(next);
+    completed(&finish(&host, &run).await);
+    close(&host).await;
+}
+
+#[tokio::test]
+async fn implicitly_allowed_file_call_rechecks_live_policy_without_a_reviewer() {
+    let mut server = Server::start().await;
+    let mut doc = document();
+    doc["agents"]["worker"]["permissions"] = json!({
+        "preset":"workspace", "rules":[forbid_shell()]
+    });
+    let f = Fixture::new(&doc.to_string());
+    let host = open(&f, true)
+        .await
+        .with_argentic(server.config(None))
+        .unwrap();
+    let run = start(&host).await;
+    let request = server.next().await;
+    host.policies.0.write().await.policy.permissions = serde_json::from_value(json!({
+        "preset":"workspace", "rules":[{"action":"write","match":"memo.txt","effect":"ask"}]
+    }))
+    .unwrap();
+    write_memo(request);
+    let next = server.next().await;
+    assert!(next.body["messages"]
+        .to_string()
+        .contains("permission denied"));
+    assert!(!f.workspace.join("memo.txt").exists());
+    submit_done(next);
+    completed(&finish(&host, &run).await);
+    close(&host).await;
+}
+
+#[tokio::test]
+async fn approved_search_uses_live_policy_for_descendants() {
+    let mut server = Server::start().await;
+    let mut doc = document();
+    doc["agents"]["worker"]["permissions"] = json!({
+        "preset":"read-only", "reviewer":"person", "rules":[
+            {"action":"read","match":"tree","effect":"ask"}
+        ]
+    });
+    let f = Fixture::new(&doc.to_string());
+    let tree = f.workspace.join("tree");
+    std::fs::create_dir(&tree).unwrap();
+    for name in ["public.txt", "private.txt", "unapproved.txt"] {
+        std::fs::write(tree.join(name), "match").unwrap();
+    }
+    let host = open(&f, false)
+        .await
+        .with_argentic(server.config(None))
+        .unwrap();
+    let run = start(&host).await;
+    let request = server.next().await;
+    host.policies.0.write().await.policy.permissions = serde_json::from_value(json!({
+        "preset":"read-only", "rules":[
+            {"action":"read","match":"tree/private.txt","effect":"deny"},
+            {"action":"read","match":"tree/unapproved.txt","effect":"ask"}
+        ]
+    }))
+    .unwrap();
+    request.tool("grep", json!({"path":"tree", "pattern":"match"}));
+    answer_next_argentic_ask(&host, &run).await;
+    let next = server.next().await;
+    let messages = next.body["messages"].to_string();
+    assert!(messages.contains("public.txt"), "{messages}");
+    assert!(!messages.contains("private.txt"), "{messages}");
+    assert!(!messages.contains("unapproved.txt"), "{messages}");
+    submit_done(next);
+    completed(&finish(&host, &run).await);
+    close(&host).await;
+}
+
+#[tokio::test]
+async fn escalated_person_approval_satisfies_live_person_requirement() {
+    let mut server = Server::start().await;
+    let (doc, cfg) = reviewer_fixture(&server);
+    let f = Fixture::new(&doc.to_string());
+    let host = open(&f, true)
+        .await
+        .with_argentic(serde_json::from_value(cfg).unwrap())
+        .unwrap();
+    let run = start(&host).await;
+    write_memo(server.next().await);
+    let review = server.next().await;
+    assert_eq!(review.body["model"], "reviewer");
+    host.policies.0.write().await.policy.permissions = serde_json::from_value(json!({
+        "preset":"workspace", "reviewer":"person",
+        "rules":[{"action":"write","match":"memo.txt","effect":"ask"}]
+    }))
+    .unwrap();
+    send_text(review, r#"{"verdict":"ESCALATE"}"#);
+    answer_next_argentic_ask(&host, &run).await;
+    let next = server.next().await;
+    assert!(f.workspace.join("memo.txt").is_file(), "{}", next.body);
+    submit_done(next);
+    completed(&finish(&host, &run).await);
     close(&host).await;
 }
 

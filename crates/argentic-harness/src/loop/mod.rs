@@ -27,8 +27,9 @@ use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use crate::{
     config::{Layer, Settings},
     providers::{
-        Chunk, DeliveryProgress, DeliveryStatus, Finish, Message, ModelName, Provider,
-        ProviderError, Request, ToolCall, ToolChoice, ToolDefinition, Usage,
+        contains_credential, credential::TextScreen, Chunk, DeliveryProgress, DeliveryStatus,
+        Finish, Message, ModelName, Provider, ProviderError, Request, ToolCall, ToolChoice,
+        ToolDefinition, Usage,
     },
     tools::{Registry, SUBMIT_RESULT},
 };
@@ -285,6 +286,7 @@ pub struct Harness {
     registry: Arc<Registry>,
     settings: Settings,
     context_window: Option<u32>,
+    provider_credential: Option<String>,
     plan: PlanMode,
     delegation: bool,
     hooks: Vec<Arc<dyn Hook>>,
@@ -297,10 +299,18 @@ impl Harness {
             registry,
             settings,
             context_window: None,
+            provider_credential: None,
             plan: PlanMode::Off,
             delegation: false,
             hooks: Vec::new(),
         }
+    }
+
+    /// Screen model output for echoes of the configured HTTP header credential.
+    pub fn with_provider_credential(mut self, credential: Option<String>) -> Self {
+        self.provider_credential =
+            credential.filter(|key| key.len() >= crate::providers::MIN_SCREENED_CREDENTIAL_BYTES);
+        self
     }
 
     pub fn with_context_window(mut self, context_window: Option<u32>) -> Self {
@@ -385,20 +395,46 @@ impl Harness {
                 budget,
                 turn_limit,
             };
-            let (outcome, forced) = {
+            let grace = Duration::from_millis(u64::from(self.settings.limit("cancelGraceMs")));
+            let (outcome, deadline, mut forced) = {
                 let future = instance.execute(&mut work);
                 tokio::pin!(future);
                 tokio::select! {
                     biased;
                     _ = cancel.cancelled() => {
-                        let grace = Duration::from_millis(u64::from(self.settings.limit("cancelGraceMs")));
-                        let forced = tokio::time::timeout(grace, &mut future).await.is_err();
-                        (Err(Failure::Cancelled), forced)
+                        let deadline = tokio::time::Instant::now() + grace;
+                        let forced = tokio::time::timeout_at(deadline, &mut future).await.is_err();
+                        (Err(Failure::Cancelled), Some(deadline), forced)
                     }
-                    outcome = &mut future => (outcome, false),
+                    outcome = &mut future => (outcome, None, false),
                 }
             };
-            let steer_result = instance.settle_steer().await;
+            let steer_result = {
+                let settlement = instance.settle_steer();
+                tokio::pin!(settlement);
+                let result = match deadline {
+                    Some(deadline) => tokio::time::timeout_at(deadline, &mut settlement).await,
+                    None => tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => tokio::time::timeout(grace, &mut settlement).await,
+                        result = &mut settlement => Ok(result),
+                    },
+                };
+                match result {
+                    Ok(result) => result,
+                    Err(_) => {
+                        forced = true;
+                        Err(Failure::Cancelled)
+                    }
+                }
+            };
+            // A transport acceptance is history even if Stop interrupted
+            // the host callback. Dropping the sender closes its receipt.
+            while let Some(steer) = instance.pending_steer.pop_front() {
+                if instance.delivery.status() == DeliveryStatus::Accepted {
+                    instance.record_delivered_steer(&steer.id, steer.reference, steer.message);
+                }
+            }
             instance.persist_steer(&mut work.messages);
             let outcome = if cancel.is_cancelled() {
                 Err(Failure::Cancelled)
@@ -406,7 +442,6 @@ impl Harness {
                 outcome.and_then(|outcome| steer_result.map(|()| outcome))
             };
             cancel.cancel();
-            // Closing drops any undelivered steer receipt before joining workers.
             instance.steer.close();
             while instance.steer.try_recv().is_ok() {}
             tracker.close();
@@ -668,7 +703,10 @@ impl Instance<'_> {
                     .take_while(|call| call.name != SUBMIT_RESULT)
                     .count();
                 let (reads, tail) = pending.split_at(read_count);
-                if let Some(skipped) = self.tool_batch(turn, reads, work).await? {
+                if let Some(skipped) = self
+                    .tool_batch(turn, reads, &response.refused, work)
+                    .await?
+                {
                     for call in skipped.iter().chain(tail) {
                         self.publish_tool(
                             turn,
@@ -690,7 +728,9 @@ impl Instance<'_> {
                     pending = tail;
                     continue;
                 }
-                let validation = if self.port.validates_submission() {
+                let validation = if response.refused.contains(&call.id) {
+                    Err(CREDENTIAL_ARGUMENTS.into())
+                } else if self.port.validates_submission() {
                     serde_json::from_str(&call.arguments).map_err(|e| e.to_string())
                 } else {
                     self.harness.registry.validate_submission(&call.arguments)
@@ -903,29 +943,36 @@ impl Instance<'_> {
         let mut stream = opened?;
         let mut text = String::new();
         let mut reasoning = String::new();
+        let credential = self.harness.provider_credential.as_deref();
+        let mut text_screen = TextScreen::new(credential);
+        let mut reasoning_screen = TextScreen::new(credential);
         let mut replay = None;
         let mut calls = Vec::new();
         let mut ids = HashSet::new();
+        let mut refused = HashSet::new();
         let mut bytes = 0usize;
         while let Some(chunk) = stream.next().await {
             self.active()?;
             match chunk? {
                 Chunk::Text(part) => {
+                    let part = text_screen.push(part);
                     account_bytes(&mut bytes, part.len())?;
-                    self.port
-                        .event(Event::VisibleText { turn, text: &part }, self.cancel)
-                        .await?;
+                    self.visible_text(turn, &part).await?;
                     text.push_str(&part);
-                    self.text.push_str(&part);
                 }
                 Chunk::Reasoning(part) => {
+                    let part = reasoning_screen.push(part);
                     account_bytes(&mut bytes, part.len())?;
-                    self.port
-                        .event(Event::Reasoning { turn, text: &part }, self.cancel)
-                        .await?;
+                    self.reasoning_text(turn, &part).await?;
                     reasoning.push_str(&part);
                 }
-                Chunk::ToolCall(call) => {
+                Chunk::ToolCall(mut call) => {
+                    if credential.is_some_and(|key| contains_credential(&call.arguments, key)) {
+                        refused.insert(call.id.clone());
+                        // Invalid JSON asks the Host's submission controller for its normal
+                        // correction without sending the credential to the controller.
+                        call.arguments.clear();
+                    }
                     account_bytes(
                         &mut bytes,
                         call.arguments
@@ -942,8 +989,21 @@ impl Instance<'_> {
                     }
                     calls.push(call);
                 }
-                Chunk::Replay(state) => replay = Some(state),
+                Chunk::Replay(mut state) => {
+                    if credential.is_some_and(|key| !state.screen(key)) {
+                        return Err(credential_in_response());
+                    }
+                    replay = Some(state);
+                }
                 Chunk::End { finish, usage } => {
+                    let tail = text_screen.finish();
+                    account_bytes(&mut bytes, tail.len())?;
+                    self.visible_text(turn, &tail).await?;
+                    text.push_str(&tail);
+                    let tail = reasoning_screen.finish();
+                    account_bytes(&mut bytes, tail.len())?;
+                    self.reasoning_text(turn, &tail).await?;
+                    reasoning.push_str(&tail);
                     self.port
                         .assistant_message(turn, &text, self.cancel)
                         .await?;
@@ -962,6 +1022,7 @@ impl Instance<'_> {
                                 reasoning,
                                 replay,
                                 calls,
+                                refused,
                                 finish,
                                 usage,
                             })
@@ -973,15 +1034,46 @@ impl Instance<'_> {
         Err(ProviderError::Invalid("Provider ended without a terminal chunk".into()).into())
     }
 
+    async fn visible_text(&mut self, turn: u32, text: &str) -> Result<(), Failure> {
+        if !text.is_empty() {
+            self.port
+                .event(Event::VisibleText { turn, text }, self.cancel)
+                .await?;
+            self.text.push_str(text);
+        }
+        Ok(())
+    }
+
+    async fn reasoning_text(&self, turn: u32, text: &str) -> Result<(), Failure> {
+        if !text.is_empty() {
+            self.port
+                .event(Event::Reasoning { turn, text }, self.cancel)
+                .await?;
+        }
+        Ok(())
+    }
+
     async fn tool_batch<'a>(
         &mut self,
         turn: u32,
         calls: &'a [ToolCall],
+        refused: &HashSet<String>,
         work: &mut Work,
     ) -> Result<Option<&'a [ToolCall]>, Failure> {
         let parallelism = self.harness.settings.limit("maxParallelReads") as usize;
         let mut pending = calls;
         while !pending.is_empty() {
+            if refused.contains(&pending[0].id) {
+                self.publish_tool(
+                    turn,
+                    &pending[0],
+                    &json!({"error": CREDENTIAL_ARGUMENTS}).to_string(),
+                    &mut work.messages,
+                )
+                .await?;
+                pending = &pending[1..];
+                continue;
+            }
             let parallel_reads = pending
                 .iter()
                 .take(if self.harness.registry.has_authorizer() {
@@ -989,7 +1081,10 @@ impl Instance<'_> {
                 } else {
                     parallelism
                 })
-                .take_while(|call| matches!(call.name.as_str(), "read" | "list" | "glob" | "grep"))
+                .take_while(|call| {
+                    !refused.contains(&call.id)
+                        && matches!(call.name.as_str(), "read" | "list" | "glob" | "grep")
+                })
                 .count();
             let (batch, remaining) = pending.split_at(parallel_reads.max(1));
             pending = remaining;
@@ -1022,9 +1117,12 @@ impl Instance<'_> {
             } else {
                 stream::iter(batch.iter().cloned())
                     .map(|call| {
-                        self.harness
-                            .registry
-                            .execute(call, self.cancel.child_token(), self.tracker)
+                        self.harness.registry.execute(
+                            call,
+                            self.cancel.child_token(),
+                            self.tracker,
+                            self.harness.provider_credential.as_deref(),
+                        )
                     })
                     .buffered(batch.len())
                     .collect::<Vec<_>>()
@@ -1095,6 +1193,16 @@ impl Instance<'_> {
         content: &str,
         messages: &mut Vec<Message>,
     ) -> Result<(), Failure> {
+        let content = if self
+            .harness
+            .provider_credential
+            .as_deref()
+            .is_some_and(|key| contains_credential(content, key))
+        {
+            ""
+        } else {
+            content
+        };
         for hook in &self.harness.hooks {
             hook.after_tool_call(turn, call, content, self.cancel)
                 .await?;
@@ -1171,13 +1279,7 @@ impl Instance<'_> {
             self.port.settle_steer(&steer.id, status).await?;
             if let Some(steer) = self.pending_steer.pop_front() {
                 if status == DeliveryStatus::Accepted {
-                    for hook in &self.harness.hooks {
-                        hook.steer_delivered(&steer.id, &steer.message);
-                    }
-                    if let Some(reference) = steer.reference {
-                        self.accepted_steer.push(Message::User(reference));
-                    }
-                    self.accepted_steer.push(Message::User(steer.message));
+                    self.record_delivered_steer(&steer.id, steer.reference, steer.message);
                     let _ = steer.consumed.send(());
                     self.port
                         .event(Event::SteerConsumed { id: &steer.id }, self.cancel)
@@ -1187,6 +1289,16 @@ impl Instance<'_> {
         }
         self.host_steer_pending = false;
         Ok(())
+    }
+
+    fn record_delivered_steer(&mut self, id: &str, reference: Option<String>, message: String) {
+        for hook in &self.harness.hooks {
+            hook.steer_delivered(id, &message);
+        }
+        if let Some(reference) = reference {
+            self.accepted_steer.push(Message::User(reference));
+        }
+        self.accepted_steer.push(Message::User(message));
     }
 
     fn persist_steer(&mut self, messages: &mut Vec<Message>) {
@@ -1255,8 +1367,16 @@ struct Response {
     text: String,
     reasoning: String,
     calls: Vec<ToolCall>,
+    refused: HashSet<String>,
     finish: Finish,
     usage: Option<crate::providers::Usage>,
+}
+
+const CREDENTIAL_ARGUMENTS: &str =
+    "Tool arguments contain a configured provider credential. Remove it and retry.";
+
+fn credential_in_response() -> Failure {
+    ProviderError::Invalid("Provider response contains a configured credential".into()).into()
 }
 
 fn account_bytes(bytes: &mut usize, additional: usize) -> Result<(), Failure> {

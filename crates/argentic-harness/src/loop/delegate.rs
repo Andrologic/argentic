@@ -53,6 +53,7 @@ impl Instance<'_> {
             Arc::new(registry),
             self.harness.settings.clone(),
         )
+        .with_provider_credential(self.harness.provider_credential.clone())
         .with_context_window(self.harness.context_window)
         .with_hook(Arc::new(ChildToolHooks(self.harness.hooks.clone())));
         let child = Work {

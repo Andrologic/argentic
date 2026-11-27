@@ -203,8 +203,9 @@ prompt before reporting its size.
 `read`, `list`, `glob` and `grep` take a zero-based `root` index and a
 relative `path`. Directory tools default to the root. `glob` matches against
 paths relative to the selected directory. `grep` takes a regular expression
-and returns filenames, one-based line numbers and matching lines. Read calls
-can run in parallel up to `maxParallelReads` when no reviewer is attached.
+and returns filenames, one-based line numbers and matching lines. The 64 MiB
+scan budget counts bytes read from skipped binary and oversized files too.
+Read calls can run in parallel up to `maxParallelReads` when no reviewer is attached.
 Replies retain the provider's call order. Mutations, shell calls and submissions
 are barriers. An accepted submission ends work.
 
@@ -218,7 +219,13 @@ and denies an `ask` without a reviewer.
 The engine can enable `write`, `edit` and `apply_patch` for paths relative to
 the selected root. Edits and patch updates require read and write permission.
 Patch moves also require permission on the destination. Writes use per-file queues
-and atomic replacement. A patch validates its whole plan before changing files.
+and atomic replacement. The Host revalidates every requested file action
+against the current policy after the tool acquires its locks, including
+implicitly allowed actions. A current `ask` requires approval for that exact
+action from a reviewer the current policy accepts. The lease lasts through
+file I/O and publication. List, glob and grep check each discovered path
+against the policy held by the lease. A patch validates its whole plan
+before changing files.
 An I/O failure during publication can leave some files changed, and the reply
 reports how many changes were applied. Parent directories must already exist.
 
@@ -351,6 +358,11 @@ specifies. Qualification refuses shell with an explicit `outside: "deny"`
 or any read denial or approval rule that overlaps a required runtime mount.
 The executor checks all effective policy layers before enabling shell.
 
+After acquiring the root locks, the Host revalidates the command against the
+current policy and holds that lease while staging the workspace. It releases
+the lease before starting Bash. Before publishing, it takes a fresh lease and
+checks the command and each proposed change against the current policy.
+
 Bash starts in a private copy built from verified directory and file handles.
 On Linux the copy is mounted at `/workspace`. Each staged root can contain up
 to 50,000 entries and 256 MiB, with an 8 MiB limit per source or published file.
@@ -421,6 +433,15 @@ could repeat its effects.
 The standalone host registers the adapter when configured and requires explicit
 opt-in. Shared and named instances keep their conversation in memory for the run.
 Compaction runs when the provider entry sets `contextWindowTokens`.
+Credential screening covers provider keys of at least 16 bytes. Short local
+placeholders such as `lm-studio` can still authenticate a request. The
+harness masks literal echoes in assistant text and reasoning across stream
+deltas and counts the filtered bytes toward its response budget. Structured
+screening checks decoded JSON string values. Protocol IDs, tool names, object
+keys and JSON syntax remain intact. Screened tool arguments receive a
+correction in the same conversation, including `agsdl_submit_result`.
+A credential in signed replay data invalidates the reply. Tool results are
+screened before pagination and overflow-file creation.
 
 - Agent and message resources appear as origin-labelled, untrusted reference
   data in a separate user message. The Host resolves local URIs under the
@@ -432,7 +453,8 @@ Compaction runs when the provider entry sets `contextWindowTokens`.
 - The Host discovers tools from selected MCP servers and exposes them with
   provider-safe names, typically `mcp__server__tool`. Permissions apply to the
   original `server/tool` name. An `ask` requires a person and never grants
-  lasting access. Local stdio requires macOS ARM64. Remote servers use the
+  lasting access. MCP arguments containing the provider credential are refused
+  before approval or dispatch. Local stdio requires macOS ARM64. Remote servers use the
   Host's authorized Streamable HTTP transport. Stop closes admission and
   joins local sessions. A dispatched remote call whose termination cannot be
   confirmed yields `MCP_TERMINATION_UNCERTAIN`. Operator Hold is unavailable

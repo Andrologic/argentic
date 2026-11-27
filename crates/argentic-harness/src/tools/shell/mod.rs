@@ -30,7 +30,7 @@ mod proxy;
 ))]
 mod workspace;
 
-use super::{output, Page, Registry};
+use super::{Approval, ApprovalSource, DispatchAction, DispatchPolicy, Page, Registry};
 use crate::{
     policy::{Action, Effect, Policy},
     providers::ToolCall,
@@ -178,6 +178,7 @@ impl Registry {
         call: ToolCall,
         cancel: CancellationToken,
         tracker: &TaskTracker,
+        credential: Option<&str>,
     ) -> Result<Page, String> {
         if !self.toolbox.shell {
             return Err("Shell tool is disabled".into());
@@ -193,29 +194,13 @@ impl Registry {
             .map(|policy| policy.parsed_shell_effect(&parsed))
             .max()
             .unwrap_or(Effect::Deny);
-        let network = shell_network_allowed(&self.policy, self.shell_network);
         if effect != Effect::Deny {
-            if self.shell_network == ShellNetwork::Blanket
-                && self
-                    .policy
-                    .iter()
-                    .any(|policy| policy.first_network_pattern().is_some())
-            {
-                return Err(SHELL_NETWORK_PATTERN.into());
-            }
-            for policy in self.policy.iter() {
-                if let Some(conflict) = shell_read_conflict(policy, network) {
-                    return Err(conflict.to_string());
-                }
-            }
+            self.shell_network_for(None)?;
         }
-        self.authorize(
-            effect,
-            &call,
-            super::Approval::Shell(&args.command),
-            &cancel,
-        )
-        .await?;
+        let approved_by = self
+            .authorize_action(effect, &call, Approval::Shell(&args.command), &cancel)
+            .await?
+            .approved_by;
         // Take every root's gate in path order so overlapping calls cannot
         // deadlock. Identical roots share a gate.
         let mut roots: Vec<_> = self.roots.iter().zip(&self.root_gates).collect();
@@ -229,28 +214,81 @@ impl Registry {
                 guard = gate.clone().write_owned() => guard,
             });
         }
+        let admission = self
+            .lock_dispatch(
+                &call,
+                &[DispatchAction {
+                    action: Approval::Shell(&args.command),
+                    approved_by,
+                }],
+                &cancel,
+            )
+            .await?;
         let registry = self.clone();
+        let credential = credential.map(str::to_owned);
         tracker
             .spawn_blocking(move || {
                 let _guards = guards;
-                let text = run(registry, &args, network, &call, &cancel)?;
+                let text = run(registry, &args, &call, approved_by, admission, &cancel)?;
                 // Shell output starts with its status and is retained once. Replaying
                 // a shell call to retrieve a cursor would repeat its effects.
-                let mut page =
-                    output::paginate(&text, &call.id, None, None).map_err(|e| e.to_string())?;
-                page.next_cursor = None;
-                Ok(page)
+                Page::one_shot_screened(&text, &call.id, credential.as_deref())
+                    .map_err(|error| error.to_string())
             })
             .await
             .map_err(|e| e.to_string())?
+    }
+
+    fn shell_network_for(&self, live: Option<&Policy>) -> Result<bool, String> {
+        let network = shell_network_allowed(&self.policy, self.shell_network)
+            && live.is_none_or(|policy| {
+                shell_network_allowed(std::slice::from_ref(policy), self.shell_network)
+            });
+        for policy in self.policy.iter().chain(live) {
+            if self.shell_network == ShellNetwork::Blanket
+                && policy.first_network_pattern().is_some()
+            {
+                return Err(SHELL_NETWORK_PATTERN.into());
+            }
+            if let Some(conflict) = shell_read_conflict(policy, network) {
+                return Err(conflict.to_string());
+            }
+        }
+        Ok(network)
+    }
+}
+
+#[cfg(any(
+    all(
+        target_os = "linux",
+        any(target_arch = "aarch64", target_arch = "x86_64")
+    ),
+    all(target_os = "macos", target_arch = "aarch64")
+))]
+fn recheck_shell(
+    policy: &DispatchPolicy,
+    command: &str,
+    approved_by: Option<ApprovalSource>,
+) -> Result<(), String> {
+    match policy
+        .policy
+        .as_ref()
+        .map(|policy| policy.shell_effect(command))
+    {
+        Some(Effect::Deny) => Err("Shell permission denied by current policy".into()),
+        Some(Effect::Ask) if approved_by != Some(ApprovalSource::Person) => {
+            Err("Shell permission denied by current policy".into())
+        }
+        _ => Ok(()),
     }
 }
 
 fn run(
     registry: Arc<Registry>,
     args: &Arguments,
-    network: bool,
     call: &ToolCall,
+    approved_by: Option<ApprovalSource>,
+    admission: DispatchPolicy,
     cancel: &CancellationToken,
 ) -> Result<String, String> {
     #[cfg(any(
@@ -261,22 +299,30 @@ fn run(
         all(target_os = "macos", target_arch = "aarch64")
     ))]
     {
+        recheck_shell(&admission, &args.command, approved_by)?;
+        let network = registry.shell_network_for(admission.policy.as_ref())?;
         let mut snapshots = Vec::with_capacity(registry.roots.len());
         for root in &registry.roots {
             let write = registry.toolbox.writes
-                && registry.policy.iter().all(|policy| {
-                    let zone = registry.base_zone(&root.path);
-                    [Action::Read, Action::Write]
-                        .into_iter()
-                        .all(|action| policy.blanket_allows_mount(action, &root.path, zone))
-                });
+                && !admission.read_only
+                && registry
+                    .policy
+                    .iter()
+                    .chain(admission.policy.iter())
+                    .all(|policy| {
+                        let zone = registry.base_zone(&root.path);
+                        [Action::Read, Action::Write]
+                            .into_iter()
+                            .all(|action| policy.blanket_allows_mount(action, &root.path, zone))
+                    });
             let snapshot = workspace::Snapshot::new(
                 root,
                 registry.shell_staging_directory.as_deref(),
                 cancel,
                 write,
                 |path| {
-                    registry.path_effect(root, Action::Read, &root.path.join(path)) == Effect::Allow
+                    registry.live_path_effect(&admission, root, Action::Read, &root.path.join(path))
+                        == Effect::Allow
                 },
             )
             .map_err(|error| error.to_string())?;
@@ -286,8 +332,10 @@ fn run(
             .iter()
             .map(|(snapshot, write)| (snapshot.path(), *write))
             .collect::<Vec<_>>();
+        let live = admission.policy.clone();
+        drop(admission);
         let proxy = network
-            .then(|| proxy::Proxy::start(registry.clone(), call.clone(), cancel))
+            .then(|| proxy::Proxy::start(registry.clone(), live, call.clone(), cancel))
             .transpose()
             .map_err(|error| format!("Argentic proxy is unavailable: {error}"))?;
         #[cfg(target_os = "linux")]
@@ -302,6 +350,15 @@ fn run(
             cancel,
         )?;
         drop(proxy);
+        let publication = tokio::runtime::Handle::current().block_on(registry.lock_dispatch(
+            call,
+            &[DispatchAction {
+                action: Approval::Shell(&args.command),
+                approved_by,
+            }],
+            cancel,
+        ))?;
+        recheck_shell(&publication, &args.command, approved_by)?;
         let mut pending = Vec::new();
         for (root, (snapshot, write)) in registry.roots.iter().zip(snapshots) {
             if write {
@@ -309,7 +366,8 @@ fn run(
                     .changes(root, cancel, |path| {
                         let absolute = root.path.join(path);
                         [Action::Read, Action::Write].into_iter().all(|action| {
-                            registry.path_effect(root, action, &absolute) == Effect::Allow
+                            registry.live_path_effect(&publication, root, action, &absolute)
+                                == Effect::Allow
                         })
                     })
                     .map_err(|error| format!("Shell workspace publication: {error}"))?;
@@ -332,8 +390,167 @@ fn run(
         all(target_os = "macos", target_arch = "aarch64")
     )))]
     {
-        let _ = (registry, args, network, call, cancel);
+        let _ = (registry, args, call, approved_by, admission, cancel);
         preflight()?;
         unreachable!()
+    }
+}
+
+#[cfg(all(
+    test,
+    target_os = "linux",
+    any(target_arch = "aarch64", target_arch = "x86_64")
+))]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod dispatch_tests {
+    use super::*;
+    use crate::{
+        policy::{Preset, Rule},
+        tools::Authorizer,
+    };
+    use std::time::Duration;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+        sync::{Notify, RwLock},
+    };
+
+    struct LivePolicy {
+        approved: Notify,
+        allowed: Arc<RwLock<bool>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Authorizer for LivePolicy {
+        async fn approve(
+            &self,
+            _: &ToolCall,
+            action: Approval<'_>,
+            _: &CancellationToken,
+        ) -> Result<bool, String> {
+            assert!(matches!(action, Approval::Shell(_)));
+            self.approved.notify_one();
+            Ok(true)
+        }
+
+        async fn revalidate_dispatch(
+            &self,
+            _: &ToolCall,
+            actions: &[DispatchAction<'_>],
+        ) -> Result<DispatchPolicy, String> {
+            assert!(matches!(
+                actions,
+                [DispatchAction {
+                    action: Approval::Shell(_),
+                    approved_by: Some(ApprovalSource::Person),
+                }]
+            ));
+            let guard = self.allowed.clone().read_owned().await;
+            if !*guard {
+                return Err("Shell permission denied by current policy".into());
+            }
+            Ok(DispatchPolicy::new(guard))
+        }
+    }
+
+    fn setup(path: &std::path::Path, network: bool) -> (Arc<Registry>, Arc<LivePolicy>) {
+        let mut rules = vec![Rule {
+            action: Action::Shell,
+            pattern: None,
+            effect: Effect::Ask,
+        }];
+        if network {
+            rules.push(Rule {
+                action: Action::Network,
+                pattern: Some("127.0.0.1".into()),
+                effect: Effect::Allow,
+            });
+        }
+        let policy =
+            Policy::compile_rules(path, None, Some(Preset::Workspace), None, &rules).unwrap();
+        let live = Arc::new(LivePolicy {
+            approved: Notify::new(),
+            allowed: Arc::new(RwLock::new(true)),
+        });
+        let registry = Registry::new(&[path.to_owned()], policy, serde_json::json!(true))
+            .unwrap()
+            .with_writes()
+            .with_shell()
+            .with_shell_network(ShellNetwork::Intercept)
+            .with_authorizer(live.clone());
+        (Arc::new(registry), live)
+    }
+
+    async fn shell_call(registry: Arc<Registry>, command: String) -> Result<Page, String> {
+        registry
+            .read_tool(
+                ToolCall {
+                    id: "shell-test".into(),
+                    name: "shell".into(),
+                    arguments: serde_json::json!({"command":command,"timeout_ms":10000})
+                        .to_string(),
+                },
+                CancellationToken::new(),
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn shell_rechecks_approval_after_waiting_for_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, live) = setup(dir.path(), false);
+        let gate = registry.root_gates[0].clone().write_owned().await;
+        let command = tokio::spawn(shell_call(registry, "printf changed > memo".into()));
+        live.approved.notified().await;
+        *live.allowed.write().await = false;
+        drop(gate);
+        let error = command.await.unwrap().unwrap_err();
+        assert!(
+            error.contains("permission denied by current policy"),
+            "{error}"
+        );
+        assert!(!dir.path().join("memo").exists());
+    }
+
+    #[tokio::test]
+    async fn shell_releases_its_lease_during_bash_and_rechecks_before_publication() {
+        if let Err(error) = preflight_network(true) {
+            assert_ne!(
+                std::env::var("ARGENTIC_REQUIRE_BWRAP").as_deref(),
+                Ok("1"),
+                "{error}"
+            );
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, live) = setup(dir.path(), true);
+        let server = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = server.local_addr().unwrap().port();
+        let command = tokio::spawn(shell_call(
+            registry,
+            format!("curl -fsS http://127.0.0.1:{port}/ && printf changed > memo"),
+        ));
+        let (mut socket, _) = tokio::time::timeout(Duration::from_secs(5), server.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut request = [0; 1024];
+        assert!(socket.read(&mut request).await.unwrap() > 0);
+        let mut policy = tokio::time::timeout(Duration::from_secs(1), live.allowed.write())
+            .await
+            .expect("Bash must not hold the policy lease");
+        *policy = false;
+        drop(policy);
+        socket
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+            .await
+            .unwrap();
+        drop(socket);
+        let error = command.await.unwrap().unwrap_err();
+        assert!(
+            error.contains("permission denied by current policy"),
+            "{error}"
+        );
+        assert!(!dir.path().join("memo").exists());
     }
 }
