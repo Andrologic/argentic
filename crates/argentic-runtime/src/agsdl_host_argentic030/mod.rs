@@ -119,6 +119,7 @@ mod tests {
 }
 
 impl ArgenticAdapter030 {
+    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub fn new(config: ArgenticConfig030) -> Result<Self> {
         config.validate()?;
         Ok(Self(Arc::new(config)))
@@ -273,13 +274,17 @@ struct Executor {
     // The Host creates one executor per run. The reducer serializes works
     // with the same instance ID and waits for the previous owner to join.
     sessions: Arc<Mutex<BTreeMap<String, session::IdleHistory>>>,
-    policies: Arc<Mutex<BTreeMap<String, Arc<[argentic_harness::policy::Policy]>>>>,
-    toolboxes: Arc<Mutex<BTreeMap<([u8; 32], bool, bool), argentic_harness::tools::Toolbox>>>,
+    policies: Arc<Mutex<PolicyCache>>,
+    toolboxes: Arc<Mutex<ToolboxCache>>,
     approvals: Arc<dyn crate::harness::CommandApprovals030>,
     has_mcp_equipment: bool,
 }
 
+type ToolboxCache = BTreeMap<([u8; 32], bool, bool), argentic_harness::tools::Toolbox>;
+type PolicyCache = BTreeMap<String, Arc<[argentic_harness::policy::Policy]>>;
+
 impl Executor {
+    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     fn policies(
         &self,
         policy: &crate::permissions::EffectivePolicy,
@@ -299,6 +304,7 @@ impl Executor {
         Ok(compiled)
     }
 
+    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     fn toolbox(
         &self,
         schema: Value,
@@ -330,6 +336,7 @@ impl Executor {
         Ok(toolbox)
     }
 
+    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     fn verify_evidence(&self, entry: &Value) -> Result<()> {
         let evidence: Value = serde_json::from_str(required(entry, "evidenceJson")?)?;
         if evidence["configDigest"] != self.config.fingerprint()? || evidence["version"] != VERSION
@@ -402,6 +409,7 @@ impl AgentExecutor030 for Executor {
 }
 
 impl Executor {
+    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     async fn execute(
         &self,
         mut work: AgentWork030,
@@ -754,6 +762,7 @@ fn provider_failure(
     failure("ARGENTIC_PROVIDER", "provider", &detail)
 }
 
+#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 fn open_extra_root(path: &Path) -> Result<cap_std::fs::Dir> {
     use crate::content_io::admitted::{open_root_capability, workspace_root_identity};
     let identity = workspace_root_identity(path).map_err(|_| missing("additionalRoot"))?;
@@ -765,6 +774,7 @@ fn open_extra_root(path: &Path) -> Result<cap_std::fs::Dir> {
     Ok(directory)
 }
 
+#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 fn admitted_root(
     capture: &crate::persistence::start030::StartCapture030,
     workspace: &Path,
@@ -818,6 +828,7 @@ fn submission_schema(agent: &Value, contract: &Value) -> Value {
     envelope
 }
 
+#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 fn registry_agent<'a>(agents: &'a Value, agent: &str) -> Result<&'a Value> {
     agents
         .as_array()
@@ -834,6 +845,7 @@ fn settings(agent: &Value) -> Value {
         .unwrap_or_else(|| json!({}))
 }
 
+#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 fn required<'a>(value: &'a Value, name: &str) -> Result<&'a str> {
     value[name].as_str().ok_or_else(|| missing(name))
 }

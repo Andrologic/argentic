@@ -11,6 +11,7 @@ use std::sync::Mutex;
 use tokio::sync::{oneshot, Notify};
 use tokio_util::sync::CancellationToken;
 
+#[cfg(test)]
 const MAX_JOBS: usize = 64;
 const MAX_BYTES: usize = 8_000_000;
 
@@ -147,6 +148,7 @@ impl RouteBroker030 {
         }
     }
 
+    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub(crate) async fn evaluate_native(
         &self,
         expected_generation: &str,
@@ -228,6 +230,7 @@ impl RouteBroker030 {
     }
 
     #[cfg(test)]
+    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub(crate) fn complete(&self, generation: &str, result: HostRouteCompletion030) -> Result<()> {
         validate_output(&result.output)?;
         let mut queue = self.queue.lock().expect("route mailbox");
@@ -263,6 +266,7 @@ impl RouteBroker030 {
     }
 }
 
+#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 fn validate_input(generation: &str, input_json: &str) -> Result<()> {
     if generation.is_empty() || input_json.len() > MAX_BYTES {
         return Err(failure(
@@ -271,9 +275,10 @@ fn validate_input(generation: &str, input_json: &str) -> Result<()> {
             "Route input is invalid or too large",
         ));
     }
-    validate_json(&input_json)?;
+    validate_json(input_json)?;
     Ok(())
 }
+#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 fn validate_output(output: &HostRouteOutput030) -> Result<()> {
     match output {
         HostRouteOutput030::Ready { result_json } => {
@@ -294,6 +299,7 @@ fn validate_output(output: &HostRouteOutput030) -> Result<()> {
     }
     Ok(())
 }
+#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 fn response(output: HostRouteOutput030) -> Result<String> {
     match output {
         HostRouteOutput030::Ready { result_json } => Ok(result_json),

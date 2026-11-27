@@ -32,6 +32,13 @@ use crate::process::ContainedBackgroundProcess;
 #[derive(Clone, Copy)]
 pub(crate) enum Protocol {
     Legacy,
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "Native capture currently selects legacy MCP; transport tests exercise modern MCP"
+        )
+    )]
     Modern,
 }
 
@@ -61,11 +68,6 @@ pub(crate) struct CapturedServer {
     pub capture_digest: String,
     pub protocol: Protocol,
     pub transport: ServerTransport,
-}
-impl CapturedServer {
-    pub(crate) fn name(&self) -> &str {
-        &self.document_name
-    }
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -23,11 +23,13 @@ use crate::content::{
 };
 use crate::permissions::{normalize_requested, ExecutionPurpose};
 
+#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 pub(crate) fn validate_text_sources(
     document: &Value,
     document_location: Option<&url::Url>,
 ) -> HostResult<()> {
     use crate::agsdl_host_work_admission030::pointer_token030;
+    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     fn visit(value: &Value, pointer: &str, document_location: Option<&url::Url>) -> HostResult<()> {
         if let Some(object) = value.as_object() {
             if object.get("uri").is_some_and(Value::is_string)
@@ -225,6 +227,7 @@ impl Sources030 {
         Ok(sources)
     }
 
+    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub(crate) fn from_context(
         context: ContentContext,
         document: Value,
@@ -477,6 +480,7 @@ impl Sources030 {
         read.await
     }
 
+    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     fn allowed_file(&self, source: &Value, pointer: &str) -> HostResult<()> {
         if let Some(uri) = source.get("uri").and_then(Value::as_str) {
             let path = crate::content::local_file_path(uri, self.context.document_location())
@@ -504,6 +508,7 @@ impl Sources030 {
 
 /// Only inspect selected folders within the native project scope. Other skill
 /// shapes remain explicit refusals before launch as well as at work admission.
+#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 pub(crate) fn qualify_skill_folders(
     document: &Value,
     root: &Path,

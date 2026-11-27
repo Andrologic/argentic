@@ -22,14 +22,15 @@ pub(crate) struct CapturedWorkPlan030<'a> {
 
 /// Select only the exact 04 contract from an authenticated 02 plan.
 /// This function does not authenticate the caller or grant work admission.
+#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 pub(crate) fn captured_work_contract030(
     snapshot: &CapturedWorkPlan030<'_>,
     work: &crate::persistence::dto::EngineWork,
     agent_name: &str,
 ) -> Result<String> {
     use serde_json::Value;
-    validate_json(&snapshot.compiled_plan_json)?;
-    let plan: Value = serde_json::from_str(&snapshot.compiled_plan_json)?;
+    validate_json(snapshot.compiled_plan_json)?;
+    let plan: Value = serde_json::from_str(snapshot.compiled_plan_json)?;
     if snapshot.system_start_id != work.system_start_id
         || plan.get("format").and_then(Value::as_str) != Some("macro-agsdl-compiled-plan/2")
         || snapshot.versions.snapshot != "2"
@@ -137,6 +138,7 @@ struct CheckIdentity030 {
 }
 
 /// Only extracts a durable reservation. It does not qualify or launch the check.
+#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 pub(crate) fn reserved_check030(
     context: &EngineContext,
     receipt_json: &str,
@@ -199,6 +201,7 @@ pub(crate) fn reserved_check030(
     }
 }
 
+#[cfg(test)]
 const MAX_JOBS: usize = 64;
 const MAX_BYTES: usize = 8_000_000;
 
@@ -365,6 +368,7 @@ impl WorkBroker030 {
         }
     }
 
+    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub(crate) async fn evaluate_native(
         &self,
         generation: &str,
@@ -445,6 +449,7 @@ impl WorkBroker030 {
     }
 
     #[cfg(test)]
+    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub(crate) fn complete(
         &self,
         generation: &str,
@@ -495,6 +500,7 @@ impl WorkBroker030 {
     }
 }
 
+#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 fn validate_input(generation: &str, input: &HostWorkInput030) -> Result<Vec<u8>> {
     let bytes = serde_json::to_vec(&input)?;
     if bytes.len() > MAX_BYTES {
@@ -527,6 +533,7 @@ fn validate_input(generation: &str, input: &HostWorkInput030) -> Result<Vec<u8>>
     }
     Ok(bytes)
 }
+#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 fn validate_output(completion: &HostWorkCompletion030) -> Result<()> {
     if serde_json::to_vec(&completion)?.len() > MAX_BYTES {
         return Err(failure(
@@ -569,6 +576,7 @@ mod tests {
         }
     }
     #[test]
+    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     fn captured_contract_is_bound_to_snapshot_step_agent_and_exact_bytes() {
         use crate::persistence::dto::{EngineSourceRevision, EngineVersions};
         let source: EngineSourceRevision = serde_json::from_value(serde_json::json!({

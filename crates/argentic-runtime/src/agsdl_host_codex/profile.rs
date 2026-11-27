@@ -16,6 +16,7 @@ const HELPERS: &[&str] = &["codex-code-mode-host", "codex-exec-server"];
 
 /// Presence/executability and capture binding, not release qualification. The
 /// installer must supply the complete official package from the same release.
+#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 fn package_helpers(executable: &Path, version: &str) -> Result<Vec<(&'static str, String)>> {
     use std::io::Read;
     let unavailable = || {
@@ -141,6 +142,7 @@ fn context_io(_: std::io::Error) -> crate::persistence::dto::EngineFailure {
     )
 }
 #[cfg(unix)]
+#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 fn bootstrap(directory: &Path, context: &Path) -> Result<PathBuf> {
     use std::io::Write;
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
@@ -234,6 +236,7 @@ fn bootstrap(_: &Path, _: &Path) -> Result<PathBuf> {
         "Private native bootstrap is not qualified on this platform",
     ))
 }
+#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 fn context_roots_are_empty(directory: &Path, home: &Path) -> Result<()> {
     match std::fs::symlink_metadata("/etc/codex/skills") {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
@@ -260,6 +263,7 @@ fn context_roots_are_empty(directory: &Path, home: &Path) -> Result<()> {
     }
     Ok(())
 }
+#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 fn private_directory(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
@@ -294,6 +298,7 @@ fn private_directory(path: &Path) -> Result<()> {
         ))
     }
 }
+#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 fn environment(manager: &HostContext) -> Result<Profile> {
     let executable = executable().ok_or_else(|| {
         failure(
@@ -327,6 +332,7 @@ fn environment(manager: &HostContext) -> Result<Profile> {
     })
 }
 
+#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 pub(crate) fn prepare(manager: &HostContext, version: &str) -> Result<Profile> {
     if !qualified_version(version) {
         return Err(failure(
@@ -338,6 +344,7 @@ pub(crate) fn prepare(manager: &HostContext, version: &str) -> Result<Profile> {
     prepare_profile(manager, version, environment(manager)?)
 }
 
+#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 fn prepare_profile(manager: &HostContext, version: &str, mut profile: Profile) -> Result<Profile> {
     let helpers = package_helpers(&profile.executable, version)?;
     let bytes = std::fs::read(&profile.executable).map_err(|_| {
@@ -416,6 +423,7 @@ impl Profile {
         }
         command
     }
+    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub fn settings(&self, root: &Path, read_only: bool) -> Result<Value> {
         if let Some(runtime) = &self.runtime {
             if !read_only || self.directory.starts_with("/tmp") {
@@ -485,6 +493,7 @@ impl Profile {
             "permissions":{"macro-agsdl":{"workspace_roots":{(self.bootstrap.to_string_lossy().into_owned()):true},"filesystem":tool_files,"network":{"enabled":false}}}}),
         )
     }
+    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub fn app_server_command(
         &self,
         root: &Path,
@@ -495,6 +504,7 @@ impl Profile {
             settings["mcp_servers"] = mcp.servers.clone();
         }
         let mut flags = Vec::new();
+        #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
         fn inline_toml(value: &Value) -> Result<String> {
             if let Some(object) = value.as_object() {
                 return Ok(format!(
@@ -542,6 +552,7 @@ impl Profile {
             "digest":self.digest,"toolPolicy":"codex-native","approvalPolicy":"never"}).to_string()
     }
     #[cfg(test)]
+    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub fn attestation(&self, read_only: bool, scope: &Value) -> Result<String> {
         Ok(json!({"format":"macro-codex-native-profile/1","version":self.identity_version(),"platform":format!("{}-{}",std::env::consts::OS,std::env::consts::ARCH),
             "digest":self.digest,"toolPolicy":"codex-native","approvalPolicy":"never","readOnly":read_only,"contextCwd":self.bootstrap,
@@ -641,6 +652,7 @@ pub(crate) async fn status(manager: &HostContext) -> CodexStatus {
 /// Reject all active executable config outside the profile before starting a
 /// thread. Project layers must be disabled. Managed sources cannot be assumed
 /// empty merely because command-line flags were supplied.
+#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 pub(crate) fn verify_layers(
     value: &Value,
     profile: &Profile,

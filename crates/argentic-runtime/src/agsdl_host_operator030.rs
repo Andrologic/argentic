@@ -34,6 +34,7 @@ pub(crate) fn conflict(message: &str) -> repository::dto::EngineFailure {
     failure("OPERATOR_TRANSITION", "operator", message)
 }
 
+#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 pub(crate) async fn control(
     host: &HostState,
     pool: &SqlitePool,
@@ -243,6 +244,7 @@ pub(crate) async fn control(
     operator_receipt(applied)
 }
 
+#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 fn operator_receipt(applied: Apply030) -> Result<FlowReceipt030> {
     match applied {
         Apply030::Applied(receipt) | Apply030::Replayed(receipt) => Ok(receipt),

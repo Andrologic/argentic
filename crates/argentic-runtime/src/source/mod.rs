@@ -78,11 +78,13 @@ pub struct OpenedSource {
 impl OpenedSource {
     /// Open a local JSON document, a project directory or manifest, or an archive.
     /// Only a trusted local caller should select a path on the host machine.
+    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub fn open_path(path: &Path) -> Result<Self> {
         Self::open_path_with_budget(path, SourceBudget::default())
     }
 
     /// Open a local source using the supplied operation budget.
+    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub fn open_path_with_budget(path: &Path, budget: SourceBudget) -> Result<Self> {
         // Rebuild from components: with a trailing separator, `lstat` would
         // follow a symlinked project root.
@@ -164,25 +166,30 @@ impl OpenedSource {
 
     /// Open untrusted uploaded bytes. References are resolved inside the
     /// archive only. This API never uses a client-supplied local path.
+    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub fn open_archive_bytes(bytes: &[u8]) -> Result<Self> {
         Self::open_archive_bytes_with_budget(bytes, SourceBudget::default())
     }
 
     /// Open uploaded archive bytes using the supplied operation budget.
+    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub fn open_archive_bytes_with_budget(bytes: &[u8], budget: SourceBudget) -> Result<Self> {
         Self::open_archive(Cursor::new(bytes), budget)
     }
 
     #[cfg(test)]
+    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     fn folder(dir: Dir, manifest: Option<ProjectFile>) -> Result<Self> {
         Self::assembled(project::assemble_folder(dir, manifest, cfg!(unix))?)
     }
 
+    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     fn open_archive(input: impl Read + std::io::Seek, budget: SourceBudget) -> Result<Self> {
         let files = archive::read_with_budget(input, &budget)?;
         Self::assembled(project::assemble_archive(files, budget)?)
     }
 
+    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     fn assembled(mut project: project::Project) -> Result<Self> {
         // A folder accepts only what its archive could list, which also bounds
         // the retained index that a later run reopens.
@@ -249,6 +256,7 @@ impl OpenedSource {
     /// violation before writing any bytes. On an I/O error the output may be
     /// incomplete. The output is flushed before success is reported; the
     /// caller still owns syncing and publishing it.
+    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub fn write_archive<W: Write + ?Sized>(&self, output: &mut W) -> Result<()> {
         let project = self
             .project
@@ -299,6 +307,7 @@ impl OpenedSource {
 
     /// Freeze the selected project files in private host storage. Use the
     /// same directory as [crate::host::HostContext::root] when executing a run.
+    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub fn retain(&self, host_data: &Path) -> Result<RetainedSource> {
         match &self.project {
             Some(project) => {
@@ -394,6 +403,7 @@ fn source_limit(file: &str, error: argentic_core::calculation::Failure) -> Engin
     )
 }
 
+#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 fn validate_source_syntax(authored: &str, file: &str, budget: &SourceBudget) -> Result<()> {
     argentic_core::check_source_json(authored, "", budget).map_err(|error| {
         if error.code == GRAPH_LIMIT_CODE {
@@ -404,6 +414,7 @@ fn validate_source_syntax(authored: &str, file: &str, budget: &SourceBudget) -> 
     })
 }
 
+#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 fn encode_document(value: &Value, budget: &SourceBudget) -> Result<String> {
     struct Writer<'a> {
         budget: &'a SourceBudget,
@@ -440,6 +451,7 @@ fn encode_document(value: &Value, budget: &SourceBudget) -> Result<String> {
     Ok(String::from_utf8(writer.bytes).expect("JSON is UTF-8"))
 }
 
+#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 fn parse_json(
     bytes: &[u8],
     file: &str,
@@ -460,6 +472,7 @@ fn parse_json(
     Ok(value)
 }
 
+#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 fn check_project_json(
     value: &Value,
     file: &str,
@@ -492,6 +505,7 @@ fn check_project_json(
     Ok(())
 }
 
+#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 fn open_project_root(path: &Path) -> Result<Dir> {
     let no_link = || {
         invalid(
@@ -679,6 +693,7 @@ fn read_regular(
     Ok(ProjectFile::new(bytes, executable))
 }
 
+#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 fn file_url(path: &Path) -> Result<Url> {
     Url::from_file_path(path).map_err(|_| invalid("source", "", "Cannot form a local document URI"))
 }

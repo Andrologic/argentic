@@ -31,6 +31,7 @@ pub fn failure(code: &str, pointer: &str, message: &str) -> EngineFailure {
     }
 }
 #[doc(hidden)]
+#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 pub fn require(ok: bool, message: &str) -> Result<()> {
     if ok {
         Ok(())
@@ -39,6 +40,7 @@ pub fn require(ok: bool, message: &str) -> Result<()> {
     }
 }
 #[doc(hidden)]
+#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 pub fn opaque(value: &str) -> Result<()> {
     require(
         !value.trim().is_empty() && value.len() <= 512 && !value.chars().any(char::is_control),
@@ -46,6 +48,7 @@ pub fn opaque(value: &str) -> Result<()> {
     )
 }
 #[doc(hidden)]
+#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 pub fn decimal(value: &str) -> Result<()> {
     require(
         !value.is_empty()
@@ -72,9 +75,11 @@ pub fn next(value: &str) -> String {
     String::from_utf8(bytes).expect("decimal")
 }
 #[doc(hidden)]
+#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 pub fn encode<T: Serialize>(value: &T) -> Result<String> {
     Ok(serde_json::to_string(value)?)
 }
+#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 pub fn validate_json(value: &str) -> Result<()> {
     argentic_core::durable_json::validate(value)?;
     Ok(())
@@ -102,3 +107,8 @@ pub mod runtime_projection030;
 
 #[path = "v030/replay_verify030.rs"]
 pub mod replay_verify030;
+
+#[path = "v030/human_answer030.rs"]
+pub(crate) mod human_answer030;
+#[path = "v030/human_clock_verify030.rs"]
+pub(crate) mod human_clock_verify030;

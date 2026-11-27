@@ -223,6 +223,7 @@ pub(crate) fn entry_at(
 
 /// Report at an actual fallible boundary, then propagate the original result.
 /// Diagnostic IO cannot change admission, failure handling or physical cleanup.
+#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 pub(crate) fn at<T>(
     attempt: &crate::agsdl_host_flow030::FlowWorkAttempt030,
     stage: Stage,

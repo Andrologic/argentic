@@ -99,6 +99,7 @@ pub(crate) fn identity() -> CallIdentity {
         native_call_id: "native-call".into(),
     }
 }
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn grant(root: &std::path::Path) -> CommandGrant {
     CommandGrant {
         workspace: root.canonicalize().unwrap(),

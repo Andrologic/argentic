@@ -238,6 +238,7 @@ async fn prepared(pool: &SqlitePool, attempt: &CallAttempt030) -> Result<Prepare
 
 /// Calls have no agent permissions to borrow. Both captured and current host
 /// ceilings must explicitly allow local work; project read-only remains a ceiling.
+#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 fn grant(
     data: &Path,
     capture: &StartCapture030,
@@ -274,6 +275,7 @@ fn grant(
     workspace_grant(data, capture, &scope, mcp, true)
 }
 
+#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 pub(crate) fn agent_mcp_grant(
     config: &HostContext,
     capture: &StartCapture030,
@@ -284,6 +286,7 @@ pub(crate) fn agent_mcp_grant(
     workspace_grant(config.root(), capture, scope, Some(server), !read_only)
 }
 
+#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 fn workspace_grant(
     data: &Path,
     capture: &StartCapture030,
@@ -452,8 +455,11 @@ impl CallTransport030 for NativeCallTransport030 {
 }
 
 pub(crate) enum StartedTransport {
-    Command(crate::process::ContainedBackgroundProcess, SandboxPolicy),
-    Mcp(raw_mcp::Session),
+    Command(
+        crate::process::ContainedBackgroundProcess,
+        Box<SandboxPolicy>,
+    ),
+    Mcp(Box<raw_mcp::Session>),
     RemoteMcp(Box<RemoteMcp>),
 }
 fn start_transport(
@@ -473,7 +479,7 @@ fn start_transport(
                     &grant.environment,
                 )
                 .map_err(transport::CallError::transport)?;
-            Ok(StartedTransport::Command(child, grant.sandbox))
+            Ok(StartedTransport::Command(child, Box::new(grant.sandbox)))
         }
         PreparedCall030::Mcp { server, .. } => {
             let document: Value = serde_json::from_str(&capture.authored_source)
@@ -484,7 +490,7 @@ fn start_transport(
             } else {
                 raw_mcp::require_stdio()?;
                 raw_mcp::start(mcp_server(config, grant, capture, server)?)
-                    .map(StartedTransport::Mcp)
+                    .map(|session| StartedTransport::Mcp(Box::new(session)))
             }
         }
     }
@@ -497,6 +503,7 @@ struct RetainedMcp {
 }
 
 impl RetainedMcp {
+    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     fn open(
         data: &Path,
         capture: &StartCapture030,
@@ -729,7 +736,7 @@ pub(crate) async fn run_transport(
         StartedTransport::RemoteMcp(remote) => match remote.start(control).await {
             Ok(mut session) => {
                 session.set_tool_admission(admit_tool);
-                StartedTransport::Mcp(session)
+                StartedTransport::Mcp(Box::new(session))
             }
             Err(_) if control.stop.is_cancelled() => return Ok(CallEnd030::Stopped),
             Err(_) => {
@@ -848,12 +855,15 @@ impl transport::HostPort for NoHuman {
     fn supports_human_requests(&self) -> bool {
         false
     }
+    #[cfg(test)]
     async fn claim(&self, _: &transport::CallRequest) -> transport::Result<transport::ClaimedCall> {
         Err(no_human())
     }
+    #[cfg(test)]
     fn launch_gate(&self) -> std::sync::Arc<tokio::sync::Mutex<()>> {
         std::sync::Arc::new(tokio::sync::Mutex::new(()))
     }
+    #[cfg(test)]
     async fn authorize_launch(
         &self,
         _: &transport::CallRequest,
@@ -861,6 +871,7 @@ impl transport::HostPort for NoHuman {
     ) -> transport::Result<transport::LaunchGrant> {
         Err(no_human())
     }
+    #[cfg(test)]
     async fn finish(&self, _: &str, _: &transport::Completion) -> transport::Result<()> {
         Err(no_human())
     }

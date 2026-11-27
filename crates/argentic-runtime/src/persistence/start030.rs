@@ -39,6 +39,10 @@ pub struct RetainedStart030 {
     pub capture: StartCapture030,
 }
 
+#[allow(
+    clippy::large_enum_variant,
+    reason = "Boxing the retained start changes the public inspection type"
+)]
 pub enum StartInspection030 {
     Committed(RetainedStart030),
     /// Absence alone cannot prove that the submitted commit has settled.
@@ -49,11 +53,17 @@ pub enum StartInspection030 {
 /// `bind_capture_tx` authenticates the complete capture and entry, registers the
 /// 030 owner under the current epoch, and uses only this SQLite transaction.
 /// It must not perform provider, filesystem or other external IO.
+#[allow(
+    async_fn_in_trait,
+    reason = "Preserve the public trait’s existing future bounds"
+)]
 pub trait StartAuthority030: Authority030 {
     type SourceGuard;
     /// The native barrier is shared with capture, claims, dispatch and fencing.
+    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     fn require_clear(&self, request: &EngineStartRequest) -> Result<()>;
     /// Install the exclusion before submitting COMMIT; cancellation retains it.
+    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     fn begin_commit(&self, request: &EngineStartRequest, identity: &FlowIdentity030) -> Result<()>;
     /// Release only after an acknowledged successful commit.
     fn commit_acknowledged(&self, request: &EngineStartRequest, identity: &FlowIdentity030);
@@ -79,6 +89,7 @@ fn store_error(error: StoreError030) -> super::dto::EngineFailure {
     }
 }
 
+#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 pub fn validate_capture(
     request: &EngineStartRequest,
     capture: &StartCapture030,

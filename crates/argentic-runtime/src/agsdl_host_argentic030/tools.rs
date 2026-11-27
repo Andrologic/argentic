@@ -115,6 +115,7 @@ impl Tools {
         }
     }
 
+    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     fn catalogue_mcp(equipment: &Equipment) -> HostResult<BTreeMap<String, McpTool>> {
         let mut mcp = BTreeMap::new();
         for (server, name, tool) in equipment.tools() {

@@ -4,32 +4,41 @@
 use crate::agsdl_host::{HostStartLease, HostState};
 use crate::agsdl_host_flow030::{FlowHost030, NativeRouteMaterial030, RouteMaterialVerifier030};
 use crate::agsdl_host_route_verifier030::{
-    content_receipt_fingerprint030, same_flow_plan030, unique_agent_work_event_tx,
-    verify_join_error_source_tx, SqlRouteMaterialVerifier030,
+    same_flow_plan030, unique_agent_work_event_tx, verify_join_error_source_tx,
+    SqlRouteMaterialVerifier030,
 };
-#[cfg(feature = "agsdl-content-qa")]
-use crate::content::resolve_content;
-use crate::content::{ContentContext, ContentContextBinding, ContentUse, ResolvedContentReceipt};
+#[cfg(all(test, feature = "agsdl-content-qa"))]
+use crate::content::{
+    resolve_content, ContentContext, ContentContextBinding, ContentUse, ResolvedContentReceipt,
+};
 use crate::persistence::{
     dto::EngineOwner,
     failure,
     flow030::{
         Continuation030, FlowEffect030, FlowEffectKind030, FlowIdentity030, FlowPlan030,
-        FlowState030, PrepareRef030, Producer030, Target030,
+        FlowState030, PrepareRef030, Producer030,
     },
-    flow_store030::CheckFuture,
-    json_lexemes030::document_tokens_equal,
     start030::StartCapture030,
     Result,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use sqlx::{Acquire, Row, Sqlite, SqliteConnection, Transaction};
-use std::collections::BTreeSet;
+#[cfg(all(test, feature = "agsdl-content-qa"))]
+use {
+    crate::{
+        agsdl_host_route_verifier030::content_receipt_fingerprint030,
+        persistence::{
+            flow030::Target030, flow_store030::CheckFuture, json_lexemes030::document_tokens_equal,
+        },
+    },
+    std::collections::BTreeSet,
+};
 
 fn sha(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
+#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 fn require(ok: bool) -> Result<()> {
     if ok {
         Ok(())
@@ -41,6 +50,7 @@ fn require(ok: bool) -> Result<()> {
         ))
     }
 }
+#[cfg(all(test, feature = "agsdl-content-qa"))]
 fn content_error(error: crate::content::ContentError) -> crate::persistence::dto::EngineFailure {
     failure(&error.code, &error.pointer, &error.message)
 }
@@ -58,7 +68,12 @@ fn verification_error(
 /// accepting a policy supplied in JSON. This checks the recipient's captured
 /// ceilings and the exact uses against the current native policy at commit.
 /// Binding metadata alone is not an authorization decision.
+#[cfg(all(test, feature = "agsdl-content-qa"))]
 pub(crate) trait RouteRecipientAuthority030 {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "The recipient policy must receive the exact occurrence and captured uses"
+    )]
     fn attest_tx<'a>(
         &'a self,
         db: &'a mut SqliteConnection,
@@ -181,12 +196,14 @@ impl AttestedRouteSource030 {
     pub(crate) fn producer(&self) -> &Producer030 {
         &self.producer
     }
+    #[cfg(all(test, feature = "agsdl-content-qa"))]
     pub(crate) fn is_join_source(&self) -> bool {
         matches!(
             self.kind,
             SourceKind030::Join | SourceKind030::JoinError | SourceKind030::FailedGroupError
         )
     }
+    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub(crate) fn commit_marker(&self) -> Result<RouteSourceCommitMarker030> {
         require(!self.native_receipt_id.is_empty())?;
         let row = json!({
@@ -222,6 +239,7 @@ impl AttestedRouteSource030 {
 }
 /// Owns the actual context and the actual 11 resolution results. There is no
 /// constructor accepting deserialized receipts or a callback that supplies them.
+#[cfg(all(test, feature = "agsdl-content-qa"))]
 pub(crate) struct ResolvedRouteOccurrence030 {
     context: ContentContext,
     uses: Vec<ContentUse>,
@@ -251,6 +269,7 @@ impl RouteAttestor030 {
             verifier,
         })
     }
+    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     fn live(&self, lease: &HostStartLease) -> Result<()> {
         lease.ensure_live()?;
         require(
@@ -690,7 +709,7 @@ impl RouteAttestor030 {
 
     /// The caller obtains the context from the native recipient policy owner.
     /// This function performs actual 11 resolution, never JSON cache replay.
-    #[cfg(feature = "agsdl-content-qa")]
+    #[cfg(all(test, feature = "agsdl-content-qa"))]
     pub(crate) async fn resolve_occurrence(
         &self,
         source: &AttestedRouteSource030,
@@ -733,6 +752,7 @@ impl RouteAttestor030 {
     /// No external IO. The policy owner revalidates the exact recipient and uses
     /// under the caller's shared admission gate and SQL transaction. A failed
     /// verification rolls this savepoint back, including every receipt row.
+    #[cfg(all(test, feature = "agsdl-content-qa"))]
     pub(crate) async fn attest_occurrences_tx<P: RouteRecipientAuthority030>(
         &self,
         tx: &mut Transaction<'_, Sqlite>,
@@ -830,6 +850,8 @@ impl RouteAttestor030 {
     }
 }
 
+#[cfg(all(test, feature = "agsdl-content-qa"))]
+#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 fn canonical_index(index: &str) -> Result<()> {
     require(
         index == "0"
@@ -838,6 +860,8 @@ fn canonical_index(index: &str) -> Result<()> {
                 && index.bytes().all(|b| b.is_ascii_digit())),
     )
 }
+#[cfg(all(test, feature = "agsdl-content-qa"))]
+#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 fn validate_recipient(
     capture: &StartCapture030,
     reference: &PrepareRef030,
@@ -879,6 +903,8 @@ fn validate_recipient(
     require(step.r#type == "agent" && step.agent.as_deref() == Some(binding.agent.as_str()))?;
     Ok((address.clone(), binding.agent.clone()))
 }
+#[cfg(all(test, feature = "agsdl-content-qa"))]
+#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 fn transport_receipt(
     binding: &ContentContextBinding,
     usage: &ContentUse,

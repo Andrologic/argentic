@@ -290,7 +290,14 @@ where
     feature = "dev-support",
     all(target_os = "macos", feature = "agsdl-content-qa", debug_assertions)
 ))]
-static CONTENT_BEFORE_OPEN_HOOKS: LazyLock<Mutex<HashMap<PathBuf, (Arc<Barrier>, Arc<Barrier>)>>> =
+type BeforeOpenHooks = HashMap<PathBuf, (Arc<Barrier>, Arc<Barrier>)>;
+
+#[cfg(any(
+    test,
+    feature = "dev-support",
+    all(target_os = "macos", feature = "agsdl-content-qa", debug_assertions)
+))]
+static CONTENT_BEFORE_OPEN_HOOKS: LazyLock<Mutex<BeforeOpenHooks>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 #[cfg(any(

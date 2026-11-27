@@ -1,7 +1,14 @@
 //! Readback of 040 uses the same native deadline and pause checks as COMMIT.
 use super::*;
 use crate::agsdl_host_flow030::{NativeSystemStopReceipt030, SupersededClockTicket030};
-use std::collections::BTreeMap;
+use crate::persistence::{
+    human_answer030::HumanAnswer030,
+    human_clock_verify030::{
+        duration, ms, validate_projection, verify_existing, Request, Submission, VerificationError,
+        Work,
+    },
+};
+
 type NativeError = Box<dyn std::error::Error + Send + Sync>;
 type Result<T> = std::result::Result<T, NativeError>;
 fn failure(_: &str, _: &str, message: &str) -> NativeError {
@@ -14,15 +21,16 @@ fn require(ok: bool, message: &str) -> Result<()> {
         Err(failure("CORRELATION", "human", message))
     }
 }
-fn human_comment_is_empty030(comment: &str) -> bool {
-    comment.chars().all(|c| matches!(c,'\u{0009}'..='\u{000d}' | '\u{0020}' | '\u{00a0}' | '\u{1680}' | '\u{2000}'..='\u{200a}' | '\u{2028}' | '\u{2029}' | '\u{202f}' | '\u{205f}' | '\u{3000}' | '\u{feff}'))
+
+impl From<VerificationError> for NativeError {
+    fn from(error: VerificationError) -> Self {
+        match error {
+            VerificationError::Correlation { message, .. } => message.to_owned().into(),
+            VerificationError::Json(error) => error.into(),
+        }
+    }
 }
-#[path = "human_answer030.rs"]
-mod answer;
-use answer::HumanAnswer030;
-#[path = "human_clock_verify030.rs"]
-mod core;
-use core::*;
+
 #[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HumanProjection030 {

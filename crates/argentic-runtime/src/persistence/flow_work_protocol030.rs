@@ -45,7 +45,7 @@ pub(crate) struct FlowWorkTicket030 {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Reservation030 {
-    Pending(FlowWorkTicket030),
+    Pending(Box<FlowWorkTicket030>),
     Committed(ProtocolDecision030),
 }
 
@@ -166,6 +166,7 @@ fn uncertain() -> super::dto::EngineFailure {
         "Commit or handoff is uncertain; do not replay effects",
     )
 }
+#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 fn require(ok: bool, message: &str) -> Result<()> {
     if ok {
         Ok(())
@@ -173,10 +174,12 @@ fn require(ok: bool, message: &str) -> Result<()> {
         Err(denied(message))
     }
 }
+#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 fn json<T: Serialize>(value: &T) -> Result<String> {
     Ok(serde_json::to_string(value)?)
 }
 
+#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 fn live_activation<'a>(
     flow: &'a FlowState030,
     id: &FlowIdentity030,
@@ -613,7 +616,7 @@ async fn reserve_tx(
                 .execute(&mut *db).await?.rows_affected();
             require(changed == 1, "Pending ticket changed")?;
         }
-        return Ok(Reservation030::Pending(ticket));
+        return Ok(Reservation030::Pending(Box::new(ticket)));
     }
     let state = sqlx::query("SELECT revision,state_json FROM engine_flow030_work_state WHERE system_id=? AND invocation_id=? AND activation_id=?")
         .bind(&id.system_start_id).bind(&id.flow_invocation_id).bind(&input.context.work.activation_id).fetch_optional(&mut *db).await?;
@@ -649,7 +652,7 @@ async fn reserve_tx(
         .bind(json(&ticket)?)
         .execute(&mut *db)
         .await?;
-    Ok(Reservation030::Pending(ticket))
+    Ok(Reservation030::Pending(Box::new(ticket)))
 }
 
 async fn commit_tx(
@@ -864,6 +867,7 @@ pub(crate) async fn finish_joined_agent030(
     .await
 }
 
+#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 fn accepted_terminal030(
     attempt: &crate::agsdl_host_flow030::FlowWorkAttempt030,
     joined: &crate::agsdl_host_dispatch030::JoinedOwnedAgent030,
@@ -938,6 +942,10 @@ fn accepted_terminal030(
     }))
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "The transition checks independent ownership and join capabilities"
+)]
 async fn transition_inner(
     host: &HostState,
     pool: &SqlitePool,
@@ -978,7 +986,7 @@ async fn transition_inner(
     lease.ensure_live().map_err(|_| uncertain())?;
     let ticket = match reservation {
         Reservation030::Committed(value) => return Ok(value),
-        Reservation030::Pending(ticket) => ticket,
+        Reservation030::Pending(ticket) => *ticket,
     };
     drop(db);
     drop(gate);
@@ -1229,6 +1237,7 @@ pub(crate) async fn inspect_work_commit(
 
 /// Exercise the production 04 validator from a synthetic native test fixture.
 #[cfg(test)]
+#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 pub(crate) fn test_accepted_terminal030(
     attempt: &crate::agsdl_host_flow030::FlowWorkAttempt030,
     joined: &crate::agsdl_host_dispatch030::JoinedOwnedAgent030,

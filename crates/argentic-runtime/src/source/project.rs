@@ -72,6 +72,7 @@ struct Reader<'a> {
 }
 
 #[cfg(test)]
+#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 pub(super) fn assemble_folder(
     dir: Dir,
     manifest: Option<super::ProjectFile>,
@@ -80,6 +81,7 @@ pub(super) fn assemble_folder(
     assemble_folder_with_budget(dir, manifest, native_modes, SourceBudget::default())
 }
 
+#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 pub(super) fn assemble_folder_with_budget(
     dir: Dir,
     manifest: Option<super::ProjectFile>,
@@ -114,6 +116,7 @@ fn sidecar_name(name: &str) -> bool {
             }))
 }
 
+#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 fn restore_executable_modes(dir: &Dir, files: &mut Files, budget: &SourceBudget) -> Result<()> {
     let root = Path::new(MANIFEST);
     // Both folder and archive assembly preserve the project's selection.
@@ -181,6 +184,7 @@ fn restore_executable_modes(dir: &Dir, files: &mut Files, budget: &SourceBudget)
     Ok(())
 }
 
+#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 pub(super) fn assemble_archive(files: Files, budget: SourceBudget) -> Result<Project> {
     Reader::new(None, files, budget).assemble()
 }
@@ -199,6 +203,7 @@ impl<'a> Reader<'a> {
         }
     }
 
+    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     fn select(&mut self, path: &str, limit: u64) -> Result<()> {
         // Folder and archive inputs select the same portable names.
         self.budget
@@ -247,12 +252,14 @@ impl<'a> Reader<'a> {
 
     /// Record one path's spelling. Names that differ only by case folding
     /// or Unicode normalization collide, including directory names.
+    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     fn spell(&mut self, part: &str, path: &str) -> Result<()> {
         self.spell_charged_to(part, path, path)
     }
 
     /// Like `spell`, but a budget exhaustion names `owner`, the component
     /// whose walk is paying, while a collision still names `path`.
+    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     fn spell_charged_to(&mut self, part: &str, owner: &str, path: &str) -> Result<()> {
         self.budget
             .work(1 + part.len().div_ceil(8), "")
@@ -273,6 +280,7 @@ impl<'a> Reader<'a> {
         Ok(())
     }
 
+    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     fn resolve(&mut self, owner: &str, name: &str, pointer: &str) -> Result<String> {
         self.budget
             .work(1 + name.len().div_ceil(8), pointer)
@@ -358,6 +366,7 @@ impl<'a> Reader<'a> {
         }
     }
 
+    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     fn json(&mut self, file: &str) -> Result<Value> {
         self.select(file, MAX_JSON)?;
         let bytes = &self.files[file].bytes;
@@ -374,6 +383,7 @@ impl<'a> Reader<'a> {
         parse_json(bytes, file, true, &self.budget)
     }
 
+    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     fn component(
         &mut self,
         origins: &mut BTreeMap<String, String>,
@@ -402,6 +412,7 @@ impl<'a> Reader<'a> {
         Ok(value)
     }
 
+    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     fn assemble(mut self) -> Result<Project> {
         let entry = self.resolve(MANIFEST, MANIFEST, "")?;
         let config = self.json(&entry)?;
@@ -515,6 +526,7 @@ impl<'a> Reader<'a> {
         Ok(project)
     }
 
+    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     fn mcp_declarations(
         &mut self,
         project: &mut Project,
@@ -583,6 +595,7 @@ impl<'a> Reader<'a> {
         Ok(())
     }
 
+    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     fn rebase(
         &mut self,
         kind: &str,
@@ -617,6 +630,7 @@ impl<'a> Reader<'a> {
         }
     }
 
+    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     fn step(&mut self, step: &mut Value, owner: &str, pointer: &str) -> Result<()> {
         self.message(step, owner, pointer, "prompt")?;
         if let Some(next) = step.get_mut("next") {
@@ -635,6 +649,7 @@ impl<'a> Reader<'a> {
         Ok(())
     }
 
+    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     fn route(&mut self, route: &mut Value, owner: &str, pointer: &str) -> Result<()> {
         let mut target = |value: &mut Value, pointer: &str| -> Result<()> {
             if let Some(message) = value.get_mut("message") {
@@ -652,6 +667,7 @@ impl<'a> Reader<'a> {
         Ok(())
     }
 
+    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     fn message(&mut self, value: &mut Value, owner: &str, pointer: &str, key: &str) -> Result<()> {
         if let Some(items) = value.get_mut(key).and_then(Value::as_array_mut) {
             for (i, source) in items.iter_mut().enumerate() {
@@ -676,6 +692,7 @@ impl<'a> Reader<'a> {
         Ok(())
     }
 
+    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     fn uri(&mut self, source: &mut Value, owner: &str, pointer: &str, skill: bool) -> Result<()> {
         let Some(uri) = source.get("uri").and_then(Value::as_str) else {
             return Ok(());
@@ -755,6 +772,7 @@ impl<'a> Reader<'a> {
         Ok(())
     }
 
+    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     fn skill_tree(&mut self, directory: &str) -> Result<()> {
         if self.skills.contains(directory) {
             return Ok(());
@@ -842,6 +860,7 @@ impl<'a> Reader<'a> {
     }
 }
 
+#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 fn validate(project: &Project) -> Result<()> {
     let authored = encode_document(&project.document, &project.budget)?;
     argentic_core::validate_source(authored.as_bytes(), &project.budget).map_err(|error| {
@@ -861,6 +880,7 @@ fn validate(project: &Project) -> Result<()> {
     })
 }
 
+#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 fn object(value: Value, file: &str, pointer: &str) -> Result<Map<String, Value>> {
     match value {
         Value::Object(map) => Ok(map),
@@ -868,6 +888,7 @@ fn object(value: Value, file: &str, pointer: &str) -> Result<Map<String, Value>>
     }
 }
 
+#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 fn take_map(manifest: &mut Map<String, Value>, field: &str) -> Result<Map<String, Value>> {
     manifest
         .remove(field)
@@ -876,12 +897,14 @@ fn take_map(manifest: &mut Map<String, Value>, field: &str) -> Result<Map<String
         .map(Option::unwrap_or_default)
 }
 
+#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 fn string<'a>(value: &'a Value, file: &str, pointer: &str) -> Result<&'a str> {
     value
         .as_str()
         .ok_or_else(|| invalid(file, pointer, "Expected a string"))
 }
 
+#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 fn list(value: &Value, file: &str, pointer: &str) -> Result<Vec<String>> {
     let items = value
         .as_array()

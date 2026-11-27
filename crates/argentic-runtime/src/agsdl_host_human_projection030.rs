@@ -6,6 +6,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use sqlx::{Row, SqlitePool};
 
+#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 pub(crate) async fn read(
     pool: &SqlitePool,
     scope: HumanScope030,

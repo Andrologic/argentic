@@ -43,6 +43,10 @@ pub struct RuntimeProjectionContinuation030 {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "Boxing activation data changes the public projection item type"
+)]
 pub enum RuntimeProjectionItem030 {
     Instance { value: RuntimeInstance030 },
     Activation { value: RuntimeActivation030 },
@@ -81,6 +85,7 @@ pub struct RuntimeProjectionPage030 {
     pub next_page: Option<RuntimeProjectionContinuation030>,
 }
 
+#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 fn page(
     scope: RuntimeProjectionScope030,
     continuation: Option<RuntimeProjectionContinuation030>,

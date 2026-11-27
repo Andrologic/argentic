@@ -1,20 +1,20 @@
 //! Native command/check/MCP execution. The parent owns durable effect identities,
 //! permissions03, capture, the controller04 broker, and normalization05.
 //! No routing decisions or provider-generated identities are accepted here.
-use std::{
-    collections::BTreeMap,
-    path::PathBuf,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
-    time::Duration,
-};
+use std::{collections::BTreeMap, path::PathBuf, time::Duration};
 
 use async_trait::async_trait;
 use serde::Serialize;
-use tokio::{io::AsyncReadExt, sync::Mutex};
+use tokio::io::AsyncReadExt;
 use tokio_util::sync::CancellationToken;
+#[cfg(test)]
+use {
+    std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    tokio::sync::Mutex,
+};
 
 use crate::agsdl_host_confinement::SandboxPolicy;
 use crate::process::ContainedBackgroundProcess;
@@ -56,6 +56,7 @@ pub(crate) struct CallIdentity {
     pub native_call_id: String,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub(crate) enum Invocation {
@@ -63,6 +64,13 @@ pub(crate) enum Invocation {
         command: String,
         parse: Option<CommandParse>,
     },
+    #[cfg_attr(
+        not(all(target_os = "macos", target_arch = "aarch64")),
+        allow(
+            dead_code,
+            reason = "The macOS ARM64 process test constructs this check"
+        )
+    )]
     CompletionCheck {
         command: String,
         candidate_json: String,
@@ -75,13 +83,15 @@ pub(crate) enum Invocation {
         arguments_json: String,
     },
 }
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) enum CommandParse {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     Json,
-    Lines,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct CallRequest {
@@ -120,10 +130,19 @@ pub(crate) struct CommandGrant {
     pub environment: BTreeMap<String, String>,
     pub sandbox: SandboxPolicy,
 }
+#[cfg(test)]
 pub(crate) enum LaunchGrant {
+    #[cfg_attr(
+        not(all(target_os = "macos", target_arch = "aarch64")),
+        allow(
+            dead_code,
+            reason = "The macOS ARM64 process tests construct command grants"
+        )
+    )]
     Command(CommandGrant),
-    Mcp(raw_mcp::CapturedServer),
+    Mcp(Box<raw_mcp::CapturedServer>),
 }
+#[cfg(test)]
 pub(crate) struct ClaimedCall {
     pub ticket: String,
     pub control: Control,
@@ -133,6 +152,7 @@ pub(crate) struct ClaimedCall {
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub(crate) enum PhysicalEvidence {
+    #[cfg(test)]
     NotStarted,
     /// The existing process owner waits for the leader and every discovered
     /// descendant to disappear. Callers must reject incomplete tree inspection,
@@ -164,13 +184,14 @@ pub(crate) struct CommandReceipt {
     pub stderr_bytes: u64,
     pub truncated: bool,
 }
+#[cfg(test)]
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub(crate) enum RawReceipt {
     Command { receipt: CommandReceipt },
     CompletionCheck { receipt: CommandReceipt },
-    Mcp { receipt: raw_mcp::McpReceipt },
 }
+#[cfg(test)]
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Completion {
@@ -188,16 +209,20 @@ pub(crate) trait HostPort: Send + Sync + 'static {
     /// One durable claim before any external IO. A consumed claim, even after a
     /// lost receipt, MUST return an error, never a fresh launch ticket. Bind all
     /// request bytes and candidate/provider/work/epoch identities transactionally.
+    #[cfg(test)]
     async fn claim(&self, request: &CallRequest) -> Result<ClaimedCall>;
     /// Same gate acquired by parent Stop/revocation. It covers revalidation and
     /// synchronous process launch, not the whole duration of the effect.
+    #[cfg(test)]
     fn launch_gate(&self) -> Arc<Mutex<()>>;
     /// Under the gate: authenticate ticket, reload captured policy/server, consume
     /// any one-shot ask grant, enforce03 and revalidate current epoch/work/plan.
+    #[cfg(test)]
     async fn authorize_launch(&self, request: &CallRequest, ticket: &str) -> Result<LaunchGrant>;
     /// Persist raw result + physical facts atomically with effect settlement.
     /// Use normalization05 for calls and durable controller04 checkEnded for
     /// checks. Revalidate Stop/epoch; late results cannot release successors.
+    #[cfg(test)]
     async fn finish(&self, ticket: &str, completion: &Completion) -> Result<()>;
     /// Durable human open/close, pauses and answer deadlines belong to04/09.
     /// No answerTimeout means no implicit refusal. The callback returns only
@@ -217,11 +242,13 @@ pub(crate) trait HostPort: Send + Sync + 'static {
 /// One service shared by all provider adapters. The host stops admitted works,
 /// then calls close_and_join before releasing its runtime. IPC cancellation only
 /// drops the answer receiver; the owned job still cleans up and persists.
+#[cfg(test)]
 pub(crate) struct HostCallService {
     jobs: Mutex<Option<tokio::task::JoinSet<bool>>>,
     owner_failed: AtomicBool,
     closed: AtomicBool,
 }
+#[cfg(test)]
 impl HostCallService {
     pub(crate) fn new() -> Self {
         Self {
@@ -296,6 +323,7 @@ async fn execute(host: Arc<dyn HostPort>, request: CallRequest) -> Result<Comple
     result
 }
 
+#[cfg(test)]
 async fn execute_owned(host: Arc<dyn HostPort>, request: CallRequest) -> Result<Completion> {
     let claimed = host.claim(&request).await?;
     let gate = host.launch_gate();
@@ -332,7 +360,7 @@ async fn execute_owned(host: Arc<dyn HostPort>, request: CallRequest) -> Result<
                 "Command grant for a non-command invocation",
             )),
         },
-        Ok(LaunchGrant::Mcp(_)) => Err(CallError::new(
+        Ok(LaunchGrant::Mcp(_server)) => Err(CallError::new(
             "HOST_CAPABILITY",
             "MCP dispatch is closed until the native delivery fence is connected",
         )),
@@ -371,6 +399,7 @@ async fn execute_owned(host: Arc<dyn HostPort>, request: CallRequest) -> Result<
     Ok(completion)
 }
 
+#[cfg(test)]
 enum Started {
     Command(ContainedBackgroundProcess, CommandGrant),
 }

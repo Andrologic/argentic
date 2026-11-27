@@ -172,6 +172,7 @@ impl Client {
     pub(crate) async fn answer_request030(&mut self, id: Value, result: Value) -> Result<()> {
         self.reply_sender030().answer_request030(id, result).await
     }
+    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub(crate) fn response_value030(&mut self, value: &Value) -> Result<Value> {
         if value.get("error").is_some() {
             return Err(failure(
@@ -327,6 +328,7 @@ impl Client {
     }
 }
 
+#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 fn account_digest(account: &Value) -> Result<String> {
     if account["account"]["type"] != "chatgpt" {
         return Err(failure(
@@ -519,6 +521,7 @@ impl Client {
     }
 }
 #[cfg(test)]
+#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 fn conclusive_turn(value: &Value, turn: &str) -> Result<bool> {
     if required(value, "id")? != turn {
         return Err(failure(
@@ -538,6 +541,7 @@ fn conclusive_turn(value: &Value, turn: &str) -> Result<bool> {
     }
 }
 
+#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 pub(crate) fn required(value: &Value, name: &str) -> Result<String> {
     value
         .get(name)
@@ -553,6 +557,7 @@ pub(crate) fn required(value: &Value, name: &str) -> Result<String> {
         })
 }
 
+#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 fn verify_skills(value: &Value, bootstrap: &std::path::Path) -> Result<()> {
     let Some(entries) = value["data"].as_array() else {
         return Err(failure(
@@ -628,6 +633,7 @@ mod tests {
 
 /// Preserve only model settings advertised by model/list. No effort or default
 /// model is inferred from a module or a hard-coded model catalogue.
+#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 pub(crate) fn model_observations030(response: &Value) -> Result<Vec<Value>> {
     let refused = || {
         failure(

@@ -873,6 +873,7 @@ struct StopBeforeClaimExecutor {
     starts: Arc<AtomicUsize>,
 }
 impl AgentExecutor030 for StopBeforeClaimExecutor {
+    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     fn prepare(
         &self,
         prepared: PreparedEffectiveAgentWork030,
@@ -1153,7 +1154,7 @@ async fn native_flow_choices_preserve_received_prompt_through_entry_and_route() 
         let broker = host
             .flow030()
             .humans
-            .broker(&host, &pool, &identity)
+            .broker(host, &pool, &identity)
             .await
             .unwrap();
         for comment in ["First choice", "Second choice"] {
@@ -1175,7 +1176,7 @@ async fn native_flow_choices_preserve_received_prompt_through_entry_and_route() 
             let source: StartCapture030 = serde_json::from_str(&source).unwrap();
             broker
                 .submit(
-                    &host,
+                    host,
                     HumanSubmission030 {
                         scope: crate::persistence::public030::HumanScope030 {
                             source: source.source,
@@ -1192,7 +1193,7 @@ async fn native_flow_choices_preserve_received_prompt_through_entry_and_route() 
                 )
                 .await
                 .unwrap();
-            broker.pump(&host, &CancellationToken::new()).await.unwrap();
+            broker.pump(host, &CancellationToken::new()).await.unwrap();
         }
     });
     let event_app = app.as_ref().clone();
@@ -1212,7 +1213,7 @@ async fn native_flow_choices_preserve_received_prompt_through_entry_and_route() 
         std::time::Duration::from_secs(15),
         supervise_with_emitter030(
             Some(app.as_ref()),
-            &host,
+            host,
             &f.pool,
             &f.config.clone(),
             &tasks,
@@ -1226,7 +1227,7 @@ async fn native_flow_choices_preserve_received_prompt_through_entry_and_route() 
     .await;
     answers.abort();
     result.expect("flow choices stalled").unwrap();
-    let view = flow::inspect_run(host.flow030(), &host, &f.pool, &f.owner)
+    let view = flow::inspect_run(host.flow030(), host, &f.pool, &f.owner)
         .await
         .unwrap();
     assert_eq!(view.flow.state.verdict.as_deref(), Some("succeeded"));

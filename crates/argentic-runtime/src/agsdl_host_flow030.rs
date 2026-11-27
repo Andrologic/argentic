@@ -70,6 +70,7 @@ pub(crate) struct FlowWorkCommitMarker030 {
     ticket_sha256: String,
     decision_sha256: String,
 }
+#[cfg(test)]
 impl FlowWorkCommitMarker030 {
     pub(crate) fn identity(&self) -> &FlowIdentity030 {
         &self.identity
@@ -235,6 +236,7 @@ impl FlowWorkAttempt030 {
 }
 
 /// Correlation for the native terminal ledger, never an authority to emit it.
+#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 pub(crate) fn work_terminal_event_id030(
     identity: &FlowIdentity030,
     protocol_event_id: &str,
@@ -304,6 +306,7 @@ fn store_error(error: StoreError030) -> repository::dto::EngineFailure {
         _ => refused(),
     }
 }
+#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 pub(crate) fn digest<T: serde::Serialize>(value: &T) -> Result<String> {
     Ok(format!("{:x}", Sha256::digest(serde_json::to_vec(value)?)))
 }
@@ -427,17 +430,20 @@ impl FlowHost030 {
                 .forget();
         }
     }
+    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub(crate) fn available(&self, identity: &FlowIdentity030) -> Result<()> {
         self.available_except_route_source(identity, None)
     }
     /// A readback may inspect its own 037 marker, never another preparation or
     /// a Start, event or work commit. Mutation paths always use `available`.
+    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub(crate) fn available_for_route_source_readback(
         &self,
         reference: &PrepareRef030,
     ) -> Result<()> {
         self.available_except_route_source(&reference.identity, Some(reference))
     }
+    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     fn available_except_route_source(
         &self,
         identity: &FlowIdentity030,
@@ -485,6 +491,7 @@ impl FlowHost030 {
     }
     /// Install under the common admission gate before submitting the source
     /// transaction's COMMIT. Dropping its future never releases this barrier.
+    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub(crate) fn begin_route_source_commit(
         &self,
         source: &AttestedRouteSource030,
@@ -506,6 +513,7 @@ impl FlowHost030 {
         Ok(marker)
     }
     /// Observation only. A missing marker does not authorize a source write.
+    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub(crate) fn pending_route_source_commit(
         &self,
         reference: &PrepareRef030,
@@ -524,6 +532,7 @@ impl FlowHost030 {
     }
     /// The native lifecycle owner calls this only after successful COMMIT or
     /// an exact source readback. Absence leaves the marker in place.
+    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub(crate) fn acknowledge_route_source_commit(
         &self,
         marker: &RouteSourceCommitMarker030,
@@ -548,6 +557,7 @@ impl FlowHost030 {
     /// Called under the common admission gate after native SQL validation and
     /// before submitting the decision/check transaction's COMMIT. Cancellation
     /// never drops this barrier; only an exact native readback may resolve it.
+    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub(crate) fn begin_work_commit(
         &self,
         identity: &FlowIdentity030,
@@ -586,6 +596,7 @@ impl FlowHost030 {
     }
     /// Retrieving a marker grants no authority and does not release the gate.
     #[cfg(test)]
+    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub(crate) fn pending_work_commit(
         &self,
         identity: &FlowIdentity030,
@@ -599,6 +610,7 @@ impl FlowHost030 {
     }
     /// Native persistence first confirms the exact ticket, decision and check
     /// rows. This removes only that marker, without re-emitting any effect.
+    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub(crate) fn acknowledge_work_commit(&self, marker: &FlowWorkCommitMarker030) -> Result<()> {
         let mut pending = self.work_committing.lock().map_err(|_| unavailable())?;
         let key = (
@@ -614,6 +626,7 @@ impl FlowHost030 {
             }
         }
     }
+    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub(crate) fn pending_event_commit(
         &self,
         identity: &FlowIdentity030,
@@ -625,6 +638,7 @@ impl FlowHost030 {
             event => Ok(event.cloned()),
         }
     }
+    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub(crate) fn begin_event_commit(&self, event: &FlowEvent030) -> Result<()> {
         let mut pending = self.event_committing.lock().map_err(|_| unavailable())?;
         let key = (
@@ -649,6 +663,7 @@ impl FlowHost030 {
             }
         }
     }
+    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     fn begin(&self, request: &EngineStartRequest, identity: &FlowIdentity030) -> Result<()> {
         let mut pending = self.committing.lock().map_err(|_| unavailable())?;
         if pending.contains_key(&request.request_id) {
@@ -665,6 +680,7 @@ impl FlowHost030 {
             }
         }
     }
+    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub(crate) fn retain_diagnostic_join(&self, joined: &JoinedOwnedAgent030) -> Result<()> {
         let attempt = joined.attempt();
         let key = (
@@ -700,6 +716,7 @@ impl FlowHost030 {
             }
         }
     }
+    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub(crate) fn diagnostic_join(
         &self,
         identity: &FlowIdentity030,
@@ -718,6 +735,7 @@ impl FlowHost030 {
     }
     /// These capabilities were installed by native Start before COMMIT. A
     /// supplied system label cannot create retirement authority.
+    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub(crate) fn retiring_controls(&self, generation: &str) -> Result<Vec<Arc<FlowControl030>>> {
         Ok(self
             .controls
@@ -1000,15 +1018,15 @@ impl Authority030 for Authority<'_> {
                         return Err(StoreError030::Authority);
                     }
                 }
-                FlowEffectKind030::StopWork { work, .. } => {
+                FlowEffectKind030::StopWork { work, .. }
                     if !state.activations.iter().any(|a| {
                         a.id == work.activation_id
                             && a.start_effect_id.as_deref() == Some(&work.start_effect_id)
                             && a.instance_id == work.agent_instance_id
                             && a.physical
-                    }) {
-                        return Err(StoreError030::Authority);
-                    }
+                    }) =>
+                {
+                    return Err(StoreError030::Authority);
                 }
                 _ => {}
             }
@@ -1064,6 +1082,7 @@ impl FlowHost030 {
     pub(crate) async fn start_admission_guard(&self) -> tokio::sync::RwLockReadGuard<'_, ()> {
         self.start_admission.read().await
     }
+    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub(crate) fn ensure_accepting_starts(&self) -> Result<()> {
         if self
             .shutdown_started
@@ -1090,6 +1109,7 @@ impl FlowHost030 {
     pub(crate) fn supervisor_registry(&self) -> &crate::agsdl_host_runtime030::RuntimeRegistry030 {
         &self.supervisors
     }
+    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub(crate) fn require_start_clear(&self, request: &EngineStartRequest) -> Result<()> {
         if self
             .committing
@@ -1101,6 +1121,7 @@ impl FlowHost030 {
         }
         Ok(())
     }
+    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub(crate) fn retain_start_before_commit(
         &self,
         host: &HostState,
@@ -1142,6 +1163,7 @@ pub(crate) struct NativeFlowInspection030 {
 }
 
 impl NativeFlowInspection030 {
+    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub(crate) fn start_withdrawn(&self, effect: &FlowEffect030) -> Result<bool> {
         let FlowEffectKind030::Start { work, .. } = &effect.kind else {
             return Ok(false);
@@ -1412,30 +1434,6 @@ pub(crate) async fn apply_native_event_transaction030(
     Ok(result)
 }
 
-/// Readback only: never reapply an absent event or infer rollback from absence.
-/// A matching durable event can resolve a cancelled/unknown COMMIT barrier.
-pub(crate) async fn inspect_native_event_commit(
-    runtime: &FlowHost030,
-    host: &HostState,
-    pool: &SqlitePool,
-    event: &FlowEvent030,
-) -> Result<Option<Apply030>> {
-    let lease = host.start_lease().await?;
-    let _admission = host.admission_lock().lock_owned().await;
-    let authority = Authority {
-        runtime,
-        lease: &lease,
-        owner: lease.owner(&event.identity.system_start_id)?,
-    };
-    let mut db = pool.acquire().await?;
-    let mut tx = db.begin().await?;
-    authority
-        .owner(&mut tx, &event.identity)
-        .await
-        .map_err(store_error)?;
-    resolve_native_event_commit_tx(runtime, &lease, tx, event).await
-}
-
 async fn resolve_native_event_commit_tx(
     runtime: &FlowHost030,
     lease: &HostStartLease,
@@ -1529,6 +1527,7 @@ pub(crate) async fn reconcile_event_commits_locked030(
     Ok(true)
 }
 
+#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 fn pending_flow_events(runtime: &FlowHost030, system_id: &str) -> Result<Vec<FlowEvent030>> {
     Ok(runtime
         .event_committing
@@ -1621,9 +1620,7 @@ pub(crate) struct CapturedRoutePreparation030 {
     receipt_id: String,
 }
 impl CapturedRoutePreparation030 {
-    pub(crate) fn receipt_id(&self) -> &str {
-        &self.receipt_id
-    }
+    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub(crate) fn input_json(&self) -> Result<String> {
         Ok(serde_json::to_string(&json!({
             "planJson": self.capture.compiled_plan_json,
@@ -1673,52 +1670,6 @@ pub(crate) async fn check_persisted_occurrence(
     Ok(raw)
 }
 
-/// Private host lookup for delivery construction, never an IPC grant. Admission
-/// rechecks the same witness inside its immediate claim transaction.
-pub(crate) async fn occurrence_provenance(
-    runtime: &FlowHost030,
-    host: &HostState,
-    pool: &SqlitePool,
-    owner: &EngineOwner,
-    occurrence: &DeliveryOccurrence030,
-    producer: &Producer030,
-) -> Result<String> {
-    let lease = host.start_lease().await?;
-    if lease.owner(&owner.system_start_id)? != *owner {
-        return Err(refused());
-    }
-    let authority = Authority {
-        runtime,
-        lease: &lease,
-        owner: owner.clone(),
-    };
-    let mut db = pool.acquire().await?;
-    let mut tx = db.begin().await?;
-    let capture: String =
-        sqlx::query_scalar("SELECT capture_json FROM engine_start030_requests WHERE system_id=?")
-            .bind(&owner.system_start_id)
-            .fetch_one(&mut *tx)
-            .await?;
-    let capture: StartCapture030 = serde_json::from_str(&capture)?;
-    authority
-        .owner(&mut tx, &capture.identity)
-        .await
-        .map_err(store_error)?;
-    let raw = check_persisted_occurrence(
-        &mut tx,
-        &capture.identity,
-        occurrence,
-        &Some(producer.clone()),
-        &owner.owner_epoch,
-        lease.generation(),
-    )
-    .await
-    .map_err(store_error)?;
-    tx.commit().await?;
-    lease.ensure_live()?;
-    Ok(raw)
-}
-
 #[derive(Deserialize)]
 #[serde(
     tag = "kind",
@@ -1737,6 +1688,7 @@ enum RoutePreparationOutput030 {
     },
 }
 
+#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 fn route_material_source(
     material: &NativeRouteMaterial030,
     producer: &Producer030,
@@ -1851,6 +1803,10 @@ pub(crate) async fn capture_route_preparation<V: RouteMaterialVerifier030>(
 
 /// Native end-to-end path through the resident pure helper. This evaluates no
 /// model and performs no content I/O; material contains previously attested receipts.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "The route commit binds separate native authority and input values"
+)]
 pub(crate) async fn prepare_route<V: RouteMaterialVerifier030>(
     runtime: &FlowHost030,
     host: &HostState,
@@ -1881,6 +1837,7 @@ pub(crate) async fn prepare_route<V: RouteMaterialVerifier030>(
     apply_route_preparation(runtime, host, pool, &job, &result, verifier).await
 }
 
+#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 fn route_prepared_result(
     job: &CapturedRoutePreparation030,
     result_json: &str,
@@ -2089,33 +2046,6 @@ pub(crate) async fn apply_route_preparation<V: RouteMaterialVerifier030>(
     Ok(result)
 }
 
-/// Resolve this process's pending preparation COMMIT by its sealed native job.
-/// Absence leaves the barrier untouched and never authorizes another effect.
-pub(crate) async fn inspect_route_preparation_commit(
-    runtime: &FlowHost030,
-    host: &HostState,
-    pool: &SqlitePool,
-    job: &CapturedRoutePreparation030,
-) -> Result<Option<Apply030>> {
-    let key = (
-        job.reference.identity.system_start_id.clone(),
-        format!("prepared:{}", job.receipt_id),
-    );
-    let event = runtime
-        .event_committing
-        .lock()
-        .map_err(|_| unavailable())?
-        .get(&key)
-        .cloned();
-    match event {
-        Some(event) if event.identity == job.reference.identity => {
-            inspect_native_event_commit(runtime, host, pool, &event).await
-        }
-        Some(_) => Err(refused()),
-        None => Ok(None),
-    }
-}
-
 struct Unadmitted030 {
     owner: EngineOwner,
     generation: String,
@@ -2174,8 +2104,8 @@ impl ClaimedStopWork030 {
 enum Handoff030 {
     Host,
     Agent {
-        attempt: FlowWorkAttempt030,
-        policy: AttestedWorkPolicy030,
+        attempt: Box<FlowWorkAttempt030>,
+        policy: Box<AttestedWorkPolicy030>,
     },
 }
 impl DispatchLease030<'_> {
@@ -2190,6 +2120,7 @@ impl DispatchLease030<'_> {
     }
     /// Retain the exact claimed cancellation while releasing admission before
     /// waiting for the already-owned agent. SQL remains uncertain on drop.
+    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub(crate) fn into_stop_work(self, attempt: &FlowWorkAttempt030) -> Result<ClaimedStopWork030> {
         self.runtime.available(&self.effect.identity)?;
         self.lease.ensure_live()?;
@@ -2529,8 +2460,15 @@ impl DispatchLease030<'_> {
             provider_attempt_id: uuid::Uuid::new_v4().to_string(),
         };
         let work = make_work(attempt.clone());
-        self.handoff_inner(tasks, work, Handoff030::Agent { attempt, policy })
-            .await
+        self.handoff_inner(
+            tasks,
+            work,
+            Handoff030::Agent {
+                attempt: Box::new(attempt),
+                policy: Box::new(policy),
+            },
+        )
+        .await
     }
 
     async fn handoff_inner<F>(
@@ -3094,6 +3032,7 @@ fn stop_marker(receipt: &NativeSystemStopReceipt030) -> FlowEvent030 {
     }
 }
 
+#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 fn system_stop_control(
     runtime: &FlowHost030,
     request: &EngineStopRequest,

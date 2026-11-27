@@ -19,6 +19,7 @@ pub struct ModelOverride {
 
 /// Add a run's model choices to its native observations before versioning
 /// the registry and compiling. Keep all authored agent declarations intact.
+#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 pub fn apply_model_overrides(
     registry: &mut Value,
     overrides: &BTreeMap<String, ModelOverride>,
@@ -67,6 +68,7 @@ fn model_correlation() -> crate::persistence::dto::EngineFailure {
 
 /// Match the frozen choice to the native request and recorded catalogue.
 /// Old captures omit the optional field on both sides.
+#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 pub(crate) fn verify_model_overrides(
     plan: &crate::persistence::flow030::FlowPlan030,
     registry: &Value,
@@ -136,6 +138,7 @@ pub(crate) fn verify_model_overrides(
     Ok(effective)
 }
 
+#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 pub(crate) fn document_location(scope: &Value) -> Result<Option<url::Url>> {
     scope
         .get("documentLocation")
@@ -148,6 +151,7 @@ pub(crate) fn document_location(scope: &Value) -> Result<Option<url::Url>> {
         .transpose()
 }
 
+#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 pub(crate) fn captured_document_location(
     capture: &crate::persistence::start030::StartCapture030,
 ) -> Result<Option<url::Url>> {
@@ -177,6 +181,7 @@ fn version_requirement(range: &str) -> std::result::Result<VersionReq, semver::E
 
 /// The retained project root in the same form `canonicalize` gives a skill
 /// path, including Windows' verbatim prefix. A missing snapshot is refused.
+#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 pub(crate) fn captured_project_root(
     document_location: Option<&url::Url>,
 ) -> Result<std::path::PathBuf> {
@@ -195,6 +200,7 @@ pub(crate) fn captured_project_root(
 
 /// Describe only the installed adapter observed through the native profile.
 /// This prepares compiler inputs and never authorizes execution.
+#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 pub fn codex_registry(
     document: &Value,
     source_sha256: &str,
@@ -213,6 +219,7 @@ pub fn codex_registry(
 }
 
 /// Build only compiler inputs. Native admission verifies the captured adapter.
+#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 pub fn observed_registry(
     document: &Value,
     source_sha256: &str,

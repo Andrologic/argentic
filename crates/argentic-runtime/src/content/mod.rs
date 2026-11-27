@@ -45,6 +45,10 @@ pub type ContentReadScope = Arc<dyn Fn(&std::path::Path) -> ContentResult<()> + 
 type ReadTargetScope =
     Arc<dyn Fn(&std::path::Path, Option<&std::path::Path>) -> ContentResult<()> + Send + Sync>;
 
+type ContentApprover = dyn Fn(ContentAdmission) -> Pin<Box<dyn Future<Output = ContentResult<()>> + Send>>
+    + Send
+    + Sync;
+
 /// Only the native host constructs this. Do not expose its constructor as IPC.
 /// The host supplies the import/read location, never a message's baseUri or cwd.
 pub struct ContentContext {
@@ -61,11 +65,7 @@ pub struct ContentContext {
     purpose: ExecutionPurpose,
     cancel: CancellationToken,
     // 09 consumes a single-action, correlated approval after revalidation.
-    approve: Arc<
-        dyn Fn(ContentAdmission) -> Pin<Box<dyn Future<Output = ContentResult<()>> + Send>>
-            + Send
-            + Sync,
-    >,
+    approve: Arc<ContentApprover>,
 }
 
 /// Native-only snapshot of a live context. It carries no deserializer and does
@@ -221,11 +221,7 @@ impl ContentContext {
         policy: EffectivePolicy,
         purpose: ExecutionPurpose,
         cancel: CancellationToken,
-        approve: Arc<
-            dyn Fn(ContentAdmission) -> Pin<Box<dyn Future<Output = ContentResult<()>> + Send>>
-                + Send
-                + Sync,
-        >,
+        approve: Arc<ContentApprover>,
     ) -> ContentResult<Self> {
         argentic_core::durable_json::validate(&document_json).map_err(|e| error("PARSE", e))?;
         if capture_id.is_empty() || digest(document_json.as_bytes()) != source_digest {

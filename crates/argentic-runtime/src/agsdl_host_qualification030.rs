@@ -105,6 +105,7 @@ pub(crate) fn mcp_endpoint_diagnostic(name: &str, server: &Value) -> Option<Diag
     })
 }
 
+#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 pub(crate) fn qualify_product030(
     document: &Value,
     compiled: Option<&str>,

@@ -25,6 +25,7 @@ struct Incarnation {
 impl Incarnation {
     // This gate covers only synchronous ownership transfer. Work admitted here
     // stays owned after revocation and must be cancelled and joined by retirement.
+    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     fn admit_owned<F>(
         &self,
         owner: &EngineOwner,
@@ -157,6 +158,7 @@ pub(crate) struct HostStartLease {
 impl HostStartLease {
     /// Clear a reconciled work barrier at the same synchronous boundary used
     /// by revocation. No IO or await occurs while this guard is held.
+    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub(crate) fn acknowledge_work_commit(
         &self,
         runtime: &crate::agsdl_host_flow030::FlowHost030,
@@ -173,6 +175,7 @@ impl HostStartLease {
         runtime.acknowledge_work_commit(marker)
     }
 
+    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub(crate) fn acknowledge_route_source_commit(
         &self,
         runtime: &crate::agsdl_host_flow030::FlowHost030,
@@ -227,6 +230,7 @@ impl HostStartLease {
             self.host.generation.clone(),
         ))
     }
+    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub(crate) fn call_data030(&self) -> Result<crate::agsdl_host_calls030::CallDataBroker030> {
         self.ensure_live()?;
         Ok(
@@ -239,6 +243,7 @@ impl HostStartLease {
     /// Transfer an exact native effect to its cancellable owner while this
     /// lease keeps the incarnation attached. The caller must also hold the
     /// shared admission exclusion through the acknowledged claim commit.
+    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub(crate) fn admit_owned_stream<F>(
         &self,
         owner: &EngineOwner,
@@ -254,6 +259,7 @@ impl HostStartLease {
 
     /// Install a native agent parent before its first poll. The surrounding
     /// handoff keeps IO gated until its durable receipt has committed.
+    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub(crate) fn admit_owned_agent_stream030<F>(
         &self,
         attempt: &crate::agsdl_host_flow030::FlowWorkAttempt030,
@@ -310,6 +316,7 @@ impl HostStartLease {
     /// Attach an already claimed exact operation to the currently executing
     /// owned parent. The caller must hold the admission gate and confirm the
     /// durable claim before calling; this attachment does not grant authority.
+    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub(crate) fn attach_owned_operation030(
         &self,
         tasks: &stream_tasks::StreamTasks,
@@ -355,6 +362,7 @@ impl HostStartLease {
 
     /// Release an already owned effect at the same boundary as revocation.
     /// The callback must only update in-memory bookkeeping and must not block.
+    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub(crate) fn release_owned_stream030(
         &self,
         owner: &EngineOwner,
@@ -394,6 +402,7 @@ impl HostStartLease {
     pub(crate) fn generation(&self) -> &str {
         &self.host.generation
     }
+    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub(crate) fn ensure_live(&self) -> Result<()> {
         if !self.host.live.load(Ordering::SeqCst) {
             return Err(failure(
@@ -404,6 +413,7 @@ impl HostStartLease {
         }
         Ok(())
     }
+    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub(crate) fn owner(&self, system_id: &str) -> Result<EngineOwner> {
         self.ensure_live()?;
         self.host
@@ -414,6 +424,7 @@ impl HostStartLease {
             .cloned()
             .ok_or_else(|| failure("RUNTIME_UNAVAILABLE", "owner", "System has no native owner"))
     }
+    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub(crate) fn retain_committed_owner(&self, owner: EngineOwner) -> Result<()> {
         // Deliberately record even if retirement began during SQL commit. The
         // retirement writer cannot inspect this map until this lease is dropped.
@@ -444,6 +455,7 @@ impl HostState {
         self.flow030().shutdown_started.load(Ordering::SeqCst)
     }
 
+    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     fn native_incarnation(&self) -> Result<Arc<Incarnation>> {
         self.inner
             .incarnation

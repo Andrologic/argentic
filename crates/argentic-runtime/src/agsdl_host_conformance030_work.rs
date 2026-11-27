@@ -28,7 +28,7 @@ pub(super) fn compare(raw_job: &str, expected: &Value) -> Result<(), String> {
         if actual[field].as_str() != Some(expected) {
             return Err(format!(
                 "Captured work {field} differs; job={raw_job}; expected={expected}; actual={}",
-                actual.to_string()
+                actual
             ));
         }
     }

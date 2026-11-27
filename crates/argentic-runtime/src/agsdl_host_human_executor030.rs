@@ -170,6 +170,7 @@ impl crate::agsdl_host_calls::HostPort for CallHumans030 {
     fn supports_human_requests(&self) -> bool {
         true
     }
+    #[cfg(test)]
     async fn claim(
         &self,
         _: &crate::agsdl_host_calls::CallRequest,
@@ -179,9 +180,11 @@ impl crate::agsdl_host_calls::HostPort for CallHumans030 {
             "Use the flow call admission",
         ))
     }
+    #[cfg(test)]
     fn launch_gate(&self) -> Arc<tokio::sync::Mutex<()>> {
         self.app.clone().admission_lock()
     }
+    #[cfg(test)]
     async fn authorize_launch(
         &self,
         _: &crate::agsdl_host_calls::CallRequest,
@@ -192,6 +195,7 @@ impl crate::agsdl_host_calls::HostPort for CallHumans030 {
             "Use the flow call admission",
         ))
     }
+    #[cfg(test)]
     async fn finish(
         &self,
         _: &str,

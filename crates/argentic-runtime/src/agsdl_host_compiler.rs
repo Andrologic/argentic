@@ -147,6 +147,7 @@ impl CompileBroker {
             })?
             .map_err(|_| failure("RUNTIME_UNAVAILABLE", "", "Compiler ticket was lost"))?
     }
+    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub(crate) async fn compile_native(
         &self,
         generation: &str,
@@ -275,6 +276,7 @@ impl CompileBroker {
         }
     }
     #[cfg(test)]
+    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub(crate) fn complete(
         &self,
         generation: &str,
@@ -351,6 +353,7 @@ fn native_json_failure(
     }
 }
 
+#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 fn check_json(raw: &str, pointer: &str, budget: &SourceBudget) -> Result<()> {
     argentic_core::check_source_json(raw, pointer, budget).map_err(native_json_failure)?;
     // The host parses this checked text once more to correlate the receipt.
@@ -359,6 +362,7 @@ fn check_json(raw: &str, pointer: &str, budget: &SourceBudget) -> Result<()> {
         .map_err(native_limit)
 }
 
+#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 fn validate_input(
     source: &EngineSourceRevision,
     authored_source: &str,
@@ -418,6 +422,7 @@ fn validate_input(
     Ok(registry)
 }
 
+#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 fn validate_result(
     source: &EngineSourceRevision,
     authored_source: &str,

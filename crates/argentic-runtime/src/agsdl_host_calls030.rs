@@ -3,7 +3,7 @@
 //! These APIs are private, never model tools or IPC.
 use crate::agsdl_host_calls::Control;
 use crate::agsdl_host_route030::RouteBroker030;
-#[cfg(test)]
+#[cfg(all(test, feature = "agsdl-engine-qa", debug_assertions))]
 use crate::agsdl_host_route030::{HostRouteCompletion030, HostRouteJob030};
 use crate::persistence::{
     call_protocol030 as protocol,
@@ -12,7 +12,7 @@ use crate::persistence::{
     start030::StartCapture030,
     Result,
 };
-#[cfg(test)]
+#[cfg(all(test, feature = "agsdl-engine-qa", debug_assertions))]
 use crate::persistence::{call_protocol030::CallCauseReceipt030, flow030::WorkRef030};
 use serde::{Deserialize, Serialize};
 use sqlx::{Connection, SqliteConnection, SqlitePool};
@@ -32,6 +32,7 @@ pub(crate) use protocol::{CallAttempt030, CallDiagnostic030, CallReceipt030, Cal
 /// debug-only and restricted to its authenticated fixture pin.
 pub(crate) trait CallAuthority030: Authority030 + Sync {
     fn generation(&self) -> &str;
+    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     fn ensure_live(&self) -> Result<()>;
     /// The integrator also checks this fence in flow admission/dispatch.
     fn call_commits(&self) -> &CallCommitFence030;
@@ -56,6 +57,7 @@ impl CallCommitFence030 {
     fn key(id: &FlowIdentity030) -> (String, String) {
         (id.system_start_id.clone(), id.flow_invocation_id.clone())
     }
+    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub(crate) fn require_clear(&self, id: &FlowIdentity030) -> Result<()> {
         if self
             .0
@@ -68,7 +70,7 @@ impl CallCommitFence030 {
             Ok(())
         }
     }
-    #[cfg(test)]
+    #[cfg(all(test, feature = "agsdl-engine-qa", debug_assertions))]
     pub(crate) fn pending(&self, id: &FlowIdentity030) -> Option<protocol::CallCommitMarker030> {
         self.0
             .lock()
@@ -76,6 +78,7 @@ impl CallCommitFence030 {
             .get(&Self::key(id))
             .cloned()
     }
+    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub(crate) fn begin(&self, marker: &protocol::CallCommitMarker030) -> Result<()> {
         let mut pending = self.0.lock().expect("call commits");
         protocol::require(
@@ -85,6 +88,7 @@ impl CallCommitFence030 {
         pending.insert(Self::key(marker.identity()), marker.clone());
         Ok(())
     }
+    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     fn acknowledge(&self, marker: &protocol::CallCommitMarker030) -> Result<()> {
         let mut pending = self.0.lock().expect("call commits");
         protocol::require(
@@ -109,7 +113,7 @@ async fn commit_call_tx<A: CallAuthority030>(
 }
 /// A matching retained marker is the only way to clear an unknown COMMIT.
 /// Missing/mismatching rows remain blocked; no status is reset for convenience.
-#[cfg(test)]
+#[cfg(all(test, feature = "agsdl-engine-qa", debug_assertions))]
 pub(crate) async fn inspect_call_commit030<A: CallAuthority030>(
     pool: &SqlitePool,
     authority: &A,
@@ -182,8 +186,26 @@ enum PreparedData030 {
 #[derive(Debug)]
 pub(crate) enum CallPreparation030 {
     Ready,
-    Failed { receipt: CallReceipt030 },
-    Diagnostic { diagnostic: CallDiagnostic030 },
+    Failed {
+        #[cfg_attr(
+            not(all(test, feature = "agsdl-engine-qa", debug_assertions)),
+            allow(
+                dead_code,
+                reason = "Tests inspect the terminal receipt already persisted by settlement"
+            )
+        )]
+        receipt: CallReceipt030,
+    },
+    Diagnostic {
+        #[cfg_attr(
+            not(all(test, feature = "agsdl-engine-qa", debug_assertions)),
+            allow(
+                dead_code,
+                reason = "Tests inspect the diagnostic already persisted by settlement"
+            )
+        )]
+        diagnostic: CallDiagnostic030,
+    },
 }
 struct NormalizedData030(protocol::CallResult030);
 
@@ -215,15 +237,16 @@ impl CallDataBroker030 {
             evaluation: CallDataEvaluation030::Native(generation),
         }
     }
-    #[cfg(test)]
+    #[cfg(all(test, feature = "agsdl-engine-qa", debug_assertions))]
     pub(crate) async fn next(&self) -> Result<HostRouteJob030> {
         self.route.next().await
     }
-    #[cfg(test)]
+    #[cfg(all(test, feature = "agsdl-engine-qa", debug_assertions))]
+    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub(crate) fn complete(&self, generation: &str, result: HostRouteCompletion030) -> Result<()> {
         self.route.complete(generation, result)
     }
-    #[cfg(test)]
+    #[cfg(all(test, feature = "agsdl-engine-qa", debug_assertions))]
     pub(crate) fn close(&self) {
         self.route.close();
     }
@@ -531,6 +554,7 @@ pub(crate) struct SyntheticCallDriver030 {
 }
 #[cfg(test)]
 impl SyntheticCallDriver030 {
+    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub(crate) fn send(self, event: CallEvent030) -> Result<()> {
         self.sender
             .send(event)
@@ -707,7 +731,7 @@ pub(crate) async fn stop_before_launch030<A: CallAuthority030>(
 /// The 040 clock decision is re-read on this transaction; call admission alone
 /// cannot authorize expiration. No reason, proof or timestamp comes from a caller.
 /// This transaction includes the exact cause in the unknown-commit fence.
-#[cfg(test)]
+#[cfg(all(test, feature = "agsdl-engine-qa", debug_assertions))]
 pub(crate) async fn record_call_cause030<A: CallAuthority030>(
     pool: &SqlitePool,
     authority: &A,
@@ -724,7 +748,7 @@ pub(crate) async fn record_call_cause030<A: CallAuthority030>(
     commit_call_tx(tx, authority, attempt).await?;
     Ok(receipt)
 }
-#[cfg(test)]
+#[cfg(all(test, feature = "agsdl-engine-qa", debug_assertions))]
 pub(crate) async fn read_call_diagnostic030<A: CallAuthority030>(
     pool: &SqlitePool,
     authority: &A,
@@ -739,7 +763,7 @@ pub(crate) async fn read_call_diagnostic030<A: CallAuthority030>(
 }
 
 /// Readback grants no launch capability and never calls the pure worker.
-#[cfg(test)]
+#[cfg(all(test, feature = "agsdl-engine-qa", debug_assertions))]
 pub(crate) async fn read_call_receipt030<A: CallAuthority030>(
     pool: &SqlitePool,
     authority: &A,

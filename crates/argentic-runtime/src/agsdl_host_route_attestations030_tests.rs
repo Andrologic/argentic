@@ -1498,9 +1498,7 @@ async fn join_error_relabelled_as_agent_is_rejected_before_commit() {
         &CancellationToken::new(),
     )
     .await;
-    let error = result
-        .err()
-        .expect("join error relabelled as agent was accepted");
+    let error = result.expect_err("join error relabelled as agent was accepted");
     assert_eq!(error.code, "AUTHORITY");
     assert_eq!(error.message, "Native route material is not attested");
     let count: i64 =
@@ -1528,9 +1526,7 @@ async fn agent_route_without_joined_witness_is_rejected_before_commit() {
         &CancellationToken::new(),
     )
     .await;
-    let error = result
-        .err()
-        .expect("agent route without a joined witness was accepted");
+    let error = result.expect_err("agent route without a joined witness was accepted");
     assert_eq!(error.code, "CORRELATION");
     assert_eq!(error.message, "Route source ownership kind differs");
     let count: i64 =

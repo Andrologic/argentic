@@ -35,6 +35,7 @@ pub(crate) struct OwnedOperation030 {
 /// consume the attached operation itself rather than reconstructing its bytes.
 pub(crate) struct OwnedOperationPermit030 {
     operation: OwnedOperation030,
+    #[cfg(test)]
     digest: String,
     registry: std::sync::Weak<Mutex<HashMap<String, Entry>>>,
     parent_request_id: String,
@@ -64,6 +65,7 @@ fn agent_binding030(
     Ok(format!("{:x}", Sha256::digest(raw)))
 }
 impl OwnedOperationPermit030 {
+    #[cfg(test)]
     pub(crate) fn digest(&self) -> &str {
         &self.digest
     }
@@ -238,6 +240,10 @@ impl StreamTasks {
     // Production binding awaits native 036 admission; do not derive it from
     // the first operation. This constructor is available only to fixtures.
     #[cfg(test)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Tests construct the full work identity explicitly"
+    )]
     pub(crate) fn start_work_fixture030<F>(
         &self,
         request_id: String,
@@ -358,6 +364,7 @@ impl StreamTasks {
         request_id: &str,
         operation: OwnedOperation030,
     ) -> Result<OwnedOperationPermit030, String> {
+        #[cfg(test)]
         use sha2::{Digest, Sha256};
         let in_parent = OWNED_STREAM_SCOPE
             .try_with(|(registry, scoped_id)| {
@@ -381,6 +388,7 @@ impl StreamTasks {
         }
         let encoded = serde_json::to_vec(&operation)
             .map_err(|_| "Native operation attribution cannot be encoded.")?;
+        #[cfg(test)]
         let digest = format!("{:x}", Sha256::digest(&encoded));
         let mut entries = self
             .entries
@@ -433,6 +441,7 @@ impl StreamTasks {
         parent.operations030_bytes = total;
         Ok(OwnedOperationPermit030 {
             operation,
+            #[cfg(test)]
             digest,
             registry: Arc::downgrade(&self.entries),
             parent_request_id: request_id.into(),
@@ -834,11 +843,12 @@ mod tests {
             )
             .unwrap();
         rx.await.unwrap();
-        let entries = registry.entries.lock().unwrap();
-        let stored = &entries["parent"].operations030["operation"];
-        assert_eq!(stored.request_json, r#"{"value":1e0}"#);
-        assert_eq!(stored.provider_attempt_id, "attempt");
-        drop(entries);
+        {
+            let entries = registry.entries.lock().unwrap();
+            let stored = &entries["parent"].operations030["operation"];
+            assert_eq!(stored.request_json, r#"{"value":1e0}"#);
+            assert_eq!(stored.provider_attempt_id, "attempt");
+        }
         assert!(registry.cancel_owned("parent").await.unwrap());
         assert!(registry
             .attach_operation030("parent", operation030())

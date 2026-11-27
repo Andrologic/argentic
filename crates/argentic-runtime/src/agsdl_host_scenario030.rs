@@ -325,6 +325,7 @@ const SCENARIO_PINS: &[(&str, &str)] = &[
         "c66096b2d8a6a4b50bd6457827914f8b6aa2bbe67399aaba50b4f50c71261ca9",
     ),
 ];
+#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 fn verify_fixture_pin(name: &str, raw: &str) -> Result<()> {
     if SCENARIOS_040
         .iter()
@@ -426,6 +427,7 @@ fn bad() -> crate::persistence::dto::EngineFailure {
     )
 }
 
+#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 fn key(step: &str, item: Option<&RawValue>) -> Result<WorkKey030> {
     let path = step.split('/').map(str::to_owned).collect::<Vec<_>>();
     if path.is_empty() || path.iter().any(|s| s.is_empty()) {
@@ -441,6 +443,7 @@ fn key(step: &str, item: Option<&RawValue>) -> Result<WorkKey030> {
     Ok(WorkKey030 { step: path, item })
 }
 
+#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 fn parse_timeline(raw: &RawValue) -> Result<TimelineEvent030> {
     let mut fields: BTreeMap<String, Box<RawValue>> = serde_json::from_str(raw.get())?;
     if let Some(elapse) = fields.remove("elapse") {
@@ -603,6 +606,7 @@ fn parse_timeline(raw: &RawValue) -> Result<TimelineEvent030> {
     Ok(TimelineEvent030::Work { key: k, outcome })
 }
 
+#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 pub(crate) fn fixture_document(raw: &str) -> Result<&str> {
     match raw.trim_start().as_bytes().first() {
         Some(b'{') => Ok(raw),
@@ -619,6 +623,7 @@ pub(crate) fn fixture_document(raw: &str) -> Result<&str> {
 }
 
 #[cfg(test)]
+#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 pub(crate) fn published_fixture(
     name: &'static str,
     raw: &str,
@@ -640,6 +645,7 @@ pub(crate) fn published_fixture(
 }
 
 impl PinnedScenario030 {
+    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub(crate) fn recognizes_document(document_json: &str) -> Result<bool> {
         for &(name, raw) in SCENARIOS
             .iter()
@@ -657,6 +663,7 @@ impl PinnedScenario030 {
     }
 
     /// Accept only an exact fixture document and entry from the native capture.
+    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub(crate) fn from_capture(document_json: &str, entry_json: &str) -> Result<Self> {
         let mut found = None;
         for &(name, raw) in SCENARIOS.iter().chain(SHARED_STOP_SCENARIOS) {

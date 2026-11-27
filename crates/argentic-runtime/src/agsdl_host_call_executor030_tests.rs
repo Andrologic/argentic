@@ -102,13 +102,13 @@ async fn finish(f: &Fixture) -> crate::persistence::flow_store030::FlowView030 {
         .await;
     assert!(result.is_ok(), "Native call did not terminate");
     cleanup.unwrap();
-    let view = flow::inspect_run(host.flow030(), &host, &f.pool, &f.owner)
+    let view = flow::inspect_run(host.flow030(), host, &f.pool, &f.owner)
         .await
         .unwrap()
         .flow;
     assert!(view.state.activations.iter().all(|a| !a.physical));
     let page = crate::agsdl_host_projection030::read(
-        &host,
+        host,
         &f.pool,
         crate::agsdl_host_projection030::RuntimeProjectionQuery030 {
             system_start_id: f.owner.system_start_id.clone(),
@@ -769,7 +769,7 @@ impl crate::agsdl_host_call_executor030::CallTransport030 for RetainedStdio {
         let started = crate::agsdl_host_calls::raw_mcp::start_test_stdio(config)?;
         Ok(Box::pin(async move {
             run_transport(
-                StartedTransport::Mcp(started),
+                StartedTransport::Mcp(Box::new(started)),
                 &prepared,
                 &attempt,
                 &control,

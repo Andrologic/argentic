@@ -8,6 +8,7 @@ use crate::{
 };
 use serde_json::Value;
 
+#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 pub(crate) fn prepare(prepared: PreparedEffectiveAgentWork030) -> Result<AttestedWorkPolicy030> {
     let registry = serde_json::from_str(prepared.registry_json())?;
     let observed = qualified_observation030(
@@ -53,6 +54,7 @@ pub(crate) fn prepare(prepared: PreparedEffectiveAgentWork030) -> Result<Atteste
     )
 }
 
+#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 pub(crate) fn codex_permissions030(value: &serde_json::Value, pointer: &str) -> Result<()> {
     use crate::permissions::{Action, Effect, Outside, Preset, RequestedPermissions, Reviewer};
     let parsed = serde_json::from_value::<RequestedPermissions>(value.clone()).map_err(|_| {
@@ -111,6 +113,7 @@ pub(crate) fn codex_permissions030(value: &serde_json::Value, pointer: &str) -> 
 
 /// All ceilings must be expressible by the qualified named native profiles.
 /// A restrictive custom rule is refused rather than silently dropped.
+#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 pub(crate) fn codex_read_only030(policy: &crate::permissions::EffectivePolicy) -> Result<bool> {
     crate::agsdl_host_completion030::workspace_sandbox_read_only030(
         policy,
@@ -120,10 +123,12 @@ pub(crate) fn codex_read_only030(policy: &crate::permissions::EffectivePolicy) -
 
 /// Shared native preflight/admission restriction. Inline values are payloads,
 /// so data containing keys such as uri or timeoutMs is never treated as code.
+#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 pub(crate) fn validate_codex_document030(document: &serde_json::Value) -> Result<()> {
     validate_codex_document_at030(document, None)
 }
 
+#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 pub(crate) fn validate_codex_document_at030(
     document: &serde_json::Value,
     document_location: Option<&url::Url>,
