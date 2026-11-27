@@ -738,9 +738,18 @@ An explicit 0.4.0 whole-run stop survives reopening the file. Recovery can
 settle a Start that never crossed the executor boundary and a local approval
 whose in-memory wait ended with the previous host. If other previously admitted
 work still lacks physical termination evidence, inspection continues to show
-`stopping: true` with `terminationUncertain: true`. The standalone host has
-no transport for reconnecting to a lost external executor. Run history and
-projections remain available for 0.3.0 databases.
+`stopping: true` with `terminationUncertain: true`. This includes a Call
+whose handoff was committed before the crash if the host did not persist its
+`notStarted` receipt. Reopen does not use an absent launch record to complete
+the former owner's Call. The standalone host has no transport for reconnecting
+to a lost external executor. Run history and projections remain available for
+0.3.0 databases.
+
+Upgrade note for journals written by `629f525`. If the process crashed after
+committing a Call's terminal result and before reserving its clock retirement,
+replay still reports divergence after upgrade. Current Call settlement writes
+the terminal result and its retirement reservation in the same transaction.
+Reopening an older journal does not add the missing reservation.
 
 The small embedding API exposes `Host`, `Policy`, preflight, Start, projections,
 human submissions, message delivery, Stop, shutdown and close. It keeps the Start
