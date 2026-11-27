@@ -121,7 +121,7 @@ async fn http_handler(
             }
             if state.mode == "redirect" { return (axum::http::StatusCode::TEMPORARY_REDIRECT, [("location", "/other")]).into_response(); }
             if state.mode == "lost" { return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response(); }
-            if matches!(state.mode, "modern" | "modern-bad-state" | "modern-rejected-input") {
+            if matches!(state.mode, "modern" | "modern-bad-state" | "modern-rejected-input" | "modern-null-input" | "modern-invalid-complete" | "modern-invalid-next") {
                 assert_eq!(headers.get("mcp-protocol-version").unwrap(), "2026-07-28");
                 assert_eq!(headers.get("mcp-method").unwrap(), "tools/call");
                 assert_eq!(headers.get("mcp-name").unwrap(), "synthetic");
@@ -136,7 +136,12 @@ async fn http_handler(
                             format!(r#"{{"jsonrpc":"2.0","id":{id},"error":{{"code":-32602,"message":"Input rejected"}}}}"#),
                         ).into_response();
                     }
-                    r#"{"resultType":"complete","content":[],"structuredContent":{"large":9007199254740993},"isError":true}"#.into()
+                    match state.mode {
+                        "modern-null-input" => "null".into(),
+                        "modern-invalid-complete" => r#"{"resultType":"complete","content":null}"#.into(),
+                        "modern-invalid-next" => r#"{"resultType":"input_required","requestState":123}"#.into(),
+                        _ => r#"{"resultType":"complete","content":[],"structuredContent":{"large":9007199254740993},"isError":true}"#.into(),
+                    }
                 }
             } else if matches!(state.mode, "sse" | "rejected-human-response") {
                 let raw = format!("data: {{\"jsonrpc\":\"2.0\",\"id\":\"human\",\"method\":\"elicitation/create\",\"params\":{{\"message\":\"Continue?\",\"requestedSchema\":{{\"type\":\"object\"}}}}}}\r\n\r\ndata: {{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"content\":[{{\"type\":\"text\",\"text\":\"done\"}}],\"isError\":false}}}}\r\n\r\n");
@@ -678,6 +683,34 @@ async fn rejected_modern_continuation_does_not_acknowledge_delivery() {
     assert_eq!(host.human_closed.load(Ordering::SeqCst), 1);
     assert_eq!(host.human_delivered.load(Ordering::SeqCst), 0);
     task.abort();
+}
+
+#[tokio::test]
+async fn malformed_modern_continuation_results_do_not_acknowledge_delivery() {
+    for mode in [
+        "modern-null-input",
+        "modern-invalid-complete",
+        "modern-invalid-next",
+    ] {
+        let (server, fixture, task) = http_fixture(mode).await;
+        let host = dummy_host();
+        let (result, evidence) = isolated(&host, server).await;
+        assert!(result.is_err(), "{mode}");
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 2, "{mode}");
+        assert_eq!(host.human_closed.load(Ordering::SeqCst), 1, "{mode}");
+        assert_eq!(host.human_delivered.load(Ordering::SeqCst), 0, "{mode}");
+        assert!(
+            matches!(
+                evidence,
+                PhysicalEvidence::Remote {
+                    response_received: false,
+                    termination_proven: false
+                }
+            ),
+            "{mode}"
+        );
+        task.abort();
+    }
 }
 
 #[tokio::test]

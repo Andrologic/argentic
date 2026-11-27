@@ -153,6 +153,103 @@ pub(crate) fn receipt(raw: String) -> Result<McpReceipt> {
     })
 }
 
+enum ToolResult {
+    Continue {
+        extra: String,
+        requests: Option<BTreeMap<String, Box<RawValue>>>,
+    },
+    Complete(McpReceipt),
+}
+
+fn tool_result(raw: &str, can_continue: bool) -> Result<ToolResult> {
+    let fields = object(raw)?;
+    if fields.contains_key("task") {
+        return Err(CallError::new(
+            "UNCERTAIN",
+            "MCP task termination is unavailable",
+        ));
+    }
+    match fields
+        .get("resultType")
+        .map(|v| string(v))
+        .transpose()?
+        .as_deref()
+    {
+        Some("input_required") => {
+            if !can_continue {
+                return Err(CallError::new(
+                    "UNCERTAIN",
+                    "Unsupported MCP continuation or interaction limit exceeded",
+                ));
+            }
+            let state = fields.get("requestState").map(|v| string(v)).transpose()?;
+            if state.as_ref().is_some_and(|s| s.len() > 128 * 1024) {
+                return Err(CallError::transport(
+                    "MCP requestState exceeds the 128 KiB limit",
+                ));
+            }
+            let requests = fields
+                .get("inputRequests")
+                .map(|v| object(v.get()))
+                .transpose()?;
+            if state.is_none() && requests.as_ref().is_none_or(|r| r.is_empty()) {
+                return Err(CallError::transport(
+                    "MCP input_required has no state or prompts",
+                ));
+            }
+            let mut extra = String::new();
+            if let Some(value) = fields.get("requestState") {
+                extra.push_str(&format!(",\"requestState\":{}", value.get()));
+            }
+            let requests = requests.filter(|r| !r.is_empty());
+            if let Some(requests) = &requests {
+                for request in requests.values() {
+                    let fields = object(request.get())?;
+                    if fields
+                        .get("method")
+                        .map(|v| string(v))
+                        .transpose()?
+                        .as_deref()
+                        != Some("elicitation/create")
+                    {
+                        return Err(CallError::transport(
+                            "Only MCP form elicitation is supported",
+                        ));
+                    }
+                    let params = object(
+                        fields
+                            .get("params")
+                            .ok_or_else(|| {
+                                CallError::transport("MCP elicitation has no parameters")
+                            })?
+                            .get(),
+                    )?;
+                    if !params.contains_key("requestedSchema")
+                        || params
+                            .get("mode")
+                            .map(|v| string(v))
+                            .transpose()?
+                            .is_some_and(|m| m != "form")
+                    {
+                        return Err(CallError::transport(
+                            "Only MCP form elicitation is supported",
+                        ));
+                    }
+                }
+            }
+            Ok(ToolResult::Continue { extra, requests })
+        }
+        Some("task") => Err(CallError::new(
+            "UNCERTAIN",
+            "MCP task requires a captured task completion adapter; remote effect may remain active",
+        )),
+        None | Some("complete") => receipt(raw.to_owned())
+            .map(ToolResult::Complete)
+            .map_err(|_| CallError::transport("Malformed MCP tool result")),
+        Some(_) => Err(CallError::transport("Unknown MCP resultType")),
+    }
+}
+
 fn header_value(value: &str) -> String {
     let bytes = value.as_bytes();
     let wrap = bytes.first().is_some_and(|b| matches!(b, b' ' | b'\t'))
@@ -841,85 +938,76 @@ impl Session {
         identity: &CallIdentity,
         control: &Control,
     ) -> Result<McpReceipt> {
-        let mut raw = self
+        let mut delivery = self
             .receive_tool(pending.id, pending.response, host, identity, control)
-            .await?;
-        let base = pending.base;
+            .await;
+        let mut human = None;
         let mut continuations = 0;
         loop {
-            let fields = object(&raw)?;
-            if fields.contains_key("task") {
-                return Err(CallError::new(
-                    "UNCERTAIN",
-                    "MCP task termination is unavailable",
-                ));
+            // Acknowledge the previous answer only once the next result is a
+            // valid MCP result that this call accepts.
+            let secrets = &self.secret_values;
+            let mut completed = false;
+            let accepted = delivery.and_then(|raw| {
+                let result = tool_result(
+                    &raw,
+                    matches!(self.protocol, Protocol::Modern) && continuations < 4,
+                )?;
+                completed = matches!(result, ToolResult::Complete(_));
+                if !secrets.is_empty() {
+                    match &result {
+                        ToolResult::Continue {
+                            requests: Some(_), ..
+                        } => reject_secret_echo(&raw, secrets)?,
+                        ToolResult::Continue { .. } => {}
+                        ToolResult::Complete(result) => {
+                            reject_secret_echo(&result.raw_result_json, secrets)?;
+                            if secrets.iter().any(|secret| result.text.contains(secret)) {
+                                return Err(secret_echo());
+                            }
+                        }
+                    }
+                }
+                Ok((raw, result))
+            });
+            if completed {
+                self.tool_in_flight = false;
             }
-            match fields.get("resultType").map(|v| string(v)).transpose()?.as_deref() {
-                Some("input_required") => {
-                    if !matches!(self.protocol, Protocol::Modern) || continuations >= 4 {
-                        return Err(CallError::new("UNCERTAIN", "Unsupported MCP continuation or interaction limit exceeded"));
-                    }
+            let (raw, result) = complete_human(host, human.take(), accepted).await?;
+            match result {
+                ToolResult::Continue {
+                    mut extra,
+                    requests,
+                } => {
                     continuations += 1;
-                    let state = fields.get("requestState").map(|v| string(v)).transpose()?;
-                    if state.as_ref().is_some_and(|s| s.len() > 128 * 1024) {
-                        return Err(CallError::transport("MCP requestState exceeds the 128 KiB limit"));
+                    if requests.is_some() {
+                        human =
+                            Some(wait_human(host, identity, &self.server, &raw, control).await?);
                     }
-                    let requests = fields.get("inputRequests").map(|v| object(v.get())).transpose()?;
-                    if state.is_none() && requests.as_ref().is_none_or(|r| r.is_empty()) {
-                        return Err(CallError::transport("MCP input_required has no state or prompts"));
-                    }
-                    let mut extra = String::new();
-                    if let Some(value) = fields.get("requestState") {
-                        extra.push_str(&format!(",\"requestState\":{}", value.get()));
-                    }
-                    let requests = requests.filter(|r| !r.is_empty());
-                    let human = if let Some(requests) = &requests {
-                        for request in requests.values() {
-                            let fields = object(request.get())?;
-                            if fields.get("method").map(|v| string(v)).transpose()?.as_deref() != Some("elicitation/create") {
-                                return Err(CallError::transport("Only MCP form elicitation is supported"));
-                            }
-                            let params = object(fields.get("params").ok_or_else(|| CallError::transport("MCP elicitation has no parameters"))?.get())?;
-                            if !params.contains_key("requestedSchema") || params.get("mode").map(|v| string(v)).transpose()?.is_some_and(|m| m != "form") {
-                                return Err(CallError::transport("Only MCP form elicitation is supported"));
-                            }
-                        }
-                        if !self.secret_values.is_empty() {
-                            reject_secret_echo(&raw, &self.secret_values)?;
-                        }
-                        Some(wait_human(host, identity, &self.server, &raw, control).await?)
-                    } else {
-                        None
-                    };
+                    let base = &pending.base;
                     let params = (|| {
                         if let (Some((_, answer)), Some(requests)) = (&human, requests) {
                             let answers_map = object(&answer.body)?;
-                            if answers_map.len() != requests.len() || requests.keys().any(|id| !answers_map.contains_key(id)) {
-                                return Err(CallError::new("CORRELATION", "MCP form answers do not match requests"));
+                            if answers_map.len() != requests.len()
+                                || requests.keys().any(|id| !answers_map.contains_key(id))
+                            {
+                                return Err(CallError::new(
+                                    "CORRELATION",
+                                    "MCP form answers do not match requests",
+                                ));
                             }
                             extra.push_str(&format!(",\"inputResponses\":{}", answer.body));
                         }
                         Ok(format!("{{{base}{extra}}}"))
                     })();
-                    let delivery = async {
+                    delivery = async {
                         let (id, response) = self.handoff_tool(&params?, control, None).await?;
-                        self.receive_tool(id, response, host, identity, control).await
-                    }.await;
-                    raw = complete_human(host, human, delivery).await?;
+                        self.receive_tool(id, response, host, identity, control)
+                            .await
+                    }
+                    .await;
                 }
-                Some("task") => return Err(CallError::new("UNCERTAIN", "MCP task requires a captured task completion adapter; remote effect may remain active")),
-                None | Some("complete") => {
-                    let result = receipt(raw).map_err(|_| CallError::transport("Malformed MCP tool result"))?;
-                    self.tool_in_flight = false;
-                    if !self.secret_values.is_empty() {
-                        reject_secret_echo(&result.raw_result_json, &self.secret_values)?;
-                    }
-                    if self.secret_values.iter().any(|secret| result.text.contains(secret)) {
-                        return Err(secret_echo());
-                    }
-                    return Ok(result);
-                },
-                Some(_) => return Err(CallError::transport("Unknown MCP resultType")),
+                ToolResult::Complete(result) => return Ok(result),
             }
         }
     }
