@@ -1,6 +1,7 @@
 //! Open project members by single components relative to pinned directories.
-use cap_std::fs::{Dir, File, Metadata};
+use cap_std::fs::{Dir, Metadata};
 use std::{
+    fs::File,
     io,
     path::{Component, Path},
 };
@@ -103,9 +104,17 @@ pub(super) fn open_regular(root: &Dir, path: &Path) -> io::Result<File> {
         if !metadata.is_file() || is_link(&metadata) {
             return Err(invalid_member());
         }
-        let file = File::from_std(open_relative(dir, name, false)?);
-        let metadata = file.metadata()?;
-        if !metadata.is_file() || is_link(&metadata) {
+        let file = open_relative(dir, name, false)?;
+        let metadata = crate::content_io::single_link_metadata(&file)?;
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+            if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                return Err(invalid_member());
+            }
+        }
+        if !metadata.is_file() {
             return Err(invalid_member());
         }
         Ok(file)

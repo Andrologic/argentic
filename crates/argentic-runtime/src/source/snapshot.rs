@@ -300,10 +300,11 @@ impl Snapshot {
         let entry = self.manifest.files.get(name).ok_or_else(unavailable)?;
         let dir =
             Dir::open_ambient_dir(&self.root, ambient_authority()).map_err(|_| unavailable())?;
-        let file = super::open_regular(&dir, Path::new(name)).map_err(|_| unavailable())?;
+        let mut file = super::open_regular(&dir, Path::new(name)).map_err(|_| unavailable())?;
         let mut hash = sha2::Sha256::new();
-        let size =
-            std::io::copy(&mut file.take(entry.size + 1), &mut hash).map_err(|_| unavailable())?;
+        let size = std::io::copy(&mut (&mut file).take(entry.size + 1), &mut hash)
+            .map_err(|_| unavailable())?;
+        crate::content_io::single_link_metadata(&file).map_err(|_| unavailable())?;
         if size != entry.size || format!("{:x}", hash.finalize()) != entry.sha256 {
             return Err(unavailable());
         }
@@ -324,11 +325,13 @@ impl Snapshot {
         let name = path.strip_prefix(&self.root).map_err(|_| unavailable())?;
         let dir =
             Dir::open_ambient_dir(&self.root, ambient_authority()).map_err(|_| unavailable())?;
-        let file = super::open_regular(&dir, name).map_err(|_| unavailable())?;
+        let mut file = super::open_regular(&dir, name).map_err(|_| unavailable())?;
         let mut prefix = Vec::with_capacity(256);
-        file.take(256)
+        (&mut file)
+            .take(256)
             .read_to_end(&mut prefix)
             .map_err(|_| unavailable())?;
+        crate::content_io::single_link_metadata(&file).map_err(|_| unavailable())?;
         Ok(prefix.strip_prefix(b"#!").is_none_or(|line| {
             line.iter().find(|&&byte| !matches!(byte, b' ' | b'\t')) == Some(&b'/')
         }))

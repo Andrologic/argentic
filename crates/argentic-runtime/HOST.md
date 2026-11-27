@@ -81,8 +81,8 @@ before writing. The host owns the output. When saving to disk, write to a
 private temporary file, flush it and publish the completed file at a new
 `.agsdl` path. Discard the temporary file on failure.
 
-The writer flushes the output before reporting success. A flush or write
-error returns an error, and the partial output must be discarded.
+The writer flushes the output before reporting success. A write or flush
+failure returns `STORAGE` with pointer `archive`. Discard any partial output.
 
 Path checks use the Unicode tables of this crate's dependencies. The AgSDL
 v0.5.0 reference tool uses the tables of its Python runtime, so on Python 3.9
@@ -123,6 +123,8 @@ A folder and its archive select the same project files. Both apply the
 archive name rules, including the refusal of `.git`, `.env` and `.env.*`
 in skill trees. Opening a folder or its `agsdl.json` pins the root directory
 before reading the manifest. Members are opened relative to that handle.
+Folder members and native local content must have exactly one hard link
+when opened and after reading.
 Unix opens the root with no-follow flags. Windows opens the root without
 following reparse points and keeps the handle open without delete sharing.
 A reference can pass through `..` lexically. Any component traversed on

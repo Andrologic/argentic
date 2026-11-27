@@ -163,6 +163,24 @@ async fn exercise_reader() {
     assert_eq!(loaded.instructions.trim(), "Review the draft.");
 
     let directory = Dir::open_ambient_dir(&plans, ambient_authority()).unwrap();
+    let alias = plans.join("duplicate.txt");
+    fs::hard_link(&instructions, &alias).unwrap();
+    assert!(
+        file_helper::read_confined(&directory, Path::new("duplicate.txt"), &cancel, None)
+            .await
+            .is_err()
+    );
+    assert!(resolve_content(
+        &context,
+        ContentUse {
+            source_json: json!({"uri":"duplicate.txt","mediaType":"text/plain"}).to_string(),
+            usage: ContentUsage::Resource,
+            pointer: "/file".into(),
+        },
+    )
+    .await
+    .is_err());
+    fs::remove_file(alias).unwrap();
     fs::File::create(plans.join("oversized.txt"))
         .unwrap()
         .set_len(MAX_BYTES + 1)
