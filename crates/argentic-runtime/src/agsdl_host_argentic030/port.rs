@@ -37,7 +37,7 @@ struct PortState {
     sources: Arc<Mutex<Sources030>>,
     sequence: AtomicU64,
     credential: Option<String>,
-    approvals: Arc<dyn crate::harness::CommandApprovals030>,
+    approvals: Option<Arc<dyn crate::harness::CommandApprovals030>>,
     plan_lock: Option<Arc<crate::harness::NativePlanLock030>>,
 }
 
@@ -52,7 +52,7 @@ impl Port {
         events: WorkEventSink030,
         work: &AgentWork030,
         inbox: SteerInbox030,
-        approvals: Arc<dyn crate::harness::CommandApprovals030>,
+        approvals: Option<Arc<dyn crate::harness::CommandApprovals030>>,
         sources: Arc<Mutex<Sources030>>,
         credential: Option<String>,
     ) -> Self {
@@ -208,12 +208,24 @@ impl WorkPort for Port {
                 .as_object_mut()
                 .expect("plan payload")
                 .remove("kind");
-            receipt = self
-                .0
-                .approvals
-                .answer_plan(&self.0.attempt, payload, lock, &self.0.events, cancel)
-                .await
-                .map_err(port_error)?;
+            receipt = if let Some(approvals) = &self.0.approvals {
+                approvals
+                    .answer_plan(&self.0.attempt, payload, lock, &self.0.events, cancel)
+                    .await
+                    .map_err(port_error)?
+            } else {
+                let receipt = self
+                    .0
+                    .events
+                    .emit(
+                        json!({"kind":"planResolved","planId":plan_id,"decision":"reject"}),
+                        cancel,
+                    )
+                    .await
+                    .map_err(port_error)?;
+                serde_json::from_str(&receipt.receipt_json)
+                    .map_err(|_| port_error(missing("planReceipt")))?
+            };
         }
         match receipt["decision"]["kind"].as_str() {
             Some("planAccepted") => Ok(PlanDecision::Accept),
@@ -445,7 +457,7 @@ impl WorkPort for Port {
     }
 }
 
-fn contains_credential(raw: &str, key: &str) -> bool {
+pub(super) fn contains_credential(raw: &str, key: &str) -> bool {
     fn contains(value: &Value, key: &str) -> bool {
         match value {
             Value::String(value) => value.contains(key),

@@ -3,6 +3,7 @@ mod admission;
 mod approval;
 mod config;
 mod port;
+mod review;
 mod tools;
 
 pub use config::ArgenticConfig030;
@@ -138,6 +139,11 @@ impl HarnessAdapter030 for ArgenticAdapter030 {
 
     fn qualify_agent(&self, agent: &Value, pointer: &str) -> Result<()> {
         admission::qualify(agent, pointer)?;
+        if agent["permissions"]["reviewer"] == "model" && self.0.reviewer_model.is_none() {
+            return Err(config::invalid_model(&format!(
+                "{pointer}/permissions/reviewer"
+            )));
+        }
         let name = match agent.pointer("/model/name") {
             Some(name) => name.as_str(),
             None => self.0.default_model.as_deref(),
@@ -210,6 +216,9 @@ impl HarnessAdapter030 for ArgenticAdapter030 {
             .into_iter()
             .map(|name| json!({"name":name,"support":"native","evidenceJson":evidence.to_string()}))
             .collect();
+            if self.0.reviewer_model.is_some() {
+                capabilities.push(json!({"name":"reviewer.model","support":"native","evidenceJson":evidence.to_string()}));
+            }
             capabilities.push(json!({"name":"model.effort","support":"approximate","evidenceJson":evidence.to_string()}));
             Ok(HarnessObservation030 {
                 version: VERSION.into(),
@@ -292,9 +301,15 @@ impl AgentExecutor030 for Executor {
         ArgenticAdapter030(self.config.clone())
             .qualify_agent(&work.document()["agents"][agent], &pointer)?;
         admission::validate_document(work.document(), work.document_location())?;
+        let reviewer = work.policy().reviewer();
+        if reviewer == Some(Reviewer::Model) && self.config.reviewer_model.is_none() {
+            return Err(config::invalid_model(&format!(
+                "{pointer}/permissions/reviewer"
+            )));
+        }
         let shell = admission::admit_shell(
             &admission::compile_policy(work.policy())?,
-            work.policy().reviewer() == Some(Reviewer::Person),
+            reviewer.is_some() && self.config.person_review_available,
             &pointer,
         )?;
         admission::extra_roots(
@@ -459,8 +474,54 @@ impl Executor {
             && project.tools["readOnly"] != true;
         drop(project);
         let policies = admission::compile_policy(&work.policy)?;
-        let person = work.policy.reviewer() == Some(Reviewer::Person);
-        let shell = admission::admit_shell(&policies, person, &admission::agent_pointer(agent))?;
+        let reviewer = work.policy.reviewer();
+        let person = self
+            .config
+            .person_review_available
+            .then(|| self.approvals.clone());
+        let shell = admission::admit_shell(
+            &policies,
+            reviewer.is_some() && person.is_some(),
+            &admission::agent_pointer(agent),
+        )?;
+        let model_reviewer = if reviewer == Some(Reviewer::Model) {
+            let name = self
+                .config
+                .reviewer_model
+                .as_deref()
+                .ok_or_else(|| missing("reviewerModel"))?;
+            let model = name
+                .parse()
+                .map_err(|_| config::invalid_model("/reviewerModel"))?;
+            let (provider, reviewer_credential) = match self.config.provider(&model) {
+                Ok((provider, credential)) => (Some(provider), credential),
+                Err(_) => (None, None),
+            };
+            Some(Arc::new(review::ModelReviewer {
+                model,
+                model_name: name.into(),
+                provider,
+                person: person.clone(),
+                authorization: self.approvals.clone(),
+                operator: work.operator.clone(),
+                events: events.clone(),
+                policy_digest: work.policy.fingerprint(),
+                credentials: credential
+                    .iter()
+                    .cloned()
+                    .chain(reviewer_credential)
+                    .collect(),
+                recent: Mutex::default(),
+            }))
+        } else {
+            None
+        };
+        let approvals: Option<Arc<dyn crate::harness::CommandApprovals030>> = match &model_reviewer
+        {
+            Some(reviewer) => Some(reviewer.clone()),
+            None if reviewer == Some(Reviewer::Person) => person.clone(),
+            _ => None,
+        };
         let extra = admission::extra_roots(
             &work.policy,
             &self
@@ -486,12 +547,13 @@ impl Executor {
                 registry = registry.with_shell_staging_directory(directory.clone());
             }
         }
-        if person {
-            registry = registry.with_authorizer(Arc::new(approval::Human {
-                approvals: self.approvals.clone(),
+        if let Some(approvals) = &approvals {
+            registry = registry.with_authorizer(Arc::new(approval::ToolApprovals {
+                approvals: approvals.clone(),
                 attempt: work.attempt.clone(),
                 sequence: std::sync::atomic::AtomicU64::new(0),
                 credential: credential.clone(),
+                model: model_reviewer.is_some(),
             }));
         }
         let skills = sources.skills().await?;
@@ -508,16 +570,8 @@ impl Executor {
             _ => PlanMode::Off,
         };
         let inbox = std::mem::replace(&mut work.steer, crate::agsdl_host_steer030::channel030().1);
-        let port = port::Port::new(
-            events,
-            &work,
-            inbox,
-            self.approvals.clone(),
-            sources.clone(),
-            credential,
-        );
+        let port = port::Port::new(events, &work, inbox, person, sources.clone(), credential);
         let context = self.host.clone();
-        let approvals = person.then(|| self.approvals.clone());
         let work_cancel = cancel.child_token();
         let equipment_cancel = work_cancel.clone();
         let setup = Box::pin(async move {
@@ -582,10 +636,13 @@ impl Executor {
         messages.push(Message::User(mission));
         let (_send, steer) = tokio::sync::mpsc::channel(1);
         let context_window = self.config.context_window(&model);
-        let harness = Harness::new(provider, Arc::new(registry), settings)
+        let mut harness = Harness::new(provider, Arc::new(registry), settings)
             .with_context_window(context_window)
             .with_plan(plan_mode)
             .with_hook(Arc::new(port.clone()));
+        if let Some(reviewer) = model_reviewer {
+            harness = harness.with_hook(reviewer);
+        }
         let report = harness
             .run(
                 Work {
@@ -614,10 +671,7 @@ impl Executor {
                 .insert(instance, report.messages.into_iter().skip(1).collect());
         }
         match report.outcome {
-            Ok(_) | Err(Failure::Cancelled) => Ok(()),
-            Err(Failure::PlanRejected) => {
-                Err(failure("PLAN_REJECTED", "plan", "Plan was rejected"))
-            }
+            Ok(_) | Err(Failure::Cancelled | Failure::PlanRejected) => Ok(()),
             Err(Failure::Provider(error)) => Err(provider_failure(error)),
             Err(error) => Err(failure("ARGENTIC_WORK_FAILED", "work", &error.to_string())),
         }

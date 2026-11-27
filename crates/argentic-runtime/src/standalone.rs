@@ -244,6 +244,8 @@ impl ActionPolicySource for Policies {
                 let requests: Vec<ActionRequest> =
                     serde_json::from_value(native["params"]["actions"].clone())?;
                 let allowed = !requests.is_empty()
+                    && !(payload["reviewer"] == "model"
+                        && policy.reviewer() == Some(Reviewer::Person))
                     && requests.iter().all(|request| {
                         matches!(
                             request.action(),

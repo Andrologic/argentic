@@ -2,7 +2,6 @@ use crate::{
     agsdl_host_work_admission030::pointer_token030,
     permissions::{
         Action, DirectoryAccess, Effect, EffectivePolicy, Outside, Preset, RequestedPermissions,
-        Reviewer,
     },
     persistence::{failure, Result},
 };
@@ -37,12 +36,6 @@ pub(super) fn qualify(agent: &Value, pointer: &str) -> Result<()> {
                 "HARNESS_CAPABILITY",
                 &format!("{at}/directories"),
                 "Argentic supports at most eight additional roots per agent",
-            ));
-        }
-        if permissions.reviewer == Some(Reviewer::Model) {
-            return Err(unsupported(
-                &format!("{at}/reviewer"),
-                "model permission reviewers",
             ));
         }
         for (index, rule) in permissions.rules.iter().enumerate() {

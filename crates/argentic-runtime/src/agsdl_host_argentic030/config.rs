@@ -18,6 +18,9 @@ use url::Url;
 pub struct ArgenticConfig030 {
     providers: BTreeMap<String, ProviderConfig>,
     pub(super) default_model: Option<String>,
+    pub(super) reviewer_model: Option<String>,
+    #[serde(default = "person_available")]
+    pub(super) person_review_available: bool,
     pub(super) shell_staging_directory: Option<PathBuf>,
     #[serde(default = "empty_settings")]
     settings: Value,
@@ -44,6 +47,10 @@ enum Protocol {
     AnthropicMessages,
     #[serde(rename = "openai-responses")]
     OpenAiResponses,
+}
+
+fn person_available() -> bool {
+    true
 }
 
 fn empty_settings() -> Value {
@@ -162,6 +169,11 @@ impl ArgenticConfig030 {
                 ));
             }
         }
+        if let Some(name) = &self.reviewer_model {
+            if !self.catalogue()?.iter().any(|model| model["name"] == *name) {
+                return Err(invalid_model("/reviewerModel"));
+            }
+        }
         if self
             .shell_staging_directory
             .as_ref()
@@ -206,6 +218,11 @@ impl ArgenticConfig030 {
             (name, Some(path)) => serde_json::to_vec(&(legacy.0, legacy.1, name, path))?,
             (Some(name), None) => serde_json::to_vec(&(legacy.0, legacy.1, name))?,
             (None, None) => serde_json::to_vec(&legacy)?,
+        };
+        let bytes = if self.reviewer_model.is_some() || !self.person_review_available {
+            serde_json::to_vec(&(bytes, &self.reviewer_model, self.person_review_available))?
+        } else {
+            bytes
         };
         Ok(format!("sha256:{:x}", Sha256::digest(bytes)))
     }

@@ -15,11 +15,12 @@ use std::sync::{
 };
 use tokio_util::sync::CancellationToken;
 
-pub(super) struct Human {
+pub(super) struct ToolApprovals {
     pub approvals: Arc<dyn CommandApprovals030>,
     pub attempt: FlowWorkAttempt030,
     pub sequence: AtomicU64,
     pub credential: Option<String>,
+    pub model: bool,
 }
 
 fn file_request(path: &Path, write: bool) -> Result<(String, Vec<ActionRequest>), String> {
@@ -33,7 +34,7 @@ fn file_request(path: &Path, write: bool) -> Result<(String, Vec<ActionRequest>)
 }
 
 #[async_trait::async_trait]
-impl Authorizer for Human {
+impl Authorizer for ToolApprovals {
     async fn approve(
         &self,
         call: &ToolCall,
@@ -61,7 +62,7 @@ impl Authorizer for Human {
             return Ok(false);
         }
         let sequence = self.sequence.fetch_add(1, Ordering::Relaxed);
-        let payload = json!({
+        let mut payload = json!({
             "title": title,
             "nativeRequest": {
                 "id": format!("argentic-{sequence}"),
@@ -73,6 +74,9 @@ impl Authorizer for Human {
                 }
             }
         });
+        if self.model {
+            payload["nativeRequest"]["params"]["reviewArguments"] = json!(call.arguments);
+        }
         let permit = AtomicBool::new(false);
         self.approvals
             .answer(

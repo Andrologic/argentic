@@ -38,6 +38,17 @@ pub trait CommandApprovals030: Send + Sync {
         })
     }
 
+    fn answer_model<'a>(
+        &'a self,
+        _work: &'a flow::FlowWorkAttempt030,
+        _payload: serde_json::Value,
+        _operator: &'a crate::harness::AgentOperator030,
+        _cancel: &'a CancellationToken,
+        respond: Respond030<'a>,
+    ) -> BoxFuture<'a, Result<()>> {
+        respond(false)
+    }
+
     fn answer<'a>(
         &'a self,
         work: &'a flow::FlowWorkAttempt030,
@@ -48,6 +59,25 @@ pub trait CommandApprovals030: Send + Sync {
 }
 
 impl CommandApprovals030 for AgentActionHumans030 {
+    fn answer_model<'a>(
+        &'a self,
+        attempt: &'a flow::FlowWorkAttempt030,
+        payload: serde_json::Value,
+        operator: &'a crate::harness::AgentOperator030,
+        cancel: &'a CancellationToken,
+        respond: Respond030<'a>,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let view =
+                flow::inspect_run(self.host.flow030(), &self.host, &self.pool, attempt.owner())
+                    .await?;
+            let policy = self.policy.lock_current(&view.capture, &payload).await?;
+            let admission = operator.admit_turn().await?;
+            let allowed = policy.allows() && admission.is_some() && !cancel.is_cancelled();
+            respond(allowed).await
+        })
+    }
+
     fn answer_plan<'a>(
         &'a self,
         attempt: &'a flow::FlowWorkAttempt030,

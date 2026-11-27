@@ -38,7 +38,8 @@
       "support": "native"
     },
     "reviewer.model": {
-      "support": "absent"
+      "support": "native",
+      "note": "Requires a host-configured reviewer model. Shell and MCP asks require a person. Model errors deny the action."
     },
     "directories": {
       "support": "native",
@@ -82,7 +83,7 @@
       "allow": "harness",
       "ask": "harness",
       "deny": "harness",
-      "note": "Each tool is evaluated by server/tool across the effective policy. Ask requires a person and is denied without one."
+      "note": "Each tool is evaluated by server/tool across the effective policy. MCP asks require a person and are denied without one."
     },
     "delegate": {
       "allow": "absent",

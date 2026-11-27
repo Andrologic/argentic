@@ -1694,16 +1694,20 @@ async fn plan_first_auto_blocks_writes_until_a_plan() {
 
 #[tokio::test]
 async fn plan_first_ask_stays_locked_until_human_accepts_a_revision() {
-    for answer in ["accept revision", "reject", "timeout"] {
+    for answer in ["accept revision", "reject", "timeout", "no person"] {
         let mut server = Server::start().await;
         let mut doc = plan_write_document("ask");
         if answer == "timeout" {
             doc["agents"]["worker"]["answerTimeoutMs"] = json!(250);
         }
         let f = Fixture::new(&doc.to_string());
+        let mut cfg = config(&server.base_url, None);
+        if answer == "no person" {
+            cfg["personReviewAvailable"] = json!(false);
+        }
         let host = open(&f, true)
             .await
-            .with_argentic(server.config(None))
+            .with_argentic(serde_json::from_value(cfg).unwrap())
             .unwrap();
         let run = start(&host).await;
         let scope = persistence::public030::HumanScope030 {
@@ -1711,6 +1715,13 @@ async fn plan_first_ask_stays_locked_until_human_accepts_a_revision() {
             source: run.capture.source.clone(),
         };
         send_plan(server.next().await, "Write the memo");
+        if answer == "no person" {
+            let state = finish(&host, &run).await;
+            assert!(state.to_string().contains("PLAN_REJECTED"), "{state}");
+            assert!(host.humans(scope, None).await.unwrap().requests.is_empty());
+            close(&host).await;
+            continue;
+        }
         let ask = pending_ask(&host, &scope).await;
         assert!(matches!(
             ask.content,
@@ -1779,4 +1790,100 @@ async fn answer_person(
     })
     .await
     .unwrap();
+}
+
+#[tokio::test]
+async fn model_reviewer_decides_exact_actions_and_fails_closed() {
+    for (reply, person, approved, verdict, source) in [
+        ("APPROVE", false, true, "APPROVE", "model"),
+        ("DENY", true, false, "DENY", "model"),
+        ("ESCALATE", true, true, "ESCALATE", "model"),
+        ("ESCALATE", false, false, "ESCALATE", "model"),
+        ("malformed", true, false, "DENY", "reviewUnavailable"),
+        ("network", true, false, "DENY", "reviewUnavailable"),
+    ] {
+        let mut server = Server::start().await;
+        let mut doc = document();
+        doc["agents"]["worker"]["permissions"] = json!({"preset":"workspace","reviewer":"model","rules":[
+            forbid_shell(), {"action":"write","match":"memo.txt","effect":"ask"}
+        ]});
+        let f = Fixture::new(&doc.to_string());
+        let mut cfg = config(&server.base_url, None);
+        cfg["providers"]["local"]["models"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!("reviewer"));
+        cfg["reviewerModel"] = json!("local/reviewer");
+        cfg["personReviewAvailable"] = json!(person);
+        let host = open(&f, true)
+            .await
+            .with_argentic(serde_json::from_value(cfg).unwrap())
+            .unwrap();
+        let run = start(&host).await;
+        let scope = persistence::public030::HumanScope030 {
+            system_start_id: run.receipt.identity.system_start_id.clone(),
+            source: run.capture.source.clone(),
+        };
+        write_memo(server.next().await);
+        let review = server.next().await;
+        assert_eq!(review.body["model"], "reviewer");
+        assert!(review.body["tools"].as_array().is_none_or(Vec::is_empty));
+        let context: Value =
+            serde_json::from_str(review.body["messages"][1]["content"].as_str().unwrap()).unwrap();
+        let args: Value = serde_json::from_str(
+            context["action"]["nativeRequest"]["params"]["reviewArguments"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(args, json!({"path":"memo.txt","content":"approved"}));
+        assert_eq!(context["permissionEffect"], "ask");
+        assert!(context["recentConversation"]
+            .to_string()
+            .contains("Read memo.txt"));
+        if reply == "network" {
+            review.send(StatusCode::UNAUTHORIZED, "unavailable", "text/plain");
+        } else {
+            let text = if reply == "malformed" {
+                "APPROVE!".into()
+            } else {
+                json!({"verdict":reply}).to_string()
+            };
+            send_text(review, &text);
+        }
+        if reply == "ESCALATE" && person {
+            let ask = pending_ask(&host, &scope).await;
+            assert!(!f.workspace.join("memo.txt").exists());
+            answer_person(&host, &scope, ask, "yes", "").await;
+        }
+        submit_done(server.next().await);
+        completed(&finish(&host, &run).await);
+        assert_eq!(f.workspace.join("memo.txt").exists(), approved, "{reply}");
+        let events: Vec<String> = sqlx::query_scalar(
+            "SELECT ticket_json -> 'input' ->> 'eventJson' FROM engine_flow030_work_events WHERE decision_json IS NOT NULL ORDER BY rowid",
+        ).fetch_all(&host.pool).await.unwrap();
+        assert!(
+            events.iter().any(|event| {
+                let event: Value = serde_json::from_str(event).unwrap();
+                event["event"]["kind"] == "reviewerDecision"
+                    && event["event"]["verdict"] == verdict
+                    && event["event"]["source"] == source
+                    && !event.to_string().contains("reviewArguments")
+            }),
+            "{events:?}"
+        );
+        if reply != "ESCALATE" || !person {
+            assert!(host.humans(scope, None).await.unwrap().requests.is_empty());
+        }
+        close(&host).await;
+    }
+}
+
+fn send_text(request: Request, text: &str) {
+    let chunk = json!({"choices":[{"index":0,"delta":{"content":text},"finish_reason":"stop"}]});
+    request.send(
+        StatusCode::OK,
+        format!("data: {chunk}\n\ndata: [DONE]\n\n"),
+        "text/event-stream",
+    );
 }

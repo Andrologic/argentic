@@ -86,6 +86,7 @@ fn event_key(event: &Value) -> Result<Option<Text>> {
         ("turnEnded", "turnId", "turn:"),
         ("planPresented", "planId", "plan:"),
         ("planResolved", "planId", "planDecision:"),
+        ("reviewerDecision", "requestId", "reviewerDecision:"),
         ("checkEnded", "checkId", "check:"),
     ] {
         if event.get("kind").eq_str(kind) {
@@ -437,6 +438,15 @@ impl Controller {
         }
         if self.state == "accepted" {
             return Ok(waiting("physicalEnd"));
+        }
+        if kind.eq_str("reviewerDecision") {
+            if !["APPROVE", "DENY", "ESCALATE"]
+                .iter()
+                .any(|v| event.get("verdict").eq_str(v))
+            {
+                return correlation("/verdict", "Invalid reviewer verdict.");
+            }
+            return Ok(waiting("provider"));
         }
         if kind.eq_str("planPresented") {
             if trimmed(event.get("text"), "event.text.trim", false)? {
