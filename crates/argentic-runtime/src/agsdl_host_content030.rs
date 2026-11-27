@@ -449,8 +449,7 @@ impl Sources030 {
     ) -> HostResult<String> {
         let pointer = "/skills/resources";
         self.with_skill_ceiling(pointer, async {
-            let origin = url::Url::from_file_path(&skill.path).map_err(|_| missing("skillRoot"))?;
-            let target = origin.join(path).map_err(|_| missing("skillResource"))?;
+            let target = skill.resource_uri(path).map_err(content_error)?;
             self.allowed_file(&json!({"uri": target.as_str()}), pointer)?;
             let receipt = crate::content::read_skill_resource(&self.context, loaded, path, None)
                 .await

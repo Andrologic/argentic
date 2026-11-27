@@ -24,7 +24,7 @@ fn main() {
     ]);
     // This hook exists only in the explicit macOS debug QA build. If a QA
     // configuration omits it, linking the QA-only FFI must fail closed.
-    if std::env::var("PROFILE").as_deref() == Ok("debug")
+    if std::env::var_os("CARGO_CFG_DEBUG_ASSERTIONS").is_some()
         && std::env::var_os("CARGO_FEATURE_AGSDL_CONTENT_QA").is_some()
     {
         compiler.args(["-D", "AGSDL_CONTENT_TESTING"]);

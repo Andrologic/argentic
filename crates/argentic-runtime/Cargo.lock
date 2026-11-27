@@ -110,6 +110,7 @@ dependencies = [
  "futures",
  "jsonschema",
  "libc",
+ "libyaml-rs",
  "percent-encoding",
  "portable-pty",
  "regex",
