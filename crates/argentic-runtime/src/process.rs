@@ -390,28 +390,25 @@ impl ContainedBackgroundProcess {
 
     #[cfg(unix)]
     fn stop_unix_workload(&self) -> (Vec<u32>, Option<io::Error>) {
+        #[cfg(target_os = "linux")]
+        let supervisor = match self.child.id() {
+            Some(pid) => Some(pid),
+            // Reaping the supervisor releases the workload group ID.
+            None => return (Vec::new(), None),
+        };
+        #[cfg(not(target_os = "linux"))]
+        let supervisor = None;
         let (process_ids, inspection_error) = suspend_unix_process_tree(
             self.process_group_id,
             &self.containment_id,
             self.containment_marker_path(),
+            supervisor,
         );
-        #[cfg(target_os = "linux")]
-        let process_ids: Vec<_> = process_ids
-            .into_iter()
-            .filter(|pid| Some(*pid) != self.process_group_id)
-            .collect();
         for process_id in &process_ids {
             signal_process(*process_id, libc::SIGKILL);
         }
         if let Some(process_group_id) = self.process_group_id {
-            #[cfg(not(target_os = "linux"))]
             signal_process_group(process_group_id, libc::SIGKILL);
-            #[cfg(target_os = "linux")]
-            if self.child.id().is_some() {
-                // The inspection stopped the reaper along with the workload.
-                // Resume only the reaper so it can adopt and collect children.
-                signal_process(process_group_id, libc::SIGCONT);
-            }
         }
         (process_ids, inspection_error)
     }
@@ -429,26 +426,30 @@ impl ContainedBackgroundProcess {
         };
         let deadline = tokio::time::Instant::now() + reap_timeout;
         match tokio::time::timeout_at(deadline, self.child.wait()).await {
-            Ok(status) => match inspection_error {
-                Some(error) => Err(io::Error::other(IncompleteProcessTreeInspection(error))),
-                None => {
-                    let status = status?;
-                    #[cfg(target_os = "linux")]
-                    let status = {
-                        if !status.success() {
-                            return Err(io::Error::other("Linux reaper did not confirm tree exit"));
-                        }
-                        self.wait().await?
-                    };
-                    // SIGKILL delivery and the leader's reap do not establish
-                    // that descendants with detached streams have exited.
-                    wait_for_processes_exit(&process_ids, deadline).await?;
-                    // Retire only after all observed processes disappeared.
-                    // Drop must not scan the machine again or signal a reused PID.
-                    self.process_group_id = None;
-                    Ok(status)
+            Ok(status) => {
+                #[cfg(not(target_os = "linux"))]
+                if let Some(error) = inspection_error {
+                    return Err(io::Error::other(IncompleteProcessTreeInspection(error)));
                 }
-            },
+                let status = status?;
+                #[cfg(target_os = "linux")]
+                let status = {
+                    if !status.success() {
+                        return Err(io::Error::other("Linux reaper did not confirm tree exit"));
+                    }
+                    if let Some(error) = inspection_error {
+                        tracing::debug!(error = %error, "Linux reaper confirmed exit after incomplete process inspection");
+                    }
+                    self.wait().await?
+                };
+                // SIGKILL delivery and the leader's reap do not establish
+                // that descendants with detached streams have exited.
+                wait_for_processes_exit(&process_ids, deadline).await?;
+                // Retire only after all observed processes disappeared.
+                // Drop must not scan the machine again or signal a reused PID.
+                self.process_group_id = None;
+                Ok(status)
+            }
             Err(_) => Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "contained process tree did not exit after SIGKILL",
@@ -553,18 +554,74 @@ fn install_linux_process_supervisor(status_descriptor: i32) -> io::Result<()> {
     if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) } == -1 {
         return Err(io::Error::last_os_error());
     }
-    let command_process_id = unsafe { libc::fork() };
-    if command_process_id == -1 {
+    // The workload inherits the supervisor's original group. Keep that
+    // group's ID tied to the supervisor PID even after the command exits.
+    // A short-lived child reserves a separate group for the supervisor.
+    let supervisor_group = unsafe { libc::fork() };
+    match supervisor_group {
+        -1 => return Err(io::Error::last_os_error()),
+        0 => unsafe { libc::_exit(0) },
+        _ => {}
+    }
+    match start_linux_workload(supervisor_group, status_descriptor) {
+        Ok(None) => Ok(()),
+        Ok(Some(command_process_id)) => {
+            close_linux_file_descriptors_except(status_descriptor);
+            supervise_linux_command(command_process_id, status_descriptor)
+        }
+        Err(error) => {
+            reap_linux_setup_child(supervisor_group);
+            Err(error)
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn start_linux_workload(
+    supervisor_group: libc::pid_t,
+    status_descriptor: i32,
+) -> io::Result<Option<libc::pid_t>> {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+
+    // Linux retains the group of an exited child until it is reaped.
+    if unsafe { libc::setpgid(supervisor_group, supervisor_group) } == -1 {
         return Err(io::Error::last_os_error());
     }
-    if command_process_id == 0 {
-        unsafe {
-            libc::close(status_descriptor);
-        }
-        return Ok(());
+    let (mut ready_reader, mut ready_writer) = UnixStream::pair()?;
+    let pid = unsafe { libc::fork() };
+    if pid == -1 {
+        return Err(io::Error::last_os_error());
     }
-    close_linux_file_descriptors_except(status_descriptor);
-    supervise_linux_command(command_process_id, status_descriptor)
+    if pid == 0 {
+        drop(ready_writer);
+        unsafe { libc::close(status_descriptor) };
+        // Do not exec while the supervisor is still in the workload group.
+        if ready_reader.read_exact(&mut [0]).is_err() {
+            unsafe { libc::_exit(1) };
+        }
+        return Ok(None);
+    }
+
+    drop(ready_reader);
+    let ready = if unsafe { libc::setpgid(0, supervisor_group) } == -1 {
+        Err(io::Error::last_os_error())
+    } else {
+        ready_writer.write_all(&[1])
+    };
+    drop(ready_writer);
+    if let Err(error) = ready {
+        reap_linux_setup_child(pid);
+        return Err(error);
+    }
+    Ok(Some(pid))
+}
+
+#[cfg(target_os = "linux")]
+fn reap_linux_setup_child(pid: libc::pid_t) {
+    while unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) } == -1
+        && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted
+    {}
 }
 
 #[cfg(target_os = "linux")]
@@ -911,8 +968,17 @@ fn bounded_process_inspection(
     result
 }
 
+#[cfg(all(test, target_os = "linux"))]
+thread_local! {
+    static FAIL_PROCESS_TABLE_INSPECTION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 #[cfg(unix)]
 fn read_unix_process_table(deadline: std::time::Instant) -> io::Result<Vec<UnixProcessRecord>> {
+    #[cfg(all(test, target_os = "linux"))]
+    if FAIL_PROCESS_TABLE_INSPECTION.get() {
+        return Err(io::Error::from(io::ErrorKind::NotFound));
+    }
     let output = bounded_process_inspection(
         std::process::Command::new("/bin/ps").args(["-axo", "pid=,ppid=,pgid="]),
         deadline,
@@ -1181,6 +1247,7 @@ impl TerminalProcessTree {
             self.process_group_id,
             &self.containment_id,
             Some(&self.marker.path),
+            None,
         );
         for process_id in process_ids {
             signal_process(process_id, libc::SIGKILL);
@@ -1210,8 +1277,9 @@ fn suspend_unix_process_tree(
     root_id: Option<u32>,
     containment_id: &str,
     containment_marker_path: Option<&Path>,
+    supervisor: Option<u32>,
 ) -> (Vec<u32>, Option<io::Error>) {
-    suspend_unix_process_tree_using(root_id, |process_ids, deadline| {
+    suspend_unix_process_tree_using(root_id, supervisor, |process_ids, deadline| {
         let mut failures = ProcessInspectionFailures::default();
         // On macOS both searches inventory the machine. They are independent,
         // so share the same budget instead of spending it serially.
@@ -1255,7 +1323,8 @@ fn suspend_unix_process_tree(
                             .map(|record| record.process_id),
                     );
                 }
-                match descendant_process_ids(process_ids.iter().copied(), &table, deadline) {
+                let roots = process_ids.iter().copied().chain(supervisor);
+                match descendant_process_ids(roots, &table, deadline) {
                     Ok(descendants) => process_ids.extend(descendants),
                     Err(error) => failures.record(ProcessInspector::Descendants, &error),
                 }
@@ -1269,6 +1338,7 @@ fn suspend_unix_process_tree(
 #[cfg(unix)]
 fn suspend_unix_process_tree_using(
     root_id: Option<u32>,
+    supervisor: Option<u32>,
     mut inspect: impl FnMut(&mut HashSet<u32>, std::time::Instant) -> Option<ProcessInspectionFailures>,
 ) -> (Vec<u32>, Option<io::Error>) {
     let deadline = std::time::Instant::now() + PROCESS_TREE_INSPECTION_TIMEOUT;
@@ -1277,7 +1347,10 @@ fn suspend_unix_process_tree_using(
     if let Some(root_id) = root_id {
         signal_process_group(root_id, libc::SIGSTOP);
     }
-    let mut process_ids = root_id.into_iter().collect::<HashSet<_>>();
+    let mut process_ids = root_id
+        .filter(|id| Some(*id) != supervisor)
+        .into_iter()
+        .collect::<HashSet<_>>();
     for _ in 0..8 {
         if check_process_inspection_deadline(deadline).is_err() {
             deadline_expired = true;
@@ -1287,6 +1360,9 @@ fn suspend_unix_process_tree_using(
         // Only a fully successful round can establish convergence. A partial
         // inventory may look unchanged; retry it within the original deadline.
         let inspection_error = inspect(&mut process_ids, deadline);
+        if let Some(supervisor) = supervisor {
+            process_ids.remove(&supervisor);
+        }
         let round_complete = inspection_error.is_none();
         if let Some(inspection_error) = inspection_error {
             failures.extend(inspection_error);
@@ -1397,7 +1473,7 @@ mod tests {
     fn tree_inspection_retries_a_partial_round_with_the_original_deadline() {
         let mut calls = 0;
         let mut first_deadline = None;
-        let (ids, error) = super::suspend_unix_process_tree_using(None, |_, deadline| {
+        let (ids, error) = super::suspend_unix_process_tree_using(None, None, |_, deadline| {
             calls += 1;
             assert_eq!(*first_deadline.get_or_insert(deadline), deadline);
             (calls == 1).then(|| {
@@ -1425,7 +1501,7 @@ mod tests {
     fn tree_inspection_rejects_rounds_that_never_complete() {
         let mut calls = 0;
         let mut first_deadline = None;
-        let (_, error) = super::suspend_unix_process_tree_using(None, |_, deadline| {
+        let (_, error) = super::suspend_unix_process_tree_using(None, None, |_, deadline| {
             calls += 1;
             assert_eq!(*first_deadline.get_or_insert(deadline), deadline);
             // Success from different sources on different rounds must not be
@@ -1450,7 +1526,7 @@ mod tests {
     #[test]
     fn tree_inspection_preserves_first_cause_and_all_failed_inspectors_across_rounds() {
         let mut calls = 0;
-        let (_, error) = super::suspend_unix_process_tree_using(None, |_, _| {
+        let (_, error) = super::suspend_unix_process_tree_using(None, None, |_, _| {
             calls += 1;
             let mut failures = super::ProcessInspectionFailures::default();
             if calls == 1 {
@@ -1889,6 +1965,62 @@ mod tests {
         use std::os::unix::process::ExitStatusExt;
         assert_eq!(status.signal(), Some(libc::SIGKILL));
         assert!(process.child.wait().await.unwrap().success());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn contained_stop_kills_the_linux_workload_group_when_process_table_fails() {
+        use super::{background_contained_tokio_command, ContainedBackgroundProcess};
+        use std::{process::Stdio, time::Duration};
+        use tokio::io::{AsyncBufReadExt, BufReader};
+
+        let mut command = background_contained_tokio_command("/bin/sh");
+        command
+            .args([
+                "-c",
+                "env -i /bin/sh -c 'echo $$; exec /bin/sleep 30' & exit 23",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let mut process = ContainedBackgroundProcess::spawn(command).unwrap();
+        let mut stdout = BufReader::new(process.take_stdout().unwrap());
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(2), stdout.read_line(&mut line))
+            .await
+            .unwrap()
+            .unwrap();
+        let descendant: u32 = line.trim().parse().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        assert!(
+            !super::processes_with_containment_id(&process.containment_id, deadline)
+                .unwrap()
+                .contains(&descendant)
+        );
+        assert_eq!(
+            unsafe { libc::getpgid(descendant as libc::pid_t) },
+            process.unix_process_group_id().unwrap() as libc::pid_t
+        );
+        let supervisor = process.child.id().unwrap() as libc::pid_t;
+        assert_ne!(unsafe { libc::getpgid(supervisor) }, supervisor);
+        assert_eq!(process.wait().await.unwrap().code(), Some(23));
+
+        super::FAIL_PROCESS_TABLE_INSPECTION.set(true);
+        let result = process.terminate_with_grace(Duration::from_secs(1)).await;
+        super::FAIL_PROCESS_TABLE_INSPECTION.set(false);
+        let acknowledgement = process.child.try_wait().unwrap();
+        if acknowledgement.is_none() {
+            super::signal_process(descendant, libc::SIGKILL);
+            process.child.wait().await.unwrap();
+        }
+        assert_eq!(result.unwrap().code(), Some(23));
+        assert!(acknowledgement.unwrap().success());
+        assert!(process.unix_process_group_id().is_none());
+        assert_eq!(unsafe { libc::kill(descendant as libc::pid_t, 0) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
     }
 
     #[cfg(target_os = "linux")]
