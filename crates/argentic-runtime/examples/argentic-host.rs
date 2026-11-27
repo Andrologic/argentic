@@ -265,12 +265,87 @@ fn main() {
             std::process::exit(1);
         }
     }
+    if let Err(e) = run_on_runtime(run()) {
+        eprintln!("{e}");
+        std::process::exit(1);
+    }
+}
+
+fn run_on_runtime<F: std::future::Future>(future: F) -> F::Output {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .expect("Tokio runtime");
-    if let Err(e) = runtime.block_on(run()) {
-        eprintln!("{e}");
-        std::process::exit(1);
+    let result = runtime.block_on(future);
+    // Tokio's blocking stdin read may outlive an interrupted command loop.
+    // The host has already drained its owned resources by this point.
+    runtime.shutdown_background();
+    result
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::process::Stdio;
+
+    #[tokio::test]
+    async fn interrupt_exits_with_stdin_still_open() {
+        const CHILD: &str = "ARGENTIC_TEST_BLOCKED_HOST_STDIN";
+        if let Some(ready) = std::env::var_os(CHILD) {
+            std::thread::spawn(move || {
+                run_on_runtime(async {
+                    let mut input = tokio::io::stdin();
+                    let mut byte = [0];
+                    let mut read = Box::pin(input.read(&mut byte));
+                    let mut interrupt = Box::pin(tokio::signal::ctrl_c());
+                    assert!(futures::poll!(&mut interrupt).is_pending());
+                    assert!(futures::poll!(&mut read).is_pending());
+                    std::fs::write(ready, []).unwrap();
+                    interrupt.await.unwrap();
+                });
+            })
+            .join()
+            .unwrap();
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let ready = temp.path().join("stdin-ready");
+        let mut child = tokio::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::interrupt_exits_with_stdin_still_open",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD, &ready)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let _input = child.stdin.take().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !ready.exists() {
+                assert!(
+                    child.try_wait().unwrap().is_none(),
+                    "Child exited before readiness"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("Child did not install the signal handler");
+        // The child has installed its signal handler and submitted the stdin read.
+        assert_eq!(
+            unsafe { libc::kill(child.id().unwrap() as libc::pid_t, libc::SIGINT) },
+            0
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(3), child.wait())
+                .await
+                .expect("the runtime kept waiting for stdin after drain")
+                .unwrap()
+                .success()
+        );
     }
 }

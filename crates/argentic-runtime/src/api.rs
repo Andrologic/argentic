@@ -91,6 +91,17 @@ impl HostState {
         tasks: &StreamTasks,
         request: &EngineStopRequest,
     ) -> Result<persistence::public::PublicStopState> {
+        if !self
+            .flow030()
+            .supervisors
+            .is_registered(&request.system_start_id)?
+        {
+            if let Some(receipt) =
+                flow::read_retained_stop(pool, request, &self.native_generation()?).await?
+            {
+                return Ok(receipt);
+            }
+        }
         let result =
             crate::agsdl_host_stop030::request(self.flow030(), pool, tasks, request).await?;
         let asynchronous: bool = sqlx::query_scalar(
@@ -100,7 +111,12 @@ impl HostState {
         .bind(&request.system_start_id)
         .fetch_one(pool)
         .await?;
-        if !asynchronous {
+        if !asynchronous
+            && matches!(
+                result,
+                persistence::public::PublicStopState::Requested { .. }
+            )
+        {
             self.flow030()
                 .supervisors
                 .wait(&request.system_start_id)
@@ -114,9 +130,19 @@ impl HostState {
         tasks: &StreamTasks,
         system: &str,
     ) -> Result<persistence::public::PublicStopState> {
-        let result = crate::agsdl_host_stop030::ensure(self.flow030(), pool, tasks, system).await?;
-        self.flow030().supervisors.wake(system);
-        self.flow030().supervisors.wait(system).await?;
+        let generation = self.native_generation()?;
+        let result =
+            crate::agsdl_host_stop030::ensure(self.flow030(), pool, tasks, system, &generation)
+                .await?;
+        if self.flow030().supervisors.has_task(system)?
+            && matches!(
+                result,
+                persistence::public::PublicStopState::Requested { .. }
+            )
+        {
+            self.flow030().supervisors.wake(system);
+            self.flow030().supervisors.wait(system).await?;
+        }
         Ok(result)
     }
     pub async fn runtime_projection(
@@ -148,7 +174,7 @@ impl HostState {
         scope: persistence::public030::HumanScope030,
         continuation: Option<persistence::public030::HumanContinuation030>,
     ) -> Result<persistence::public030::HumanPage030> {
-        crate::agsdl_host_human_projection030::read(pool, scope, continuation).await
+        crate::agsdl_host_human_projection030::read(self, pool, scope, continuation).await
     }
     pub async fn submit_person(&self, pool: &SqlitePool, input: HumanSubmission) -> Result<String> {
         let owner = {
@@ -370,7 +396,14 @@ impl StartSession<'_> {
     ) -> Result<()> {
         self.lease.ensure_live()?;
         let owner = self.lease.owner(&identity.system_start_id)?;
-        let inspected = flow::inspect_run(self.engine.flow030(), self.engine, pool, &owner).await?;
+        let inspected = flow::inspect_run_with_lease(
+            self.engine.flow030(),
+            self.engine,
+            pool,
+            &owner,
+            &self.lease,
+        )
+        .await?;
         if inspected.owner != owner
             || inspected.capture.identity != *identity
             || expected_capture.identity != *identity

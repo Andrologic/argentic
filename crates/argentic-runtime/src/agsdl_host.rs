@@ -454,6 +454,10 @@ impl HostState {
             .ok_or_else(|| failure("RUNTIME_UNAVAILABLE", "", "Host not installed"))
     }
 
+    pub(crate) fn native_generation(&self) -> Result<String> {
+        Ok(self.native_incarnation()?.generation.clone())
+    }
+
     /// All process-owned runs, including call-only flows and unselected plans.
     /// Database/decoding failures are errors, never an empty activity snapshot.
     pub async fn shutdown_active_runs(&self, pool: &SqlitePool) -> Result<Vec<String>> {
@@ -475,16 +479,17 @@ impl HostState {
             .map_err(|_| failure("RUNTIME_UNAVAILABLE", "", "Host ownership unavailable"))?;
         let mut active = Vec::new();
         for row in rows {
+            let owner_epoch: &str = row.try_get("owner_epoch")?;
             let system: String = row.try_get("system_id")?;
             let state: repository::flow030::FlowState030 =
                 serde_json::from_str(row.try_get("state_json")?)?;
             if state.identity.system_start_id != system
-                || state.identity.flow_invocation_id != row.get::<String, _>("invocation_id")
-                || state.identity.snapshot_id != row.get::<String, _>("snapshot_id")
-                || state.identity.epoch != row.get::<String, _>("capture_epoch")
+                || state.identity.flow_invocation_id != row.try_get::<String, _>("invocation_id")?
+                || state.identity.snapshot_id != row.try_get::<String, _>("snapshot_id")?
+                || state.identity.epoch != row.try_get::<String, _>("capture_epoch")?
                 || !owners
                     .get(&system)
-                    .is_some_and(|owner| owner.owner_epoch == row.get::<String, _>("owner_epoch"))
+                    .is_some_and(|owner| owner.owner_epoch == owner_epoch)
             {
                 return Err(failure("CORRELATION", "", "Native shutdown owner differs"));
             }
@@ -537,7 +542,7 @@ impl HostState {
         }
         for control in self.flow030().retiring_controls(&host.generation)? {
             let system = &control.identity().system_start_id;
-            if self.flow030().supervisors.is_registered(system)? {
+            if self.flow030().supervisors.has_task(system)? {
                 self.flow030().supervisors.wake(system);
                 self.flow030().supervisors.wait(system).await?;
             }
@@ -593,7 +598,14 @@ impl HostState {
             .as_ref()
             .map(|host| host.incarnation.clone())
             .ok_or_else(|| failure("RUNTIME_UNAVAILABLE", "", "Host not installed"))?;
-        let guard = host.lifecycle.clone().read_owned().await;
+        // A retired reader must not queue behind the writer draining its lease.
+        let guard = tokio::select! {
+            biased;
+            _ = host.retired.cancelled() => {
+                return Err(failure("RUNTIME_UNAVAILABLE", "", "Execution host was revoked"));
+            }
+            guard = host.lifecycle.clone().read_owned() => guard,
+        };
         if !host.ready.load(Ordering::SeqCst) {
             return Err(failure("RUNTIME_UNAVAILABLE", "", "Host not ready"));
         }

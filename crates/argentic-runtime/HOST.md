@@ -494,6 +494,20 @@ this process's admitted runs on EOF, Ctrl-C or output disconnection. Keep the
 process alive for all commands and human answers. A separate invocation never
 adopts a live run.
 
+On Unix, the standalone host requires the data directory to have mode `0700`
+and `engine.sqlite` and its SQLite sidecars to have mode `0600`. All must
+belong to the user running the host. To migrate data created under an older
+umask, stop all hosts using the directory. Replace the example data path and
+run these commands as the data owner before restarting.
+
+```sh
+data=/absolute/private-host-data
+chmod 700 "$data"
+for file in "$data"/engine.sqlite "$data"/engine.sqlite-wal "$data"/engine.sqlite-shm "$data"/engine.sqlite-journal; do
+    if [ -f "$file" ]; then chmod 600 "$file"; fi
+done
+```
+
 The official private Codex profile is rooted at the explicit `--data` directory:
 `native-engines/codex-v1`, with the isolated context in `native-contexts/codex-v1`.
 Use the official login procedure in [Native Codex](https://github.com/Andrologic/Macro/blob/develop/docs/agsdl-codex-native.md#private-login),
@@ -715,7 +729,10 @@ After a crash, an ordinary unfinished 0.4.0 run reports
 `verdict: "interrupted"` in `inspect`. The `runs` list also reports
 `interrupted: true`. The host fences the old owner and does not retry its work
 or adopt its session. `terminationUncertain` indicates that activity may have
-survived the interruption.
+survived the interruption. A remote MCP question whose answer was sent without
+a confirmed response stays reserved; while its call's termination is uncertain,
+the human projection reports that request as `uncertain` with
+`phase: "afterResolution"` rather than `resolved`.
 
 An explicit 0.4.0 whole-run stop survives reopening the file. Recovery can
 settle a Start that never crossed the executor boundary and a local approval

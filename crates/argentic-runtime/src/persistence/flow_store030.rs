@@ -76,16 +76,16 @@ async fn load(
     let row = sqlx::query("SELECT snapshot_id, epoch, plan_json, state_json FROM engine_flow030_runs WHERE system_id=? AND invocation_id=?")
         .bind(&identity.system_start_id).bind(&identity.flow_invocation_id)
         .fetch_optional(&mut *db).await?.ok_or(StoreError030::Missing)?;
-    if row.get::<String, _>("snapshot_id") != identity.snapshot_id
-        || row.get::<String, _>("epoch") != identity.epoch
+    if row.try_get::<String, _>("snapshot_id")? != identity.snapshot_id
+        || row.try_get::<String, _>("epoch")? != identity.epoch
     {
         return Err(StoreError030::Authority);
     }
-    let state: FlowState030 = serde_json::from_str(row.get::<&str, _>("state_json"))?;
+    let state: FlowState030 = serde_json::from_str(row.try_get::<&str, _>("state_json")?)?;
     if state.identity != *identity {
         return Err(StoreError030::Authority);
     }
-    Ok((row.get("plan_json"), state))
+    Ok((row.try_get("plan_json")?, state))
 }
 
 pub async fn initialize_tx<A: Authority030>(
@@ -126,9 +126,9 @@ pub async fn apply_tx<A: Authority030>(
     let encoded = serde_json::to_string(event)?;
     if let Some(row) = sqlx::query("SELECT event_json,receipt_json,diagnostic_json FROM engine_flow030_events WHERE system_id=? AND invocation_id=? AND event_id=?")
         .bind(&id.system_start_id).bind(&id.flow_invocation_id).bind(&event.event_id).fetch_optional(&mut *db).await? {
-        if row.get::<String,_>("event_json") != encoded { return Err(StoreError030::Conflict); }
-        if let Some(receipt) = row.get::<Option<String>,_>("receipt_json") { return Ok(Apply030::Replayed(serde_json::from_str(&receipt)?)); }
-        return Ok(Apply030::Diagnostic(serde_json::from_str(row.get::<&str,_>("diagnostic_json"))?));
+        if row.try_get::<String,_>("event_json")? != encoded { return Err(StoreError030::Conflict); }
+        if let Some(receipt) = row.try_get::<Option<String>,_>("receipt_json")? { return Ok(Apply030::Replayed(serde_json::from_str(&receipt)?)); }
+        return Ok(Apply030::Diagnostic(serde_json::from_str(row.try_get::<&str,_>("diagnostic_json")?)?));
     }
     // A diagnostic is durable and non-retriable. Stop and its physical proofs
     // remain available; neither manufactures a verdict for the rejected event.
@@ -258,12 +258,12 @@ pub(crate) async fn pending_effect_tx(
     let id = &state.identity;
     let row = sqlx::query("SELECT effect_json,status,owner_epoch FROM engine_flow030_outbox WHERE system_id=? AND invocation_id=? AND effect_id=?")
         .bind(&id.system_start_id).bind(&id.flow_invocation_id).bind(effect_id).fetch_optional(&mut *db).await?.ok_or(StoreError030::Missing)?;
-    if row.get::<String, _>("status") != "pending"
-        || row.get::<String, _>("owner_epoch") != owner_epoch
+    if row.try_get::<String, _>("status")? != "pending"
+        || row.try_get::<String, _>("owner_epoch")? != owner_epoch
     {
         return Err(StoreError030::NotClaimable);
     }
-    let effect: FlowEffect030 = serde_json::from_str(row.get::<&str, _>("effect_json"))?;
+    let effect: FlowEffect030 = serde_json::from_str(row.try_get::<&str, _>("effect_json")?)?;
     if effect.id != effect_id || !eligible(state, &effect) {
         return Err(StoreError030::NotClaimable);
     }
@@ -316,15 +316,19 @@ pub async fn settle_tx<A: Authority030>(
     load(db, id).await?;
     let row = sqlx::query("SELECT effect_json,status,settlement_json FROM engine_flow030_outbox WHERE system_id=? AND invocation_id=? AND effect_id=?")
         .bind(&id.system_start_id).bind(&id.flow_invocation_id).bind(effect_id).fetch_optional(&mut *db).await?.ok_or(StoreError030::Missing)?;
-    let effect: FlowEffect030 = serde_json::from_str(row.get::<&str, _>("effect_json"))?;
+    let effect: FlowEffect030 = serde_json::from_str(row.try_get::<&str, _>("effect_json")?)?;
     if effect.id != effect_id || effect.identity != *id {
         return Err(StoreError030::Authority);
     }
     authority.settlement(db, &effect, receipt).await?;
     let raw = serde_json::to_string(receipt)?;
-    let status: String = row.get("status");
+    let status: String = row.try_get("status")?;
     if status == "settled" {
-        return if row.get::<Option<String>, _>("settlement_json").as_deref() == Some(raw.as_str()) {
+        return if row
+            .try_get::<Option<String>, _>("settlement_json")?
+            .as_deref()
+            == Some(raw.as_str())
+        {
             Ok(())
         } else {
             Err(StoreError030::Conflict)
@@ -349,13 +353,13 @@ pub async fn read_tx<A: Authority030>(
         .bind(&id.system_start_id).bind(&id.flow_invocation_id).fetch_all(&mut *db).await?;
     let mut events = Vec::new();
     for row in rows {
-        events.push(json!({"event":serde_json::from_str::<Value>(row.get("event_json"))?,"receipt":row.get::<Option<String>,_>("receipt_json").map(|s|serde_json::from_str::<Value>(&s)).transpose()?,"diagnostic":row.get::<Option<String>,_>("diagnostic_json").map(|s|serde_json::from_str::<Value>(&s)).transpose()?}));
+        events.push(json!({"event":serde_json::from_str::<Value>(row.try_get("event_json")?)?,"receipt":row.try_get::<Option<String>,_>("receipt_json")?.map(|s|serde_json::from_str::<Value>(&s)).transpose()?,"diagnostic":row.try_get::<Option<String>,_>("diagnostic_json")?.map(|s|serde_json::from_str::<Value>(&s)).transpose()?}));
     }
     let rows = sqlx::query("SELECT effect_json,status,settlement_json FROM engine_flow030_outbox WHERE system_id=? AND invocation_id=? ORDER BY rowid")
         .bind(&id.system_start_id).bind(&id.flow_invocation_id).fetch_all(&mut *db).await?;
     let mut effects = Vec::new();
     for row in rows {
-        effects.push(json!({"effect":serde_json::from_str::<Value>(row.get("effect_json"))?,"status":row.get::<String,_>("status"),"settlement":row.get::<Option<String>,_>("settlement_json").map(|s|serde_json::from_str::<Value>(&s)).transpose()?}));
+        effects.push(json!({"effect":serde_json::from_str::<Value>(row.try_get("effect_json")?)?,"status":row.try_get::<String,_>("status")?,"settlement":row.try_get::<Option<String>,_>("settlement_json")?.map(|s|serde_json::from_str::<Value>(&s)).transpose()?}));
     }
     Ok(FlowView030 {
         state,

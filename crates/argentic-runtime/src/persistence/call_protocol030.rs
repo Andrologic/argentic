@@ -443,14 +443,14 @@ impl CallStopCause030 {
             .bind(&attempt.work().activation_id).fetch_optional(&mut *db).await?
             .ok_or_else(|| denied("TIMEOUT has no durable clock decision for this activation"))?;
         require(
-            row.get::<&str, _>("reason") == "TIMEOUT"
-                && row.get::<&str, _>("start_effect_id") == attempt.work().start_effect_id
-                && row.get::<&str, _>("owner_epoch") == attempt.owner_epoch()
-                && row.get::<&str, _>("generation") == attempt.generation()
-                && row.get::<&str, _>("kind") == "call",
+            row.try_get::<&str, _>("reason")? == "TIMEOUT"
+                && row.try_get::<&str, _>("start_effect_id")? == attempt.work().start_effect_id
+                && row.try_get::<&str, _>("owner_epoch")? == attempt.owner_epoch()
+                && row.try_get::<&str, _>("generation")? == attempt.generation()
+                && row.try_get::<&str, _>("kind")? == "call",
             "Clock decision belongs to another work, visit or generation",
         )?;
-        let binding: ClockWorkBinding030 = serde_json::from_str(row.get("work_json"))?;
+        let binding: ClockWorkBinding030 = serde_json::from_str(row.try_get("work_json")?)?;
         require(
             binding.identity == *attempt.identity()
                 && binding.owner.system_start_id == attempt.identity.system_start_id
@@ -462,7 +462,7 @@ impl CallStopCause030 {
             "Clock work does not attest this native call",
         )?;
         let timeout = row
-            .get::<Option<&str>, _>("timeout_json")
+            .try_get::<Option<&str>, _>("timeout_json")?
             .ok_or_else(|| denied("Clock work has no machine timeout budget"))?;
         require(
             argentic_core::durable_json::positive_integer(timeout).is_some(),
@@ -508,9 +508,9 @@ impl CallStopCause030 {
             argentic_core::durable_json::equal(&budget, timeout)?,
             "Clock timeout differs from captured call budget",
         )?;
-        let receipt_id: &str = row.get("receipt_id");
-        let observed: &str = row.get("observed_ms");
-        let admitted: &str = row.get("admitted_ms");
+        let receipt_id: &str = row.try_get("receipt_id")?;
+        let observed: &str = row.try_get("observed_ms")?;
+        let admitted: &str = row.try_get("admitted_ms")?;
         super::decimal(observed)?;
         super::decimal(admitted)?;
         require(
@@ -571,7 +571,7 @@ pub(crate) async fn record_cause_tx<A: CallAuthority030>(
     verify_attempt_tx(db, authority, attempt, AttemptCheck::Active).await?;
     let row = row_tx(db, attempt).await?;
     require(
-        matches!(row.get::<&str, _>("status"), "launched" | "received"),
+        matches!(row.try_get::<&str, _>("status")?, "launched" | "received"),
         "Call cause requires a live launched call",
     )?;
     if let Some(receipt) = read_cause_tx(db, attempt).await? {
@@ -602,7 +602,7 @@ pub(crate) async fn settlement_cause_tx<A: CallAuthority030>(
     if let Some(cause) = read_cause_tx(db, attempt).await? {
         return Ok(Some(cause));
     }
-    if row_tx(db, attempt).await?.get::<&str, _>("status") == "terminal" {
+    if row_tx(db, attempt).await?.try_get::<&str, _>("status")? == "terminal" {
         return Ok(None);
     }
     if !clock_timeout_exists_tx(db, attempt).await? {
@@ -653,9 +653,9 @@ pub(crate) async fn commit_marker_tx(
     .bind(attempt.call_id())
     .fetch_optional(&mut *db)
     .await?;
-    let exact = serde_json::json!({"attempt":row.get::<&str,_>("attempt_json"),"status":row.get::<&str,_>("status"),
-        "prepared":row.get::<Option<&str>,_>("prepared_json"),"received":row.get::<Option<&str>,_>("received_json"),
-        "receipt":row.get::<Option<&str>,_>("receipt_json"),"event":event,"cause":cause,"diagnostic":diagnostic}).to_string();
+    let exact = serde_json::json!({"attempt":row.try_get::<&str,_>("attempt_json")?,"status":row.try_get::<&str,_>("status")?,
+        "prepared":row.try_get::<Option<&str>,_>("prepared_json")?,"received":row.try_get::<Option<&str>,_>("received_json")?,
+        "receipt":row.try_get::<Option<&str>,_>("receipt_json")?,"event":event,"cause":cause,"diagnostic":diagnostic}).to_string();
     Ok(CallCommitMarker030 {
         attempt: attempt.clone(),
         row_sha256: sha(exact.as_bytes()),
@@ -684,11 +684,11 @@ async fn capture_tx<A: CallAuthority030>(
         .bind(&identity.system_start_id).bind(&identity.flow_invocation_id).fetch_optional(&mut *db).await?
         .ok_or_else(|| denied("Call native owner missing"))?;
     require(
-        row.get::<&str, _>("capture_epoch") == identity.epoch
-            && row.get::<&str, _>("snapshot_id") == identity.snapshot_id
-            && row.get::<&str, _>("owner_epoch") == authority.owner_epoch()
-            && row.get::<&str, _>("generation") == authority.generation()
-            && row.get::<&str, _>("status") == "live",
+        row.try_get::<&str, _>("capture_epoch")? == identity.epoch
+            && row.try_get::<&str, _>("snapshot_id")? == identity.snapshot_id
+            && row.try_get::<&str, _>("owner_epoch")? == authority.owner_epoch()
+            && row.try_get::<&str, _>("generation")? == authority.generation()
+            && row.try_get::<&str, _>("status")? == "live",
         "Call owner was revoked or replaced",
     )?;
     let raw: String = sqlx::query_scalar(
@@ -701,7 +701,7 @@ async fn capture_tx<A: CallAuthority030>(
     let capture: StartCapture030 = serde_json::from_str(&raw)?;
     require(
         capture.identity == *identity
-            && sha(&serde_json::to_vec(&capture)?) == row.get::<&str, _>("capture_sha256"),
+            && sha(&serde_json::to_vec(&capture)?) == row.try_get::<&str, _>("capture_sha256")?,
         "Call capture differs",
     )?;
     Ok(capture)
@@ -709,11 +709,11 @@ async fn capture_tx<A: CallAuthority030>(
 async fn state_tx(db: &mut SqliteConnection, id: &FlowIdentity030) -> Result<FlowState030> {
     let row = sqlx::query("SELECT snapshot_id,epoch,state_json FROM engine_flow030_runs WHERE system_id=? AND invocation_id=?")
         .bind(&id.system_start_id).bind(&id.flow_invocation_id).fetch_one(&mut *db).await?;
-    let state: FlowState030 = serde_json::from_str(row.get("state_json"))?;
+    let state: FlowState030 = serde_json::from_str(row.try_get("state_json")?)?;
     require(
         state.identity == *id
-            && row.get::<&str, _>("snapshot_id") == id.snapshot_id
-            && row.get::<&str, _>("epoch") == id.epoch,
+            && row.try_get::<&str, _>("snapshot_id")? == id.snapshot_id
+            && row.try_get::<&str, _>("epoch")? == id.epoch,
         "Call flow identity differs",
     )?;
     Ok(state)
@@ -800,22 +800,8 @@ async fn verify_attempt_tx<A: CallAuthority030>(
         "Call attribution differs",
     )?;
     let capture = capture_tx(db, authority, &attempt.identity).await?;
-    require(
-        sha(&serde_json::to_vec(&capture)?) == attempt.capture_sha256,
-        "Call captured bytes differ",
-    )?;
     let state = state_tx(db, &attempt.identity).await?;
-    require(
-        declaration(&capture, &attempt.effect, &state)? == attempt.declaration_json,
-        "Call declaration changed",
-    )?;
-    let row = sqlx::query("SELECT effect_json,owner_epoch FROM engine_flow030_outbox WHERE system_id=? AND invocation_id=? AND effect_id=?")
-        .bind(&attempt.identity.system_start_id).bind(&attempt.identity.flow_invocation_id).bind(&attempt.effect.id).fetch_one(&mut *db).await?;
-    require(
-        serde_json::from_str::<FlowEffect030>(row.get("effect_json"))? == attempt.effect
-            && row.get::<&str, _>("owner_epoch") == attempt.owner_epoch,
-        "Call Start differs",
-    )?;
+    verify_captured_start_tx(db, attempt, &capture, &state).await?;
     if matches!(check, AttemptCheck::PendingStart) {
         require_pending_call_start_tx(db, authority, &state, attempt.effect()).await?;
     }
@@ -835,6 +821,30 @@ async fn verify_attempt_tx<A: CallAuthority030>(
             .map_err(store_error)?;
     }
     Ok(state)
+}
+
+async fn verify_captured_start_tx(
+    db: &mut SqliteConnection,
+    attempt: &CallAttempt030,
+    capture: &StartCapture030,
+    state: &FlowState030,
+) -> Result<()> {
+    require(
+        sha(&serde_json::to_vec(capture)?) == attempt.capture_sha256,
+        "Call captured bytes differ",
+    )?;
+    require(
+        declaration(capture, &attempt.effect, state)? == attempt.declaration_json,
+        "Call declaration changed",
+    )?;
+    let row = sqlx::query("SELECT effect_json,owner_epoch FROM engine_flow030_outbox WHERE system_id=? AND invocation_id=? AND effect_id=?")
+        .bind(&attempt.identity.system_start_id).bind(&attempt.identity.flow_invocation_id).bind(&attempt.effect.id).fetch_one(&mut *db).await?;
+    require(
+        serde_json::from_str::<FlowEffect030>(row.try_get("effect_json")?)? == attempt.effect
+            && row.try_get::<&str, _>("owner_epoch")? == attempt.owner_epoch,
+        "Call Start differs",
+    )?;
+    Ok(())
 }
 
 async fn require_pending_call_start_tx<A: CallAuthority030>(
@@ -895,9 +905,9 @@ async fn row_tx(
         .bind(&attempt.identity.system_start_id).bind(&attempt.identity.flow_invocation_id).bind(&attempt.work().activation_id)
         .fetch_one(&mut *db).await?;
     require(
-        row.get::<&str, _>("call_id") == attempt.call_id
-            && row.get::<&str, _>("start_effect_id") == attempt.effect.id
-            && decode_attempt(row.get("attempt_json"))? == *attempt,
+        row.try_get::<&str, _>("call_id")? == attempt.call_id
+            && row.try_get::<&str, _>("start_effect_id")? == attempt.effect.id
+            && decode_attempt(row.try_get("attempt_json")?)? == *attempt,
         "Receipt belongs to a different call/visit",
     )?;
     Ok(row)
@@ -1060,7 +1070,7 @@ pub(crate) async fn fail_preparation_tx<A: CallAuthority030>(
     let state = verify_attempt_tx(db, authority, attempt, AttemptCheck::PendingStart).await?;
     let row = row_tx(db, attempt).await?;
     require(
-        row.get::<&str, _>("status") == "reserved",
+        row.try_get::<&str, _>("status")? == "reserved",
         "Preparation failure arrived after admission",
     )?;
     require_operand_failure(attempt)?;
@@ -1100,7 +1110,7 @@ pub(crate) async fn prepare_tx<A: CallAuthority030>(
     let row = row_tx(db, attempt).await?;
     validate_prepared(attempt, prepared)?;
     require(
-        row.get::<&str, _>("status") == "reserved",
+        row.try_get::<&str, _>("status")? == "reserved",
         "Call preparation already consumed",
     )?;
     sqlx::query("UPDATE engine_flow030_calls SET status='prepared',prepared_json=? WHERE call_id=? AND status='reserved'")
@@ -1122,19 +1132,19 @@ pub(crate) async fn launch_tx<A: CallAuthority030>(
         .map_err(|e| failure(&e.code, "call", &e.detail))?;
     let row = row_tx(db, attempt).await?;
     require(
-        row.get::<&str, _>("status") == "prepared",
+        row.try_get::<&str, _>("status")? == "prepared",
         "Call launch consumed or not prepared",
     )?;
     let handoff = sqlx::query("SELECT h.receipt_json,h.owner_epoch,h.generation,o.status,o.settlement_json FROM engine_flow030_handoffs h JOIN engine_flow030_outbox o USING(system_id,invocation_id,effect_id) WHERE h.system_id=? AND h.invocation_id=? AND h.effect_id=?")
         .bind(&attempt.identity.system_start_id).bind(&attempt.identity.flow_invocation_id).bind(&attempt.effect.id)
         .fetch_optional(&mut *db).await?.ok_or_else(|| denied("Call has no native owned handoff"))?;
-    let raw: &str = handoff.get("receipt_json");
+    let raw: &str = handoff.try_get("receipt_json")?;
     let receipt: Value = serde_json::from_str(raw)?;
     require(
-        handoff.get::<&str, _>("owner_epoch") == attempt.owner_epoch
-            && handoff.get::<&str, _>("generation") == attempt.generation
-            && handoff.get::<&str, _>("status") == "settled"
-            && handoff.get::<Option<&str>, _>("settlement_json") == Some(raw)
+        handoff.try_get::<&str, _>("owner_epoch")? == attempt.owner_epoch
+            && handoff.try_get::<&str, _>("generation")? == attempt.generation
+            && handoff.try_get::<&str, _>("status")? == "settled"
+            && handoff.try_get::<Option<&str>, _>("settlement_json")? == Some(raw)
             && receipt["kind"] == "nativeOwnedHandoff030"
             && receipt["identity"] == serde_json::to_value(&attempt.identity)?
             && receipt["effectId"] == attempt.effect.id
@@ -1172,7 +1182,7 @@ pub(crate) async fn admit_remote_tool_tx<A: CallAuthority030>(
     require_admission_tx(db, attempt.identity()).await?;
     require(
         state.verdict.is_none()
-            && row_tx(db, attempt).await?.get::<&str, _>("status") == "launched",
+            && row_tx(db, attempt).await?.try_get::<&str, _>("status")? == "launched",
         "Call is no longer active",
     )?;
     if clock_timeout_exists_tx(db, attempt).await? {
@@ -1379,7 +1389,7 @@ pub(crate) async fn receive_tx<A: CallAuthority030>(
     let state = verify_attempt_tx(db, authority, attempt, AttemptCheck::Attribution).await?;
     let row = row_tx(db, attempt).await?;
     let prepared: PreparedCall030 = serde_json::from_str(
-        row.get::<Option<&str>, _>("prepared_json")
+        row.try_get::<Option<&str>, _>("prepared_json")?
             .ok_or_else(|| denied("Call was not prepared"))?,
     )?;
     if !call_stopped(&state, attempt)?
@@ -1390,13 +1400,13 @@ pub(crate) async fn receive_tx<A: CallAuthority030>(
         }
     }
     let raw = serde_json::to_string(&received)?;
-    match row.get::<&str, _>("status") {
+    match row.try_get::<&str, _>("status")? {
         "launched" => {
             sqlx::query("UPDATE engine_flow030_calls SET status='received',received_json=? WHERE call_id=? AND status='launched'")
                 .bind(raw).bind(&attempt.call_id).execute(db).await?;
         }
         "received" => require(
-            row.get::<Option<&str>, _>("received_json") == Some(raw.as_str()),
+            row.try_get::<Option<&str>, _>("received_json")? == Some(raw.as_str()),
             "Contradictory call receipt",
         )?,
         _ => {
@@ -1553,7 +1563,7 @@ pub(crate) async fn finish_tx<A: CallAuthority030>(
         result = clock_failure(attempt)?;
     }
 
-    if row.get::<&str, _>("status") == "terminal" {
+    if row.try_get::<&str, _>("status")? == "terminal" {
         let receipt = read_receipt_tx(db, authority, attempt.identity(), attempt.work())
             .await?
             .ok_or_else(|| denied("Call terminal receipt missing"))?;
@@ -1564,8 +1574,8 @@ pub(crate) async fn finish_tx<A: CallAuthority030>(
         return Ok(CallSettlement030::Terminal { receipt });
     }
     require(
-        row.get::<&str, _>("status") == "received"
-            && row.get::<Option<&str>, _>("received_json")
+        row.try_get::<&str, _>("status")? == "received"
+            && row.try_get::<Option<&str>, _>("received_json")?
                 == Some(serde_json::to_string(&received)?.as_str()),
         "Call terminal raw receipt differs",
     )?;
@@ -1582,7 +1592,7 @@ pub(crate) async fn finish_tx<A: CallAuthority030>(
             "Call Stop has no native flow decision",
         )?;
         let prepared: PreparedCall030 = serde_json::from_str(
-            row.get::<Option<&str>, _>("prepared_json")
+            row.try_get::<Option<&str>, _>("prepared_json")?
                 .ok_or_else(|| denied("Call request missing"))?,
         )?;
         validate_prepared(attempt, &prepared)?;
@@ -1614,7 +1624,7 @@ pub(crate) async fn stop_before_launch_tx<A: CallAuthority030>(
     }
     let state = verify_attempt_tx(db, authority, attempt, AttemptCheck::Attribution).await?;
     let row = row_tx(db, attempt).await?;
-    if row.get::<&str, _>("status") == "terminal" {
+    if row.try_get::<&str, _>("status")? == "terminal" {
         let receipt = read_receipt_tx(db, authority, attempt.identity(), attempt.work())
             .await?
             .ok_or_else(|| denied("Call receipt absent"))?;
@@ -1628,7 +1638,7 @@ pub(crate) async fn stop_before_launch_tx<A: CallAuthority030>(
         return Ok(CallSettlement030::Terminal { receipt });
     }
     require(
-        matches!(row.get::<&str, _>("status"), "reserved" | "prepared"),
+        matches!(row.try_get::<&str, _>("status")?, "reserved" | "prepared"),
         "Launched call needs its owned join",
     )?;
     let received = ReceivedCall030 {
@@ -1666,16 +1676,16 @@ pub(crate) async fn read_diagnostic_tx<A: CallAuthority030>(
     let row = sqlx::query("SELECT event_id,record_json FROM engine_flow030_call_diagnostics WHERE call_id=? AND system_id=? AND invocation_id=?")
         .bind(attempt.call_id()).bind(&id.system_start_id).bind(&id.flow_invocation_id).fetch_optional(&mut *db).await?;
     let Some(row) = row else { return Ok(None) };
-    let stored: StoredDiagnostic030 = serde_json::from_str(row.get("record_json"))?;
+    let stored: StoredDiagnostic030 = serde_json::from_str(row.try_get("record_json")?)?;
     let candidate = stored.candidate;
     require(
         candidate.attempt == attempt
-            && candidate.event_id == row.get::<&str, _>("event_id")
+            && candidate.event_id == row.try_get::<&str, _>("event_id")?
             && candidate.event_id == format!("call:{}:terminal", attempt.call_id()),
         "Call diagnostic attribution differs",
     )?;
     let call = row_tx(db, &attempt).await?;
-    match call.get::<Option<&str>, _>("received_json") {
+    match call.try_get::<Option<&str>, _>("received_json")? {
         Some(raw) => {
             require(
                 decode_received(raw)? == candidate.received,
@@ -1683,7 +1693,7 @@ pub(crate) async fn read_diagnostic_tx<A: CallAuthority030>(
             )?;
             if !matches!(candidate.result, CallResult030::Stopped) {
                 let prepared: PreparedCall030 = serde_json::from_str(
-                    call.get::<Option<&str>, _>("prepared_json")
+                    call.try_get::<Option<&str>, _>("prepared_json")?
                         .ok_or_else(|| denied("Diagnostic preparation absent"))?,
                 )?;
                 validate_prepared(&attempt, &prepared)?;
@@ -1712,15 +1722,15 @@ pub(crate) async fn read_diagnostic_tx<A: CallAuthority030>(
     let event = sqlx::query("SELECT event_json,receipt_json,diagnostic_json FROM engine_flow030_events WHERE system_id=? AND invocation_id=? AND event_id=?")
         .bind(&id.system_start_id).bind(&id.flow_invocation_id).bind(&candidate.event_id).fetch_one(&mut *db).await?;
     require(
-        event.get::<Option<&str>, _>("receipt_json").is_none()
+        event.try_get::<Option<&str>, _>("receipt_json")?.is_none()
             && event
-                .get::<Option<&str>, _>("diagnostic_json")
+                .try_get::<Option<&str>, _>("diagnostic_json")?
                 .is_some_and(|raw| {
                     serde_json::from_str::<Value>(raw).ok().as_ref() == Some(&stored.diagnostic)
                 }),
         "Call diagnostic is not committed by the reducer",
     )?;
-    let actual: Value = serde_json::from_str(event.get("event_json"))?;
+    let actual: Value = serde_json::from_str(event.try_get("event_json")?)?;
     let kind = match candidate.work_result()? {
         Some(result) => FlowEventKind030::WorkResult {
             work: work.clone(),
@@ -1760,6 +1770,78 @@ pub(crate) async fn read_diagnostic_tx<A: CallAuthority030>(
     }))
 }
 
+/// A resolved MCP question can remain reserved when the call fails while
+/// returning the answer. Replay authenticates the joined failure even after
+/// startup fencing revoked the live owner.
+pub(crate) async fn verify_joined_mcp_failure_tx(
+    db: &mut SqliteConnection,
+    state: &FlowState030,
+    capture_json: &str,
+    work_id: &str,
+    question_call_id: &str,
+    owner_epoch: &str,
+    generation: &str,
+) -> Result<bool> {
+    let id = &state.identity;
+    let row: Option<(String, String, String, String)> = sqlx::query_as(
+        "SELECT call_id,attempt_json,received_json,receipt_json FROM engine_flow030_calls
+         WHERE system_id=? AND invocation_id=? AND activation_id=? AND status='terminal'",
+    )
+    .bind(&id.system_start_id)
+    .bind(&id.flow_invocation_id)
+    .bind(work_id)
+    .fetch_optional(&mut *db)
+    .await?;
+    let Some((call_id, attempt, received, receipt)) = row else {
+        return Ok(false);
+    };
+    let receipt = decode_receipt(&receipt)?;
+    let attempt = decode_attempt(&attempt)?;
+    let received = decode_received(&received)?;
+    let declaration: Value = serde_json::from_str(attempt.declaration_json())?;
+    if receipt.attempt != attempt
+        || receipt.received != received
+        || attempt.identity != *id
+        || attempt.owner_epoch != owner_epoch
+        || attempt.generation != generation
+        || attempt.call_id != call_id
+        || attempt.call_id != question_call_id
+        || receipt.event_id != format!("call:{call_id}:terminal")
+        || !declaration["mcp"].is_object()
+        || !matches!(&received.physical, CallPhysical030::Joined { receipt_id } if !receipt_id.is_empty())
+        || !matches!(
+            received.end,
+            CallEnd030::Returned {
+                event: CallEvent030::StartFailed
+            }
+        )
+        || receipt.result != CallResult030::failure("CALL_FAILED")
+    {
+        return Ok(false);
+    }
+    let capture: StartCapture030 = serde_json::from_str(capture_json)?;
+    if capture.identity != *id {
+        return Ok(false);
+    }
+    verify_captured_start_tx(db, &attempt, &capture, state).await?;
+    let work = attempt.work();
+    let Some(event) = state.events.get(&receipt.event_id) else {
+        return Ok(false);
+    };
+    let event: Value = serde_json::from_str(&event.event_json)?;
+    Ok(work.activation_id == work_id
+        && event["identity"] == serde_json::to_value(id)?
+        && event["eventId"] == receipt.event_id
+        && event["kind"]
+            == serde_json::to_value(FlowEventKind030::WorkResult {
+                work: work.clone(),
+                result: WorkResult030::Failed {
+                    error: super::flow030::Failure030::new("CALL_FAILED"),
+                },
+                physical: Some(receipt.physical()),
+            })?)
+}
+
 /// Read-only source authority for both normal and error call routes. Authenticates
 /// complete capture/epoch/owner/Start/visit AND the committed reducer event.
 /// No physical capability, outbox claim or worker job is minted by a read.
@@ -1774,15 +1856,15 @@ pub(crate) async fn read_receipt_tx<A: CallAuthority030>(
         return Ok(None);
     };
     let row = row_tx(db, &attempt).await?;
-    if row.get::<&str, _>("status") != "terminal" {
+    if row.try_get::<&str, _>("status")? != "terminal" {
         return Ok(None);
     }
     let receipt = decode_receipt(
-        row.get::<Option<&str>, _>("receipt_json")
+        row.try_get::<Option<&str>, _>("receipt_json")?
             .ok_or_else(|| denied("Call terminal has no receipt"))?,
     )?;
     let received = decode_received(
-        row.get::<Option<&str>, _>("received_json")
+        row.try_get::<Option<&str>, _>("received_json")?
             .ok_or_else(|| denied("Call terminal has no physical receipt"))?,
     )?;
     require(
@@ -1795,11 +1877,13 @@ pub(crate) async fn read_receipt_tx<A: CallAuthority030>(
         .bind(&id.system_start_id).bind(&id.flow_invocation_id).bind(&receipt.event_id).fetch_optional(&mut *db).await?
         .ok_or_else(|| denied("Call receipt has no committed reducer event"))?;
     require(
-        event.get::<Option<&str>, _>("receipt_json").is_some()
-            && event.get::<Option<&str>, _>("diagnostic_json").is_none(),
+        event.try_get::<Option<&str>, _>("receipt_json")?.is_some()
+            && event
+                .try_get::<Option<&str>, _>("diagnostic_json")?
+                .is_none(),
         "Call terminal reducer event unresolved",
     )?;
-    let actual: Value = serde_json::from_str(event.get("event_json"))?;
+    let actual: Value = serde_json::from_str(event.try_get("event_json")?)?;
     let kind = match &receipt.result {
         CallResult030::Stopped => {
             let state = state_tx(db, id).await?;
@@ -1841,14 +1925,14 @@ pub(crate) async fn read_receipt_tx<A: CallAuthority030>(
         require(
             matches!(receipt.result, CallResult030::Failed { ref code } if code == "OPERAND")
                 && matches!(received.physical, CallPhysical030::NotStarted { ref receipt_id } if !receipt_id.is_empty())
-                && row.get::<Option<&str>, _>("prepared_json").is_none(),
+                && row.try_get::<Option<&str>, _>("prepared_json")?.is_none(),
             "Preparation failure proof differs",
         )?;
         require_operand_failure(&attempt)?;
         require_no_handoff_tx(db, &attempt).await?;
     } else if !matches!(receipt.result, CallResult030::Stopped) {
         let prepared: PreparedCall030 = serde_json::from_str(
-            row.get::<Option<&str>, _>("prepared_json")
+            row.try_get::<Option<&str>, _>("prepared_json")?
                 .ok_or_else(|| denied("Call prepared request absent"))?,
         )?;
         validate_prepared(&attempt, &prepared)?;
@@ -1954,11 +2038,11 @@ pub(crate) async fn require_live_mcp_tx<A: CallAuthority030>(
     verify_attempt_tx(db, authority, attempt, AttemptCheck::Active).await?;
     let row = row_tx(db, attempt).await?;
     require(
-        row.get::<&str, _>("status") == "launched",
+        row.try_get::<&str, _>("status")? == "launched",
         "Human question requires an active launched call",
     )?;
     let prepared: PreparedCall030 = serde_json::from_str(
-        row.get::<Option<&str>, _>("prepared_json")
+        row.try_get::<Option<&str>, _>("prepared_json")?
             .ok_or_else(|| denied("MCP request absent"))?,
     )?;
     require(

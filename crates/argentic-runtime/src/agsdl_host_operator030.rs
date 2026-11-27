@@ -57,7 +57,7 @@ pub(crate) async fn control(
     #[cfg(test)]
     runtime.operator_test_yield("operator.dispatch").await;
     let _dispatch = dispatch.lock().await;
-    let inspection = inspect_run(runtime, host, pool, &owner).await?;
+    let inspection = inspect_run_with_lease(runtime, host, pool, &owner, &lease).await?;
     let capture = &inspection.capture;
     if capture.source != request.scope.source
         || capture.identity.snapshot_id != request.scope.snapshot_id
@@ -106,7 +106,7 @@ pub(crate) async fn control(
         .map_err(store_error)?;
     let state = &view.state;
     if let Some(previous) = previous {
-        let value: Value = serde_json::from_str(previous.get("event_json"))?;
+        let value: Value = serde_json::from_str(previous.try_get("event_json")?)?;
         let recorded = &value["kind"]["Operator"];
         let matches = match request.action {
             OperatorAction::InterruptWork { activation_id } => {
@@ -132,11 +132,11 @@ pub(crate) async fn control(
                     .ok_or_else(uncertain)?,
             );
         }
-        let receipt = previous.get::<Option<&str>, _>("receipt_json");
+        let receipt = previous.try_get::<Option<&str>, _>("receipt_json")?;
         return match receipt {
             Some(receipt) => Ok(serde_json::from_str(receipt)?),
             None => operator_receipt(Apply030::Diagnostic(serde_json::from_str(
-                previous.get("diagnostic_json"),
+                previous.try_get("diagnostic_json")?,
             )?)),
         };
     }

@@ -879,7 +879,7 @@ impl transport::HostPort for NoHuman {
     ) -> transport::Result<String> {
         Err(no_human())
     }
-    async fn human_answer(&self, _: &str) -> transport::Result<String> {
+    async fn human_answer(&self, _: &str) -> transport::Result<transport::HumanReply> {
         Err(no_human())
     }
     async fn human_close(&self, _: &str, _: &transport::Result<String>) -> transport::Result<()> {

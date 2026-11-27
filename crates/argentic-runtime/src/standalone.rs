@@ -13,7 +13,7 @@ use crate::{
         failure,
         flow030::{FlowEffect030, FlowIdentity030},
         flow_store030::{Authority030, CheckFuture, StoreError030},
-        start030::{self, RetainedStart030, StartAuthority030, StartCapture030},
+        start030::{self, RetainedStart030, StartAuthority030, StartCapture030, StartOutcome030},
         Result,
     },
     source::{OpenedSource, RetainedSource},
@@ -28,9 +28,9 @@ use std::{
     fs::File,
     io::{self, Read},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{atomic::AtomicBool, Arc, Mutex},
 };
-use tokio::sync::{OwnedRwLockReadGuard, RwLock};
+use tokio::sync::{oneshot, OwnedRwLockReadGuard, RwLock};
 
 /// The exact policy file is approved by its SHA-256 at construction. It cannot
 /// change during this process. Agent requests are still intersected with it.
@@ -337,8 +337,8 @@ pub struct Host {
     tasks: StreamTasks,
     policies: Policies,
     context: HostContext,
-    database_lock: Mutex<DatabaseLock>,
-    shutdown_complete: std::sync::atomic::AtomicBool,
+    database_lock: Arc<Mutex<DatabaseLock>>,
+    shutdown_complete: Arc<AtomicBool>,
 }
 impl Host {
     /// Native host configuration, before preflight/Start. Never a document input.
@@ -378,8 +378,17 @@ impl Host {
         approved_sha256: &str,
     ) -> Result<Self> {
         let workspace = workspace.canonicalize().map_err(io_error)?;
-        std::fs::create_dir_all(data).map_err(io_error)?;
+        let mut directory = std::fs::DirBuilder::new();
+        directory.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            directory.mode(0o700);
+        }
+        directory.create(data).map_err(io_error)?;
         let data = data.canonicalize().map_err(io_error)?;
+        #[cfg(unix)]
+        crate::sqlite::require_private(&data, &std::fs::metadata(&data).map_err(io_error)?, 0o700)?;
         if data.starts_with(&workspace) || workspace.starts_with(&data) {
             return Err(failure(
                 "PERMISSION",
@@ -458,19 +467,7 @@ impl Host {
             policy_digest,
         };
         inputs.verify()?;
-        let database = data.join("engine.sqlite");
-        if std::fs::symlink_metadata(&database).is_ok_and(|m| !m.file_type().is_file()) {
-            return Err(failure(
-                "STORAGE",
-                "data",
-                "Database must be a regular file",
-            ));
-        }
-        let pool = if database.exists() {
-            crate::sqlite::open_file(&database).await?
-        } else {
-            crate::sqlite::create_file(&database).await?
-        };
+        let pool = crate::sqlite::open_standalone(&data.join("engine.sqlite")).await?;
         api::interrupt_previous_runs(&pool).await?;
         let engine = Engine::new();
         crate::agsdl_host_flow030::recover_pending_stops030(&engine, &pool).await?;
@@ -482,8 +479,8 @@ impl Host {
             tasks: StreamTasks::default(),
             policies,
             context,
-            database_lock: Mutex::new(lock),
-            shutdown_complete: std::sync::atomic::AtomicBool::new(false),
+            database_lock: Arc::new(Mutex::new(lock)),
+            shutdown_complete: Arc::new(AtomicBool::new(false)),
         })
     }
     /// Returns the source revision authenticated at open, including exact bytes' digest.
@@ -676,6 +673,41 @@ impl Host {
         entry: Option<EngineEntry>,
         allowed_harnesses: &BTreeSet<String>,
     ) -> Result<RetainedStart030> {
+        // The worker owns the lock and the Start session through COMMIT and
+        // supervisor attachment, even when the caller drops the reply future.
+        let owner = Self {
+            engine: self.engine.clone(),
+            pool: self.pool.clone(),
+            tasks: self.tasks.clone(),
+            policies: self.policies.clone(),
+            context: self.context.clone(),
+            database_lock: self.database_lock.clone(),
+            shutdown_complete: self.shutdown_complete.clone(),
+        };
+        let allowed_harnesses = allowed_harnesses.clone();
+        let (mut reply, result) = oneshot::channel();
+        tokio::spawn(async move {
+            let outcome = owner
+                .start_owned(request_id, entry, &allowed_harnesses, &mut reply)
+                .await;
+            let _ = reply.send(outcome);
+        });
+        result.await.map_err(|_| {
+            failure(
+                "RUNTIME_UNAVAILABLE",
+                "start",
+                "Start worker did not finish",
+            )
+        })?
+    }
+
+    async fn start_owned(
+        &self,
+        request_id: String,
+        entry: Option<EngineEntry>,
+        allowed_harnesses: &BTreeSet<String>,
+        reply: &mut oneshot::Sender<Result<RetainedStart030>>,
+    ) -> Result<RetainedStart030> {
         let session = self.engine.begin_start().await?;
         let request = EngineStartRequest {
             source: self.source().await,
@@ -689,33 +721,99 @@ impl Host {
             session: &session,
             prepared: Mutex::new(None),
             capture: Mutex::new(None),
+            committing: Mutex::new(None),
             allowed_harnesses,
         };
-        let retained = match start030::start(&self.pool, &request, &adapter).await {
-            Ok(r) => r,
-            Err(e) => {
-                if let Some(c) = adapter
-                    .capture
-                    .lock()
-                    .map_err(|_| failure("RUNTIME_UNAVAILABLE", "start", "Capture unavailable"))?
-                    .as_ref()
-                {
-                    session.fail_reservation(&c.identity.system_start_id, e.clone());
+        let reconciled = if self
+            .engine
+            .flow030()
+            .pending_start_retry(&request)?
+            .is_some()
+        {
+            let _gate = session.lock_admission().await;
+            if let Some(identity) = self.engine.flow030().pending_start_retry(&request)? {
+                let retained = adapter.read_settled(&request).await?;
+                let outcome = match retained {
+                    Some(retained) if retained.receipt.identity == identity => {
+                        self.engine
+                            .flow030()
+                            .supervisors
+                            .resume_start_reservation(&identity.system_start_id)?;
+                        Some(StartOutcome030::Created(retained))
+                    }
+                    Some(retained) => Some(StartOutcome030::Replayed(retained)),
+                    None => None,
+                };
+                session.commit_acknowledged(&request, &identity);
+                outcome
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let outcome = if let Some(outcome) = reconciled {
+            outcome
+        } else {
+            let start = start030::start_with_outcome(&self.pool, &request, &adapter);
+            tokio::pin!(start);
+            let outcome = tokio::select! {
+                biased;
+                _ = reply.closed() => {
+                    if adapter.committing.lock().expect("Start commit marker").is_none() {
+                        return Err(failure("CANCELLED", "start", "Start caller disconnected before commit"));
+                    }
+                    start.await
                 }
-                return Err(e);
+                outcome = &mut start => outcome,
+            };
+            match outcome {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    let identity = adapter
+                        .committing
+                        .lock()
+                        .expect("Start commit marker")
+                        .clone();
+                    let Some(identity) = identity else {
+                        return Err(error);
+                    };
+                    let _gate = session.lock_admission().await;
+                    match adapter.read_settled(&request).await {
+                        Ok(Some(retained)) if retained.receipt.identity == identity => {
+                            session.commit_acknowledged(&request, &identity);
+                            StartOutcome030::Created(retained)
+                        }
+                        settled => {
+                            session.fail_reservation(&identity.system_start_id, error.clone());
+                            match settled {
+                                Ok(None) => session.commit_acknowledged(&request, &identity),
+                                _ => self
+                                    .engine
+                                    .flow030()
+                                    .mark_start_retryable(&request, &identity)?,
+                            }
+                            return Err(error);
+                        }
+                    }
+                }
             }
         };
+        let (fresh, retained) = match outcome {
+            StartOutcome030::Created(retained) => (true, retained),
+            StartOutcome030::Replayed(retained) => (false, retained),
+        };
+        #[cfg(test)]
+        self.engine
+            .flow030()
+            .operator_test_yield("start.attach")
+            .await;
         // A replay must name the snapshot this host retained, or none for a
         // JSON document. A fresh start that fails here is released.
         let matched = snapshot_matches(
             &retained.capture.private_capture_json,
             &self.policies.0.read().await.scope,
         );
-        let fresh = adapter
-            .capture
-            .lock()
-            .map_err(|_| failure("RUNTIME_UNAVAILABLE", "start", "Capture unavailable"))?
-            .is_some();
         if let Err(e) = matched {
             if fresh {
                 // Release the reservation even if interruption fails.
@@ -844,7 +942,23 @@ struct Start<'a> {
     session: &'a StartSession<'a>,
     prepared: Mutex<Option<Prepared>>,
     capture: Mutex<Option<StartCapture030>>,
+    committing: Mutex<Option<FlowIdentity030>>,
     allowed_harnesses: &'a BTreeSet<String>,
+}
+impl Start<'_> {
+    async fn read_settled(&self, request: &EngineStartRequest) -> Result<Option<RetainedStart030>> {
+        #[cfg(test)]
+        if self
+            .host
+            .engine
+            .flow030()
+            .operator_test_yield("start.readback.failed")
+            .await
+        {
+            return Err(failure("STORAGE", "start", "Test Start readback failure"));
+        }
+        start030::read_settled_start(&self.host.pool, request, self).await
+    }
 }
 impl Authority030 for Start<'_> {
     fn owner<'a>(
@@ -885,7 +999,25 @@ impl StartAuthority030 for Start<'_> {
         self.session.require_clear(r)
     }
     fn begin_commit(&self, r: &EngineStartRequest, id: &FlowIdentity030) -> Result<()> {
-        self.session.begin_commit(r, id, true)
+        self.session.begin_commit(r, id, true)?;
+        *self.committing.lock().expect("Start commit marker") = Some(id.clone());
+        Ok(())
+    }
+    #[cfg(test)]
+    async fn before_commit(&self) {
+        self.host
+            .engine
+            .flow030()
+            .operator_test_yield("start.commit")
+            .await;
+    }
+    #[cfg(test)]
+    async fn lose_commit_reply(&self) -> bool {
+        self.host
+            .engine
+            .flow030()
+            .operator_test_yield("start.commit.unknown")
+            .await
     }
     fn commit_acknowledged(&self, r: &EngineStartRequest, id: &FlowIdentity030) {
         self.session.commit_acknowledged(r, id)
@@ -926,6 +1058,12 @@ impl StartAuthority030 for Start<'_> {
             .lock()
             .map_err(|_| failure("RUNTIME_UNAVAILABLE", "start", "Preparation unavailable"))? =
             Some(p);
+        #[cfg(test)]
+        self.host
+            .engine
+            .flow030()
+            .operator_test_yield("start.captured")
+            .await;
         Ok(capture)
     }
     async fn lock_source(&self, r: &EngineStartRequest) -> Result<Self::SourceGuard> {
@@ -1086,6 +1224,225 @@ mod tests {
             message_json: "{}".into(),
         })
     }
+    #[tokio::test]
+    async fn concurrent_start_retry_keeps_the_creating_supervisor() {
+        let f = Fixture::new(WAIT);
+        let host = f.open().await.unwrap();
+        let hook = host
+            .engine
+            .flow030()
+            .install_operator_test_hook("start.captured");
+        let mut first = Box::pin(host.start("start".into(), entry(), false));
+        tokio::select! {
+            _ = hook.reached() => (),
+            result = &mut first => panic!("First Start returned before capture barrier: {result:?}"),
+        }
+        let second = host.start("start".into(), entry(), false).await.unwrap();
+        hook.release();
+        assert_eq!(first.await.unwrap().receipt, second.receipt);
+        let id = second.receipt.identity.system_start_id;
+        assert_eq!(host.active_runs().await.unwrap(), std::slice::from_ref(&id));
+        host.shutdown(&[id]).await.unwrap();
+        host.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn start_retry_reconciles_after_commit_and_readback_fail() {
+        let f = Fixture::new(WAIT);
+        let host = f.open().await.unwrap();
+        let commit = host
+            .engine
+            .flow030()
+            .install_operator_test_hook("start.commit.unknown");
+        let readback = host
+            .engine
+            .flow030()
+            .install_operator_test_hook("start.readback.failed");
+        let mut first = Box::pin(host.start("retry".into(), entry(), false));
+        tokio::select! {
+            _ = commit.reached() => (),
+            result = &mut first => panic!("Start returned before COMMIT: {result:?}"),
+        }
+        commit.release();
+        tokio::select! {
+            _ = readback.reached() => (),
+            result = &mut first => panic!("Start returned before readback: {result:?}"),
+        }
+        readback.release();
+        assert_eq!(first.await.unwrap_err().code, "UNCERTAIN");
+
+        let recorded = host.runs().await.unwrap();
+        assert_eq!(recorded.len(), 1);
+        let mut wrong = entry().unwrap();
+        wrong.message_json = "{} ".into();
+        assert!(host
+            .start("retry".into(), Some(wrong), false)
+            .await
+            .is_err());
+
+        let retry = host.start("retry".into(), entry(), false).await.unwrap();
+        assert_eq!(
+            serde_json::to_value(&retry.receipt).unwrap(),
+            recorded[0]["receipt"]
+        );
+        let system = retry.receipt.identity.system_start_id;
+        assert!(host.engine.flow030().supervisors.has_task(&system).unwrap());
+        assert_eq!(
+            host.start("retry".into(), entry(), false)
+                .await
+                .unwrap()
+                .receipt
+                .identity
+                .system_start_id,
+            system
+        );
+        host.shutdown(&[system]).await.unwrap();
+        host.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelling_start_before_attachment_allows_shutdown() {
+        for boundary in ["start.commit", "start.attach"] {
+            let f = Fixture::new(WAIT);
+            let host = f.open().await.unwrap();
+            let hook = host.engine.flow030().install_operator_test_hook(boundary);
+            let mut start = Box::pin(host.start("start".into(), entry(), false));
+            tokio::select! {
+                _ = hook.reached() => (),
+                result = &mut start => panic!("Start returned before {boundary}: {result:?}"),
+            }
+            drop(start);
+            hook.release();
+            let approved = host.active_runs().await.unwrap();
+            assert_eq!(approved.len(), 1, "{boundary}");
+            tokio::time::timeout(std::time::Duration::from_secs(3), host.shutdown(&approved))
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("shutdown waited on an orphaned reservation at {boundary}")
+                })
+                .unwrap();
+            host.close().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn delivery_with_a_queued_retirement_releases_its_lifecycle_lease() {
+        let f = Fixture::new(WAIT);
+        let host = f.open().await.unwrap();
+        let started = host.start("start".into(), entry(), false).await.unwrap();
+        let hook = host
+            .engine
+            .flow030()
+            .install_operator_test_hook("delivery.inspect");
+        let mut delivery = Box::pin(host.deliver(api::DeliveryRequest030 {
+            scope: api::RuntimeProjectionScope030 {
+                system_start_id: started.receipt.identity.system_start_id,
+                source: started.capture.source,
+                snapshot_id: started.receipt.identity.snapshot_id,
+            },
+            delivery_id: "delivery".into(),
+            agent_name: "worker".into(),
+            instance: None,
+            delivery: "queue".into(),
+            message_json: "{}".into(),
+        }));
+        tokio::select! {
+            _ = hook.reached() => (),
+            result = &mut delivery => panic!("Delivery returned before its inspection: {result:?}"),
+        }
+        let mut retirement = Box::pin(host.engine.revoke_native(&host.pool, &host.tasks));
+        assert!(futures::poll!(&mut retirement).is_pending());
+        hook.release();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(3), delivery)
+            .await
+            .expect("inspection blocked behind a writer while holding a read lease");
+        assert_eq!(result.unwrap_err().code, "RUNTIME_UNAVAILABLE");
+    }
+
+    #[tokio::test]
+    async fn opens_storage_after_first_schema_transaction_rolls_back() {
+        use sqlx::Connection;
+        let f = Fixture::new(WAIT);
+        let mut builder = std::fs::DirBuilder::new();
+        let mut file = std::fs::OpenOptions::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+            builder.mode(0o700);
+            file.mode(0o600);
+        }
+        builder.create(&f.data).unwrap();
+        let db = f.data.join("engine.sqlite");
+        file.write(true).create_new(true).open(&db).unwrap();
+        let mut connection =
+            SqliteConnection::connect_with(&sqlx::sqlite::SqliteConnectOptions::new().filename(db))
+                .await
+                .unwrap();
+        let mut tx = connection.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        sqlx::query("CREATE TABLE initialization_probe (id INTEGER)")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tx.rollback().await.unwrap();
+        connection.close().await.unwrap();
+        let host = f.open().await.unwrap();
+        host.shutdown(&[]).await.unwrap();
+        host.close().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn standalone_storage_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let f = Fixture::new(WAIT);
+        let host = f.open().await.unwrap();
+        for (path, mode) in [
+            ("", 0o700),
+            ("engine.sqlite", 0o600),
+            ("engine.sqlite-wal", 0o600),
+            ("engine.sqlite-shm", 0o600),
+        ] {
+            let metadata = std::fs::metadata(f.data.join(path)).unwrap();
+            assert_eq!(metadata.permissions().mode() & 0o777, mode, "{path}");
+        }
+        host.shutdown(&[]).await.unwrap();
+        host.close().await.unwrap();
+        let uid = unsafe { libc::geteuid() };
+        for (name, expected, actual) in [
+            ("engine.sqlite", "0600", 0o644),
+            ("engine.sqlite-wal", "0600", 0o644),
+            ("engine.sqlite-shm", "0600", 0o644),
+            ("engine.sqlite-journal", "0600", 0o644),
+            ("", "0700", 0o755),
+        ] {
+            let path = f.data.join(name);
+            if name != "engine.sqlite" && !name.is_empty() {
+                std::fs::write(&path, []).unwrap();
+            }
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(actual)).unwrap();
+            let error = f.open().await.err().expect("insecure storage was opened");
+            assert_eq!(error.code, "PERMISSION");
+            assert!(error
+                .message
+                .contains(path.to_str().unwrap().trim_end_matches('/')));
+            assert!(error
+                .message
+                .contains(&format!("expected UID {uid} and mode {expected}")));
+            assert!(error
+                .message
+                .contains(&format!("found UID {uid} and mode {actual:04o}")));
+            if name == "engine.sqlite" || name.is_empty() {
+                let mode = if name.is_empty() { 0o700 } else { 0o600 };
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            } else {
+                std::fs::remove_file(&path).unwrap();
+            }
+        }
+        let reopened = f.open().await.unwrap();
+        reopened.shutdown(&[]).await.unwrap();
+        reopened.close().await.unwrap();
+    }
+
     #[test]
     fn operational_write_review_fixture_stays_inside_the_existing_codex_slice() {
         let raw = include_str!("../examples/fixtures/write-review.json");
@@ -1598,6 +1955,27 @@ mod tests {
         .unwrap()
         .unwrap();
         assert!(child.status.success(), "{child:?}");
+        // Recovery reads persisted Stop columns; a wrongly typed value must
+        // refuse opening with a storage error instead of panicking.
+        let path = f.data.join("engine.sqlite");
+        let pool = crate::sqlite::open_file(&path).await.unwrap();
+        let generation: String = sqlx::query_scalar("SELECT generation FROM engine_flow030_owners")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE engine_flow030_owners SET generation=x'00'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+        assert_eq!(f.open().await.err().unwrap().code, "STORAGE");
+        let pool = crate::sqlite::open_file(&path).await.unwrap();
+        sqlx::query("UPDATE engine_flow030_owners SET generation=?")
+            .bind(generation)
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
         for reopening in 0..2 {
             let host = f.open().await.unwrap();
             let runs = host.runs().await.unwrap();
@@ -1619,6 +1997,25 @@ mod tests {
             .await
             .unwrap();
             assert_eq!(pending, 1);
+            let result = host
+                .stop(EngineStopRequest {
+                    request_id: "stop".into(),
+                    system_start_id: query.system_start_id.clone(),
+                    activation_id: None,
+                })
+                .await
+                .unwrap();
+            assert!(
+                matches!(result, persistence::public::PublicStopState::Confirmed { request_id } if request_id == "stop")
+            );
+            let ensured = host
+                .engine
+                .ensure_stop(&host.pool, &host.tasks, &query.system_start_id)
+                .await
+                .unwrap();
+            assert!(
+                matches!(ensured, persistence::public::PublicStopState::Confirmed { request_id } if request_id == "stop")
+            );
             host.shutdown(&[]).await.unwrap();
             host.close().await.unwrap();
             let replay = persistence::replay_verify030::verify_path030(
@@ -1647,6 +2044,8 @@ mod tests {
                      "human.readback"),
                     ("UPDATE engine_flow030_clock SET observed_ms=X'FF'",
                      "human.readback"),
+                    ("UPDATE engine_flow030_clock_works SET retired='invalid'",
+                     "human.readback"),
                 ].into_iter().enumerate() {
                     let copy = f.data.join(format!("wrong-replay-{index}.sqlite"));
                     std::fs::copy(f.data.join("engine.sqlite"), &copy).unwrap();
@@ -1655,9 +2054,15 @@ mod tests {
                     let edits_ticket = mutation.starts_with("UPDATE engine_flow030_clock_events");
                     if edits_ticket {
                         sqlx::query("DROP TRIGGER engine_flow030_clock_ticket_immutable")
-                            .execute(&mut *tx).await.unwrap();
+                            .execute(&mut *tx)
+                            .await
+                            .unwrap();
                     }
-                    let changed = sqlx::query(mutation).execute(&mut *tx).await.unwrap().rows_affected();
+                    let changed = sqlx::query(mutation)
+                        .execute(&mut *tx)
+                        .await
+                        .unwrap()
+                        .rows_affected();
                     assert_eq!(changed, 1);
                     if edits_ticket {
                         sqlx::query(
@@ -1668,8 +2073,11 @@ mod tests {
                     tx.commit().await.unwrap();
                     pool.close().await;
                     let replay = persistence::replay_verify030::verify_path030(
-                        &copy, &query.system_start_id, &page.flow_invocation_id,
-                    ).await;
+                        &copy,
+                        &query.system_start_id,
+                        &page.flow_invocation_id,
+                    )
+                    .await;
                     assert_eq!(replay.divergence.unwrap().field, expected, "{mutation}");
                 }
             }

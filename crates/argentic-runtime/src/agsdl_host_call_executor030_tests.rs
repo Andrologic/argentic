@@ -523,10 +523,11 @@ async fn native_mcp_question_answers_and_expires_while_machine_time_is_paused() 
         };
         let page = tokio::time::timeout(std::time::Duration::from_secs(10), async {
             loop {
-                let page =
-                    crate::agsdl_host_human_projection030::read(&f.pool, scope.clone(), None)
-                        .await
-                        .unwrap();
+                let page = f
+                    .host
+                    .human_page(&f.pool, scope.clone(), None)
+                    .await
+                    .unwrap();
                 if !page.requests.is_empty() {
                     break page;
                 }
@@ -602,7 +603,9 @@ async fn nested_entry_approval_keeps_host_prompt_provenance_through_its_output()
     };
     let page = tokio::time::timeout(std::time::Duration::from_secs(10), async {
         loop {
-            let page = crate::agsdl_host_human_projection030::read(&f.pool, scope.clone(), None)
+            let page = f
+                .host
+                .human_page(&f.pool, scope.clone(), None)
                 .await
                 .unwrap();
             if !page.requests.is_empty() {
@@ -744,7 +747,10 @@ async fn retained_stdio_refuses_unverified_programs_and_reserved_secrets_before_
 }
 
 #[cfg(unix)]
-struct RetainedStdio(crate::host::HostContext);
+struct RetainedStdio(
+    crate::host::HostContext,
+    Arc<dyn crate::agsdl_host_calls::HostPort>,
+);
 
 #[cfg(unix)]
 impl crate::agsdl_host_call_executor030::CallTransport030 for RetainedStdio {
@@ -759,26 +765,193 @@ impl crate::agsdl_host_call_executor030::CallTransport030 for RetainedStdio {
     ) -> crate::agsdl_host_calls::Result<
         BoxFuture<'static, Result<crate::persistence::call_protocol030::CallEnd030>>,
     > {
-        use crate::agsdl_host_call_executor030::{
-            mcp_server, run_transport, NoHuman, StartedTransport,
-        };
+        use crate::agsdl_host_call_executor030::{mcp_server, run_transport, StartedTransport};
         let crate::agsdl_host_calls030::PreparedCall030::Mcp { server, .. } = &prepared else {
             unreachable!();
         };
         let config = mcp_server(&self.0, grant, &capture, server)?;
         let started = crate::agsdl_host_calls::raw_mcp::start_test_stdio(config)?;
+        let humans = self.1.clone();
         Ok(Box::pin(async move {
             run_transport(
                 StartedTransport::Mcp(Box::new(started)),
                 &prepared,
                 &attempt,
                 &control,
-                Arc::new(NoHuman),
+                humans,
                 admit_tool,
             )
             .await
         }))
     }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn stdio_failed_human_reply_stays_reserved_and_replays_after_reopen() {
+    let (f, _) = stdio_failed_human_reply_reserved().await;
+    let replay = crate::persistence::replay_verify030::verify_path030(
+        &f._temp.path().join("run.db"),
+        &f.identity.system_start_id,
+        &f.identity.flow_invocation_id,
+    )
+    .await;
+    assert!(replay.ok, "{replay:?}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn replay_ties_reserved_mcp_question_to_its_call_receipt_and_capture() {
+    let (f, request_id) = stdio_failed_human_reply_reserved().await;
+    let path = f._temp.path().join("run.db");
+    // Rewrites one table with its immutability triggers set aside, as a
+    // damaged or forged file would present it.
+    let forge = |name: &str, table: &'static str, sql: &'static str| {
+        let forged = f._temp.path().join(name);
+        std::fs::copy(&path, &forged).unwrap();
+        let request_id = request_id.clone();
+        async move {
+            let pool = crate::sqlite::open_file(&forged).await.unwrap();
+            let triggers: Vec<(String, String)> = sqlx::query_as(
+                "SELECT name,sql FROM sqlite_master WHERE type='trigger' AND tbl_name=?",
+            )
+            .bind(table)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            for (name, _) in &triggers {
+                sqlx::raw_sql(sqlx::AssertSqlSafe(format!("DROP TRIGGER \"{name}\"")))
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+            let changed = sqlx::query(sql)
+                .bind(&request_id)
+                .execute(&pool)
+                .await
+                .unwrap()
+                .rows_affected();
+            assert_eq!(changed, 1, "{sql}");
+            for (_, sql) in &triggers {
+                sqlx::raw_sql(sqlx::AssertSqlSafe(sql.as_str()))
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+            pool.close().await;
+            forged
+        }
+    };
+    let forged = [
+        forge(
+            "question-call.db",
+            "engine_flow030_human_requests",
+            "UPDATE engine_flow030_human_requests SET payload_json=json_set(payload_json,'$.nativeCallId','forged-call') WHERE request_id=?",
+        )
+        .await,
+        forge(
+            "declaration.db",
+            "engine_flow030_calls",
+            "UPDATE engine_flow030_calls SET
+                attempt_json=json_set(attempt_json,'$.declarationJson',''||json_set(json_extract(attempt_json,'$.declarationJson'),'$.mcp.tool','forged')),
+                receipt_json=json_set(receipt_json,'$.attempt.declarationJson',''||json_set(json_extract(receipt_json,'$.attempt.declarationJson'),'$.mcp.tool','forged'))
+             WHERE ?<>'' AND status='terminal'",
+        )
+        .await,
+    ];
+    for path in forged {
+        let replay = crate::persistence::replay_verify030::verify_path030(
+            &path,
+            &f.identity.system_start_id,
+            &f.identity.flow_invocation_id,
+        )
+        .await;
+        assert!(!replay.ok, "{path:?} replayed");
+    }
+}
+
+#[cfg(unix)]
+async fn stdio_failed_human_reply_reserved() -> (Fixture, String) {
+    let server = r#"set -eu
+IFS= read -r init
+printf '%s\n' '{"jsonrpc":"2.0","id":"1","result":{"protocolVersion":"2025-11-25","capabilities":{},"serverInfo":{"name":"fixture","version":"1"}}}'
+IFS= read -r initialized
+IFS= read -r call
+exec 0<&-
+printf '%s\n' '{"jsonrpc":"2.0","id":"person","method":"elicitation/create","params":{"message":"Continue?","requestedSchema":{"type":"object"}}}'
+"#;
+    let mut doc = document(json!({"type":"call","mcp":{"server":"local","tool":"check"}}));
+    doc["contract"] = json!(argentic_core::AGSDL_040);
+    doc["mcpServers"] = json!({"local":{"command":["/bin/sh","-c",server]}});
+    let f = Fixture::new(&json!({"document":doc,"entry":{},"timeline":[]}).to_string()).await;
+    let humans = Arc::new(crate::agsdl_host_human_executor030::CallHumans030 {
+        app: f.host.clone(),
+        pool: f.pool.clone(),
+        identity: f.identity.clone(),
+    });
+    let _tasks = start_calls(
+        &f,
+        f.config.clone(),
+        Arc::new(RetainedStdio(f.config.clone(), humans)),
+    );
+    let scope = crate::persistence::public030::HumanScope030 {
+        system_start_id: f.identity.system_start_id.clone(),
+        source: serde_json::from_value(f.plan.source.clone()).unwrap(),
+    };
+    let request_id = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let page = f
+                .host
+                .human_page(&f.pool, scope.clone(), None)
+                .await
+                .unwrap();
+            if let Some(request) = page.requests.first() {
+                break request.id.clone();
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    f.host
+        .submit_person(
+            &f.pool,
+            crate::api::HumanSubmission {
+                scope,
+                request_id: request_id.clone(),
+                expected_revision: "0".into(),
+                answer: crate::api::HumanAnswer030::Question {
+                    answer_json: r#"{"action":"accept","content":{}}"#.into(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let view = finish(&f).await;
+    assert_eq!(view.state.verdict.as_deref(), Some("failed"));
+    assert!(
+        matches!(&view.state.activations[0].result, Some(WorkResultRecord030::Failed { error }) if error.code == "CALL_FAILED")
+    );
+
+    let path = f._temp.path().join("run.db");
+    let reopened = crate::sqlite::open_file(&path).await.unwrap();
+    crate::api::interrupt_previous_runs(&reopened)
+        .await
+        .unwrap();
+    let delivery: String =
+        sqlx::query_scalar("SELECT delivery FROM engine_flow030_human_requests WHERE request_id=?")
+            .bind(&request_id)
+            .fetch_one(&reopened)
+            .await
+            .unwrap();
+    assert_eq!(delivery, "reserved");
+    let interrupted: i64 = sqlx::query_scalar("SELECT count(*) FROM engine_flow030_interruptions")
+        .fetch_one(&reopened)
+        .await
+        .unwrap();
+    assert_eq!(interrupted, 0);
+    reopened.close().await;
+    (f, request_id)
 }
 
 #[cfg(unix)]
@@ -850,7 +1023,14 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":"2","result":{{"structuredContent":{{"chec
             assert_eq!(names, [key]);
             Some(BTreeMap::from([(key.into(), value.into())]))
         }));
-    let _tasks = start_calls(&f, config.clone(), Arc::new(RetainedStdio(config)));
+    let _tasks = start_calls(
+        &f,
+        config.clone(),
+        Arc::new(RetainedStdio(
+            config,
+            Arc::new(crate::agsdl_host_call_executor030::NoHuman),
+        )),
+    );
     let view = finish(&f).await;
     assert_eq!(view.state.verdict.as_deref(), Some("succeeded"));
     assert_eq!(*seen.lock().unwrap(), ["first", "second"]);
@@ -952,7 +1132,7 @@ async fn native_http_mcp_isolates_server_secrets_and_rejects_echoes_before_persi
 
 #[cfg(unix)]
 #[tokio::test]
-async fn native_http_mcp_stop_leaves_unconfirmed_tool_in_stopping_state() {
+async fn native_http_mcp_stop_remains_uncertain_after_reopen() {
     remote_mcp_unconfirmed(false).await;
 }
 
@@ -1106,6 +1286,110 @@ async fn native_remote_mcp_routes_safe_budget_expiration_and_honors_authored_tim
         assert!(replay.ok, "{:?}", replay.divergence);
         server.abort();
     }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn lost_http_answer_response_projects_human_termination_uncertainty() {
+    use crate::test_context::mcp::*;
+    let peer = Peer::start().await;
+    let project = tempfile::tempdir().unwrap();
+    let doc = json!({
+        "projectFormat":"agsdl-project-1","contract":"agsdl-0.4.0","id":"lost-answer","agents":{},
+        "mcpServers":peer.servers(),"secrets":{"file":"requirements.json"},
+        "flow":{"entry":"first","steps":{
+            "first":{"type":"call","mcp":{"server":"first","tool":"form-lost"}}
+        }}
+    });
+    std::fs::write(project.path().join("agsdl.json"), doc.to_string()).unwrap();
+    std::fs::write(project.path().join("requirements.json"), REQUIREMENTS).unwrap();
+    let f = Fixture::new_with_project(r#"{"entry":{},"timeline":[]}"#, false, Some(project.path()))
+        .await;
+    let config = peer.configure(f.config.clone());
+    let _tasks = start_calls(
+        &f,
+        config.clone(),
+        Arc::new(crate::agsdl_host_call_executor030::NativeCallTransport030 {
+            config,
+            humans: Some(
+                Arc::new(crate::agsdl_host_human_executor030::CallHumans030 {
+                    app: f.host.clone(),
+                    pool: f.pool.clone(),
+                    identity: f.identity.clone(),
+                }) as Arc<dyn crate::agsdl_host_calls::HostPort>,
+            ),
+        }),
+    );
+    let scope = crate::persistence::public030::HumanScope030 {
+        system_start_id: f.identity.system_start_id.clone(),
+        source: serde_json::from_value(f.plan.source.clone()).unwrap(),
+    };
+    let request_id = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let page = f
+                .host
+                .human_page(&f.pool, scope.clone(), None)
+                .await
+                .unwrap();
+            if let Some(request) = page.requests.first() {
+                break request.id.clone();
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    f.host
+        .submit_person(
+            &f.pool,
+            crate::api::HumanSubmission {
+                scope: scope.clone(),
+                request_id: request_id.clone(),
+                expected_revision: "0".into(),
+                answer: crate::api::HumanAnswer030::Question {
+                    answer_json: r#"{"action":"accept","content":{}}"#.into(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let error = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        f.host.flow030().supervisors.wait(&f.owner.system_start_id),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert_eq!(error.code, "MCP_TERMINATION_UNCERTAIN");
+    let delivery: String =
+        sqlx::query_scalar("SELECT delivery FROM engine_flow030_human_requests WHERE request_id=?")
+            .bind(&request_id)
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+    assert_eq!(delivery, "reserved");
+    let run = f
+        .host
+        .runtime_projection(
+            &f.pool,
+            crate::api::RuntimeProjectionQuery030 {
+                system_start_id: f.owner.system_start_id.clone(),
+                source: serde_json::from_value(f.plan.source.clone()).unwrap(),
+                snapshot_id: Some(f.identity.snapshot_id.clone()),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(run.termination_uncertain);
+    let page = f.host.human_page(&f.pool, scope, None).await.unwrap();
+    assert_eq!(page.requests[0].status, "uncertain");
+    let facts: serde_json::Value =
+        serde_json::from_str(page.requests[0].flow_json.as_deref().unwrap()).unwrap();
+    assert_eq!(facts["state"]["kind"], "uncertain");
+    assert_eq!(facts["state"]["phase"], "afterResolution");
+    assert_eq!(facts["state"]["resolution"]["reason"], "person");
+    assert_no_secrets(&f._temp.path().join("run.db"));
 }
 
 #[cfg(unix)]
@@ -1295,6 +1579,30 @@ async fn remote_mcp_unconfirmed(expire: bool) {
         assert!(replay.ok, "{:?}", replay.divergence);
     }
     f.pool.close().await;
+    if !expire {
+        let reopened = crate::sqlite::open_file(&f._temp.path().join("run.db"))
+            .await
+            .unwrap();
+        crate::api::interrupt_previous_runs(&reopened)
+            .await
+            .unwrap();
+        let engine = crate::Engine::new();
+        crate::agsdl_host_flow030::recover_pending_stops030(&engine, &reopened)
+            .await
+            .unwrap();
+        let stop = engine
+            .ensure_stop(
+                &reopened,
+                &crate::tasks::StreamTasks::default(),
+                &f.identity.system_start_id,
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(stop, crate::persistence::public::PublicStopState::Uncertain { request_id } if request_id == "stop-remote")
+        );
+        reopened.close().await;
+    }
     assert_no_secrets(&f._temp.path().join("run.db"));
 }
 
@@ -1491,6 +1799,24 @@ async fn shutdown_attests_expired_remote_call_deadlines_for_replay() {
         )
         .await;
         assert!(replay.ok, "{replay:?}");
+        let path = f._temp.path().join("run.db");
+        let pool = crate::sqlite::open_file(&path).await.unwrap();
+        assert_eq!(
+            sqlx::query("UPDATE engine_flow030_clock_controls SET joined='invalid'")
+                .execute(&pool)
+                .await
+                .unwrap()
+                .rows_affected(),
+            1
+        );
+        pool.close().await;
+        let replay = crate::persistence::replay_verify030::verify_path030(
+            &path,
+            &f.identity.system_start_id,
+            &f.identity.flow_invocation_id,
+        )
+        .await;
+        assert_eq!(replay.divergence.unwrap().field, "human.readback");
         server.abort();
     }
 }

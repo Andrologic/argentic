@@ -637,6 +637,20 @@ impl RuntimeRegistry030 {
                 )
             })
     }
+    pub(crate) fn has_task(&self, system: &str) -> Result<bool> {
+        Ok(self
+            .0
+            .lock()
+            .map_err(|_| {
+                failure(
+                    "RUNTIME_UNAVAILABLE",
+                    "runtime",
+                    "Supervisor registry is unavailable",
+                )
+            })?
+            .get(system)
+            .is_some_and(|handle| handle.task.is_some()))
+    }
     pub(crate) fn reserve(&self, system: &str) -> Result<()> {
         let mut handles = self.0.lock().map_err(|_| {
             failure(
@@ -666,6 +680,23 @@ impl RuntimeRegistry030 {
         );
         Ok(())
     }
+    pub(crate) fn resume_start_reservation(&self, system: &str) -> Result<()> {
+        let unavailable = || {
+            failure(
+                "RUNTIME_UNAVAILABLE",
+                "runtime",
+                "Start reservation is unavailable",
+            )
+        };
+        let mut handles = self.0.lock().map_err(|_| unavailable())?;
+        let handle = handles.get_mut(system).ok_or_else(unavailable)?;
+        if handle.task.is_some() || !matches!(handle.outcome, Some(Err(_))) {
+            return Err(unavailable());
+        }
+        handle.outcome = None;
+        Ok(())
+    }
+
     pub(crate) fn fail_reservation(
         &self,
         system: &str,
@@ -748,6 +779,12 @@ impl RuntimeRegistry030 {
             .unwrap();
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
+    }
+
+    pub(crate) fn mcp_termination_uncertain(&self, system: &str) -> bool {
+        self.outcome(system).is_some_and(|outcome| {
+            outcome.is_err_and(|error| error.code == "MCP_TERMINATION_UNCERTAIN")
+        })
     }
 
     pub(crate) fn outcome(&self, system: &str) -> Option<Result<()>> {

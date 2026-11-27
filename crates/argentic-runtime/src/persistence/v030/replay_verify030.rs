@@ -20,7 +20,7 @@ pub const OUTSIDE_REPLAY: &[&str] = &[
     "036: engine_flow030_work_admissions, engine_flow030_work_authorizations, engine_flow030_work_state, engine_flow030_work_events, engine_flow030_work_checks (only Start settlement and provider-attempt correlation are checked)",
     "037: engine_flow030_route_source_attestations, engine_flow030_route_content_contexts, engine_flow030_route_content_receipts",
     "038: engine_flow030_system_stop_requests",
-    "039: engine_flow030_calls, engine_flow030_call_causes, engine_flow030_call_diagnostics",
+    "039: engine_flow030_calls, engine_flow030_call_causes, engine_flow030_call_diagnostics (only the joined failure of a call with a reserved human answer is checked)",
 ];
 
 #[derive(Debug, Serialize)]
@@ -341,13 +341,7 @@ pub async fn verify_path030(path: &Path, system_id: &str, invocation_id: &str) -
             .await
             .map_err(storage)?;
         let mut tx = db.begin().await.map_err(storage)?;
-        let result = async {
-            verify(&mut tx, system_id, invocation_id).await?;
-            let row=sqlx::query("SELECT state_json,plan_json FROM engine_flow030_runs WHERE system_id=? AND invocation_id=?").bind(system_id).bind(invocation_id).fetch_one(&mut *tx).await.map_err(storage)?;
-            let state:FlowState030=parse("human.state",row.get("state_json"))?;
-            let plan:FlowPlan030=parse("human.plan",row.get("plan_json"))?;
-            human::verify(&mut tx,&state,&plan).await.map_err(|e|mismatch("human.readback","valid native clock and human proofs",e.to_string()))
-        }.await;
+        let result = verify(&mut tx, system_id, invocation_id).await;
         tx.rollback().await.map_err(storage)?;
         db.close().await.map_err(storage)?;
         result
@@ -361,7 +355,38 @@ pub async fn verify_path030(path: &Path, system_id: &str, invocation_id: &str) -
     }
 }
 
-async fn verify(db: &mut SqliteConnection, system: &str, invocation: &str) -> Result<()> {
+/// Runs only the human/clock replay on a file whose run lacks a full Start
+/// capture, as the synthetic broker fixtures do.
+#[cfg(test)]
+pub(crate) async fn verify_human_path030(
+    path: &Path,
+    system_id: &str,
+    invocation_id: &str,
+) -> std::result::Result<human::HumanProjection030, String> {
+    let options = SqliteConnectOptions::new().filename(path).read_only(true);
+    let mut db = SqliteConnection::connect_with(&options)
+        .await
+        .map_err(|e| e.to_string())?;
+    let row = sqlx::query("SELECT state_json,plan_json FROM engine_flow030_runs WHERE system_id=? AND invocation_id=?")
+        .bind(system_id).bind(invocation_id).fetch_one(&mut db).await.map_err(|e| e.to_string())?;
+    let state: FlowState030 =
+        serde_json::from_str(row.try_get("state_json").map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+    let plan: FlowPlan030 =
+        serde_json::from_str(row.try_get("plan_json").map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+    let result = human::verify(&mut db, &state, &plan, "{}")
+        .await
+        .map_err(|e| e.to_string());
+    db.close().await.map_err(|e| e.to_string())?;
+    result
+}
+
+async fn verify(
+    db: &mut SqliteConnection,
+    system: &str,
+    invocation: &str,
+) -> Result<human::HumanProjection030> {
     let run = sqlx::query("SELECT snapshot_id,epoch,source_json,plan_json,state_json FROM engine_flow030_runs WHERE system_id=? AND invocation_id=?")
         .bind(system).bind(invocation).fetch_optional(&mut *db).await.map_err(storage)?
         .ok_or_else(|| mismatch("run", "existing run", Value::Null))?;
@@ -379,10 +404,8 @@ async fn verify(db: &mut SqliteConnection, system: &str, invocation: &str) -> Re
     let start = sqlx::query("SELECT snapshot_id,capture_epoch,capture_json,request_json,receipt_json FROM engine_start030_requests WHERE system_id=? AND invocation_id=?")
         .bind(system).bind(invocation).fetch_optional(&mut *db).await.map_err(storage)?
         .ok_or_else(|| mismatch("start.capture", "stored capture", Value::Null))?;
-    let capture: CaptureRead = parse(
-        "start.capture",
-        start.try_get("capture_json").map_err(storage)?,
-    )?;
+    let capture_json = start.try_get("capture_json").map_err(storage)?;
+    let capture: CaptureRead = parse("start.capture", capture_json)?;
     let request: StartRead = parse(
         "start.request",
         start.try_get("request_json").map_err(storage)?,
@@ -676,7 +699,15 @@ async fn verify(db: &mut SqliteConnection, system: &str, invocation: &str) -> Re
                 error
             })?;
     }
-    Ok(())
+    human::verify(db, &state, &plan, capture_json)
+        .await
+        .map_err(|error| {
+            mismatch(
+                "human.readback",
+                "valid native clock and human proofs",
+                error.to_string(),
+            )
+        })
 }
 
 async fn verify_physical_end(

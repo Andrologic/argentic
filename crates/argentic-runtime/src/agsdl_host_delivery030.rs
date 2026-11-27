@@ -50,7 +50,9 @@ pub(crate) async fn deliver030(
     crate::persistence::validate_json(&request.message_json)?;
     let lease = host.start_lease().await?;
     let owner = lease.owner(&request.scope.system_start_id)?;
-    let inspection = inspect_run(host.flow030(), host, pool, &owner).await?;
+    #[cfg(test)]
+    host.flow030().operator_test_yield("delivery.inspect").await;
+    let inspection = inspect_run_with_lease(host.flow030(), host, pool, &owner, &lease).await?;
     if inspection.capture.source != request.scope.source
         || inspection.capture.identity.snapshot_id != request.scope.snapshot_id
     {

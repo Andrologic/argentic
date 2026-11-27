@@ -82,11 +82,11 @@ pub(crate) async fn claim_check030(
         .bind(&id.system_start_id).bind(&id.flow_invocation_id).bind(&attempt.work().activation_id)
         .bind(&check.check_id).fetch_optional(&mut *db).await?.ok_or_else(|| denied("Check is not reserved"))?;
     require(
-        row.get::<&str, _>("request_json") == check.invocation_json,
+        row.try_get::<&str, _>("request_json")? == check.invocation_json,
         "Check request differs",
     )?;
     let decision: String = sqlx::query_scalar("SELECT decision_json FROM engine_flow030_work_events WHERE system_id=? AND invocation_id=? AND event_id=?")
-        .bind(&id.system_start_id).bind(&id.flow_invocation_id).bind(row.get::<&str,_>("event_id"))
+        .bind(&id.system_start_id).bind(&id.flow_invocation_id).bind(row.try_get::<&str,_>("event_id")?)
         .fetch_one(&mut *db).await?;
     let decision: ProtocolDecision030 = serde_json::from_str(&decision)?;
     let current: String = sqlx::query_scalar("SELECT state_json FROM engine_flow030_work_state WHERE system_id=? AND invocation_id=? AND activation_id=?")
@@ -222,14 +222,14 @@ async fn binding(
     let owner = lease.owner(&id.system_start_id)?;
     let row = sqlx::query("SELECT invocation_id,snapshot_id,capture_epoch,owner_epoch,generation,status,capture_sha256 FROM engine_flow030_owners WHERE system_id=?")
         .bind(&id.system_start_id).fetch_optional(&mut *db).await?.ok_or_else(|| denied("Flow owner missing"))?;
-    let capture_hash: String = row.get("capture_sha256");
+    let capture_hash: String = row.try_get("capture_sha256")?;
     require(
-        row.get::<&str, _>("invocation_id") == id.flow_invocation_id
-            && row.get::<&str, _>("snapshot_id") == id.snapshot_id
-            && row.get::<&str, _>("capture_epoch") == id.epoch
-            && row.get::<&str, _>("owner_epoch") == owner.owner_epoch
-            && row.get::<&str, _>("generation") == lease.generation()
-            && row.get::<&str, _>("status") == "live",
+        row.try_get::<&str, _>("invocation_id")? == id.flow_invocation_id
+            && row.try_get::<&str, _>("snapshot_id")? == id.snapshot_id
+            && row.try_get::<&str, _>("capture_epoch")? == id.epoch
+            && row.try_get::<&str, _>("owner_epoch")? == owner.owner_epoch
+            && row.try_get::<&str, _>("generation")? == lease.generation()
+            && row.try_get::<&str, _>("status")? == "live",
         "Flow owner differs or was revoked",
     )?;
     let raw: String = sqlx::query_scalar(
@@ -250,12 +250,12 @@ async fn binding(
         .bind(&id.system_start_id).bind(&id.flow_invocation_id).fetch_optional(&mut *db).await?
         .ok_or_else(|| denied("Flow run missing"))?;
     require(
-        run.get::<&str, _>("snapshot_id") == id.snapshot_id
-            && run.get::<&str, _>("epoch") == id.epoch
-            && run.get::<&str, _>("plan_json") == capture.compiled_plan_json,
+        run.try_get::<&str, _>("snapshot_id")? == id.snapshot_id
+            && run.try_get::<&str, _>("epoch")? == id.epoch
+            && run.try_get::<&str, _>("plan_json")? == capture.compiled_plan_json,
         "Flow capture differs",
     )?;
-    let flow: FlowState030 = serde_json::from_str(run.get("state_json"))?;
+    let flow: FlowState030 = serde_json::from_str(run.try_get("state_json")?)?;
     let activation = live_activation(&flow, id, activation_id, control)?;
     let start_id = activation
         .start_effect_id
@@ -264,10 +264,10 @@ async fn binding(
     let row = sqlx::query("SELECT effect_json,status,owner_epoch FROM engine_flow030_outbox WHERE system_id=? AND invocation_id=? AND effect_id=?")
         .bind(&id.system_start_id).bind(&id.flow_invocation_id).bind(start_id).fetch_optional(&mut *db).await?
         .ok_or_else(|| denied("Start effect missing"))?;
-    let effect: FlowEffect030 = serde_json::from_str(row.get("effect_json"))?;
+    let effect: FlowEffect030 = serde_json::from_str(row.try_get("effect_json")?)?;
     require(
-        row.get::<&str, _>("status") == "settled"
-            && row.get::<&str, _>("owner_epoch") == owner.owner_epoch
+        row.try_get::<&str, _>("status")? == "settled"
+            && row.try_get::<&str, _>("owner_epoch")? == owner.owner_epoch
             && effect.id == *start_id
             && effect.identity == *id,
         "Start is not owned and handed off",
@@ -292,12 +292,12 @@ async fn binding(
     let grant = sqlx::query("SELECT start_effect_id,owner_epoch,generation,capture_sha256,context_json,contract_json,options_json,policy_evidence_json FROM engine_flow030_work_admissions WHERE system_id=? AND invocation_id=? AND activation_id=?")
         .bind(&id.system_start_id).bind(&id.flow_invocation_id).bind(activation_id).fetch_optional(&mut *db).await?
         .ok_or_else(|| failure("PERMISSION", "admission", "Native work policy is not attested"))?;
-    let context: EngineContext = serde_json::from_str(grant.get("context_json"))?;
+    let context: EngineContext = serde_json::from_str(grant.try_get("context_json")?)?;
     require(
-        grant.get::<&str, _>("start_effect_id") == start_id
-            && grant.get::<&str, _>("owner_epoch") == owner.owner_epoch
-            && grant.get::<&str, _>("generation") == lease.generation()
-            && grant.get::<&str, _>("capture_sha256") == capture_hash
+        grant.try_get::<&str, _>("start_effect_id")? == start_id
+            && grant.try_get::<&str, _>("owner_epoch")? == owner.owner_epoch
+            && grant.try_get::<&str, _>("generation")? == lease.generation()
+            && grant.try_get::<&str, _>("capture_sha256")? == capture_hash
             && context.owner == owner
             && context.work.system_start_id == id.system_start_id
             && context.work.flow_invocation_id == id.flow_invocation_id
@@ -321,9 +321,9 @@ async fn binding(
         &context.work,
         agent,
     )?;
-    let contract: String = grant.get("contract_json");
-    let options: String = grant.get("options_json");
-    let evidence: String = grant.get("policy_evidence_json");
+    let contract: String = grant.try_get("contract_json")?;
+    let options: String = grant.try_get("options_json")?;
+    let evidence: String = grant.try_get("policy_evidence_json")?;
     for raw in [
         &contract,
         &options,
@@ -439,10 +439,12 @@ async fn authorize_joined_event_tx(
         .bind(&input.event_id).fetch_optional(&mut *db).await?;
     if let Some(row) = existing {
         require(
-            row.get::<&str, _>("activation_id") == attempt.work().activation_id
-                && row.get::<&str, _>("input_json") == raw
-                && row.get::<Option<&str>, _>("provider_attempt_id").is_none()
-                && row.get::<Option<&str>, _>("native_call_id").is_none(),
+            row.try_get::<&str, _>("activation_id")? == attempt.work().activation_id
+                && row.try_get::<&str, _>("input_json")? == raw
+                && row
+                    .try_get::<Option<&str>, _>("provider_attempt_id")?
+                    .is_none()
+                && row.try_get::<Option<&str>, _>("native_call_id")?.is_none(),
             "Physical event authorization differs",
         )?;
         return Ok(());
@@ -490,7 +492,8 @@ async fn authorize_owned_event_tx(
     .fetch_optional(&mut *db)
     .await?
     .ok_or_else(|| denied("Work capture is absent"))?;
-    let capture: super::start030::StartCapture030 = serde_json::from_str(row.get("capture_json"))?;
+    let capture: super::start030::StartCapture030 =
+        serde_json::from_str(row.try_get("capture_json")?)?;
     require(
         capture.source.owner.project_id == policies.project_id(),
         "Policy project differs",
@@ -512,11 +515,11 @@ async fn authorize_owned_event_tx(
         .fetch_optional(&mut *db).await?;
     if let Some(row) = existing {
         require(
-            row.get::<&str, _>("activation_id") == attempt.work().activation_id
-                && row.get::<&str, _>("input_json") == raw
-                && row.get::<Option<&str>, _>("provider_attempt_id")
+            row.try_get::<&str, _>("activation_id")? == attempt.work().activation_id
+                && row.try_get::<&str, _>("input_json")? == raw
+                && row.try_get::<Option<&str>, _>("provider_attempt_id")?
                     == Some(call.provider_attempt_id.as_str())
-                && row.get::<Option<&str>, _>("native_call_id")
+                && row.try_get::<Option<&str>, _>("native_call_id")?
                     == Some(call.native_call_id.as_str()),
             "Owned event authorization differs",
         )?;
@@ -574,15 +577,15 @@ async fn reserve_tx(
         opaque(id)?;
     }
     require(
-        authorized.get::<&str, _>("input_json") == raw
-            && authorized.get::<Option<&str>, _>("provider_attempt_id") == attempt
-            && authorized.get::<Option<&str>, _>("native_call_id") == native_call,
+        authorized.try_get::<&str, _>("input_json")? == raw
+            && authorized.try_get::<Option<&str>, _>("provider_attempt_id")? == attempt
+            && authorized.try_get::<Option<&str>, _>("native_call_id")? == native_call,
         "Native event provenance differs",
     )?;
     let existing = sqlx::query("SELECT ticket_json,decision_json FROM engine_flow030_work_events WHERE system_id=? AND invocation_id=? AND event_id=?")
         .bind(&id.system_start_id).bind(&id.flow_invocation_id).bind(&input.event_id).fetch_optional(&mut *db).await?;
     if let Some(row) = existing {
-        let raw_ticket: &str = row.get("ticket_json");
+        let raw_ticket: &str = row.try_get("ticket_json")?;
         let mut ticket: FlowWorkTicket030 = serde_json::from_str(raw_ticket)?;
         require(
             ticket.identity == *id
@@ -592,15 +595,15 @@ async fn reserve_tx(
                 && ticket.options_json == bound.options_json,
             "Conflicting event identity",
         )?;
-        if let Some(raw) = row.get::<Option<&str>, _>("decision_json") {
+        if let Some(raw) = row.try_get::<Option<&str>, _>("decision_json")? {
             return Ok(Reservation030::Committed(serde_json::from_str(raw)?));
         }
         let current = sqlx::query("SELECT revision,state_json FROM engine_flow030_work_state WHERE system_id=? AND invocation_id=? AND activation_id=?")
             .bind(&id.system_start_id).bind(&id.flow_invocation_id).bind(&input.context.work.activation_id)
             .fetch_optional(&mut *db).await?.ok_or_else(|| denied("Pending work state missing"))?;
         require(
-            current.get::<&str, _>("revision") == input.expected_revision
-                && current.get::<&str, _>("state_json") == ticket.state_json,
+            current.try_get::<&str, _>("revision")? == input.expected_revision
+                && current.try_get::<&str, _>("state_json")? == ticket.state_json,
             "Pending work revision changed",
         )?;
         if !bound.contract_040 && ticket.flow_revision != bound.flow_revision {
@@ -618,7 +621,7 @@ async fn reserve_tx(
     let state = sqlx::query("SELECT revision,state_json FROM engine_flow030_work_state WHERE system_id=? AND invocation_id=? AND activation_id=?")
         .bind(&id.system_start_id).bind(&id.flow_invocation_id).bind(&input.context.work.activation_id).fetch_optional(&mut *db).await?;
     let (revision, state_json): (String, String) = match state {
-        Some(row) => (row.get("revision"), row.get("state_json")),
+        Some(row) => (row.try_get("revision")?, row.try_get("state_json")?),
         None => {
             sqlx::query("INSERT INTO engine_flow030_work_state VALUES (?,?,?,'0',?)")
                 .bind(&id.system_start_id)
@@ -685,10 +688,10 @@ async fn commit_tx(
         .bind(&id.system_start_id).bind(&id.flow_invocation_id).bind(&ticket.input.event_id).fetch_optional(&mut *db).await?
         .ok_or_else(|| denied("Work ticket missing"))?;
     require(
-        serde_json::from_str::<FlowWorkTicket030>(row.get("ticket_json"))? == *ticket,
+        serde_json::from_str::<FlowWorkTicket030>(row.try_get("ticket_json")?)? == *ticket,
         "Work ticket differs",
     )?;
-    if let Some(raw) = row.get::<Option<&str>, _>("decision_json") {
+    if let Some(raw) = row.try_get::<Option<&str>, _>("decision_json")? {
         require(
             serde_json::from_str::<ProtocolDecision030>(raw)? == *decision,
             "Work decision differs",
@@ -1117,9 +1120,9 @@ async fn transition_inner(
     let row = sqlx::query("SELECT ticket_json,decision_json FROM engine_flow030_work_events WHERE system_id=? AND invocation_id=? AND event_id=?")
         .bind(&id.system_start_id).bind(&id.flow_invocation_id).bind(&ticket.input.event_id)
         .fetch_one(&mut *tx).await?;
-    let ticket_raw: &str = row.get("ticket_json");
+    let ticket_raw: &str = row.try_get("ticket_json")?;
     let decision_raw: &str = row
-        .get::<Option<&str>, _>("decision_json")
+        .try_get::<Option<&str>, _>("decision_json")?
         .ok_or_else(|| denied("Committed work decision missing"))?;
     if let Some(clock) = clock.as_ref().filter(|_| retire) {
         // Reserve under the same commit and timestamp as the result. Other
@@ -1175,12 +1178,12 @@ pub(crate) async fn inspect_work_commit(
     let capture: super::start030::StartCapture030 = serde_json::from_str(&capture_raw)?;
     require(
         capture.identity == *id
-            && owner_row.get::<&str, _>("snapshot_id") == id.snapshot_id
-            && owner_row.get::<&str, _>("capture_epoch") == id.epoch
-            && owner_row.get::<&str, _>("owner_epoch") == owner.owner_epoch
-            && owner_row.get::<&str, _>("generation") == lease.generation()
-            && owner_row.get::<&str, _>("status") == "live"
-            && owner_row.get::<&str, _>("capture_sha256")
+            && owner_row.try_get::<&str, _>("snapshot_id")? == id.snapshot_id
+            && owner_row.try_get::<&str, _>("capture_epoch")? == id.epoch
+            && owner_row.try_get::<&str, _>("owner_epoch")? == owner.owner_epoch
+            && owner_row.try_get::<&str, _>("generation")? == lease.generation()
+            && owner_row.try_get::<&str, _>("status")? == "live"
+            && owner_row.try_get::<&str, _>("capture_sha256")?
                 == format!("{:x}", Sha256::digest(serde_json::to_vec(&capture)?)),
         "Work owner or capture differs",
     )?;
@@ -1188,8 +1191,8 @@ pub(crate) async fn inspect_work_commit(
         .bind(&id.system_start_id).bind(&id.flow_invocation_id).bind(event_id)
         .fetch_optional(&mut *tx).await?;
     let Some(row) = row else { return Ok(None) };
-    let ticket_raw: &str = row.get("ticket_json");
-    let Some(decision_raw) = row.get::<Option<&str>, _>("decision_json") else {
+    let ticket_raw: &str = row.try_get("ticket_json")?;
+    let Some(decision_raw) = row.try_get::<Option<&str>, _>("decision_json")? else {
         return Ok(None);
     };
     require(
@@ -1218,11 +1221,11 @@ pub(crate) async fn inspect_work_commit(
         None => require(rows.is_empty(), "Unexpected work check")?,
         Some(check) => require(
             rows.len() == 1
-                && rows[0].get::<&str, _>("check_id") == check.check_id
-                && rows[0].get::<&str, _>("activation_id")
+                && rows[0].try_get::<&str, _>("check_id")? == check.check_id
+                && rows[0].try_get::<&str, _>("activation_id")?
                     == ticket.input.context.work.activation_id
-                && rows[0].get::<&str, _>("request_json") == check.invocation_json
-                && rows[0].get::<&str, _>("status") == "reserved",
+                && rows[0].try_get::<&str, _>("request_json")? == check.invocation_json
+                && rows[0].try_get::<&str, _>("status")? == "reserved",
             "Work check differs",
         )?,
     }

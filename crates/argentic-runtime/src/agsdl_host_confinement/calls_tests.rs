@@ -11,6 +11,7 @@ pub(crate) struct TestHost {
     pub(crate) fail_finish: bool,
     pub(crate) human_open: AtomicUsize,
     pub(crate) human_closed: AtomicUsize,
+    pub(crate) human_delivered: Arc<AtomicUsize>,
     pub(crate) human_delay: Duration,
 }
 impl TestHost {
@@ -25,6 +26,7 @@ impl TestHost {
             fail_finish: false,
             human_open: AtomicUsize::new(0),
             human_closed: AtomicUsize::new(0),
+            human_delivered: Arc::new(AtomicUsize::new(0)),
             human_delay: Duration::from_millis(30),
         }
     }
@@ -67,14 +69,21 @@ impl HostPort for TestHost {
         }
         .into())
     }
-    async fn human_answer(&self, ticket: &str) -> Result<String> {
+    async fn human_answer(&self, ticket: &str) -> Result<HumanReply> {
         tokio::time::sleep(self.human_delay).await;
-        Ok(if ticket == "modern" {
-            r#"{"ask":{"action":"decline"}}"#
-        } else {
-            r#"{"action":"decline"}"#
-        }
-        .into())
+        let delivered = self.human_delivered.clone();
+        Ok(HumanReply {
+            body: if ticket == "modern" {
+                r#"{"ask":{"action":"decline"}}"#
+            } else {
+                r#"{"action":"decline"}"#
+            }
+            .into(),
+            acknowledge: Box::pin(async move {
+                delivered.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }),
+        })
     }
     async fn human_close(&self, _: &str, _: &Result<String>) -> Result<()> {
         self.human_closed.fetch_add(1, Ordering::SeqCst);

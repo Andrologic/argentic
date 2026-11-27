@@ -137,14 +137,14 @@ pub(crate) fn verify_human_compose_source_tx<'a>(
         require(rows.len() == 1)?;
         let row = &rows[0];
         require(
-            row.get::<&str, _>("owner_epoch") == owner.owner_epoch
-                && row.get::<&str, _>("generation") == generation
-                && row.get::<&str, _>("delivery") == "acknowledged"
-                && row.get::<&str, _>("resolution_json") == row.get::<&str, _>("proof"),
+            row.try_get::<&str, _>("owner_epoch")? == owner.owner_epoch
+                && row.try_get::<&str, _>("generation")? == generation
+                && row.try_get::<&str, _>("delivery")? == "acknowledged"
+                && row.try_get::<&str, _>("resolution_json")? == row.try_get::<&str, _>("proof")?,
         )?;
-        let payload: Value = serde_json::from_str(row.get("payload_json"))?;
-        let resolution: Value = serde_json::from_str(row.get("resolution_json"))?;
-        let request: &str = row.get("request_id");
+        let payload: Value = serde_json::from_str(row.try_get("payload_json")?)?;
+        let resolution: Value = serde_json::from_str(row.try_get("resolution_json")?)?;
+        let request: &str = row.try_get("request_id")?;
         let output = if resolution["expired"] == true {
             require(resolution["failure"] == "APPROVAL_TIMEOUT")?;
             json!({"error":crate::persistence::flow030::Failure030::new("APPROVAL_TIMEOUT")})
@@ -158,7 +158,7 @@ pub(crate) fn verify_human_compose_source_tx<'a>(
         let event_raw: String=sqlx::query_scalar("SELECT event_json FROM engine_flow030_events WHERE system_id=? AND invocation_id=? AND event_id=? AND diagnostic_json IS NULL AND receipt_json IS NOT NULL")
             .bind(&id.system_start_id).bind(&id.flow_invocation_id).bind(format!("human:{request}:terminal")).fetch_one(&mut *db).await?;
         let event: Value = serde_json::from_str(&event_raw)?;
-        let work: Value = serde_json::from_str(row.get("work_json"))?;
+        let work: Value = serde_json::from_str(row.try_get("work_json")?)?;
         require(
             event["identity"] == serde_json::to_value(id)?
                 && event.pointer("/kind/WorkResult/work") == Some(&work["reference"])

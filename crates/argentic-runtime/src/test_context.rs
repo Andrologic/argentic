@@ -236,6 +236,10 @@ printf '{"jsonrpc":"2.0","id":"%s","result":{"content":[]}}\n' "$id"
             assert_eq!(request["result"]["action"], "accept");
             return StatusCode::ACCEPTED.into_response();
         }
+        if request["method"].is_null() && request["id"] == "synthetic-form-lost" {
+            // The answer may have reached the server; its response is lost.
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
         let result = match request["method"].as_str().unwrap() {
             "initialize" => {
                 json!({"protocolVersion":"2025-03-26","capabilities":{"tools":{}},"serverInfo":{"name":"fixture","version":"1"}})
@@ -248,9 +252,14 @@ printf '{"jsonrpc":"2.0","id":"%s","result":{"content":[]}}\n' "$id"
                 if tool == "blocked" {
                     std::future::pending::<()>().await;
                 }
-                if tool == "form" {
+                if tool == "form" || tool == "form-lost" {
                     use futures::StreamExt;
-                    let form = json!({"jsonrpc":"2.0","id":"synthetic-form",
+                    let id = if tool == "form" {
+                        "synthetic-form"
+                    } else {
+                        "synthetic-form-lost"
+                    };
+                    let form = json!({"jsonrpc":"2.0","id":id,
                         "method":"elicitation/create",
                         "params":{"message":"Continue?","requestedSchema":{"type":"object"}}
                     });

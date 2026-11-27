@@ -37,10 +37,9 @@ async fn connect(options: SqliteConnectOptions) -> Result<SqlitePool, sqlx::Erro
 async fn initialize(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     let mut connection = pool.acquire().await?;
     let mut tx = connection.begin_with("BEGIN IMMEDIATE").await?;
-    let objects: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'")
-            .fetch_one(&mut *tx)
-            .await?;
+    let objects: i64 = sqlx::query_scalar("SELECT count(*) FROM sqlite_schema")
+        .fetch_one(&mut *tx)
+        .await?;
     if objects != 0 {
         return Err(sqlx::Error::Protocol(
             "Standalone engine initialization requires an empty database".into(),
@@ -74,9 +73,92 @@ pub async fn memory() -> Result<SqlitePool, sqlx::Error> {
     Ok(pool)
 }
 
+/// Validate existing private storage before SQLite can read or create sidecars.
+#[cfg(unix)]
+pub(crate) fn require_private(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+    mode: u32,
+) -> crate::persistence::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: geteuid has no arguments or memory preconditions.
+    let expected_uid = unsafe { libc::geteuid() };
+    let uid = metadata.uid();
+    let actual_mode = metadata.mode() & 0o7777;
+    if uid != expected_uid || actual_mode != mode {
+        return Err(crate::persistence::failure(
+            "PERMISSION",
+            "data",
+            &format!(
+                "Standalone storage {path:?}: expected UID {expected_uid} and mode {mode:04o}, found UID {uid} and mode {actual_mode:04o}"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) async fn open_standalone(path: &Path) -> crate::persistence::Result<SqlitePool> {
+    let mut exists = false;
+    for candidate in [
+        path.to_path_buf(),
+        path.with_extension("sqlite-wal"),
+        path.with_extension("sqlite-shm"),
+        path.with_extension("sqlite-journal"),
+    ] {
+        match std::fs::symlink_metadata(&candidate) {
+            Ok(metadata) => {
+                if !metadata.is_file() {
+                    return Err(crate::persistence::failure(
+                        "PERMISSION",
+                        "data",
+                        &format!("Standalone database path {candidate:?} must be a regular file"),
+                    ));
+                }
+                #[cfg(unix)]
+                require_private(&candidate, &metadata, 0o600)?;
+                exists |= candidate == path;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+            Err(e) => return Err(sqlx::Error::Io(e).into()),
+        }
+    }
+    if !exists {
+        return Ok(create_file(path).await?);
+    }
+    // Check read-only first so an incompatible populated database is untouched.
+    let mut reader =
+        SqliteConnection::connect_with(&options().filename(path).read_only(true)).await?;
+    let empty: bool = sqlx::query_scalar("SELECT NOT EXISTS(SELECT 1 FROM sqlite_schema)")
+        .fetch_one(&mut reader)
+        .await?;
+    reader.close().await?;
+    if empty {
+        // The standalone lock is held. initialize rechecks emptiness inside
+        // BEGIN IMMEDIATE before submitting any schema changes.
+        Ok(create_file(path).await?)
+    } else {
+        Ok(open_file(path).await?)
+    }
+}
+
 /// Initialize a new standalone file database. Existing Macro databases are
 /// migrated by Macro and attached to Engine explicitly, never initialized here.
 pub async fn create_file(path: &Path) -> Result<SqlitePool, sqlx::Error> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // SQLite inherits the database mode when it creates WAL/SHM files.
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+        {
+            Ok(_) => (),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => (),
+            Err(e) => return Err(e.into()),
+        }
+    }
     let pool = connect(
         options()
             .filename(path)
@@ -106,7 +188,7 @@ pub async fn open_file(path: &Path) -> Result<SqlitePool, sqlx::Error> {
 
 async fn validate_existing(connection: &mut SqliteConnection) -> Result<(), sqlx::Error> {
     let expected = memory().await?;
-    let query = "SELECT type,name,tbl_name,coalesce(sql,'') FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name";
+    let query = "SELECT type,name,tbl_name,coalesce(sql,'') FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*' ORDER BY type,name";
     let mut tx = connection.begin().await?;
     let actual = sqlx::query_as::<_, (String, String, String, String)>(query)
         .fetch_all(&mut *tx)

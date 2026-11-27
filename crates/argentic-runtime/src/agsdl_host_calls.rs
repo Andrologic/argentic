@@ -201,6 +201,11 @@ pub(crate) struct Completion {
     pub evidence: PhysicalEvidence,
 }
 
+pub(crate) struct HumanReply {
+    pub body: String,
+    pub acknowledge: futures::future::BoxFuture<'static, Result<()>>,
+}
+
 #[async_trait]
 pub(crate) trait HostPort: Send + Sync + 'static {
     fn supports_human_requests(&self) -> bool {
@@ -233,8 +238,8 @@ pub(crate) trait HostPort: Send + Sync + 'static {
         server: &str,
         request_json: &str,
     ) -> Result<String>;
-    /// Resolve with exact MCP elicitation result or modern InputResponses JSON.
-    async fn human_answer(&self, ticket: &str) -> Result<String>;
+    /// Reserve the exact MCP response. Transport acknowledges it after delivery.
+    async fn human_answer(&self, ticket: &str) -> Result<HumanReply>;
     /// Close/pause bookkeeping is durable even on Stop or a failed answer wait.
     async fn human_close(&self, ticket: &str, answer: &Result<String>) -> Result<()>;
 }
