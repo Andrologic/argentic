@@ -56,7 +56,9 @@ pub use resource::{SourceBudget, MAX_SOURCE_BYTES, MAX_SOURCE_JSON_DEPTH, MAX_SO
 
 /// Optional local version probe for a bundled descriptive harness.
 pub fn harness_version_probe(name: &str) -> Option<(&'static str, &'static str)> {
-    reader::BUNDLED_VERSION_PROBES.iter().find(|(id, _, _)| *id == name)
+    reader::BUNDLED_VERSION_PROBES
+        .iter()
+        .find(|(id, _, _)| *id == name)
         .map(|(_, executable, argument)| (*executable, *argument))
 }
 

@@ -40,7 +40,10 @@ pub(crate) const PINNED_MODULES: [(&str, &str); 5] = [
         include_str!("../../assets/harnesses/opencode/module.json"),
     ),
     ("pi", include_str!("../../assets/harnesses/pi/module.json")),
-    ("argentic", include_str!("../../assets/harnesses/argentic/module.json")),
+    (
+        "argentic",
+        include_str!("../../assets/harnesses/argentic/module.json"),
+    ),
 ];
 
 // Installation metadata lives outside the AgSDL module schema. Only bundled
@@ -55,6 +58,7 @@ pub(crate) const BUNDLED_VERSION_PROBES: &[(&str, &str, &str)] = &[
 #[derive(Clone, Copy)]
 pub(crate) enum Modules<'m> {
     Pinned,
+    #[cfg(test)]
     Explicit(&'m ModuleMap),
     Encoded(&'m [&'m [u8]]),
 }
@@ -134,6 +138,7 @@ fn registry_with_budget(
             .iter()
             .map(|(name, module)| (name.as_str(), module))
             .collect(),
+        #[cfg(test)]
         Modules::Explicit(map) => map
             .iter()
             .map(|(name, module)| (name.as_str(), module))
@@ -176,6 +181,7 @@ fn parse_report(message: String) -> Report {
 }
 
 /// `read(bytes, options)`.
+#[cfg(test)]
 pub(crate) fn read(bytes: &[u8], modules: Modules<'_>) -> Result<Report, ReadError> {
     read_budgeted(bytes, modules, &SourceBudget::default())
 }

@@ -151,7 +151,7 @@ async fn nested_failure_prefers_the_inner_handler_over_flow_default() {
     });
     let view = run(doc, executor.clone()).await;
     assert_eq!(view.state.verdict.as_deref(), Some("succeeded"));
-    assert_eq!(view.state.visits_at(&vec!["handler".into()]), "0");
+    assert_eq!(view.state.visits_at(&["handler".into()]), "0");
     assert_eq!(failures(&view).len(), 2);
 }
 #[tokio::test]
@@ -288,7 +288,7 @@ async fn preparation_and_join_failures_bubble_through_nested_bodies() {
                 "{failures:?}"
             );
         }
-        assert_eq!(view.state.visits_at(&vec!["handler".into()]), "1");
+        assert_eq!(view.state.visits_at(&["handler".into()]), "1");
         if preparation {
             assert_eq!(executor.starts.lock().unwrap().len(), 2);
         }
@@ -314,7 +314,7 @@ async fn unhandled_composition_failure_reaches_its_outer_join_before_flow_handle
     });
     let view = run(doc, executor).await;
     assert_eq!(view.state.verdict.as_deref(), Some("succeeded"));
-    assert_eq!(view.state.visits_at(&vec!["global".into()]), "0");
-    assert_eq!(view.state.visits_at(&vec!["local".into()]), "1");
+    assert_eq!(view.state.visits_at(&["global".into()]), "0");
+    assert_eq!(view.state.visits_at(&["local".into()]), "1");
     assert!(failures(&view).contains(&(vec!["join".into()], "BRANCH_FAILED".into())));
 }

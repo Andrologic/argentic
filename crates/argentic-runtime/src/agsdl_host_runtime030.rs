@@ -696,6 +696,7 @@ impl RuntimeRegistry030 {
             }
         }
     }
+    #[cfg(test)]
     pub(crate) fn cancel(&self, system: &str) {
         if let Ok(handles) = self.0.lock() {
             if let Some(handle) = handles.get(system) {
@@ -842,7 +843,7 @@ impl EffectDriver030 for NativeDriver030<'_> {
                     .broker(self.host, self.pool, &view.capture.identity)
                     .await?;
                 for control in broker.timeout_controls().await? {
-                    if let Some(live) = self.active.get(&control.work_id().to_owned()) {
+                    if let Some(live) = self.active.get(control.work_id()) {
                         live.timeout.cancel();
                     } else if let Some((_, _, timeout)) = self.calls.get(control.work_id()) {
                         timeout.cancel();
@@ -1611,6 +1612,10 @@ pub(crate) async fn supervise_with_steer_port030(
     outcome
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "The event binds explicit host, attempt, project and cancellation inputs"
+)]
 pub(crate) async fn emit_work_event030(
     host: &HostState,
     pool: &SqlitePool,

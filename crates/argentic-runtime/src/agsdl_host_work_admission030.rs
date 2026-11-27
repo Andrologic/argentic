@@ -383,6 +383,7 @@ impl PreparedEffectiveAgentWork030 {
         self.document_location.as_ref()
     }
 
+    #[cfg(test)]
     pub(crate) fn work(&self) -> &PreparedAgentWork030 {
         &self.work
     }
@@ -411,32 +412,9 @@ impl PreparedAgentWork030 {
         Ok(())
     }
 
-    pub(crate) fn leases(&self) -> &PolicyLeases030 {
-        &self.leases
-    }
-
-    pub(crate) fn identity(&self) -> &FlowIdentity030 {
-        &self.identity
-    }
-
-    pub(crate) fn owner(&self) -> &EngineOwner {
-        &self.owner
-    }
-
-    pub(crate) fn effect_id(&self) -> &str {
-        &self.effect_id
-    }
-
+    #[cfg(test)]
     pub(crate) fn work(&self) -> &EngineWork {
         &self.work
-    }
-
-    pub(crate) fn agent(&self) -> &str {
-        &self.agent
-    }
-
-    pub(crate) fn capture_sha256(&self) -> &str {
-        &self.capture_sha256
     }
 
     pub(crate) fn inputs(&self) -> &CapturedAgentInputs030 {
@@ -447,10 +425,6 @@ impl PreparedAgentWork030 {
 impl CapturedAgentInputs030 {
     pub(crate) fn requested(&self) -> &crate::permissions::RequestedPermissions {
         &self.requested
-    }
-
-    pub(crate) fn contract_json(&self) -> &str {
-        &self.contract_json
     }
 }
 
@@ -501,10 +475,6 @@ impl PolicyLeases030 {
 
     pub(crate) fn project_id(&self) -> &str {
         &self.project_id
-    }
-
-    pub(crate) fn ceiling(&self) -> &crate::permissions::RequestedPermissions {
-        self.ceiling.permissions()
     }
 
     pub(crate) fn ceiling_fingerprint(&self) -> &str {

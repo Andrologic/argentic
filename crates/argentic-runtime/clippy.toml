@@ -1,0 +1,2 @@
+# EngineFailure (about 200 bytes) is returned by value across the engine on purpose.
+large-error-threshold = 256

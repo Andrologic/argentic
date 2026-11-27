@@ -59,6 +59,21 @@ jobs:
           rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
           rustc -Vv
 
+      - name: Check Rust formatting and Clippy
+        if: runner.os == 'Linux'
+        run: |
+          rustup component add rustfmt clippy
+          for crate in argentic-harness argentic-core argentic-runtime; do
+            (
+              cd "crates/$crate"
+              cargo fmt --all --check
+              cargo clippy --locked --all-targets -- -D warnings
+            )
+          done
+          cd crates/argentic-runtime
+          cargo clippy --locked --all-targets --features agsdl-engine-qa -- -D warnings
+          cargo clippy --locked --all-targets --features dev-support -- -D warnings
+
       - name: Check the macOS ARM64 runner
         if: runner.os == 'macOS'
         run: |

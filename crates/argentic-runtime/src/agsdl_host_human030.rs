@@ -37,19 +37,6 @@ fn require(ok: bool, message: &str) -> Result<()> {
 mod validation;
 pub(crate) use validation::machine_remaining_ms030;
 
-/// ECMAScript WhiteSpace and LineTerminator, as used by String.prototype.trim.
-/// NEL (U+0085) is content; BOM (U+FEFF) is whitespace. Keep one native
-/// definition for both resolution validation and the enforced plan lock.
-pub(crate) fn human_comment_is_empty030(comment: &str) -> bool {
-    comment.chars().all(|c| {
-        matches!(c,
-            '\u{0009}'..='\u{000d}' | '\u{0020}' | '\u{00a0}' | '\u{1680}' |
-            '\u{2000}'..='\u{200a}' | '\u{2028}' | '\u{2029}' | '\u{202f}' |
-            '\u{205f}' | '\u{3000}' | '\u{feff}'
-        )
-    })
-}
-
 fn uuid() -> String {
     uuid::Uuid::new_v4().to_string()
 }
@@ -63,9 +50,8 @@ pub(crate) struct HumanSubmission030 {
     pub expected_revision: String,
     pub answer: HumanAnswer030,
 }
-#[path = "persistence/v030/human_answer030.rs"]
-mod answer;
-pub use answer::HumanAnswer030;
+pub(crate) use crate::persistence::human_answer030::human_comment_is_empty030;
+pub use crate::persistence::human_answer030::HumanAnswer030;
 #[derive(Clone, Copy)]
 pub(crate) enum HumanOrigin030 {
     Person,
@@ -104,6 +90,7 @@ impl OwnedHumanWork030 {
     pub(crate) fn work_id(&self) -> &str {
         &self.reference.activation_id
     }
+    #[cfg(test)]
     pub(crate) fn reference(&self) -> &WorkRef030 {
         &self.reference
     }
@@ -121,15 +108,14 @@ pub(crate) struct ResolvedHumanDecision030 {
     resolution: Value,
 }
 impl ResolvedHumanDecision030 {
-    pub(crate) fn request_id(&self) -> &str {
-        &self.request_id
-    }
     pub(crate) fn resolution(&self) -> &Value {
         &self.resolution
     }
+    #[cfg(test)]
     pub(crate) fn payload(&self) -> &Value {
         &self.payload
     }
+    #[cfg(test)]
     pub(crate) fn kind(&self) -> &str {
         &self.kind
     }
@@ -162,16 +148,11 @@ impl ResolvedHumanDecision030 {
     }
 }
 pub(crate) struct TimeoutControl030 {
-    identity: FlowIdentity030,
     work_id: String,
-    receipt_id: String,
 }
 impl TimeoutControl030 {
     pub(crate) fn work_id(&self) -> &str {
         &self.work_id
-    }
-    pub(crate) fn receipt_id(&self) -> &str {
-        &self.receipt_id
     }
 }
 
@@ -637,44 +618,6 @@ impl HumanBroker030 {
         Ok(request)
     }
 
-    /// The native Call adapter supplies the current attribution set, using
-    /// associateMcpRequest030's exact/visible/fallback rules. Each capability is
-    /// reauthenticated and the pure registry recomputes the shortest deadline.
-    pub(crate) async fn associate(
-        &self,
-        host: &HostState,
-        request_id: &str,
-        works: &[OwnedHumanWork030],
-    ) -> Result<()> {
-        self.settle_pending_flow_clock(host).await?;
-        let lease = host.start_lease().await?;
-        let _gate = host.admission_lock().lock_owned().await;
-        let mut connection = self.durable_connection().await?;
-        let mut tx = connection.begin_with("BEGIN IMMEDIATE").await?;
-        self.guard(&mut tx, &lease).await?;
-        let row = self.request_row(&mut tx, request_id).await?;
-        require(
-            row.get::<&str, _>("kind") == "question",
-            "Only protocol questions may be reassociated",
-        )?;
-        let mut ids = Vec::new();
-        for work in works {
-            self.verify_work(&mut tx, work).await?;
-            require(
-                !ids.contains(&work.work_id().to_owned()),
-                "Duplicate attribution",
-            )?;
-            ids.push(work.work_id().to_owned());
-        }
-        self.reserve(
-            &mut tx,
-            json!({"kind":"associate","requestId":request_id,"workIds":ids}),
-            &self.clock.now_ms().to_string(),
-        )
-        .await?;
-        tx.commit().await?;
-        Ok(())
-    }
     /// Retire the clock after joining the work, including terminal flow cleanup.
     /// Preserve its final budget and historical requests while removing pause links.
     pub(crate) async fn retire(&self, host: &HostState, work: &OwnedHumanWork030) -> Result<()> {
@@ -1149,7 +1092,7 @@ impl HumanBroker030 {
     /// The QA driver supplies a pinned flow stabilizer that drains decisions,
     /// joined terminations and routes. A large Elapse is split at every actual
     /// wake boundary; newly admitted continuations receive only the remainder.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "agsdl-engine-qa", debug_assertions))]
     pub(crate) async fn elapse_qa<F, Fut>(
         &self,
         host: &HostState,
@@ -1197,7 +1140,7 @@ impl HumanBroker030 {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "agsdl-engine-qa", debug_assertions))]
     async fn flow_running(&self) -> Result<bool> {
         let raw: String = sqlx::query_scalar(
             "SELECT state_json FROM engine_flow030_runs WHERE system_id=? AND invocation_id=?",
@@ -1280,6 +1223,7 @@ impl HumanBroker030 {
         Ok(sqlx::query_scalar("SELECT kind FROM engine_flow030_human_requests WHERE system_id=? AND invocation_id=? AND request_id=?")
             .bind(&self.identity.system_start_id).bind(&self.identity.flow_invocation_id).bind(request).fetch_one(&self.pool).await?)
     }
+    #[cfg(test)]
     pub(crate) async fn oldest_open(&self, work: &OwnedHumanWork030) -> Result<Option<String>> {
         let rows = sqlx::query("SELECT request_id,work_ids_json FROM engine_flow030_human_requests WHERE system_id=? AND invocation_id=? AND resolution_json IS NULL ORDER BY rowid")
             .bind(&self.identity.system_start_id).bind(&self.identity.flow_invocation_id).fetch_all(&self.pool).await?;
@@ -1567,31 +1511,9 @@ impl HumanBroker030 {
         Ok(rows
             .iter()
             .map(|r| TimeoutControl030 {
-                identity: self.identity.clone(),
                 work_id: r.get("activation_id"),
-                receipt_id: r.get("receipt_id"),
             })
             .collect())
-    }
-    /// The integrator must call this only with its joined physical witness, in
-    /// the same transaction that commits finish_joined_agent030 / Call terminal.
-    pub(crate) async fn mark_joined_tx(
-        &self,
-        db: &mut SqliteConnection,
-        control: &TimeoutControl030,
-        joined: &crate::tasks::JoinedOwnedAgent030,
-    ) -> Result<()> {
-        require(
-            control.identity == self.identity
-                && joined.attempt().identity() == &self.identity
-                && joined.attempt().owner() == &self.owner
-                && joined.attempt().generation() == self.generation
-                && joined.attempt().work().activation_id == control.work_id,
-            "Foreign timeout witness",
-        )?;
-        let changed = sqlx::query("UPDATE engine_flow030_clock_controls SET joined=1 WHERE system_id=? AND invocation_id=? AND activation_id=? AND receipt_id=? AND reason='TIMEOUT'")
-            .bind(&self.identity.system_start_id).bind(&self.identity.flow_invocation_id).bind(&control.work_id).bind(&control.receipt_id).execute(db).await?;
-        require(changed.rows_affected() == 1, "Timeout cause absent")
     }
 }
 

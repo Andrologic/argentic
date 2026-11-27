@@ -63,7 +63,7 @@ async fn start_scripted_call030(
     let lease = host.start_lease().await?;
     let broker = lease.call_data030()?;
     drop(lease);
-    let authority = NativeCallAuthority030::capture(&host, owner).await?;
+    let authority = NativeCallAuthority030::capture(host, owner).await?;
     let attempt = calls::reserve_call030(pool, &authority, effect).await?;
     match calls::prepare_call030(pool, &authority, &broker, &attempt, cancelled).await? {
         calls::CallPreparation030::Ready => {}
@@ -79,7 +79,7 @@ async fn start_scripted_call030(
     let key = scripted_work_key030(effect)?;
     let claim = crate::agsdl_host_flow030::claim_expected(
         host.flow030(),
-        &host,
+        host,
         pool,
         &effect.identity,
         &effect.id,
@@ -95,7 +95,7 @@ async fn start_scripted_call030(
     let clock_broker = host
         .flow030()
         .humans
-        .broker(&host, pool, &effect.identity)
+        .broker(host, pool, &effect.identity)
         .await?;
     let (app, pool, owner, cancelled) =
         (app.clone(), pool.clone(), owner.clone(), cancelled.clone());
@@ -130,8 +130,8 @@ async fn start_scripted_call030(
         })
         .await?;
     let human = clock_broker;
-    let human_work = human.admit_host_work(&host, &effect.id).await?;
-    human.pump(&host, &CancellationToken::new()).await?;
+    let human_work = human.admit_host_work(host, &effect.id).await?;
+    human.pump(host, &CancellationToken::new()).await?;
     let driver = driver_recv
         .await
         .map_err(|_| failure("UNCERTAIN", "call", "Call launch did not acknowledge"))?;
@@ -260,11 +260,11 @@ async fn start_scripted_work030(
     use crate::agsdl_host_runtime030::{native_event_emitter030, start_agent_work030};
     let host = app;
     let inspection =
-        crate::agsdl_host_flow030::inspect_run(host.flow030(), &host, pool, owner).await?;
+        crate::agsdl_host_flow030::inspect_run(host.flow030(), host, pool, owner).await?;
     let broker = host
         .flow030()
         .humans
-        .broker(&host, pool, &effect.identity)
+        .broker(host, pool, &effect.identity)
         .await?;
     let (result_send, result) = tokio::sync::oneshot::channel();
     let (send, outcome) = tokio::sync::oneshot::channel();
@@ -287,7 +287,7 @@ async fn start_scripted_work030(
         inspection.capture.source.owner.project_id,
     );
     let started = start_agent_work030(
-        &host,
+        host,
         pool,
         config,
         tasks,
@@ -300,8 +300,8 @@ async fn start_scripted_work030(
     )
     .await?;
     let plan_lock = executor.plan_lock.lock().unwrap().clone();
-    let human = broker.admit_agent(&host, &started.attempt).await?;
-    broker.pump(&host, &CancellationToken::new()).await?;
+    let human = broker.admit_agent(host, &started.attempt).await?;
+    broker.pump(host, &CancellationToken::new()).await?;
     Ok(ScriptedWork030 {
         key: scripted_work_key030(effect)?,
         attempt: started.attempt,
@@ -316,6 +316,10 @@ async fn start_scripted_work030(
 
 /// Drain eligible effects before the next timeline event. Agent starts are
 /// attached to owned parents and wait for the corresponding native mailbox.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "The test fixture accepts explicit execution dependencies"
+)]
 async fn quiesce_scenario030(
     app: &HostState,
     pool: &SqlitePool,
@@ -343,16 +347,9 @@ async fn quiesce_scenario030(
         joined,
         cancelled,
     };
-    crate::agsdl_host_runtime030::drain_effects030(
-        &host,
-        pool,
-        tasks,
-        owner,
-        &mut driver,
-        cancelled,
-    )
-    .await?
-    .ok_or_else(|| failure("UNCERTAIN", "runtime", "A flow event commit is unresolved"))
+    crate::agsdl_host_runtime030::drain_effects030(host, pool, tasks, owner, &mut driver, cancelled)
+        .await?
+        .ok_or_else(|| failure("UNCERTAIN", "runtime", "A flow event commit is unresolved"))
 }
 
 struct ScenarioDriver030<'a> {
@@ -453,7 +450,7 @@ impl crate::agsdl_host_runtime030::EffectDriver030 for ScenarioDriver030<'_> {
                     let key = scripted_work_key030(&effect)?;
                     let claim = crate::agsdl_host_flow030::claim_expected(
                         host.flow030(),
-                        &host,
+                        host,
                         pool,
                         &effect.identity,
                         &effect.id,
@@ -463,8 +460,8 @@ impl crate::agsdl_host_runtime030::EffectDriver030 for ScenarioDriver030<'_> {
                         failure("STALE_REFERENCE", "approval", "Approval Start changed")
                     })?;
                     claim.handoff_host(tasks, std::future::pending()).await?;
-                    let work = humans.broker.admit_host_work(&host, &effect.id).await?;
-                    humans.broker.pump(&host, cancelled).await?;
+                    let work = humans.broker.admit_host_work(host, &effect.id).await?;
+                    humans.broker.pump(host, cancelled).await?;
                     humans.approvals.push(ScriptedApproval030 { key, work });
                 }
                 FlowEffectKind030::Start { agent: None, .. } => {
@@ -506,7 +503,7 @@ impl crate::agsdl_host_runtime030::EffectDriver030 for ScenarioDriver030<'_> {
             }
             let claim = crate::agsdl_host_flow030::claim_expected(
                 host.flow030(),
-                &host,
+                host,
                 pool,
                 &effect.identity,
                 &effect.id,
@@ -548,7 +545,7 @@ impl crate::agsdl_host_runtime030::EffectDriver030 for ScenarioDriver030<'_> {
             }
             let index = matching[0];
             crate::agsdl_host_dispatch030::dispatch_stop_work030(
-                &host,
+                host,
                 pool,
                 tasks,
                 owner,
@@ -592,11 +589,11 @@ pub(crate) async fn drive_scenario030(
     let host = app;
     let clock = host.flow030().humans.virtual_clock().await?;
     let inspection =
-        crate::agsdl_host_flow030::inspect_run(host.flow030(), &host, pool, owner).await?;
+        crate::agsdl_host_flow030::inspect_run(host.flow030(), host, pool, owner).await?;
     let broker = host
         .flow030()
         .humans
-        .broker(&host, pool, &inspection.capture.identity)
+        .broker(host, pool, &inspection.capture.identity)
         .await?;
     let mut humans = ScenarioHumans030 {
         broker,
@@ -640,8 +637,8 @@ pub(crate) async fn drive_scenario030(
                     .checked_add(ms)
                     .ok_or_else(|| failure("INPUT_LIMIT", "clock", "Elapse overflow"))?;
                 loop {
-                    humans.broker.tick(&host).await?;
-                    humans.broker.pump(&host, cancelled).await?;
+                    humans.broker.tick(host).await?;
+                    humans.broker.pump(host, cancelled).await?;
                     quiesce_scenario030(
                         app,
                         pool,
@@ -689,8 +686,8 @@ pub(crate) async fn drive_scenario030(
                 } else {
                     serde_json::json!({"question":"Pinned QA request"})
                 };
-                humans.broker.open(&host, work, &kind, payload).await?;
-                humans.broker.pump(&host, cancelled).await?;
+                humans.broker.open(host, work, &kind, payload).await?;
+                humans.broker.pump(host, cancelled).await?;
             }
             TimelineEvent030::Answer { key, answer } => {
                 let work = works
@@ -700,7 +697,7 @@ pub(crate) async fn drive_scenario030(
                     .or_else(|| calls.iter().find(|w| w.key == key).map(|w| &w.human))
                     .ok_or_else(|| failure("CORRELATION", "human", "Answer work absent"))?;
                 submit_scripted_human030(
-                    &host,
+                    host,
                     pool,
                     owner,
                     &humans.broker,
@@ -780,8 +777,8 @@ pub(crate) async fn drive_scenario030(
                 {
                     return Err(failure("CORRELATION", "call", "Call parent is absent"));
                 }
-                humans.broker.retire(&host, &call.human).await?;
-                humans.broker.pump(&host, cancelled).await?;
+                humans.broker.retire(host, &call.human).await?;
+                humans.broker.pump(host, cancelled).await?;
                 joined_calls.insert(witness.attempt().work().activation_id.clone(), witness);
             }
             TimelineEvent030::Work { key, outcome } => {
@@ -802,7 +799,7 @@ pub(crate) async fn drive_scenario030(
                         .to_owned();
                     let comment = value["comment"].as_str().unwrap_or("").to_owned();
                     submit_scripted_human030(
-                        &host,
+                        host,
                         pool,
                         owner,
                         &humans.broker,
@@ -831,7 +828,7 @@ pub(crate) async fn drive_scenario030(
                     .send(outcome)
                     .map_err(|_| failure("UNCERTAIN", "example", "Owned work mailbox closed"))?;
                 let witness = crate::agsdl_host_runtime030::finish_agent_work030(
-                    &host,
+                    host,
                     pool,
                     tasks,
                     &work.attempt,
@@ -846,8 +843,8 @@ pub(crate) async fn drive_scenario030(
                     )
                 })??;
                 let host = app;
-                humans.broker.retire(&host, &work.human).await?;
-                humans.broker.pump(&host, cancelled).await?;
+                humans.broker.retire(host, &work.human).await?;
+                humans.broker.pump(host, cancelled).await?;
                 joined.insert(witness.attempt().work().activation_id.clone(), witness);
             }
         }
@@ -970,7 +967,6 @@ fn expect_kind(decision: &ProtocolDecision030, expected: &str) -> Result<()> {
 }
 
 #[allow(clippy::too_many_arguments)]
-
 impl ExampleObservation030 {
     pub(crate) fn adapter_id(&self) -> &'static str {
         ADAPTER

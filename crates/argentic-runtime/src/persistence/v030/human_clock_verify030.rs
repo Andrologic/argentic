@@ -1,19 +1,48 @@
 //! Native proof checks for the resident's temporal projection. Only SQL-backed
 //! answers, native event timestamps and authored limits can create authority.
-use super::*;
-use std::cmp::Ordering;
-#[path = "flow_number.rs"]
-mod counter;
+use super::human_answer030::{human_comment_is_empty030, HumanAnswer030};
+use argentic_core::flow::number as counter;
+use serde_json::{json, Value};
+use std::{cmp::Ordering, collections::BTreeMap};
+
+#[derive(Debug)]
+pub(crate) enum VerificationError {
+    Correlation {
+        pointer: &'static str,
+        message: &'static str,
+    },
+    Json(serde_json::Error),
+}
+
+impl From<serde_json::Error> for VerificationError {
+    fn from(error: serde_json::Error) -> Self {
+        Self::Json(error)
+    }
+}
+
+type Result<T> = std::result::Result<T, VerificationError>;
+
+fn failure(pointer: &'static str, message: &'static str) -> VerificationError {
+    VerificationError::Correlation { pointer, message }
+}
+
+fn require(ok: bool, message: &'static str) -> Result<()> {
+    if ok {
+        Ok(())
+    } else {
+        Err(failure("humanClock", message))
+    }
+}
 
 pub(crate) fn ms(raw: &str) -> Result<u64> {
     require(counter::canonical(raw), "Noncanonical native milliseconds")?;
     raw.parse()
-        .map_err(|_| failure("CORRELATION", "clock", "Native milliseconds overflow"))
+        .map_err(|_| failure("clock", "Native milliseconds overflow"))
 }
 fn text<'a>(v: &'a Value, key: &str) -> Result<&'a str> {
     v[key]
         .as_str()
-        .ok_or_else(|| failure("CORRELATION", "clock", "Missing native projection field"))
+        .ok_or_else(|| failure("clock", "Missing native projection field"))
 }
 fn ids(v: &Value) -> Result<Vec<String>> {
     let values: Vec<String> = serde_json::from_value(v.clone())?;
@@ -93,9 +122,9 @@ fn compare_limits(a: &str, b: &str) -> Result<Ordering> {
         .find(|o| *o != Ordering::Equal)
         .unwrap_or(Ordering::Equal))
 }
-pub(super) fn bounded(raw: &str, bound: u128) -> Result<Option<u128>> {
-    let limit = counter::Limit::parse(raw)
-        .ok_or_else(|| failure("CORRELATION", "clock", "Invalid authored limit"))?;
+pub(crate) fn bounded(raw: &str, bound: u128) -> Result<Option<u128>> {
+    let limit =
+        counter::Limit::parse(raw).ok_or_else(|| failure("clock", "Invalid authored limit"))?;
     if limit.compare_counter(&bound.to_string()) == Ordering::Less {
         return Ok(None);
     }
@@ -121,40 +150,40 @@ fn wake(limit: Option<&str>, elapsed: u64, slice: u64) -> Result<Option<u64>> {
         .transpose()
 }
 #[derive(Clone)]
-pub(super) struct Work {
-    pub(super) id: String,
-    pub(super) kind: String,
-    pub(super) start: u64,
-    pub(super) timeout: Option<String>,
-    pub(super) answer_timeout: Option<String>,
-    pub(super) snapshot: Value,
-    pub(super) retired: bool,
+pub(crate) struct Work {
+    pub(crate) id: String,
+    pub(crate) kind: String,
+    pub(crate) start: u64,
+    pub(crate) timeout: Option<String>,
+    pub(crate) answer_timeout: Option<String>,
+    pub(crate) snapshot: Value,
+    pub(crate) retired: bool,
 }
 #[derive(Clone)]
-pub(super) struct Request {
-    pub(super) id: String,
-    pub(super) kind: String,
-    pub(super) works: Vec<String>,
-    pub(super) opened: u64,
-    pub(super) duration: Option<String>,
-    pub(super) resolution: Option<Value>,
-    pub(super) acknowledged: bool,
-    pub(super) proven: bool,
+pub(crate) struct Request {
+    pub(crate) id: String,
+    pub(crate) kind: String,
+    pub(crate) works: Vec<String>,
+    pub(crate) opened: u64,
+    pub(crate) duration: Option<String>,
+    pub(crate) resolution: Option<Value>,
+    pub(crate) acknowledged: bool,
+    pub(crate) proven: bool,
 }
 #[derive(Clone)]
-pub(super) struct Submission {
-    pub(super) id: String,
-    pub(super) request: String,
-    pub(super) received: u64,
-    pub(super) answer: HumanAnswer030,
-    pub(super) accepted: Option<bool>,
+pub(crate) struct Submission {
+    pub(crate) id: String,
+    pub(crate) request: String,
+    pub(crate) received: u64,
+    pub(crate) answer: HumanAnswer030,
+    pub(crate) accepted: Option<bool>,
 }
-pub(super) fn duration(request: &Request, works: &[Work]) -> Result<Option<String>> {
+pub(crate) fn duration(request: &Request, works: &[Work]) -> Result<Option<String>> {
     if request.kind == "approval" {
         let work = works
             .iter()
             .find(|w| request.works == [w.id.clone()])
-            .ok_or_else(|| failure("CORRELATION", "clock", "Approval work differs"))?;
+            .ok_or_else(|| failure("clock", "Approval work differs"))?;
         return Ok(work.timeout.clone());
     }
     let mut shortest: Option<String> = None;
@@ -162,7 +191,7 @@ pub(super) fn duration(request: &Request, works: &[Work]) -> Result<Option<Strin
         let work = works
             .iter()
             .find(|w| &w.id == id && w.kind != "approval")
-            .ok_or_else(|| failure("CORRELATION", "clock", "Unknown attributed native work"))?;
+            .ok_or_else(|| failure("clock", "Unknown attributed native work"))?;
         if let Some(limit) = &work.answer_timeout {
             if shortest
                 .as_ref()
@@ -176,7 +205,7 @@ pub(super) fn duration(request: &Request, works: &[Work]) -> Result<Option<Strin
     }
     Ok(shortest)
 }
-pub(super) fn due(request: &Request, now: u64, previous: u64) -> Result<Option<u64>> {
+fn due(request: &Request, now: u64, previous: u64) -> Result<Option<u64>> {
     let Some(duration) = &request.duration else {
         return Ok(None);
     };
@@ -192,11 +221,7 @@ pub(super) fn due(request: &Request, now: u64, previous: u64) -> Result<Option<u
         }
     }))
 }
-pub(super) fn resolution(
-    request: &Request,
-    at: u64,
-    submission: Option<&Submission>,
-) -> Result<Value> {
+fn resolution(request: &Request, at: u64, submission: Option<&Submission>) -> Result<Value> {
     let expired = submission.is_none();
     let answer = match submission.map(|s| &s.answer) {
         None if request.kind == "approval" || request.kind == "question" => {
@@ -216,7 +241,6 @@ pub(super) fn resolution(
         }
         _ => {
             return Err(failure(
-                "CORRELATION",
                 "human",
                 "Submission kind differs from native request",
             ))
@@ -257,7 +281,7 @@ fn keyed(values: &Value, key: &str) -> Result<BTreeMap<String, Value>> {
     let mut result = BTreeMap::new();
     for value in values
         .as_array()
-        .ok_or_else(|| failure("CORRELATION", "clock", "Projection array absent"))?
+        .ok_or_else(|| failure("clock", "Projection array absent"))?
     {
         require(
             result
@@ -268,7 +292,7 @@ fn keyed(values: &Value, key: &str) -> Result<BTreeMap<String, Value>> {
     }
     Ok(result)
 }
-pub(super) fn validate_projection(
+pub(crate) fn validate_projection(
     works: Vec<Work>,
     mut requests: Vec<Request>,
     submissions: Vec<Submission>,
@@ -295,7 +319,7 @@ pub(super) fn validate_projection(
         let request = requests
             .iter_mut()
             .find(|r| Some(r.id.as_str()) == event["requestId"].as_str())
-            .ok_or_else(|| failure("CORRELATION", "clock", "Unknown native association"))?;
+            .ok_or_else(|| failure("clock", "Unknown native association"))?;
         if request.resolution.is_none() {
             request.works = ids(&event["workIds"])?;
             request.duration = duration(request, &works)?;
@@ -321,13 +345,7 @@ pub(super) fn validate_projection(
             let work = works
                 .iter()
                 .find(|w| &w.id == id && w.kind == "agent" && !w.retired)
-                .ok_or_else(|| {
-                    failure(
-                        "CORRELATION",
-                        "clock",
-                        "Unknown live work for operator clock",
-                    )
-                })?;
+                .ok_or_else(|| failure("clock", "Unknown live work for operator clock"))?;
             require(
                 held.contains(id) != released.contains(id)
                     && (work.snapshot["operatorHeld"] == true) == released.contains(id),
@@ -338,7 +356,7 @@ pub(super) fn validate_projection(
             let request = requests
                 .iter_mut()
                 .find(|r| r.id == id)
-                .ok_or_else(|| failure("CORRELATION", "clock", "Unknown action request"))?;
+                .ok_or_else(|| failure("clock", "Unknown action request"))?;
             require(
                 request.kind == "ask" && request.works.iter().any(|id| held.contains(id)),
                 "Operator cancellation must belong to newly held agent work",
@@ -352,7 +370,7 @@ pub(super) fn validate_projection(
         let request = requests
             .iter_mut()
             .find(|r| Some(r.id.as_str()) == event["requestId"].as_str())
-            .ok_or_else(|| failure("CORRELATION", "clock", "Unknown withdrawn action request"))?;
+            .ok_or_else(|| failure("clock", "Unknown withdrawn action request"))?;
         let work_id = text(event, "workId")?;
         require(
             request.kind == "ask"
@@ -371,13 +389,7 @@ pub(super) fn validate_projection(
         let submission = submissions
             .iter()
             .find(|s| Some(s.id.as_str()) == event["nativeReceiptId"].as_str())
-            .ok_or_else(|| {
-                failure(
-                    "CORRELATION",
-                    "human",
-                    "Resident answer has no native submission",
-                )
-            })?;
+            .ok_or_else(|| failure("human", "Resident answer has no native submission"))?;
         require(
             submission.received == now
                 && Some(submission.request.as_str()) == event["requestId"].as_str(),
@@ -386,7 +398,7 @@ pub(super) fn validate_projection(
         let request = requests
             .iter_mut()
             .find(|r| r.id == submission.request)
-            .ok_or_else(|| failure("CORRELATION", "human", "Native request absent"))?;
+            .ok_or_else(|| failure("human", "Native request absent"))?;
         if request.resolution.is_none() {
             request.resolution = Some(resolution(request, now, Some(submission))?);
             accepted_current = true;
@@ -423,11 +435,11 @@ pub(super) fn validate_projection(
     for request in &requests {
         let snapshot = snapshots
             .remove(&request.id)
-            .ok_or_else(|| failure("CORRELATION", "clock", "Native request omitted"))?;
+            .ok_or_else(|| failure("clock", "Native request omitted"))?;
         require(
             snapshot["kind"] == request.kind
                 && snapshot["workIds"] == json!(request.works)
-                && snapshot["openedAtMs"] == request.opened.to_string()
+                && snapshot["openedAtMs"].as_str() == Some(request.opened.to_string().as_str())
                 && snapshot["answerTimeoutMs"] == json!(request.duration),
             "Resident changed a native deadline or attribution",
         )?;
@@ -436,7 +448,7 @@ pub(super) fn validate_projection(
     validate_clocks(&works, &before, &requests, previous, now, event, receipt)?;
     Ok(())
 }
-pub(super) fn verify_existing(request: &Request, submissions: &[Submission]) -> Result<()> {
+pub(crate) fn verify_existing(request: &Request, submissions: &[Submission]) -> Result<()> {
     let Some(stored) = &request.resolution else {
         return Ok(());
     };
@@ -543,7 +555,7 @@ fn validate_clocks(
             let is_held = held.contains(&work.id) || (was_held && !released.contains(&work.id));
             let elapsed = consumed
                 .checked_add(if was_held { 0 } else { now - start - paused })
-                .ok_or_else(|| failure("CORRELATION", "clock", "Machine budget overflow"))?;
+                .ok_or_else(|| failure("clock", "Machine budget overflow"))?;
             let open = requests
                 .iter()
                 .filter(|r| {
@@ -573,7 +585,7 @@ fn validate_clocks(
         } else {
             active.remove(&work.id)
         }
-        .ok_or_else(|| failure("CORRELATION", "clock", "Native work clock omitted"))?;
+        .ok_or_else(|| failure("clock", "Native work clock omitted"))?;
         require(
             actual["snapshot"]["elapsedMachineMs"] == snapshot["elapsedMachineMs"]
                 && actual["snapshot"]["expired"] == snapshot["expired"]

@@ -1,9 +1,24 @@
 //! SQL facts for the shared native human/clock verifier.
 use super::*;
-#[path = "persistence/v030/human_clock_verify030.rs"]
-mod core;
-pub(super) use core::ms;
-use core::*;
+use crate::persistence::{dto::EngineFailure, human_clock_verify030 as verifier};
+use verifier::{
+    duration, validate_projection, verify_existing, Request, Submission, VerificationError, Work,
+};
+
+impl From<VerificationError> for EngineFailure {
+    fn from(error: VerificationError) -> Self {
+        match error {
+            VerificationError::Correlation { pointer, message } => {
+                failure("CORRELATION", pointer, message)
+            }
+            VerificationError::Json(error) => error.into(),
+        }
+    }
+}
+
+pub(super) fn ms(raw: &str) -> Result<u64> {
+    verifier::ms(raw).map_err(Into::into)
+}
 fn strip_reason(mut value: Value) -> Value {
     if let Some(object) = value.as_object_mut() {
         object.remove("reason");
@@ -85,7 +100,7 @@ pub(super) async fn validate_stored(
         .find(|r| r.id == request_id)
         .ok_or_else(|| failure("CORRELATION", "human", "Native request absent"))?;
     require(request.resolution.is_some(), "Native resolution absent")?;
-    verify_existing(request, &submissions)
+    verify_existing(request, &submissions).map_err(Into::into)
 }
 
 /// Validate ALL authorities and their metadata before the caller writes any of
@@ -100,10 +115,11 @@ pub(super) async fn validate(
     let previous = ms(row.get("observed_ms"))?;
     let (works, requests, submissions) = facts(broker, db).await?;
     validate_projection(works, requests, submissions, previous, envelope, receipt)
+        .map_err(Into::into)
 }
 
 /// Reuse the deadline verifier's bounded exact-integer conversion for display.
 pub(crate) fn machine_remaining_ms030(raw: &str, elapsed: u64) -> Result<Option<String>> {
-    Ok(core::bounded(raw, u64::MAX as u128)?
+    Ok(verifier::bounded(raw, u64::MAX as u128)?
         .map(|limit| limit.saturating_sub(elapsed as u128).to_string()))
 }

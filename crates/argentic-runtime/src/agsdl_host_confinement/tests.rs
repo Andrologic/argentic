@@ -1,8 +1,13 @@
 use super::*;
 use argentic_harness::seatbelt::scope;
-use std::{collections::BTreeMap, path::PathBuf};
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use std::collections::BTreeMap;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use std::path::PathBuf;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use tokio::io::AsyncReadExt;
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn test_policy(root: &Path, network: bool) -> SandboxPolicy {
     let mut allow = vec![
         PathScope::Literal(PathBuf::from("/")),
@@ -61,6 +66,7 @@ fn lowering_intersects_ceilings_and_rejects_injection_or_aliases() {
     }
 }
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 async fn probe(policy: &SandboxPolicy, cwd: &Path, script: &str) -> (i32, String, String) {
     let mut child = policy
         .spawn(

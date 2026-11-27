@@ -102,3 +102,8 @@ pub mod runtime_projection030;
 
 #[path = "v030/replay_verify030.rs"]
 pub mod replay_verify030;
+
+#[path = "v030/human_answer030.rs"]
+pub(crate) mod human_answer030;
+#[path = "v030/human_clock_verify030.rs"]
+pub(crate) mod human_clock_verify030;

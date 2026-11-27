@@ -183,7 +183,7 @@ async fn exercise(pool: SqlitePool, root: &std::path::Path) {
             policy.clone(),
         )
         .await;
-    let error = result.err().expect("substituted capture must be refused");
+    let error = result.expect_err("substituted capture must be refused");
     assert_eq!(
         (error.code.as_str(), error.pointer.as_str()),
         ("CORRELATION", "capture")
@@ -200,8 +200,7 @@ async fn exercise(pool: SqlitePool, root: &std::path::Path) {
             policy.clone(),
         )
         .await
-        .err()
-        .expect("identity substitution must be refused");
+        .expect_err("identity substitution must be refused");
     assert_eq!(
         (error.code.as_str(), error.pointer.as_str()),
         ("CORRELATION", "capture")
@@ -218,8 +217,7 @@ async fn exercise(pool: SqlitePool, root: &std::path::Path) {
             policy.clone(),
         )
         .await
-        .err()
-        .expect("another incarnation cannot adopt the committed run");
+        .expect_err("another incarnation cannot adopt the committed run");
     assert_eq!(
         (error.code.as_str(), error.pointer.as_str()),
         ("RUNTIME_UNAVAILABLE", "owner")
@@ -262,8 +260,7 @@ async fn exercise(pool: SqlitePool, root: &std::path::Path) {
             policy.clone(),
         )
         .await
-        .err()
-        .expect("a reservation cannot acquire a second supervisor");
+        .expect_err("a reservation cannot acquire a second supervisor");
     assert_eq!(
         (error.code.as_str(), error.pointer.as_str()),
         ("CORRELATION", "runtime")

@@ -8,6 +8,7 @@ use crate::persistence::{
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use sqlx::Row;
+#[cfg(feature = "editor-parity")]
 use tokio::io::AsyncWriteExt;
 
 pub(crate) struct TestAuthority {
@@ -305,6 +306,7 @@ impl Fixture {
     async fn with_origin(declaration: &str, shared: bool, input: &str) -> Self {
         Self::origin_fixture(declaration, shared, input, false).await
     }
+    #[cfg(feature = "agsdl-content-qa")]
     pub(crate) async fn branch_failure() -> Self {
         Self::origin_fixture(
             r#"{"type":"call","command":"never execute","parse":"json","next":"join"}"#,
@@ -455,23 +457,19 @@ impl Fixture {
         }
         let mut state = FlowState030::new(id.clone());
         let mut history = vec![];
-        let mut send = |kind: FlowEventKind030| {
-            let event = FlowEvent030 {
-                identity: id.clone(),
-                event_id: format!("fixture:{}", history.len()),
-                expected_revision: state.revision.clone(),
-                kind,
-            };
-            let t = flow030::reduce(&plan, &state, &event).unwrap();
-            state = t.state.clone();
-            history.push((event, t));
+        let event = FlowEvent030 {
+            identity: id.clone(),
+            event_id: format!("fixture:{}", history.len()),
+            expected_revision: state.revision.clone(),
+            kind: FlowEventKind030::Enter {
+                message_json: "{}".into(),
+            },
         };
-        send(FlowEventKind030::Enter {
-            message_json: "{}".into(),
-        });
+        let transition = flow030::reduce(&plan, &state, &event).unwrap();
+        state = transition.state.clone();
+        history.push((event, transition));
         // Native synthetic origin receipt only seeds this unit fixture; no
         // provider/agent execution or authority is qualified by these tests.
-        drop(send);
         let origin = state
             .activations
             .iter()

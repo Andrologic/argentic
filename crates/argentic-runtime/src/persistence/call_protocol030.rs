@@ -153,7 +153,7 @@ impl CallAttempt030 {
             _ => unreachable!(),
         }
     }
-    #[cfg(test)]
+    #[cfg(all(test, feature = "agsdl-engine-qa", debug_assertions))]
     pub(crate) fn answer_timeout_ms_json(&self) -> Result<Option<String>> {
         let step: Object = serde_json::from_str(&self.declaration_json)?;
         Ok(step.get("answerTimeoutMs").map(|v| v.get().to_owned()))
@@ -311,9 +311,6 @@ fn decode_receipt(raw: &str) -> Result<CallReceipt030> {
 }
 
 impl CallReceipt030 {
-    pub(crate) fn attempt(&self) -> &CallAttempt030 {
-        &self.attempt
-    }
     pub(crate) fn matches_joined(&self, joined: &JoinedCall030) -> Result<bool> {
         Ok(self.attempt == *joined.attempt() && self.received == received_from_join(joined)?)
     }
@@ -341,6 +338,7 @@ impl CallReceipt030 {
     pub(crate) fn not_started(&self) -> bool {
         matches!(self.received.physical, CallPhysical030::NotStarted { .. })
     }
+    #[cfg(all(test, feature = "agsdl-engine-qa", debug_assertions))]
     pub(crate) fn status(&self) -> &str {
         match &self.result {
             CallResult030::Stopped => "stopped",
@@ -382,12 +380,11 @@ struct StoredDiagnostic030 {
     diagnostic: Value,
 }
 impl CallDiagnostic030 {
-    pub(crate) fn attempt(&self) -> &CallAttempt030 {
-        self.candidate.attempt()
-    }
+    #[cfg(all(test, feature = "agsdl-engine-qa", debug_assertions))]
     pub(crate) fn event_id(&self) -> &str {
         self.candidate.event_id()
     }
+    #[cfg(all(test, feature = "agsdl-engine-qa", debug_assertions))]
     pub(crate) fn value(&self) -> &Value {
         &self.diagnostic
     }
@@ -532,17 +529,6 @@ impl CallStopCause030 {
         })
     }
 }
-impl CallCauseReceipt030 {
-    pub(crate) fn cause_id(&self) -> &str {
-        &self.cause_id
-    }
-    pub(crate) fn attempt(&self) -> &CallAttempt030 {
-        &self.attempt
-    }
-    pub(crate) fn clock_receipt_id(&self) -> &str {
-        &self.cause.clock_receipt_id
-    }
-}
 async fn read_cause_tx(
     db: &mut SqliteConnection,
     attempt: &CallAttempt030,
@@ -675,7 +661,7 @@ pub(crate) async fn commit_marker_tx(
         row_sha256: sha(exact.as_bytes()),
     })
 }
-#[cfg(test)]
+#[cfg(all(test, feature = "agsdl-engine-qa", debug_assertions))]
 pub(crate) async fn verify_commit_marker_tx<A: CallAuthority030>(
     db: &mut SqliteConnection,
     authority: &A,
@@ -732,8 +718,8 @@ async fn state_tx(db: &mut SqliteConnection, id: &FlowIdentity030) -> Result<Flo
     )?;
     Ok(state)
 }
-fn declaration<'a>(
-    capture: &'a StartCapture030,
+fn declaration(
+    capture: &StartCapture030,
     effect: &FlowEffect030,
     state: &FlowState030,
 ) -> Result<String> {
@@ -1345,7 +1331,7 @@ async fn validate_result_tx(
     }
     match (result, &received.end) {
         (CallResult030::Completed { output_json }, CallEnd030::Returned { event }) => {
-            validate_output(&prepared, event, output_json)?
+            validate_output(prepared, event, output_json)?
         }
         (
             CallResult030::Failed { code },
@@ -1958,7 +1944,7 @@ pub(crate) async fn read_route_receipt_tx(
 
 /// N-HUMAN must use this in its own admission transaction before opening or
 /// changing an MCP association. This does not implement a human broker.
-#[cfg(test)]
+#[cfg(all(test, feature = "agsdl-engine-qa", debug_assertions))]
 pub(crate) async fn require_live_mcp_tx<A: CallAuthority030>(
     db: &mut SqliteConnection,
     authority: &A,

@@ -203,6 +203,7 @@ impl SchemaChecker {
     }
 
     /// `check(value)`: every problem, in the JS traversal order.
+    #[cfg(test)]
     pub(crate) fn check(&self, value: &Value) -> Result<Vec<Problem>, SchemaError> {
         self.check_with_budget(value, &SourceBudget::default())
     }

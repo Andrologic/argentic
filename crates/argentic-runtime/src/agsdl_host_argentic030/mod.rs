@@ -273,11 +273,14 @@ struct Executor {
     // The Host creates one executor per run. The reducer serializes works
     // with the same instance ID and waits for the previous owner to join.
     sessions: Arc<Mutex<BTreeMap<String, session::IdleHistory>>>,
-    policies: Arc<Mutex<BTreeMap<String, Arc<[argentic_harness::policy::Policy]>>>>,
-    toolboxes: Arc<Mutex<BTreeMap<([u8; 32], bool, bool), argentic_harness::tools::Toolbox>>>,
+    policies: Arc<Mutex<PolicyCache>>,
+    toolboxes: Arc<Mutex<ToolboxCache>>,
     approvals: Arc<dyn crate::harness::CommandApprovals030>,
     has_mcp_equipment: bool,
 }
+
+type ToolboxCache = BTreeMap<([u8; 32], bool, bool), argentic_harness::tools::Toolbox>;
+type PolicyCache = BTreeMap<String, Arc<[argentic_harness::policy::Policy]>>;
 
 impl Executor {
     fn policies(

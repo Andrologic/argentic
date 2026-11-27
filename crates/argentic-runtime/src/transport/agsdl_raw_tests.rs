@@ -87,11 +87,10 @@ async fn http_handler(
         "tools/call" => {
             let call = state.calls.fetch_add(1, Ordering::SeqCst);
             assert!(body.contains("9007199254740993"));
-            if state.mode == "get-blocking" {
-                if tokio::time::timeout(std::time::Duration::from_secs(2), state.answer_seen.notified()).await.is_err() {
+            if state.mode == "get-blocking"
+                && tokio::time::timeout(std::time::Duration::from_secs(2), state.answer_seen.notified()).await.is_err() {
                     return axum::http::StatusCode::GATEWAY_TIMEOUT.into_response();
                 }
-            }
             if state.mode == "modern-push" {
                 let raw = format!("data: {{\"jsonrpc\":\"2.0\",\"id\":\"server-human\",\"method\":\"elicitation/create\",\"params\":{{\"message\":\"Continue?\",\"requestedSchema\":{{\"type\":\"object\"}}}}}}\n\ndata: {{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"resultType\":\"complete\",\"content\":[]}}}}\n\n");
                 return ([("content-type", "text/event-stream")], raw).into_response();
@@ -258,7 +257,7 @@ fn request() -> CallRequest {
 }
 
 fn dummy_host() -> Arc<TestHost> {
-    Arc::new(TestHost::new(LaunchGrant::Mcp(CapturedServer {
+    Arc::new(TestHost::new(LaunchGrant::Mcp(Box::new(CapturedServer {
         document_name: "unused".into(),
         capture_digest: "unused".into(),
         protocol: Protocol::Legacy,
@@ -269,7 +268,7 @@ fn dummy_host() -> Arc<TestHost> {
             headers: Default::default(),
             tool_schema: None,
         }),
-    })))
+    }))))
 }
 
 // Exercises transport only. Product dispatch remains closed pending the parent fence.
@@ -607,7 +606,7 @@ fn annotated_parameter_headers_are_bound_to_schema_and_exact_nested_path() {
 #[tokio::test]
 async fn product_mcp_dispatch_stays_closed_before_fence() {
     let (server, fixture, task) = http_fixture("json").await;
-    let host = Arc::new(TestHost::new(LaunchGrant::Mcp(server)));
+    let host = Arc::new(TestHost::new(LaunchGrant::Mcp(Box::new(server))));
     let completion = execute(host, request()).await.unwrap();
     assert_eq!(completion.failure.unwrap().code, "HOST_CAPABILITY");
     assert!(matches!(completion.evidence, PhysicalEvidence::NotStarted));
@@ -674,7 +673,7 @@ async fn stop_during_legacy_get_human_closes_request_without_call_replay() {
             tool_schema: None,
         }),
     };
-    let mut host = TestHost::new(LaunchGrant::Mcp(dummy));
+    let mut host = TestHost::new(LaunchGrant::Mcp(Box::new(dummy)));
     host.human_delay = std::time::Duration::from_secs(30);
     let host = Arc::new(host);
     let running = {

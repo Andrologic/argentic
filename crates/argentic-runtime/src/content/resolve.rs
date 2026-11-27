@@ -80,7 +80,7 @@ fn raw_object(json: &str) -> ContentResult<BTreeMap<String, Box<RawValue>>> {
     serde_json::from_str(json).map_err(|e| error("INVALID_SOURCE", e))
 }
 
-fn field_string(value: Option<&Box<RawValue>>) -> ContentResult<Option<String>> {
+fn field_string(value: Option<&RawValue>) -> ContentResult<Option<String>> {
     value
         .map(|raw| serde_json::from_str(raw.get()).map_err(|e| error("INVALID_SOURCE", e)))
         .transpose()
@@ -134,35 +134,6 @@ fn file_read_error(
     }
 }
 
-#[cfg(test)]
-mod termination_tests {
-    use super::*;
-    #[test]
-    fn cancellation_does_not_hide_uncertain_termination() {
-        let source = std::io::Error::new(std::io::ErrorKind::TimedOut, "not reaped");
-        let error_value = crate::content_io::admitted::io_error_to_backend_error(
-            source,
-            std::path::Path::new("/synthetic/data"),
-        );
-        assert_eq!(
-            file_read_error(true, error_value).code,
-            "CONTENT_TERMINATION_UNCERTAIN"
-        );
-    }
-
-    #[test]
-    fn confirmed_cancellation_stays_distinct_from_read_failure() {
-        let failure = || crate::content_io::admitted::ReadError::Filesystem {
-            message: "synthetic failure".into(),
-        };
-        assert_eq!(file_read_error(true, failure()).code, "CANCELLED");
-        assert_eq!(
-            file_read_error(false, failure()).code,
-            "CONTENT_UNAVAILABLE"
-        );
-    }
-}
-
 pub async fn resolve_content(
     context: &ContentContext,
     usage: ContentUse,
@@ -190,7 +161,7 @@ pub(super) async fn resolve_content_in_root(
         if source.len() != 1 {
             return Err(error("INVALID_SOURCE", "A ref cannot have other fields."));
         }
-        let name = field_string(source.get("ref"))?
+        let name = field_string(source.get("ref").map(Box::as_ref))?
             .ok_or_else(|| error("INVALID_SOURCE", "Missing ref."))?;
         let entry =
             argentic_core::durable_json::at_path(&context.document_json, &["content", &name])
@@ -214,7 +185,7 @@ pub(super) async fn resolve_content_in_root(
             "Expected exactly one value or URI.",
         ));
     }
-    let declared = field_string(source.get("mediaType"))?;
+    let declared = field_string(source.get("mediaType").map(Box::as_ref))?;
     let (bytes, payload, requested, final_uri, observed, media, file_parent_identity) =
         if let Some(value) = source.get("value") {
             let raw = value.get();
@@ -248,7 +219,7 @@ pub(super) async fn resolve_content_in_root(
                 )
             }
         } else {
-            let requested = field_string(source.get("uri"))?
+            let requested = field_string(source.get("uri").map(Box::as_ref))?
                 .ok_or_else(|| error("INVALID_SOURCE", "Missing URI."))?;
             let uri = resolved_uri(context, &requested)?;
             let (bytes, final_uri, observed, file_parent_identity) =
@@ -580,4 +551,33 @@ pub async fn capture_result_file(
         },
     )
     .await
+}
+
+#[cfg(test)]
+mod termination_tests {
+    use super::*;
+    #[test]
+    fn cancellation_does_not_hide_uncertain_termination() {
+        let source = std::io::Error::new(std::io::ErrorKind::TimedOut, "not reaped");
+        let error_value = crate::content_io::admitted::io_error_to_backend_error(
+            source,
+            std::path::Path::new("/synthetic/data"),
+        );
+        assert_eq!(
+            file_read_error(true, error_value).code,
+            "CONTENT_TERMINATION_UNCERTAIN"
+        );
+    }
+
+    #[test]
+    fn confirmed_cancellation_stays_distinct_from_read_failure() {
+        let failure = || crate::content_io::admitted::ReadError::Filesystem {
+            message: "synthetic failure".into(),
+        };
+        assert_eq!(file_read_error(true, failure()).code, "CANCELLED");
+        assert_eq!(
+            file_read_error(false, failure()).code,
+            "CONTENT_UNAVAILABLE"
+        );
+    }
 }

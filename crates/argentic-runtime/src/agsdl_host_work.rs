@@ -28,8 +28,8 @@ pub(crate) fn captured_work_contract030(
     agent_name: &str,
 ) -> Result<String> {
     use serde_json::Value;
-    validate_json(&snapshot.compiled_plan_json)?;
-    let plan: Value = serde_json::from_str(&snapshot.compiled_plan_json)?;
+    validate_json(snapshot.compiled_plan_json)?;
+    let plan: Value = serde_json::from_str(snapshot.compiled_plan_json)?;
     if snapshot.system_start_id != work.system_start_id
         || plan.get("format").and_then(Value::as_str) != Some("macro-agsdl-compiled-plan/2")
         || snapshot.versions.snapshot != "2"
@@ -199,6 +199,7 @@ pub(crate) fn reserved_check030(
     }
 }
 
+#[cfg(test)]
 const MAX_JOBS: usize = 64;
 const MAX_BYTES: usize = 8_000_000;
 

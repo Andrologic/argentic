@@ -45,7 +45,7 @@ pub(crate) struct FlowWorkTicket030 {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Reservation030 {
-    Pending(FlowWorkTicket030),
+    Pending(Box<FlowWorkTicket030>),
     Committed(ProtocolDecision030),
 }
 
@@ -613,7 +613,7 @@ async fn reserve_tx(
                 .execute(&mut *db).await?.rows_affected();
             require(changed == 1, "Pending ticket changed")?;
         }
-        return Ok(Reservation030::Pending(ticket));
+        return Ok(Reservation030::Pending(Box::new(ticket)));
     }
     let state = sqlx::query("SELECT revision,state_json FROM engine_flow030_work_state WHERE system_id=? AND invocation_id=? AND activation_id=?")
         .bind(&id.system_start_id).bind(&id.flow_invocation_id).bind(&input.context.work.activation_id).fetch_optional(&mut *db).await?;
@@ -649,7 +649,7 @@ async fn reserve_tx(
         .bind(json(&ticket)?)
         .execute(&mut *db)
         .await?;
-    Ok(Reservation030::Pending(ticket))
+    Ok(Reservation030::Pending(Box::new(ticket)))
 }
 
 async fn commit_tx(
@@ -938,6 +938,10 @@ fn accepted_terminal030(
     }))
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "The transition checks independent ownership and join capabilities"
+)]
 async fn transition_inner(
     host: &HostState,
     pool: &SqlitePool,
@@ -978,7 +982,7 @@ async fn transition_inner(
     lease.ensure_live().map_err(|_| uncertain())?;
     let ticket = match reservation {
         Reservation030::Committed(value) => return Ok(value),
-        Reservation030::Pending(ticket) => ticket,
+        Reservation030::Pending(ticket) => *ticket,
     };
     drop(db);
     drop(gate);

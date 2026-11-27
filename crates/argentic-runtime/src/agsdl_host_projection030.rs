@@ -43,6 +43,10 @@ pub struct RuntimeProjectionContinuation030 {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "Boxing activation data changes the public projection item type"
+)]
 pub enum RuntimeProjectionItem030 {
     Instance { value: RuntimeInstance030 },
     Activation { value: RuntimeActivation030 },

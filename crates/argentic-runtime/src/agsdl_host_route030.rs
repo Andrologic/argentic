@@ -11,6 +11,7 @@ use std::sync::Mutex;
 use tokio::sync::{oneshot, Notify};
 use tokio_util::sync::CancellationToken;
 
+#[cfg(test)]
 const MAX_JOBS: usize = 64;
 const MAX_BYTES: usize = 8_000_000;
 
@@ -271,7 +272,7 @@ fn validate_input(generation: &str, input_json: &str) -> Result<()> {
             "Route input is invalid or too large",
         ));
     }
-    validate_json(&input_json)?;
+    validate_json(input_json)?;
     Ok(())
 }
 fn validate_output(output: &HostRouteOutput030) -> Result<()> {

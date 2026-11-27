@@ -110,9 +110,6 @@ impl Number {
         }
         Ok(Self::Finite(decimal))
     }
-    pub(crate) fn is_finite(&self) -> bool {
-        matches!(self, Self::Finite(_))
-    }
     fn json(&self) -> &str {
         match self {
             Self::Finite(s) if s == "-0" => "0",

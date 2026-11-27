@@ -844,6 +844,10 @@ fn has_local_error_handler(plan: &FlowPlan030, step: &Option<Vec<String>>) -> bo
 /// An already-opened join failure is anchored to its immutable group and to the
 /// accepted branch failure that crossed its configured threshold. The later
 /// release event may be a different physical-end event.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "The proof correlates separate owner, capture and flow facts"
+)]
 async fn verify_failed_group_source_tx(
     db: &mut SqliteConnection,
     capture: &StartCapture030,
@@ -912,6 +916,10 @@ async fn verify_failed_group_source_tx(
 // Bound native proof recursion independently of authored nesting and SQL data.
 const MAX_FAILURE_PROOF_DEPTH030: usize = 16;
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Recursive proof checks retain the original owner, capture and flow facts"
+)]
 fn verify_failed_group_tx<'a>(
     db: &'a mut SqliteConnection,
     capture: &'a StartCapture030,
@@ -1355,6 +1363,10 @@ struct ContentOccurrence030 {
     receipts: Vec<Value>,
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Content proof checks bind independently captured facts"
+)]
 async fn verify_content(
     db: &mut SqliteConnection,
     capture: &StartCapture030,

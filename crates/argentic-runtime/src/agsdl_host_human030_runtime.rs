@@ -88,6 +88,10 @@ impl HumanBroker030 {
     }
     /// Approval has no provider. Join its owned waiting future before committing
     /// its terminal result; the retained resolution is the sole output source.
+    #[allow(
+        clippy::cmp_owned,
+        reason = "Compare the stored bytes with serialized JSON"
+    )]
     pub(crate) async fn finish_approval(
         &self,
         host: &HostState,

@@ -44,7 +44,7 @@ fn skill_diagnostic(severity: &str, code: &str, message: impl Into<String>) -> S
 }
 
 fn mapping_get<'a>(mapping: &'a Mapping, key: &str) -> Option<&'a Value> {
-    mapping.get(&Value::String(key.to_string()))
+    mapping.get(Value::String(key.to_string()))
 }
 
 fn yaml_value_to_string(value: &Value) -> String {
@@ -337,8 +337,8 @@ pub fn parse_skill_text(skill_file: &Path, raw: &str) -> ParsedSkillFile {
     let normalized = raw.replace("\r\n", "\n");
     let mut body = normalized.clone();
 
-    if normalized.starts_with("---\n") {
-        let frontmatter_range = normalized[4..]
+    if let Some(after_opening) = normalized.strip_prefix("---\n") {
+        let frontmatter_range = after_opening
             .find("\n---\n")
             .map(|end_index| (4 + end_index, 4 + end_index + "\n---\n".len()))
             .or_else(|| {
@@ -347,7 +347,7 @@ pub fn parse_skill_text(skill_file: &Path, raw: &str) -> ParsedSkillFile {
                     .then_some((normalized.len() - "\n---".len(), normalized.len()))
             });
         if let Some((frontmatter_end, body_start)) = frontmatter_range {
-            let frontmatter = &normalized[4..frontmatter_end];
+            let frontmatter = &after_opening[..frontmatter_end - 4];
             body = normalized[body_start..].to_string();
             if let Some(mapping) = parse_frontmatter_mapping(frontmatter, &mut diagnostics) {
                 validate_frontmatter_fields(&mapping, &mut diagnostics);

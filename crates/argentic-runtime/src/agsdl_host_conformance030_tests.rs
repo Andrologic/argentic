@@ -57,12 +57,6 @@ impl BunHost {
             sequence: 0,
         }
     }
-    async fn request(&mut self, request: Value) -> Value {
-        self.request_raw(request).await.0
-    }
-    async fn request_raw(&mut self, request: Value) -> (Value, String) {
-        self.request_text(&request.to_string()).await
-    }
     async fn request_text(&mut self, request: &str) -> (Value, String) {
         self.sequence += 1;
         let bytes = format!("{{\"id\":{},{}\n", self.sequence, &request[1..]).into_bytes();
@@ -195,7 +189,7 @@ struct Fixture {
     host: HostState,
     pool: sqlx::SqlitePool,
     config: crate::host::HostContext,
-    incarnation: Arc<Incarnation>,
+    _incarnation: Arc<Incarnation>,
     owner: EngineOwner,
     identity: FlowIdentity030,
     plan: FlowPlan030,
@@ -401,7 +395,7 @@ impl Fixture {
             host,
             pool,
             config,
-            incarnation,
+            _incarnation: incarnation,
             owner,
             identity,
             plan,
@@ -651,7 +645,7 @@ async fn idle(
     let mut previous_progress = None;
     loop {
         let host = &f.host;
-        let view = flow::inspect_run(host.flow030(), &host, &f.pool, &f.owner)
+        let view = flow::inspect_run(host.flow030(), host, &f.pool, &f.owner)
             .await
             .unwrap()
             .flow;
@@ -672,65 +666,69 @@ async fn idle(
             .fetch_one(&f.pool)
             .await
             .unwrap();
-        let agents = running.lock().unwrap();
-        let ready = pending_clock == 0
-            && pending_controls == 0
-            && view
-                .state
-                .activations
-                .iter()
-                .filter(|a| a.physical)
-                .all(|a| clock_works.contains(&a.id))
-            && !view.effects.iter().any(|r| {
-                if r["status"] != "pending" && r["status"] != "uncertain" {
-                    return false;
-                }
-                let kind = &r["effect"]["kind"];
-                if view.state.stopping && kind["kind"] == "stopWork" && r["status"] == "uncertain" {
-                    return false;
-                }
-                if hold_steers
-                    && kind["kind"] == "steer"
-                    && kind["deliveryActivationId"]
-                        .as_str()
-                        .is_some_and(|id| deferred.lock().unwrap().contains_key(id))
-                {
-                    return false;
-                }
-                !view.state.stopping
-                    || crate::persistence::flow_store030::eligible(
-                        &view.state,
-                        &serde_json::from_value(r["effect"].clone()).unwrap(),
-                    )
-            })
-            && view
-                .state
-                .preparations
-                .iter()
-                .all(|p| p.status != "pending")
-            && view
-                .state
-                .activations
-                .iter()
-                .filter(|a| a.physical)
-                .all(|a| {
-                    agents.iter().any(|w| w.activation == a.id)
-                        || calls.lock().unwrap().iter().any(|w| w.activation == a.id)
-                        || a.agent.is_none()
-                            && a.step.as_ref().is_some_and(|step| {
-                                f.plan
-                                    .steps
-                                    .iter()
-                                    .any(|s| &s.address == step && s.r#type == "approval")
-                            })
-                })
-            && ended.is_none_or(|id| {
-                view.state
+        let ready = {
+            let agents = running.lock().unwrap();
+            pending_clock == 0
+                && pending_controls == 0
+                && view
+                    .state
                     .activations
                     .iter()
-                    .any(|a| a.id == id && !a.physical)
-            });
-        drop(agents);
+                    .filter(|a| a.physical)
+                    .all(|a| clock_works.contains(&a.id))
+                && !view.effects.iter().any(|r| {
+                    if r["status"] != "pending" && r["status"] != "uncertain" {
+                        return false;
+                    }
+                    let kind = &r["effect"]["kind"];
+                    if view.state.stopping
+                        && kind["kind"] == "stopWork"
+                        && r["status"] == "uncertain"
+                    {
+                        return false;
+                    }
+                    if hold_steers
+                        && kind["kind"] == "steer"
+                        && kind["deliveryActivationId"]
+                            .as_str()
+                            .is_some_and(|id| deferred.lock().unwrap().contains_key(id))
+                    {
+                        return false;
+                    }
+                    !view.state.stopping
+                        || crate::persistence::flow_store030::eligible(
+                            &view.state,
+                            &serde_json::from_value(r["effect"].clone()).unwrap(),
+                        )
+                })
+                && view
+                    .state
+                    .preparations
+                    .iter()
+                    .all(|p| p.status != "pending")
+                && view
+                    .state
+                    .activations
+                    .iter()
+                    .filter(|a| a.physical)
+                    .all(|a| {
+                        agents.iter().any(|w| w.activation == a.id)
+                            || calls.lock().unwrap().iter().any(|w| w.activation == a.id)
+                            || a.agent.is_none()
+                                && a.step.as_ref().is_some_and(|step| {
+                                    f.plan
+                                        .steps
+                                        .iter()
+                                        .any(|s| &s.address == step && s.r#type == "approval")
+                                })
+                    })
+                && ended.is_none_or(|id| {
+                    view.state
+                        .activations
+                        .iter()
+                        .any(|a| a.id == id && !a.physical)
+                })
+        };
         if ready {
             return view;
         }
@@ -816,7 +814,7 @@ async fn native_timeline(
     let human = host
         .flow030()
         .humans
-        .broker(&host, &f.pool, &f.identity)
+        .broker(host, &f.pool, &f.identity)
         .await?;
     let executors: Executors030 = Executors030 {
         agents: std::collections::BTreeMap::from([(
@@ -882,7 +880,7 @@ async fn native_timeline(
     let native_config = f.config.clone();
     let supervisor = supervise_with_steer_port030(
         Some(&f.host),
-        &host,
+        host,
         &f.pool,
         &native_config,
         &tasks,
@@ -1091,7 +1089,7 @@ async fn native_timeline(
                         let _operation = human.operation.lock().await;
                         human
                             .submit(
-                                &host,
+                                host,
                                 crate::agsdl_host_human030::HumanSubmission030 {
                                     scope: crate::persistence::public030::HumanScope030 {
                                         system_start_id: f.identity.system_start_id.clone(),
@@ -1107,7 +1105,7 @@ async fn native_timeline(
                                 crate::agsdl_host_human030::HumanOrigin030::SyntheticPerson,
                             )
                             .await?;
-                        human.pump(&host, &CancellationToken::new()).await?;
+                        human.pump(host, &CancellationToken::new()).await?;
                         ended = Some(approval.id.clone());
                         wake.send_modify(|n| *n += 1);
                         continue;
@@ -1200,8 +1198,8 @@ async fn native_timeline(
                         json!({"question":"Pinned QA request"})
                     };
                     let _operation = human.operation.lock().await;
-                    human.open(&host, &work, &kind, payload).await?;
-                    human.pump(&host, &CancellationToken::new()).await?;
+                    human.open(host, &work, &kind, payload).await?;
+                    human.pump(host, &CancellationToken::new()).await?;
                 }
                 TimelineEvent030::Answer { key, answer } => {
                     let activation = view
@@ -1215,7 +1213,7 @@ async fn native_timeline(
                     let _operation = human.operation.lock().await;
                     human
                         .submit(
-                            &host,
+                            host,
                             crate::agsdl_host_human030::HumanSubmission030 {
                                 scope: crate::persistence::public030::HumanScope030 {
                                     system_start_id: f.identity.system_start_id.clone(),
@@ -1231,7 +1229,7 @@ async fn native_timeline(
                             crate::agsdl_host_human030::HumanOrigin030::SyntheticPerson,
                         )
                         .await?;
-                    human.pump(&host, &CancellationToken::new()).await?;
+                    human.pump(host, &CancellationToken::new()).await?;
                 }
                 TimelineEvent030::Elapse(ms) => {
                     use crate::agsdl_host_clock030::Clock030;
@@ -1253,7 +1251,7 @@ async fn native_timeline(
                         }
                         for request in human.pending_resolutions().await? {
                             if human.request_kind(&request).await? != "approval" {
-                                let decision = human.take_resolution(&host, &request).await?;
+                                let decision = human.take_resolution(host, &request).await?;
                                 if decision.kind() == "plan" {
                                     let work = decision.resolution()["workActions"][0]["workId"]
                                         .as_str()
@@ -1282,8 +1280,8 @@ async fn native_timeline(
                                         ended = Some(work.to_owned());
                                     }
                                 }
-                                human.acknowledge(&host, &decision).await?;
-                                human.pump(&host, &CancellationToken::new()).await?;
+                                human.acknowledge(host, &decision).await?;
+                                human.pump(host, &CancellationToken::new()).await?;
                             }
                         }
                         let now = clock.now_ms();
@@ -2109,7 +2107,7 @@ async fn handled_historical_failure_does_not_block_the_current_compose_failure()
     sqlx::query("INSERT INTO engine_flow030_events(system_id,invocation_id,event_id,event_json,receipt_json) VALUES(?,?,'handled-historical',?,?)")
         .bind(&f.identity.system_start_id).bind(&f.identity.flow_invocation_id).bind(event.to_string()).bind(receipt.to_string()).execute(&f.pool).await.unwrap();
     let host = &f.host;
-    let inspection = flow::inspect_run(host.flow030(), &host, &f.pool, &f.owner)
+    let inspection = flow::inspect_run(host.flow030(), host, &f.pool, &f.owner)
         .await
         .unwrap();
     let mut db = f.pool.acquire().await.unwrap();
@@ -2168,10 +2166,10 @@ async fn delivery030_validates_retained_capture_and_is_idempotent_without_legacy
         delivery: "queue".into(),
         message_json: "{\"prompt\":\"Initial mission\"}".into(),
     };
-    let first = flow::deliver030(&host, &f.pool, request.clone())
+    let first = flow::deliver030(host, &f.pool, request.clone())
         .await
         .unwrap();
-    let replay = flow::deliver030(&host, &f.pool, request.clone())
+    let replay = flow::deliver030(host, &f.pool, request.clone())
         .await
         .unwrap();
     assert_eq!(first.event_id, replay.event_id);
@@ -2179,8 +2177,8 @@ async fn delivery030_validates_retained_capture_and_is_idempotent_without_legacy
     let mut second = request.clone();
     second.delivery_id = "second".into();
     second.message_json = "{\"prompt\":\"Queued mission\"}".into();
-    flow::deliver030(&host, &f.pool, second).await.unwrap();
-    let view = flow::inspect_run(host.flow030(), &host, &f.pool, &f.owner)
+    flow::deliver030(host, &f.pool, second).await.unwrap();
+    let view = flow::inspect_run(host.flow030(), host, &f.pool, &f.owner)
         .await
         .unwrap();
     assert_eq!(view.flow.state.activations.len(), 2);
@@ -2192,12 +2190,12 @@ async fn delivery030_validates_retained_capture_and_is_idempotent_without_legacy
         .unwrap();
     let mut changed = request.clone();
     changed.message_json = "{\"prompt\":\"Changed mission\"}".into();
-    assert!(flow::deliver030(&host, &f.pool, changed).await.is_err());
+    assert!(flow::deliver030(host, &f.pool, changed).await.is_err());
     let mut invalid = request.clone();
     invalid.delivery_id = "invalid".into();
     invalid.message_json = "{\"unexpected\":true}".into();
     assert_eq!(
-        flow::deliver030(&host, &f.pool, invalid)
+        flow::deliver030(host, &f.pool, invalid)
             .await
             .unwrap_err()
             .code,
@@ -2206,7 +2204,7 @@ async fn delivery030_validates_retained_capture_and_is_idempotent_without_legacy
     let mut foreign = request.clone();
     foreign.scope.snapshot_id = "foreign".into();
     assert_eq!(
-        flow::deliver030(&host, &f.pool, foreign)
+        flow::deliver030(host, &f.pool, foreign)
             .await
             .unwrap_err()
             .code,
@@ -2215,7 +2213,7 @@ async fn delivery030_validates_retained_capture_and_is_idempotent_without_legacy
     let mut fresh = request;
     fresh.instance = Some("new".into());
     assert_eq!(
-        flow::deliver030(&host, &f.pool, fresh)
+        flow::deliver030(host, &f.pool, fresh)
             .await
             .unwrap_err()
             .code,

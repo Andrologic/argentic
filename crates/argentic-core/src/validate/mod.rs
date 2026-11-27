@@ -159,6 +159,7 @@ impl ModuleMap {
         self.entries.iter()
     }
 
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.entries.len()
     }
@@ -522,6 +523,7 @@ fn validate_into(
 }
 
 /// `validate_bytes(bytes, modules)`.
+#[cfg(test)]
 pub(crate) fn validate_bytes(bytes: &[u8], modules: &ModuleMap) -> Result<Report, Internal> {
     let budget = SourceBudget::default();
     if let Err(error) = budget.json_input(bytes, "") {
@@ -1277,8 +1279,8 @@ impl<'a, 'r> Checker<'a, 'r> {
             expected.iter().map(|name| (*name).to_owned()).collect()
         };
         let next_at = with(parts, [key("next")]);
-        if kind == "call" && map.is_some() {
-            if !same_keys(map.expect("map"), &names(&["passed", "failed"])) {
+        if let ("call", Some(map)) = (kind, map) {
+            if !same_keys(map, &names(&["passed", "failed"])) {
                 self.report.error(
                     "ROUTES",
                     &next_at,
@@ -1296,7 +1298,7 @@ impl<'a, 'r> Checker<'a, 'r> {
             }
         } else if kind == "join" && (next.is_some() || step.contains_key("quorum")) {
             if step.contains_key("quorum") {
-                if map.map_or(true, |map| !same_keys(map, &names(&["reached", "missed"]))) {
+                if map.is_none_or(|map| !same_keys(map, &names(&["reached", "missed"]))) {
                     self.report.error(
                         "ROUTES",
                         &next_at,

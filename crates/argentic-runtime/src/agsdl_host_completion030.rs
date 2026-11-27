@@ -155,6 +155,10 @@ fn grant_scoped(
     })
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "The check binds separate host, work and cancellation inputs"
+)]
 pub(crate) async fn execute(
     host: &HostState,
     pool: &SqlitePool,

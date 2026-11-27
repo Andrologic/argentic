@@ -11,18 +11,17 @@ pub(super) struct ScenarioHumans030 {
         std::collections::BTreeMap<String, crate::agsdl_host_dispatch030::JoinedOwnedAgent030>,
 }
 pub(super) struct ScriptedAgentEvent030 {
-    pub(super) label: &'static str,
     pub(super) body: serde_json::Value,
     pub(super) reply: tokio::sync::oneshot::Sender<Result<ProtocolDecision030>>,
 }
 pub(super) async fn emit_scripted_agent030(
     work: &ScriptedWork030,
-    label: &'static str,
+    _label: &'static str,
     body: serde_json::Value,
 ) -> Result<ProtocolDecision030> {
     let (reply, result) = tokio::sync::oneshot::channel();
     work.protocol
-        .send(ScriptedAgentEvent030 { label, body, reply })
+        .send(ScriptedAgentEvent030 { body, reply })
         .await
         .map_err(|_| failure("UNCERTAIN", "example", "Owned agent protocol closed"))?;
     result.await.map_err(|_| {
@@ -78,7 +77,7 @@ pub(super) async fn settle_humans030(
     let host = app;
     let mut failures = Vec::new();
     for request in humans.broker.pending_resolutions().await? {
-        let decision = humans.broker.take_resolution(&host, &request).await?;
+        let decision = humans.broker.take_resolution(host, &request).await?;
         if decision.kind() == "approval" {
             let id = decision.payload()["work"]["activationId"]
                 .as_str()
@@ -90,7 +89,7 @@ pub(super) async fn settle_humans030(
                 .ok_or_else(|| failure("CORRELATION", "approval", "Approval owner absent"))?;
             humans
                 .broker
-                .finish_approval(&host, tasks, &decision)
+                .finish_approval(host, tasks, &decision)
                 .await?;
             humans.approvals.remove(index);
             continue;
@@ -117,8 +116,8 @@ pub(super) async fn settle_humans030(
         }
         // The synthetic provider/server receives the resolution here, while its
         // native owned future remains alive until the timeline returns a result.
-        humans.broker.acknowledge(&host, &decision).await?;
-        humans.broker.pump(&host, cancelled).await?;
+        humans.broker.acknowledge(host, &decision).await?;
+        humans.broker.pump(host, cancelled).await?;
     }
     for control in humans.broker.timeout_controls().await? {
         failures.push((control.work_id().into(), "TIMEOUT".into()));
@@ -139,9 +138,9 @@ pub(super) async fn settle_humans030(
         work.result
             .await
             .map_err(|_| failure("UNCERTAIN", "clock", "Owned work result absent"))??;
-        flow_work_protocol030::finish_joined_agent030(&host, pool, &joined, cancelled).await?;
-        humans.broker.retire(&host, &work.human).await?;
-        humans.broker.pump(&host, cancelled).await?;
+        flow_work_protocol030::finish_joined_agent030(host, pool, &joined, cancelled).await?;
+        humans.broker.retire(host, &work.human).await?;
+        humans.broker.pump(host, cancelled).await?;
         humans.joined.insert(id, joined);
     }
     Ok(())
