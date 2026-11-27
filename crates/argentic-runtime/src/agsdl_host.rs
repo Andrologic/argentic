@@ -537,7 +537,7 @@ impl HostState {
         }
         for control in self.flow030().retiring_controls(&host.generation)? {
             let system = &control.identity().system_start_id;
-            if self.flow030().supervisors.is_registered(system)? {
+            if self.flow030().supervisors.has_task(system)? {
                 self.flow030().supervisors.wake(system);
                 self.flow030().supervisors.wait(system).await?;
             }
@@ -593,7 +593,14 @@ impl HostState {
             .as_ref()
             .map(|host| host.incarnation.clone())
             .ok_or_else(|| failure("RUNTIME_UNAVAILABLE", "", "Host not installed"))?;
-        let guard = host.lifecycle.clone().read_owned().await;
+        // A retired reader must not queue behind the writer draining its lease.
+        let guard = tokio::select! {
+            biased;
+            _ = host.retired.cancelled() => {
+                return Err(failure("RUNTIME_UNAVAILABLE", "", "Execution host was revoked"));
+            }
+            guard = host.lifecycle.clone().read_owned() => guard,
+        };
         if !host.ready.load(Ordering::SeqCst) {
             return Err(failure("RUNTIME_UNAVAILABLE", "", "Host not ready"));
         }

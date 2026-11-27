@@ -39,6 +39,19 @@ pub struct RetainedStart030 {
     pub capture: StartCapture030,
 }
 
+pub(crate) enum StartOutcome030 {
+    Created(RetainedStart030),
+    Replayed(RetainedStart030),
+}
+
+impl StartOutcome030 {
+    fn retained(self) -> RetainedStart030 {
+        match self {
+            Self::Created(retained) | Self::Replayed(retained) => retained,
+        }
+    }
+}
+
 #[allow(
     clippy::large_enum_variant,
     reason = "Boxing the retained start changes the public inspection type"
@@ -65,6 +78,8 @@ pub trait StartAuthority030: Authority030 {
     fn begin_commit(&self, request: &EngineStartRequest, identity: &FlowIdentity030) -> Result<()>;
     /// Release only after an acknowledged successful commit.
     fn commit_acknowledged(&self, request: &EngineStartRequest, identity: &FlowIdentity030);
+    #[cfg(test)]
+    async fn before_commit(&self) {}
     async fn capture(&self, request: &EngineStartRequest) -> Result<StartCapture030>;
     async fn lock_source(&self, request: &EngineStartRequest) -> Result<Self::SourceGuard>;
     async fn bind_capture_tx(
@@ -235,12 +250,45 @@ pub async fn start<A: StartAuthority030>(
     start_linked(pool, request, authority, &UnlinkedStart).await
 }
 
+pub(crate) async fn start_with_outcome<A: StartAuthority030>(
+    pool: &SqlitePool,
+    request: &EngineStartRequest,
+    authority: &A,
+) -> Result<StartOutcome030> {
+    start_linked_with_outcome(pool, request, authority, &UnlinkedStart).await
+}
+
+/// A new writer can acquire this transaction only after the earlier write
+/// transaction settled. Absence here establishes that the Start rolled back.
+pub(crate) async fn read_settled_start<A: StartAuthority030>(
+    pool: &SqlitePool,
+    request: &EngineStartRequest,
+    authority: &A,
+) -> Result<Option<RetainedStart030>> {
+    let mut db = pool.acquire().await?;
+    let mut tx = db.begin_with("BEGIN IMMEDIATE").await?;
+    let retained = lookup_tx(&mut tx, request, authority, &UnlinkedStart).await?;
+    tx.commit().await?;
+    Ok(retained)
+}
+
 pub async fn start_linked<A: StartAuthority030, H: StartIntentHook + ?Sized>(
     pool: &SqlitePool,
     request: &EngineStartRequest,
     authority: &A,
     hook: &H,
 ) -> Result<RetainedStart030> {
+    start_linked_with_outcome(pool, request, authority, hook)
+        .await
+        .map(StartOutcome030::retained)
+}
+
+async fn start_linked_with_outcome<A: StartAuthority030, H: StartIntentHook + ?Sized>(
+    pool: &SqlitePool,
+    request: &EngineStartRequest,
+    authority: &A,
+    hook: &H,
+) -> Result<StartOutcome030> {
     opaque(&request.request_id)?;
     authority.require_clear(request)?;
     // This lookup is before compilation or metadata locking. Every decision,
@@ -253,7 +301,7 @@ pub async fn start_linked<A: StartAuthority030, H: StartIntentHook + ?Sized>(
     authority.require_clear(request)?;
     if let Some(retained) = lookup_tx(&mut tx, request, authority, hook).await? {
         tx.commit().await?;
-        return Ok(retained);
+        return Ok(StartOutcome030::Replayed(retained));
     }
     tx.commit().await?;
     drop(connection);
@@ -269,7 +317,7 @@ pub async fn start_linked<A: StartAuthority030, H: StartIntentHook + ?Sized>(
     let request_json = serde_json::to_string(request)?;
     if let Some(retained) = lookup_tx(&mut tx, request, authority, hook).await? {
         tx.commit().await?;
-        return Ok(retained);
+        return Ok(StartOutcome030::Replayed(retained));
     }
     authority
         .bind_capture_tx(&mut tx, request, &capture)
@@ -336,6 +384,8 @@ pub async fn start_linked<A: StartAuthority030, H: StartIntentHook + ?Sized>(
     // Set the shared native exclusion before the commit future can be polled.
     // If cancellation or an error follows, 09 retains it until reconciliation.
     authority.begin_commit(request, &capture.identity)?;
+    #[cfg(test)]
+    authority.before_commit().await;
     if tx.commit().await.is_err() {
         return Err(failure(
             "UNCERTAIN",
@@ -344,7 +394,10 @@ pub async fn start_linked<A: StartAuthority030, H: StartIntentHook + ?Sized>(
         ));
     }
     authority.commit_acknowledged(request, &capture.identity);
-    Ok(RetainedStart030 { receipt, capture })
+    Ok(StartOutcome030::Created(RetainedStart030 {
+        receipt,
+        capture,
+    }))
 }
 
 /// Host-owned UI reservation hooks. Each callback receives the exact active

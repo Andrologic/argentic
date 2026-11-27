@@ -1186,12 +1186,22 @@ pub(crate) async fn inspect_run(
     owner: &EngineOwner,
 ) -> Result<NativeFlowInspection030> {
     let lease = host.start_lease().await?;
+    inspect_run_with_lease(runtime, host, pool, owner, &lease).await
+}
+
+pub(crate) async fn inspect_run_with_lease(
+    runtime: &FlowHost030,
+    host: &HostState,
+    pool: &SqlitePool,
+    owner: &EngineOwner,
+    lease: &HostStartLease,
+) -> Result<NativeFlowInspection030> {
     if lease.owner(&owner.system_start_id)? != *owner {
         return Err(refused());
     }
     let authority = Authority {
         runtime,
-        lease: &lease,
+        lease,
         owner: owner.clone(),
     };
     // The snapshot reads several tables. Retain the native admission gate

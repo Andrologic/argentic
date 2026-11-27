@@ -637,6 +637,20 @@ impl RuntimeRegistry030 {
                 )
             })
     }
+    pub(crate) fn has_task(&self, system: &str) -> Result<bool> {
+        Ok(self
+            .0
+            .lock()
+            .map_err(|_| {
+                failure(
+                    "RUNTIME_UNAVAILABLE",
+                    "runtime",
+                    "Supervisor registry is unavailable",
+                )
+            })?
+            .get(system)
+            .is_some_and(|handle| handle.task.is_some()))
+    }
     pub(crate) fn reserve(&self, system: &str) -> Result<()> {
         let mut handles = self.0.lock().map_err(|_| {
             failure(

@@ -370,7 +370,14 @@ impl StartSession<'_> {
     ) -> Result<()> {
         self.lease.ensure_live()?;
         let owner = self.lease.owner(&identity.system_start_id)?;
-        let inspected = flow::inspect_run(self.engine.flow030(), self.engine, pool, &owner).await?;
+        let inspected = flow::inspect_run_with_lease(
+            self.engine.flow030(),
+            self.engine,
+            pool,
+            &owner,
+            &self.lease,
+        )
+        .await?;
         if inspected.owner != owner
             || inspected.capture.identity != *identity
             || expected_capture.identity != *identity

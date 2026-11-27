@@ -57,7 +57,7 @@ pub(crate) async fn control(
     #[cfg(test)]
     runtime.operator_test_yield("operator.dispatch").await;
     let _dispatch = dispatch.lock().await;
-    let inspection = inspect_run(runtime, host, pool, &owner).await?;
+    let inspection = inspect_run_with_lease(runtime, host, pool, &owner, &lease).await?;
     let capture = &inspection.capture;
     if capture.source != request.scope.source
         || capture.identity.snapshot_id != request.scope.snapshot_id
