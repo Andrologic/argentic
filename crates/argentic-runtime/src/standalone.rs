@@ -1875,6 +1875,8 @@ mod tests {
                      "human.readback"),
                     ("UPDATE engine_flow030_clock SET observed_ms=X'FF'",
                      "human.readback"),
+                    ("UPDATE engine_flow030_clock_works SET retired='invalid'",
+                     "human.readback"),
                 ].into_iter().enumerate() {
                     let copy = f.data.join(format!("wrong-replay-{index}.sqlite"));
                     std::fs::copy(f.data.join("engine.sqlite"), &copy).unwrap();
@@ -1883,9 +1885,15 @@ mod tests {
                     let edits_ticket = mutation.starts_with("UPDATE engine_flow030_clock_events");
                     if edits_ticket {
                         sqlx::query("DROP TRIGGER engine_flow030_clock_ticket_immutable")
-                            .execute(&mut *tx).await.unwrap();
+                            .execute(&mut *tx)
+                            .await
+                            .unwrap();
                     }
-                    let changed = sqlx::query(mutation).execute(&mut *tx).await.unwrap().rows_affected();
+                    let changed = sqlx::query(mutation)
+                        .execute(&mut *tx)
+                        .await
+                        .unwrap()
+                        .rows_affected();
                     assert_eq!(changed, 1);
                     if edits_ticket {
                         sqlx::query(
@@ -1896,8 +1904,11 @@ mod tests {
                     tx.commit().await.unwrap();
                     pool.close().await;
                     let replay = persistence::replay_verify030::verify_path030(
-                        &copy, &query.system_start_id, &page.flow_invocation_id,
-                    ).await;
+                        &copy,
+                        &query.system_start_id,
+                        &page.flow_invocation_id,
+                    )
+                    .await;
                     assert_eq!(replay.divergence.unwrap().field, expected, "{mutation}");
                 }
             }

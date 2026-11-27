@@ -651,7 +651,7 @@ pub(super) async fn verify(
             .find(|r| r.get::<&str, _>("activation_id") == w.id)
             .unwrap();
         require(
-            r.get::<i64, _>("retired") == i64::from(w.retired)
+            r.try_get::<i64, _>("retired")? == i64::from(w.retired)
                 && parsed(r, "snapshot_json")? == w.snapshot,
             "Stored work snapshot differs",
         )?;
