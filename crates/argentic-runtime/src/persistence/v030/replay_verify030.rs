@@ -355,6 +355,33 @@ pub async fn verify_path030(path: &Path, system_id: &str, invocation_id: &str) -
     }
 }
 
+/// Runs only the human/clock replay on a file whose run lacks a full Start
+/// capture, as the synthetic broker fixtures do.
+#[cfg(test)]
+pub(crate) async fn verify_human_path030(
+    path: &Path,
+    system_id: &str,
+    invocation_id: &str,
+) -> std::result::Result<human::HumanProjection030, String> {
+    let options = SqliteConnectOptions::new().filename(path).read_only(true);
+    let mut db = SqliteConnection::connect_with(&options)
+        .await
+        .map_err(|e| e.to_string())?;
+    let row = sqlx::query("SELECT state_json,plan_json FROM engine_flow030_runs WHERE system_id=? AND invocation_id=?")
+        .bind(system_id).bind(invocation_id).fetch_one(&mut db).await.map_err(|e| e.to_string())?;
+    let state: FlowState030 =
+        serde_json::from_str(row.try_get("state_json").map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+    let plan: FlowPlan030 =
+        serde_json::from_str(row.try_get("plan_json").map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+    let result = human::verify(&mut db, &state, &plan, "{}")
+        .await
+        .map_err(|e| e.to_string());
+    db.close().await.map_err(|e| e.to_string())?;
+    result
+}
+
 async fn verify(
     db: &mut SqliteConnection,
     system: &str,

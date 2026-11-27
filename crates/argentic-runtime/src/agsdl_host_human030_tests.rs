@@ -1679,3 +1679,69 @@ async fn pending_human_generation_loss_is_interrupted_and_never_replayed() {
     assert_eq!(facts["state"]["kind"], "cancelled");
     assert_eq!(facts["state"]["resolution"]["reason"], "revocation");
 }
+
+#[tokio::test]
+async fn replay_rejects_a_second_acknowledgment_of_one_resolution() {
+    struct Validator;
+    impl QuestionValidator030 for Validator {
+        fn validate(&self, _: &Value, _: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+    let f = fixture("call", Some(60000), Some(600000)).await;
+    let work = f
+        .broker
+        .admit_host_work(&f.host, f.attempt.start_effect_id())
+        .await
+        .unwrap();
+    pump(&f).await;
+    let request = f
+        .broker
+        .open_question(
+            &f.host,
+            &work,
+            json!({"nativeCallId":"native-call","protocolReceiptId":"native-protocol-receipt"}),
+            Arc::new(Validator),
+        )
+        .await
+        .unwrap();
+    pump(&f).await;
+    f.broker
+        .submit(
+            &f.host,
+            submission(
+                &f,
+                &request,
+                "0",
+                HumanAnswer030::Question {
+                    answer_json: r#"{"action":"accept","content":{}}"#.into(),
+                },
+            ),
+            HumanOrigin030::Person,
+        )
+        .await
+        .unwrap();
+    pump(&f).await;
+    let decision = f.broker.take_resolution(&f.host, &request).await.unwrap();
+    f.broker.acknowledge(&f.host, &decision).await.unwrap();
+    pump(&f).await;
+    let id = f.attempt.identity();
+    let path = f._tmp.path().join("human.db");
+    let replay = crate::persistence::replay_verify030::verify_human_path030(
+        &path,
+        &id.system_start_id,
+        &id.flow_invocation_id,
+    )
+    .await;
+    assert!(replay.is_ok(), "{replay:?}");
+    // The clock core tolerates a repeated acknowledgment; replay must not.
+    f.broker.acknowledge(&f.host, &decision).await.unwrap();
+    pump(&f).await;
+    let replay = crate::persistence::replay_verify030::verify_human_path030(
+        &path,
+        &id.system_start_id,
+        &id.flow_invocation_id,
+    )
+    .await;
+    assert_eq!(replay.unwrap_err(), "Invalid request acknowledgment");
+}

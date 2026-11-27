@@ -490,7 +490,7 @@ pub(super) async fn verify(
                 .find(|r| Some(r.id.as_str()) == event["requestId"].as_str())
                 .ok_or("Ack request absent")?;
             require(
-                r.resolution.is_some() && !closed_asks.contains(&r.id),
+                r.resolution.is_some() && !r.acknowledged && !closed_asks.contains(&r.id),
                 "Invalid request acknowledgment",
             )?;
             r.acknowledged = true;

@@ -16,7 +16,7 @@ impl TestClock {
 }
 pub(super) struct Fixture {
     #[cfg(test)]
-    _tmp: tempfile::TempDir,
+    pub(super) _tmp: tempfile::TempDir,
     pub(super) host: HostState,
     pub(super) broker: Arc<HumanBroker030>,
     pub(super) clock: Arc<TestClock>,
