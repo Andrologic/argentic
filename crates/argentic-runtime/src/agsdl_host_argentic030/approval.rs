@@ -1,4 +1,5 @@
 use crate::{
+    agsdl_host_action_approval030::permits_model_review,
     harness::{CommandApprovals030, FlowWorkAttempt030},
     permissions::{native_request_path, ActionRequest},
 };
@@ -17,6 +18,7 @@ use tokio_util::sync::CancellationToken;
 
 pub(super) struct ToolApprovals {
     pub approvals: Arc<dyn CommandApprovals030>,
+    pub person: Option<Arc<dyn CommandApprovals030>>,
     pub attempt: FlowWorkAttempt030,
     pub sequence: AtomicU64,
     pub credential: Option<String>,
@@ -41,6 +43,16 @@ impl Authorizer for ToolApprovals {
         action: Approval<'_>,
         cancel: &CancellationToken,
     ) -> Result<bool, String> {
+        // Proxy connections run outside the agent task that owns reviewer
+        // journal events. The human broker owns the connection's approval.
+        let approvals = if matches!(action, Approval::Network(_)) {
+            let Some(person) = &self.person else {
+                return Ok(false);
+            };
+            person
+        } else {
+            &self.approvals
+        };
         let (title, actions) = match action {
             Approval::Read(path) => file_request(path, false)?,
             Approval::Write(path) => file_request(path, true)?,
@@ -53,6 +65,10 @@ impl Authorizer for ToolApprovals {
                     vec![ActionRequest::Delegate {}],
                 )
             }
+            Approval::Network(host) => (
+                format!("Connect to {host}"),
+                vec![ActionRequest::Network { host: host.into() }],
+            ),
             Approval::Shell(command) => {
                 let actions = argentic_harness::policy::subcommands(command)?
                     .into_iter()
@@ -83,11 +99,11 @@ impl Authorizer for ToolApprovals {
                 }
             }
         });
-        if self.model {
+        if self.model && permits_model_review(&payload["nativeRequest"]) {
             payload["nativeRequest"]["params"]["reviewArguments"] = json!(call.arguments);
         }
         let permit = AtomicBool::new(false);
-        self.approvals
+        approvals
             .answer(
                 &self.attempt,
                 payload,

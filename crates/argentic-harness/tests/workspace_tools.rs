@@ -358,11 +358,15 @@ async fn writes_refuse_symlink_and_hardlink_aliases() {
     }
 }
 
-#[cfg(all(
-    target_os = "linux",
-    any(target_arch = "aarch64", target_arch = "x86_64")
+#[cfg(any(
+    all(
+        target_os = "linux",
+        any(target_arch = "aarch64", target_arch = "x86_64")
+    ),
+    all(target_os = "macos", target_arch = "aarch64")
 ))]
 fn sandbox_present() -> bool {
+    #[cfg(target_os = "linux")]
     if ["/usr/bin/bwrap", "/bin/bwrap", "/usr/local/bin/bwrap"]
         .into_iter()
         .all(|path| !Path::new(path).is_file())
@@ -613,4 +617,419 @@ async fn shell_asks_and_denials_are_checked_before_launch() {
         assert_eq!(error, "Shell permission denied");
     }
     assert!(!dir.path().join("out").exists());
+}
+
+#[test]
+fn network_globs_match_hosts_and_ip_aliases_by_most_restrictive_effect() {
+    let path = std::env::current_dir().unwrap();
+    let rules = [
+        network_rule("*.Example.COM.", Effect::Allow),
+        network_rule("review.example.com", Effect::Ask),
+        network_rule("hidden.example.com", Effect::Deny),
+        network_rule("0:0:0:*:ffff:7f00:0001", Effect::Deny),
+    ];
+    let policy = Policy::compile_rules(&path, None, Some(Preset::Workspace), None, &rules).unwrap();
+    for (host, effect) in [
+        ("nested.sub.example.com", Effect::Allow),
+        ("WWW.Example.Com.", Effect::Allow),
+        ("review.example.com", Effect::Ask),
+        ("hidden.example.com", Effect::Deny),
+        ("example.com", Effect::Deny),
+        ("example.com.invalid", Effect::Deny),
+        ("127.0.0.1", Effect::Deny),
+        ("::ffff:127.0.0.1", Effect::Deny),
+    ] {
+        assert_eq!(
+            policy.decide(Action::Network, host, Zone::Workspace),
+            effect,
+            "{host}"
+        );
+    }
+    let full = Policy::compile_rules(&path, None, Some(Preset::Full), None, &rules).unwrap();
+    assert_eq!(
+        full.decide(Action::Network, "127.0.0.1", Zone::Workspace),
+        Effect::Deny
+    );
+    assert_eq!(
+        full.decide(Action::Network, "other.example", Zone::Outside),
+        Effect::Allow
+    );
+}
+
+fn network_rule(pattern: &str, effect: Effect) -> Rule {
+    Rule {
+        action: Action::Network,
+        pattern: Some(pattern.into()),
+        effect,
+    }
+}
+
+#[cfg(any(
+    all(
+        target_os = "linux",
+        any(target_arch = "aarch64", target_arch = "x86_64")
+    ),
+    all(target_os = "macos", target_arch = "aarch64")
+))]
+mod shell_proxy_tests {
+    use super::*;
+    use argentic_harness::tools::ShellNetwork;
+    use axum::{routing::get, Router};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    async fn server() -> (u16, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let routes = Router::new()
+            .route(
+                "/",
+                get(|headers: axum::http::HeaderMap| async move {
+                    assert!(!headers.contains_key("proxy-authorization"));
+                    format!("reached {}", headers["host"].to_str().unwrap())
+                }),
+            )
+            .route(
+                "/redirect",
+                get(|| async {
+                    axum::response::Redirect::temporary("http://blocked.invalid/never")
+                }),
+            );
+        (
+            port,
+            tokio::spawn(async move { axum::serve(listener, routes).await.unwrap() }),
+        )
+    }
+
+    async fn shell_text(registry: &Arc<Registry>, command: String) -> String {
+        call(
+            registry,
+            "shell",
+            json!({"command":command,"timeout_ms":15_000}),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn shell_proxy_allows_http_and_blocks_opaque_connect_and_direct_network() {
+        if !sandbox_present() {
+            return;
+        }
+        let (port, server) = server().await;
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Arc::new(
+            registry(
+                dir.path(),
+                Some(Preset::Workspace),
+                &[network_rule("127.0.0.1", Effect::Allow)],
+            )
+            .with_shell()
+            .with_shell_network(ShellNetwork::Intercept),
+        );
+        let output = shell_text(
+            &registry,
+            format!(
+                "curl -sSf --max-time 5 http://127.0.0.1:{port}/ && \\
+             ! curl -sSf --max-time 5 --proxytunnel http://127.0.0.1:{port}/ && \\
+             ! (printf x > /dev/tcp/127.0.0.1/{port})"
+            ),
+        )
+        .await;
+        assert!(output.starts_with("Exit status: 0\n"), "{output}");
+        assert_eq!(
+            output.matches(&format!("reached 127.0.0.1:{port}")).count(),
+            1,
+            "{output}"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn shell_proxy_refuses_denied_hosts_redirects_and_implicit_private_addresses() {
+        if !sandbox_present() {
+            return;
+        }
+        let (port, server) = server().await;
+        let dir = tempfile::tempdir().unwrap();
+        let allowed = Arc::new(
+            registry(
+                dir.path(),
+                Some(Preset::Workspace),
+                &[
+                    network_rule("127.0.0.1", Effect::Allow),
+                    network_rule("blocked.invalid", Effect::Deny),
+                ],
+            )
+            .with_shell()
+            .with_shell_network(ShellNetwork::Intercept),
+        );
+        for url in [
+            "http://blocked.invalid/".into(),
+            format!("http://127.0.0.1:{port}/redirect"),
+        ] {
+            let output = shell_text(
+                &allowed,
+                format!("curl -sS --max-time 5 -L --fail-with-body {url}"),
+            )
+            .await;
+            assert!(output.starts_with("Exit status: 22\n"), "{output}");
+            assert!(
+                output.contains("Argentic network policy denied this destination"),
+                "{output}"
+            );
+        }
+        let implicit = Arc::new(
+            registry(dir.path(), Some(Preset::Full), &[])
+                .with_shell()
+                .with_shell_network(ShellNetwork::Intercept),
+        );
+        let output = shell_text(
+            &implicit,
+            format!("curl -sS --max-time 5 --fail-with-body http://127.0.0.1:{port}/"),
+        )
+        .await;
+        assert!(output.starts_with("Exit status: 22\n"), "{output}");
+        assert!(
+            output.contains("Argentic network policy denied this destination"),
+            "{output}"
+        );
+        server.abort();
+    }
+
+    #[derive(Default)]
+    struct Reviewer(AtomicUsize);
+
+    #[async_trait::async_trait]
+    impl argentic_harness::tools::Authorizer for Reviewer {
+        async fn approve(
+            &self,
+            call: &ToolCall,
+            action: argentic_harness::tools::Approval<'_>,
+            _: &CancellationToken,
+        ) -> Result<bool, String> {
+            assert_eq!(call.name, "shell");
+            assert!(matches!(
+                action,
+                argentic_harness::tools::Approval::Network("127.0.0.1")
+            ));
+            Ok(self.0.fetch_add(1, Ordering::Relaxed) == 0)
+        }
+    }
+
+    #[tokio::test]
+    async fn shell_proxy_remembers_refusal_for_the_invocation_and_requires_a_reviewer() {
+        if !sandbox_present() {
+            return;
+        }
+        let (port, server) = server().await;
+        let dir = tempfile::tempdir().unwrap();
+        let rules = [network_rule("127.0.0.1", Effect::Ask)];
+        let reviewer = Arc::new(Reviewer::default());
+        let reviewed = Arc::new(
+            registry(dir.path(), Some(Preset::Workspace), &rules)
+                .with_shell()
+                .with_shell_network(ShellNetwork::Intercept)
+                .with_authorizer(reviewer.clone()),
+        );
+        let command = format!("curl -sS --max-time 5 --fail-with-body http://127.0.0.1:{port}/");
+        let output = shell_text(&reviewed, command.clone()).await;
+        assert!(output.contains("reached"), "{output}");
+        let output = shell_text(&reviewed, format!("{command}; {command}")).await;
+        assert!(output.starts_with("Exit status: 22\n"), "{output}");
+        assert_eq!(
+            output.matches("Argentic network policy denied").count(),
+            2,
+            "{output}"
+        );
+        assert_eq!(reviewer.0.load(Ordering::Relaxed), 2);
+
+        let unreviewed = Arc::new(
+            registry(dir.path(), Some(Preset::Workspace), &rules)
+                .with_shell()
+                .with_shell_network(ShellNetwork::Intercept),
+        );
+        let output = shell_text(&unreviewed, command).await;
+        assert!(output.starts_with("Exit status: 22\n"), "{output}");
+        server.abort();
+    }
+
+    struct SlowReviewer;
+
+    #[async_trait::async_trait]
+    impl argentic_harness::tools::Authorizer for SlowReviewer {
+        async fn approve(
+            &self,
+            _: &ToolCall,
+            _: argentic_harness::tools::Approval<'_>,
+            _: &CancellationToken,
+        ) -> Result<bool, String> {
+            tokio::time::sleep(std::time::Duration::from_millis(1700)).await;
+            Ok(true)
+        }
+    }
+
+    #[tokio::test]
+    async fn shell_deadline_excludes_network_approval_wait() {
+        if !sandbox_present() {
+            return;
+        }
+        let (port, server) = server().await;
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Arc::new(
+            registry(
+                dir.path(),
+                Some(Preset::Workspace),
+                &[network_rule("127.0.0.1", Effect::Ask)],
+            )
+            .with_shell()
+            .with_shell_network(ShellNetwork::Intercept)
+            .with_authorizer(Arc::new(SlowReviewer)),
+        );
+        let output = call(
+            &registry,
+            "shell",
+            json!({
+                "command": format!("curl -sSf --max-time 10 http://127.0.0.1:{port}/"),
+                "timeout_ms": 1500,
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(
+            output.starts_with("Exit status: 0\n") && output.contains("reached"),
+            "{output}"
+        );
+        server.abort();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_network_preflight_runs_the_relay() {
+        if !sandbox_present() {
+            return;
+        }
+        argentic_harness::tools::shell_network_preflight(true).unwrap();
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[tokio::test]
+    async fn seatbelt_publishes_workspace_writes_and_refuses_other_writes() {
+        assert!(sandbox_present());
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        let extra = dir.path().join("extra");
+        fs::create_dir(&extra).unwrap();
+        fs::write(extra.join("memo"), "extra root").unwrap();
+        let outside = dir.path().canonicalize().unwrap().join("private");
+        let workspace = workspace.canonicalize().unwrap();
+        let extra = extra.canonicalize().unwrap();
+        let policy = Policy::compile_rules(&workspace, None, Some(Preset::Workspace), None, &[])
+            .unwrap()
+            .with_directories(vec![(extra.clone(), Zone::ReadDirectory)]);
+        let roots = [&workspace, &extra]
+            .into_iter()
+            .map(|path| {
+                let directory =
+                    cap_std::fs::Dir::open_ambient_dir(path, cap_std::ambient_authority()).unwrap();
+                (path.clone(), directory)
+            })
+            .collect();
+        let registry = Arc::new(
+            Registry::with_open_roots(roots, vec![policy], json!({"type":"object"}))
+                .unwrap()
+                .with_writes()
+                .with_shell(),
+        );
+        let output = shell_text(
+            &registry,
+            format!(
+                r#"printf staged > workspace.txt && ! (printf leak > '{}') && \
+                 cat "$ARGENTIC_DIRECTORY_1/memo" && ! (printf leak > "$ARGENTIC_DIRECTORY_1/write")"#,
+                outside.display()
+            ),
+        ).await;
+        assert!(output.starts_with("Exit status: 0\n"), "{output}");
+        assert_eq!(
+            fs::read_to_string(workspace.join("workspace.txt")).unwrap(),
+            "staged"
+        );
+        assert!(output.contains("extra root"), "{output}");
+        assert!(!extra.join("write").exists());
+        assert!(!outside.exists());
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[tokio::test]
+    async fn seatbelt_joins_background_jobs_in_other_process_groups() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Arc::new(registry(dir.path(), Some(Preset::Workspace), &[]).with_shell());
+        let output = shell_text(
+            &registry,
+            "set -m; (sleep 10; printf late > late) & printf '%s\\n' \"$!\"".into(),
+        )
+        .await;
+        assert!(output.starts_with("Exit status: 0\n"), "{output}");
+        let pid = output.lines().nth(2).unwrap().parse::<i32>().unwrap();
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "{output}");
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+        assert!(!dir.path().join("late").exists());
+    }
+}
+
+#[test]
+fn network_patterns_and_requests_use_the_same_idna_mapping() {
+    let rules = [
+        network_rule("*.BÜCHER。Example.", Effect::Deny),
+        network_rule("straße.example", Effect::Ask),
+    ];
+    let work = tempfile::tempdir().unwrap();
+    let policy =
+        Policy::compile_rules(work.path(), None, Some(Preset::Full), None, &rules).unwrap();
+    for host in ["api.xn--bcher-kva.example", "API.bücher.example."] {
+        assert_eq!(
+            policy.decide(Action::Network, host, Zone::Workspace),
+            Effect::Deny
+        );
+    }
+    assert_eq!(
+        policy.decide(Action::Network, "xn--strae-oqa.example", Zone::Workspace),
+        Effect::Ask
+    );
+    for pattern in [
+        "example.com:443",
+        "*.example.com:443",
+        "[::1]:443",
+        "x..test",
+        "büch*.test",
+    ] {
+        let rules = [network_rule(pattern, Effect::Deny)];
+        assert!(
+            Policy::compile_rules(work.path(), None, None, None, &rules).is_err(),
+            "{pattern}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn blanket_shell_refuses_a_host_rule_before_launching_the_command() {
+    let work = tempfile::tempdir().unwrap();
+    let shell = Arc::new(
+        registry(
+            work.path(),
+            Some(Preset::Full),
+            &[network_rule("blocked.example", Effect::Deny)],
+        )
+        .with_shell(),
+    );
+    let error = call(&shell, "shell", json!({"command":":"}))
+        .await
+        .unwrap_err();
+    assert!(
+        error.contains("shellNetwork") && error.contains("intercept"),
+        "{error}"
+    );
 }

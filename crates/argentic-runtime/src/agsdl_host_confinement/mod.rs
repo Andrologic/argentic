@@ -1,6 +1,6 @@
 //! OS enforcement of a native-authorized ceiling. Permission interpretation belongs
 //! to agsdl_permissions; this module only lowers explicit kernel access constraints.
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Stdio;
 
 use sha2::{Digest, Sha256};
@@ -23,18 +23,8 @@ pub(crate) async fn attest(
     Ok(())
 }
 
-#[derive(Debug, Clone)]
-pub(crate) enum PathScope {
-    Literal(PathBuf),
-    Subtree(PathBuf),
-}
-
-#[derive(Debug, Clone, Default)]
-pub(crate) struct FileAccess {
-    pub allow: Vec<PathScope>,
-    /// Includes denied and unmediated ask regions. A shell cannot answer an ask.
-    pub block: Vec<PathScope>,
-}
+use argentic_harness::seatbelt::{access, BASE_PROFILE, PROCESS_DEFAULTS};
+pub(crate) use argentic_harness::seatbelt::{FileAccess, PathScope};
 
 /// One already-resolved ceiling from the native permission authority. These are
 /// not authored presets/rules and are deliberately not deserializable over IPC.
@@ -52,61 +42,6 @@ pub(crate) struct SandboxPolicy {
     profile_digest: String,
 }
 
-fn quoted(path: &Path) -> Result<String, String> {
-    if !path.is_absolute() {
-        return Err("Sandbox paths must be absolute".into());
-    }
-    let text = path.to_str().ok_or("Sandbox path is not UTF-8")?;
-    if text.chars().any(char::is_control) {
-        return Err("Sandbox path contains a control character".into());
-    }
-    // SBPL strings use the same escapes needed here for quotes and backslashes.
-    Ok(format!(
-        "\"{}\"",
-        text.replace('\\', "\\\\").replace('"', "\\\"")
-    ))
-}
-
-fn scope(scope: &PathScope) -> Result<String, String> {
-    let (kind, path) = match scope {
-        PathScope::Literal(p) => ("literal", p),
-        PathScope::Subtree(p) => ("subpath", p),
-    };
-    // The authority must bind physical roots, not a mutable symlink name.
-    // Literal nonexisting files are supported when their parent is canonical.
-    let canonical = if path.exists() {
-        path.canonicalize().map_err(|e| e.to_string())?
-    } else if matches!(scope, PathScope::Literal(_)) {
-        let parent = path.parent().ok_or("Sandbox path has no parent")?;
-        parent
-            .canonicalize()
-            .map_err(|e| e.to_string())?
-            .join(path.file_name().ok_or("Sandbox path has no basename")?)
-    } else {
-        return Err("Sandbox subtree does not exist".into());
-    };
-    if canonical != *path {
-        return Err("Sandbox authority must supply canonical physical paths".into());
-    }
-    Ok(format!("({kind} {})", quoted(path)?))
-}
-
-fn access(access: &FileAccess) -> Result<Option<String>, String> {
-    if access.allow.is_empty() {
-        return Ok(None);
-    }
-    let allowed = access
-        .allow
-        .iter()
-        .map(scope)
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut clauses = vec![format!("(require-any {})", allowed.join(" "))];
-    for blocked in &access.block {
-        clauses.push(format!("(require-not {})", scope(blocked)?));
-    }
-    Ok(Some(format!("(require-all {})", clauses.join(" "))))
-}
-
 impl SandboxPolicy {
     /// Called only by the native policy adapter after evaluating shell admission
     /// and proving these ceilings are <= all agent/capture/current ceilings.
@@ -118,9 +53,9 @@ impl SandboxPolicy {
         if policy_digest.is_empty() || ceilings.is_empty() {
             return Err("Missing native policy identity or ceilings".into());
         }
-        let mut profile = String::from(
-            "(version 1)\n(deny default)\n(allow process-exec process-fork)\n(allow signal (target self))\n(allow sysctl-read)\n",
-        );
+        let mut profile = String::from(BASE_PROFILE);
+        profile.push_str("(allow process-exec process-fork)\n");
+        profile.push_str(PROCESS_DEFAULTS);
         for (operation, read) in [("file-read*", true), ("file-write*", false)] {
             let mut filters = Vec::new();
             for ceiling in ceilings {

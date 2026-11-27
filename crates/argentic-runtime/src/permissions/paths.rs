@@ -169,13 +169,12 @@ impl NormalizedRule {
             return Err(invalid("delegate does not take match"));
         }
         if rule.action == Action::Network {
-            rule.pattern = rule.pattern.map(|pattern| {
-                let pattern = pattern.to_ascii_lowercase();
-                let pattern = pattern.trim_end_matches('.');
-                pattern
-                    .parse::<std::net::IpAddr>()
-                    .map_or_else(|_| pattern.to_owned(), |ip| ip.to_string())
-            });
+            rule.pattern = rule
+                .pattern
+                .as_deref()
+                .map(argentic_harness::policy::normalize_network_pattern)
+                .transpose()
+                .map_err(invalid)?;
         }
         let (logical, physical) = match (&rule.pattern, rule.action) {
             (Some(pattern), Action::Read | Action::Write) => {
@@ -367,28 +366,10 @@ impl Subject {
                 subject.logical = command.clone();
             }
             ActionRequest::Network { host } => {
-                let host = host.to_ascii_lowercase();
-                let host = host.strip_suffix('.').unwrap_or(&host);
-                // Ports, URLs and userinfo are not destination hosts.09 must
-                // supply the actual host again at each redirect/connection.
-                let ip = host.parse::<std::net::IpAddr>();
-                let domain = !host.is_empty()
-                    && host.len() <= 253
-                    && host.split('.').all(|label| {
-                        !label.is_empty()
-                            && label.len() <= 63
-                            && !label.starts_with('-')
-                            && !label.ends_with('-')
-                            && label
-                                .bytes()
-                                .all(|c| c.is_ascii_alphanumeric() || c == b'-')
-                    });
-                if ip.is_err() && !domain {
-                    return Err(invalid(
-                        "Network subject must be a destination IP or ASCII/IDNA host without port",
-                    ));
-                }
-                subject.logical = ip.map_or_else(|_| host.to_owned(), |ip| ip.to_string());
+                subject.logical = argentic_harness::policy::normalize_network_host(host)
+                    .ok_or_else(|| {
+                        invalid("Network subject must be a destination IP or host without port")
+                    })?;
             }
             ActionRequest::Mcp { server, tool } => {
                 check_mcp_identity(server, tool.as_deref())?;
@@ -437,15 +418,7 @@ pub(super) fn glob(pattern: &str, subject: &str, paths: bool, command: bool) -> 
 /// This ensures a restrictive authored pattern cannot be evaded by spelling.
 fn network_ip_matches(pattern: &str, ip: std::net::IpAddr) -> Result<bool> {
     use std::net::IpAddr;
-    // Adjacent stars are equivalent to one star. Collapse them before the
-    // state machine so its epsilon closure has at most one transition.
-    let mut compact = Vec::with_capacity(pattern.len());
-    for byte in pattern.bytes() {
-        if byte != b'*' || compact.last() != Some(&b'*') {
-            compact.push(byte);
-        }
-    }
-    let matches_v6 = |ip: std::net::Ipv6Addr| ipv6_glob(&compact, ip);
+    let matches_v6 = |ip| argentic_harness::policy::matches_ipv6_spelling(pattern, ip);
     match ip {
         IpAddr::V4(ip) => {
             Ok(glob(pattern, &ip.to_string(), false, false)? || matches_v6(ip.to_ipv6_mapped()))
@@ -459,105 +432,4 @@ fn network_ip_matches(pattern: &str, ip: std::net::IpAddr) -> Result<bool> {
             Ok(v4_match || matches_v6(ip))
         }
     }
-}
-
-fn glob_advance(pattern: &[u8], states: &[usize], value: &[u8]) -> Vec<usize> {
-    fn closure(pattern: &[u8], states: &mut Vec<usize>) {
-        let skips: Vec<_> = states
-            .iter()
-            .copied()
-            .filter(|&state| pattern.get(state) == Some(&b'*'))
-            .map(|state| state + 1)
-            .collect();
-        states.extend(skips);
-        states.sort_unstable();
-        states.dedup();
-    }
-    let mut states = states.to_vec();
-    closure(pattern, &mut states);
-    for &byte in value {
-        let mut next = Vec::new();
-        for &state in &states {
-            match pattern.get(state) {
-                Some(b'*') => next.push(state),
-                Some(&literal) if literal == byte => next.push(state + 1),
-                _ => {}
-            }
-        }
-        next.sort_unstable();
-        next.dedup();
-        closure(pattern, &mut next);
-        states = next;
-        if states.is_empty() {
-            break;
-        }
-    }
-    states
-}
-
-fn ipv6_form_matches(
-    pattern: &[u8],
-    groups: &[u16],
-    compressed: Option<(usize, usize)>,
-    dotted: Option<&str>,
-) -> bool {
-    let mut states = glob_advance(pattern, &[0], b"");
-    let mut group = 0;
-    let mut previous_compressed = false;
-    while group < groups.len() {
-        if let Some((start, end)) = compressed {
-            if group == start {
-                states = glob_advance(pattern, &states, b"::");
-                group = end;
-                previous_compressed = true;
-                continue;
-            }
-        }
-        if group > 0 && !previous_compressed {
-            states = glob_advance(pattern, &states, b":");
-        }
-        previous_compressed = false;
-        let width = format!("{:x}", groups[group]).len();
-        let mut combined = Vec::new();
-        for width in width..=4 {
-            let text = format!("{:0width$x}", groups[group], width = width);
-            combined.extend(glob_advance(pattern, &states, text.as_bytes()));
-        }
-        combined.sort_unstable();
-        combined.dedup();
-        states = combined;
-        group += 1;
-    }
-    if let Some(dotted) = dotted {
-        if !previous_compressed {
-            states = glob_advance(pattern, &states, b":");
-        }
-        states = glob_advance(pattern, &states, dotted.as_bytes());
-    }
-    states.contains(&pattern.len())
-}
-
-fn ipv6_glob(pattern: &[u8], ip: std::net::Ipv6Addr) -> bool {
-    let groups = ip.segments();
-    let octets = ip.octets();
-    let dotted = format!(
-        "{}.{}.{}.{}",
-        octets[12], octets[13], octets[14], octets[15]
-    );
-    for (groups, tail) in [(&groups[..], None), (&groups[..6], Some(dotted.as_str()))] {
-        if ipv6_form_matches(pattern, groups, None, tail) {
-            return true;
-        }
-        for start in 0..groups.len() {
-            for end in start + 1..=groups.len() {
-                if groups[end - 1] != 0 {
-                    break;
-                }
-                if ipv6_form_matches(pattern, groups, Some((start, end)), tail) {
-                    return true;
-                }
-            }
-        }
-    }
-    false
 }

@@ -41,7 +41,7 @@ Ses défauts expliquent pourquoi on le refait plutôt que de le restaurer :
 
 | Domaine | Cible du module `argentic` |
 | --- | --- |
-| `read`, `write`, `network`, `outside` | `sandbox` pour allow, ask et deny. L’OS couvre tout ce que l’agent exécute. Un `ask` bloque le shell, et seul l’outil qui demande atteint la ressource. |
+| `read`, `write`, `network`, `outside` | `sandbox` pour allow, ask et deny. L’OS interdit l’accès direct. Le proxy réseau peut demander une approbation au moment où le shell vise un hôte soumis à `ask`. |
 | `shell` | `harness`, comparaison du texte complet de chaque sous-commande. |
 | `mcp`, `delegate` | `harness`. |
 | Toutes les propriétés | `native`, y compris `resources` (canal d’information distinct des instructions), `planFirst.ask` (verrou appliqué comme une permission), `reviewer.model` et `delivery.steer` (preuve de réception liée au work). |
@@ -227,6 +227,37 @@ accorde la lecture et l’écriture sans restriction sur le répertoire concern�
 L’admission refuse les racines qui se recouvrent pour le shell ou recouvrent
 les données privées du Host.
 
+### Lot 4b
+
+Le shell Linux conserve le namespace réseau privé et seccomp. Un relais TCP
+sur le loopback du namespace transmet les requêtes à un socket Unix du Host.
+Sur macOS ARM64, Seatbelt interdit le réseau direct et autorise uniquement
+le port TCP local du proxy. Les clients qui prennent en charge les variables
+de proxy peuvent utiliser HTTP et HTTPS. Le mode `blanket`, par défaut,
+exige une autorisation réseau globale dans chaque couche de politique. Il
+transmet les octets du tunnel HTTPS. Le mode `intercept` applique les règles
+par hôte, déchiffre HTTPS avec une autorité de certification propre à
+l’invocation et vérifie la correspondance entre l’hôte du CONNECT, le SNI
+et l’autorité des requêtes HTTP.
+
+Le proxy applique chaque politique effective à l’hôte demandé. Un refus
+renvoie une erreur HTTP 403. Une demande `ask` passe par le port partagé
+d’approbation humaine en mode `intercept` et est refusée en l’absence de
+relecteur. Le proxy demande une décision par hôte et par invocation, suspend
+les délais machine pendant l’attente et retire la demande si le client se
+déconnecte. Chaque requête issue d’une redirection repasse par les contrôles.
+Le proxy résout lui-même le nom, contrôle les adresses obtenues et se
+connecte à l’adresse vérifiée.
+Une adresse privée, de loopback ou de lien local exige une règle IP exacte.
+Les budgets bornent les connexions, les octets échangés et leur durée.
+
+Le shell Seatbelt réutilise la préparation et la publication des copies
+filtrées. Son répertoire courant est la copie du workspace. Les autres
+racines sont exposées sous `ARGENTIC_DIRECTORY_<indice>`. Le profil limite
+l’exécution à Bash et à une liste d’utilitaires système, et le lanceur vérifie
+que les processus de la session dédiée sont terminés avant de publier.
+Windows refuse le shell à la qualification.
+
 ### Lot 5
 
 `plan: true` expose un outil `plan` avec des étapes et leurs statuts. Chaque
@@ -251,18 +282,19 @@ Le Host sélectionne le relecteur dans son catalogue de fournisseurs avec
 et des extraits bornés de la conversation. Sa réponse JSON est limitée à
 `APPROVE`, `DENY` ou `ESCALATE`. Une erreur, un délai dépassé ou une réponse
 invalide produit un refus. Le Host exige une personne pour les demandes
-`ask` du shell et de MCP. Il vérifie la politique courante avant d’appliquer
-une acceptation. Le journal conserve le verdict et sa provenance. Les
-arguments bruts transmis au relecteur ne figurent pas dans
-`reviewerDecision`.
+`ask` du shell, du réseau via le proxy et de MCP. Il vérifie la politique
+courante avant d’appliquer une acceptation. Le journal conserve le verdict
+et sa provenance. Les arguments bruts transmis au relecteur ne figurent pas
+dans `reviewerDecision`.
 [AgSDL 0.4.0, reviewer](https://github.com/Andrologic/AgSDL/blob/v0.4.0/spec/agents.md#reviewer)
 
 `delegate` applique les plafonds effectifs du parent à l’action de
 délégation. Le sous-agent reçoit une conversation neuve et un registre de
 lecture seule intersecté avec les plafonds du parent. Il peut lire les
 racines admises sous les règles de lecture héritées. Les lectures `ask`
-sont refusées dans le sous-agent. Une délégation est synchrone, à une
-profondeur de un, avec un maximum de huit tours par enfant. Les tours et les
+sont refusées dans le sous-agent, qui n’a accès ni au shell ni au réseau.
+Une délégation est synchrone, avec un seul niveau et un maximum de huit
+tours par enfant. Les tours et les
 jetons facturés à l’enfant sont décomptés du budget du parent. Le parent
 reçoit la réponse finale de l’enfant ou une erreur d’outil. Stop annule le
 flux du fournisseur et attend les lecteurs de fichiers de l’enfant avant de

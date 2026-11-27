@@ -138,7 +138,7 @@ impl HarnessAdapter030 for ArgenticAdapter030 {
     }
 
     fn qualify_agent(&self, agent: &Value, pointer: &str) -> Result<()> {
-        admission::qualify(agent, pointer)?;
+        admission::qualify(agent, pointer, self.0.shell_network)?;
         if agent["permissions"]["reviewer"] == "model" && self.0.reviewer_model.is_none() {
             return Err(config::invalid_model(&format!(
                 "{pointer}/permissions/reviewer"
@@ -311,6 +311,7 @@ impl AgentExecutor030 for Executor {
             &admission::compile_policy(work.policy())?,
             reviewer.is_some() && self.config.person_review_available,
             &pointer,
+            self.config.shell_network,
         )?;
         admission::extra_roots(
             work.policy(),
@@ -483,6 +484,7 @@ impl Executor {
             &policies,
             reviewer.is_some() && person.is_some(),
             &admission::agent_pointer(agent),
+            self.config.shell_network,
         )?;
         let model_reviewer = if reviewer == Some(Reviewer::Model) {
             let name = self
@@ -545,7 +547,9 @@ impl Executor {
             registry = registry.with_writes();
         }
         if shell {
-            registry = registry.with_shell();
+            registry = registry
+                .with_shell()
+                .with_shell_network(self.config.shell_network);
             if let Some(directory) = &self.config.shell_staging_directory {
                 registry = registry.with_shell_staging_directory(directory.clone());
             }
@@ -553,6 +557,7 @@ impl Executor {
         if let Some(approvals) = &approvals {
             registry = registry.with_authorizer(Arc::new(approval::ToolApprovals {
                 approvals: approvals.clone(),
+                person: person.clone(),
                 attempt: work.attempt.clone(),
                 sequence: std::sync::atomic::AtomicU64::new(0),
                 credential: credential.clone(),

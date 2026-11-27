@@ -3,8 +3,11 @@
 mod mutation;
 mod patch;
 mod shell;
-pub use shell::preflight as shell_preflight;
-pub use shell::{shell_network_allowed, shell_read_conflict, ShellReadConflict};
+pub use shell::{preflight as shell_preflight, preflight_network as shell_network_preflight};
+pub use shell::{
+    shell_network_allowed, shell_read_conflict, ShellNetwork, ShellReadConflict,
+    SHELL_NETWORK_PATTERN,
+};
 
 mod confined;
 mod output;
@@ -71,6 +74,7 @@ pub struct Registry {
     writes: bool,
     shell: bool,
     shell_staging_directory: Option<PathBuf>,
+    shell_network: ShellNetwork,
     root_gates: Vec<Arc<tokio::sync::RwLock<()>>>,
 }
 
@@ -81,6 +85,7 @@ pub enum Approval<'a> {
     Write(&'a Path),
     Shell(&'a str),
     Delegate,
+    Network(&'a str),
 }
 
 #[async_trait::async_trait]
@@ -202,6 +207,7 @@ impl Registry {
             writes: false,
             shell: false,
             shell_staging_directory: None,
+            shell_network: ShellNetwork::default(),
             root_gates,
         })
     }
@@ -248,10 +254,19 @@ impl Registry {
         self.shell = true;
         self.definitions.push(ToolDefinition {
             name: "shell".into(),
-            description: "Run Bash in a Linux sandbox with the admitted workspace at /workspace. Output is capped.".into(),
+            description: if cfg!(target_os = "macos") {
+                "Run Bash with the staged workspace as the current directory. Additional roots are in ARGENTIC_DIRECTORY_<index>. Output is capped."
+            } else {
+                "Run Bash in a sandbox with the admitted workspace at /workspace and additional roots under /directories. Output is capped."
+            }.into(),
             parameters: json!({"type":"object","required":["command"],"additionalProperties":false,
                 "properties":{"command":{"type":"string"},"timeout_ms":{"type":"integer","minimum":1,"maximum":300000}}}),
         });
+        self
+    }
+
+    pub fn with_shell_network(mut self, mode: ShellNetwork) -> Self {
+        self.shell_network = mode;
         self
     }
 
@@ -312,6 +327,7 @@ impl Registry {
                 Approval::Write(_) => "Write",
                 Approval::Shell(_) => "Shell",
                 Approval::Delegate => "Delegation",
+                Approval::Network(_) => "Network",
             };
             return Err(format!("{action} permission denied"));
         }

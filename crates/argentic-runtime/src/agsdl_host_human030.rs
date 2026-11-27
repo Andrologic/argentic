@@ -1229,6 +1229,49 @@ impl HumanBroker030 {
             .bind(&self.identity.system_start_id).bind(&self.identity.flow_invocation_id).bind(id).fetch_one(&self.pool).await?;
         Ok(serde_json::from_str(&raw)?)
     }
+    /// Close the request when its native shell client disappears. A person
+    /// may have answered just before the disconnect. Consume that decision
+    /// without delivering it to the abandoned operation.
+    pub(crate) async fn withdraw_ask(
+        &self,
+        host: &HostState,
+        work: &OwnedHumanWork030,
+        request_id: &str,
+    ) -> Result<()> {
+        let cancel = CancellationToken::new();
+        let _operation = self.operation.lock().await;
+        self.settle_pending_flow_clock(host).await?;
+        {
+            let lease = host.start_lease().await?;
+            let _gate = host.admission_lock().lock_owned().await;
+            let mut connection = self.durable_connection().await?;
+            let mut tx = connection.begin_with("BEGIN IMMEDIATE").await?;
+            self.guard(&mut tx, &lease).await?;
+            self.verify_work(&mut tx, work).await?;
+            let row = self.request_row(&mut tx, request_id).await?;
+            let works: Vec<String> = serde_json::from_str(row.get("work_ids_json"))?;
+            require(
+                row.get::<&str, _>("kind") == "ask" && works == [work.work_id()],
+                "Foreign action withdrawal",
+            )?;
+            if row.get::<&str, _>("delivery") != "pending" {
+                return Ok(());
+            }
+            if row.get::<Option<&str>, _>("resolution_json").is_none() {
+                let event =
+                    json!({"kind":"withdrawAsk","requestId":request_id,"workId":work.work_id()});
+                self.reserve(&mut tx, event, &self.clock.now_ms().to_string())
+                    .await?;
+            }
+            tx.commit().await?;
+        }
+        self.pump(host, &cancel).await?;
+        let decision = self.take_resolution(host, request_id).await?;
+        self.acknowledge(host, &decision).await?;
+        self.pump(host, &cancel).await?;
+        Ok(())
+    }
+
     pub(crate) async fn resolution_ready(&self, request: &str) -> Result<bool> {
         Ok(sqlx::query_scalar("SELECT resolution_json IS NOT NULL FROM engine_flow030_human_requests WHERE system_id=? AND invocation_id=? AND request_id=?")
             .bind(&self.identity.system_start_id).bind(&self.identity.flow_invocation_id).bind(request).fetch_one(&self.pool).await?)

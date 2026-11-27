@@ -1239,7 +1239,11 @@ async fn shell_executes_and_stop_reaps_the_namespace_before_physical_end() {
     let mut doc = document();
     doc["agents"]["worker"]["permissions"] = json!({"preset":"full",
         "directories":{"../cache":"write","../shared":"read"},
-        "rules":[{"action":"read","effect":"deny","match":"../shared/private"}]
+        "reviewer":"person",
+        "rules":[
+            {"action":"read","effect":"deny","match":"../shared/private"},
+            {"action":"network","effect":"ask","match":"127.0.0.1"}
+        ]
     });
     let mut f = Fixture::new(&doc.to_string());
     let cache = f.workspace.with_file_name("cache");
@@ -1252,6 +1256,7 @@ async fn shell_executes_and_stop_reaps_the_namespace_before_physical_end() {
     std::fs::create_dir(&staging).unwrap();
     let mut config = config(&server.base_url, None);
     config["shellStagingDirectory"] = json!(staging);
+    config["shellNetwork"] = json!("intercept");
     let mut policy: Value = serde_json::from_slice(&std::fs::read(&f.policy).unwrap()).unwrap();
     policy["permissions"] = json!("full");
     let bytes = serde_json::to_vec(&policy).unwrap();
@@ -1284,17 +1289,81 @@ async fn shell_executes_and_stop_reaps_the_namespace_before_physical_end() {
         "sandboxed"
     );
 
-    // Keep a stream open in a grandchild. EOF after Stop proves the kernel
-    // closed its descriptor, independent of the work's journal marker.
+    // Disconnect a native client while approval is open. The broker must
+    // close the ticket and let the work continue with no upstream connection.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let scope = persistence::public030::HumanScope030 {
+        system_start_id: run.receipt.identity.system_start_id.clone(),
+        source: run.capture.source.clone(),
+    };
+    request.tool(
+        "shell",
+        json!({"command":format!(
+            "curl -sS --max-time 2 http://127.0.0.1:{port}/; sleep 2"
+        )}),
+    );
+    let withdrawn = pending_ask(&host, &scope).await;
+    let stored: String = tokio::time::timeout(WAIT_FOR, async {
+        loop {
+            let stored = sqlx::query_scalar(
+                "SELECT resolution_json FROM engine_flow030_human_requests WHERE request_id=?",
+            )
+            .bind(&withdrawn.id)
+            .fetch_one(&host.pool)
+            .await
+            .unwrap();
+            if let Some(stored) = stored {
+                break stored;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("The disconnected shell client left an open approval");
+    let request = server.next().await;
+    assert_eq!(
+        serde_json::from_str::<Value>(&stored).unwrap()["withdrawn"],
+        true
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), listener.accept())
+            .await
+            .is_err()
+    );
+
+    // Hold an approved connection until Stop. The target must see no connection
+    // before the shared approval port authorizes this destination.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     request.tool(
         "shell",
         json!({"command":format!(
-            "( (sleep 30) ) > /dev/tcp/127.0.0.1/{port} & wait"
+            "curl -sS --max-time 30 http://127.0.0.1:{port}/ & wait"
         )}),
     );
-    let (stream, _) = tokio::time::timeout(WAIT_FOR, listener.accept())
+    let scope = persistence::public030::HumanScope030 {
+        system_start_id: run.receipt.identity.system_start_id.clone(),
+        source: run.capture.source.clone(),
+    };
+    let ask = pending_ask(&host, &scope).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), listener.accept())
+            .await
+            .is_err()
+    );
+    host.submit_person(HumanSubmission {
+        scope,
+        request_id: ask.id,
+        expected_revision: ask.revision,
+        answer: api::HumanAnswer030::Decision {
+            decision: "yes".into(),
+            comment: String::new(),
+        },
+    })
+    .await
+    .unwrap();
+    let (mut stream, _) = tokio::time::timeout(WAIT_FOR, listener.accept())
         .await
         .unwrap()
         .unwrap();
@@ -1308,11 +1377,12 @@ async fn shell_executes_and_stop_reaps_the_namespace_before_physical_end() {
     .unwrap();
     let state = finish(&host, &run).await;
     assert_eq!(state["verdict"], "cancelled", "{state}");
-    tokio::time::timeout(WAIT_FOR, stream.readable())
+    use tokio::io::AsyncReadExt;
+    let mut request = Vec::new();
+    tokio::time::timeout(WAIT_FOR, stream.read_to_end(&mut request))
         .await
-        .unwrap()
+        .expect("proxy connection did not close on Stop")
         .unwrap();
-    assert_eq!(stream.try_read(&mut [0]).unwrap(), 0);
     assert_eq!(std::fs::read_dir(&staging).unwrap().count(), 0);
     let physical: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM engine_flow030_events WHERE
@@ -1324,6 +1394,154 @@ async fn shell_executes_and_stop_reaps_the_namespace_before_physical_end() {
     .unwrap();
     assert_eq!(physical, 1);
     close(&host).await;
+}
+
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "aarch64", target_arch = "x86_64")
+))]
+mod shell_network_interactions {
+    use super::*;
+    use crate::persistence::public030::HumanScope030;
+    use tokio::net::TcpListener;
+
+    async fn fixture(server: &Server, plan_first: bool) -> (Fixture, Host, RetainedStart030) {
+        let (mut doc, mut cfg) = reviewer_fixture(server);
+        doc["agents"]["worker"]["permissions"] = json!({
+            "preset":"full","reviewer":"model","rules":[
+                {"action":"network","effect":"ask","match":"127.0.0.1"},
+                {"action":"delegate","effect":"allow"}
+            ]
+        });
+        if plan_first {
+            doc["agents"]["worker"]["planFirst"] = json!("auto");
+        }
+        let mut f = Fixture::new(&doc.to_string());
+        let mut policy: Value = serde_json::from_slice(&std::fs::read(&f.policy).unwrap()).unwrap();
+        policy["permissions"] = json!("full");
+        let bytes = serde_json::to_vec(&policy).unwrap();
+        std::fs::write(&f.policy, &bytes).unwrap();
+        f.digest = digest(bytes);
+        cfg["shellNetwork"] = json!("intercept");
+        let host = f
+            .open()
+            .await
+            .unwrap()
+            .with_argentic(serde_json::from_value(cfg).unwrap())
+            .unwrap();
+        let run = start(&host).await;
+        (f, host, run)
+    }
+
+    fn scope(run: &RetainedStart030) -> HumanScope030 {
+        HumanScope030 {
+            system_start_id: run.receipt.identity.system_start_id.clone(),
+            source: run.capture.source.clone(),
+        }
+    }
+
+    fn curl(request: Request, listener: &TcpListener) {
+        let address = listener.local_addr().unwrap();
+        request.tool(
+            "shell",
+            json!({"command":format!("curl -fsS --max-time 10 http://{address}/")}),
+        );
+    }
+
+    #[tokio::test]
+    async fn proxy_network_ask_bypasses_the_model_reviewer() {
+        let mut server = Server::start().await;
+        let (_f, host, run) = fixture(&server, false).await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let scope = scope(&run);
+        let request = server.next().await;
+        assert!(has_tool(&request, "shell"));
+        curl(request, &listener);
+        let ask = tokio::select! {
+            ask = pending_ask(&host, &scope) => ask,
+            request = server.next() => panic!("Unexpected provider request: {}", request.body),
+            _ = listener.accept() => panic!("Proxy connected before person approval"),
+        };
+        let facts: Value = serde_json::from_str(ask.flow_json.as_deref().unwrap()).unwrap();
+        assert_eq!(facts["content"]["kind"], "actionApproval");
+        assert_eq!(facts["content"]["title"], "Connect to 127.0.0.1");
+        host.submit_person(HumanSubmission {
+            scope,
+            request_id: ask.id,
+            expected_revision: ask.revision,
+            answer: api::HumanAnswer030::Decision {
+                decision: "no".into(),
+                comment: String::new(),
+            },
+        })
+        .await
+        .unwrap();
+        let next = tokio::select! {
+            request = server.next() => request,
+            _ = listener.accept() => panic!("Proxy connected after person denial"),
+        };
+        assert_eq!(next.body["model"], "gpt-5.5");
+        assert!(next.body["messages"].to_string().contains("403"));
+        let decisions: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM engine_flow030_work_events
+             WHERE decision_json IS NOT NULL
+               AND (ticket_json -> 'input' ->> 'eventJson') ->> '$.event.kind' = 'reviewerDecision'",
+        )
+        .fetch_one(&host.pool)
+        .await
+        .unwrap();
+        assert_eq!(decisions, 0);
+        submit_done(next);
+        completed(&finish(&host, &run).await);
+        close(&host).await;
+    }
+
+    #[tokio::test]
+    async fn plan_first_blocks_shell_before_any_proxy_approval() {
+        let mut server = Server::start().await;
+        let (_f, host, run) = fixture(&server, true).await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        curl(server.next().await, &listener);
+        let blocked = server.next().await;
+        assert!(blocked.body["messages"]
+            .to_string()
+            .contains("Present a plan"));
+        let scope = scope(&run);
+        assert!(host.humans(scope, None).await.unwrap().requests.is_empty());
+        send_plan(blocked, "Inspect the workspace");
+        let planned = server.next().await;
+        assert!(has_tool(&planned, "shell"));
+        submit_done(planned);
+        completed(&finish(&host, &run).await);
+        close(&host).await;
+    }
+
+    #[tokio::test]
+    async fn delegated_child_cannot_run_its_parents_network_enabled_shell() {
+        let mut server = Server::start().await;
+        let (_f, host, run) = fixture(&server, false).await;
+        let parent = server.next().await;
+        assert!(has_tool(&parent, "shell"));
+        delegate_task(parent);
+        let child = server.next().await;
+        assert!(!has_tool(&child, "shell"));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        curl(child, &listener);
+        let refused = server.next().await;
+        assert!(refused.body["messages"]
+            .to_string()
+            .contains("Shell tool is disabled"));
+        assert!(host
+            .humans(scope(&run), None)
+            .await
+            .unwrap()
+            .requests
+            .is_empty());
+        send_text(refused, "Child finished.");
+        submit_done(server.next().await);
+        completed(&finish(&host, &run).await);
+        close(&host).await;
+    }
 }
 
 #[tokio::test]

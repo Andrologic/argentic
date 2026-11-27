@@ -1,5 +1,6 @@
 use super::port::contains_credential;
 use crate::{
+    agsdl_host_action_approval030::permits_model_review,
     harness::{
         AgentOperator030, CommandApprovals030, FlowWorkAttempt030, Respond030, WorkEventSink030,
     },
@@ -199,15 +200,7 @@ impl CommandApprovals030 for ModelReviewer {
         Box::pin(async move {
             let native = &payload["nativeRequest"];
             let method = native["method"].as_str().unwrap_or_default();
-            // An opaque shell command or MCP tool can have effects a model
-            // cannot inspect. The host requires a person for these asks.
-            let floor = method != "argentic/tool/requestApproval"
-                || native["params"]["actions"]
-                    .as_array()
-                    .is_none_or(|actions| {
-                        actions.is_empty() || actions.iter().any(|a| a["action"] == "shell")
-                    });
-            let (decision, source) = if floor {
+            let (decision, source) = if !permits_model_review(native) {
                 (Verdict::Escalate, "personFloor")
             } else if let Some(verdict) = self.verdict(&payload, cancel).await {
                 (verdict, "model")

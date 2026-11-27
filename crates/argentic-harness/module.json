@@ -2,7 +2,7 @@
   "$schema": "https://raw.githubusercontent.com/Andrologic/AgSDL/v0.4.0/schema/harness-module.schema.json",
   "name": "argentic",
   "title": "Argentic",
-  "version": "1.0.0",
+  "version": "1.2.0",
   "contract": "agsdl-0.4.0",
   "harnessVersions": ">=0.1.0 <0.2.0",
   "properties": {
@@ -24,19 +24,24 @@
       "support": "absent"
     },
     "plan": {
-      "support": "absent"
+      "support": "native",
+      "note": "The embedding host enables the plan tool and receives plan updates."
     },
     "planFirst.auto": {
-      "support": "absent"
+      "support": "native",
+      "note": "The embedding host can require a plan before changes, delegation or completion."
     },
     "planFirst.ask": {
-      "support": "absent"
+      "support": "native",
+      "note": "The embedding host supplies the human plan review port."
     },
     "reviewer.person": {
-      "support": "absent"
+      "support": "native",
+      "note": "The embedding host supplies the human approval port. An ask fails closed when the port is absent."
     },
     "reviewer.model": {
-      "support": "absent"
+      "support": "native",
+      "note": "The embedding host supplies the model reviewer. Shell, proxy network and MCP asks require a person."
     },
     "directories": {
       "support": "absent"
@@ -63,14 +68,16 @@
       "deny": "absent"
     },
     "shell": {
-      "allow": "absent",
-      "ask": "absent",
-      "deny": "absent"
+      "allow": "harness",
+      "ask": "harness",
+      "deny": "harness",
+      "note": "Shell rules match the command text, including each subcommand of a compound command, but not programs that a matched command starts. Dynamic command words and shell constructs that indirectly execute commands take the most restrictive explicit shell rule. Shell requires system Bubblewrap and working PID and user namespaces on Linux ARM64 or x86-64, or Seatbelt on macOS ARM64."
     },
     "network": {
-      "allow": "absent",
-      "ask": "absent",
-      "deny": "absent"
+      "allow": "sandbox",
+      "ask": "sandbox",
+      "deny": "sandbox",
+      "note": "The OS blocks direct shell egress. The default shellNetwork mode, blanket, requires an unconditional grant in every policy layer. Shell host patterns require shellNetwork: \"intercept\" and are refused at qualification otherwise. Intercept mode enforces host rules for HTTP/1.1 and decrypts HTTPS in the host process using a per-invocation CA."
     },
     "mcp": {
       "allow": "absent",
@@ -78,9 +85,10 @@
       "deny": "absent"
     },
     "delegate": {
-      "allow": "absent",
-      "ask": "absent",
-      "deny": "absent"
+      "allow": "harness",
+      "ask": "harness",
+      "deny": "harness",
+      "note": "When enabled by the embedding host, children inherit the parent ceilings and can only read from admitted roots."
     }
   },
   "settings": {

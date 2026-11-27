@@ -354,7 +354,7 @@ pub(super) async fn verify(
                 });
             }
             "open" | "associate" | "answer" | "approvalAnswer" | "ack" | "retire" | "tick"
-            | "operatorHold" => {}
+            | "operatorHold" | "withdrawAsk" => {}
             _ => return Err("Unknown clock event".into()),
         }
         if kind == "open" || kind == "approval" {
@@ -700,6 +700,7 @@ pub(super) async fn verify(
                 parsed(row, "resolution_json")? == expected
                     && row.get::<&str, _>("revision") == "1"
                     && (resolution["operatorCancelled"] == true
+                        || resolution["withdrawn"] == true
                         || (delivery == "acknowledged" && r.acknowledged)
                         || (delivery == "reserved" && closed_asks.contains(&r.id))
                         || fenced_before_delivery
