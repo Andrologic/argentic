@@ -65,6 +65,8 @@ pub fn initialize() -> std::io::Result<Option<i32>> {
     if let Some(code) = dispatch(&args) {
         return Ok(Some(code));
     }
+    #[cfg(target_os = "macos")]
+    super::macos_launcher::require_child_exit_status()?;
     register_host_executable(std::env::current_exe()?)?;
     Ok(None)
 }

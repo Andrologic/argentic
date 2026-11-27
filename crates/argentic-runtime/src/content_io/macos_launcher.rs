@@ -45,6 +45,74 @@ pub fn available() -> bool {
     unsafe { agsdl_content_macos_available() == 1 }
 }
 
+// Darwin <sys/signal.h>. The libc crate does not export this flag on macOS.
+const SA_NOCLDWAIT: libc::c_int = 0x0020;
+
+pub(super) fn require_child_exit_status() -> io::Result<()> {
+    let mut action = std::mem::MaybeUninit::<libc::sigaction>::uninit();
+    if unsafe { libc::sigaction(libc::SIGCHLD, std::ptr::null(), action.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let action = unsafe { action.assume_init() };
+    if action.sa_sigaction == libc::SIG_IGN || action.sa_flags & SA_NOCLDWAIT != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "The macOS content reader requires child exit status. Disable SIGCHLD SIG_IGN and SA_NOCLDWAIT.",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn macos_initialize_rejects_auto_reaping_sigchld() {
+    const CHILD_CASE: &str = "ARGENTIC_TEST_SIGCHLD_DISPOSITION";
+    if let Ok(case) = std::env::var(CHILD_CASE) {
+        // Mutate the process-wide disposition only in the isolated subprocess.
+        let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+        action.sa_sigaction = if case == "ignore" {
+            libc::SIG_IGN
+        } else {
+            libc::SIG_DFL
+        };
+        if case == "no-child-wait" {
+            action.sa_flags = SA_NOCLDWAIT;
+        }
+        unsafe {
+            assert_eq!(libc::sigemptyset(&mut action.sa_mask), 0);
+            assert_eq!(
+                libc::sigaction(libc::SIGCHLD, &action, std::ptr::null_mut()),
+                0
+            );
+        }
+        if case == "default" {
+            assert_eq!(super::file_helper::initialize().unwrap(), None);
+        } else {
+            let error = super::file_helper::initialize().unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+            assert!(error.to_string().contains("requires child exit status"));
+        }
+        return;
+    }
+    let test = format!(
+        "{}::macos_initialize_rejects_auto_reaping_sigchld",
+        module_path!()
+    );
+    let test = test.split_once("::").unwrap().1;
+    for case in ["default", "ignore", "no-child-wait"] {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test])
+            .env(CHILD_CASE, case)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "{case}: {stdout}"
+        );
+    }
+}
+
 #[cfg(all(feature = "agsdl-content-qa", debug_assertions))]
 unsafe extern "C" {
     fn agsdl_content_macos_qa_arm_swap(target: *const c_char, replacement: *const c_char) -> i32;
@@ -80,6 +148,7 @@ impl Launch {
     }
 
     pub fn start(executable: &Path, name: &Path, parent_fd: RawFd) -> io::Result<Self> {
+        require_child_exit_status()?;
         let executable = CString::new(executable.as_os_str().as_bytes()).map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidInput, "Invalid helper executable")
         })?;
@@ -312,6 +381,9 @@ pub fn read_supervised(
                         (false, 3) => io::Error::new(
                             io::ErrorKind::PermissionDenied,
                             "Content helper refused the file",
+                        ),
+                        (false, -1) => io::Error::other(
+                            "Content helper exit status unavailable. Check the host's SIGCHLD disposition and child reaper.",
                         ),
                         _ => io::Error::other(format!(
                             "Content helper exited with status {} (signal: {})",
