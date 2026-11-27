@@ -1799,7 +1799,7 @@ auth_refreshed=False
 def rotate_auth():
  source=sys.argv[5]
  record=json.load(open(source))
- payload=base64.urlsafe_b64encode(json.dumps({'exp':18446744073709551615,'generation':'rotated'}).encode()).decode().rstrip('=')
+ payload=base64.urlsafe_b64encode(json.dumps({'exp':18446744073709551615,'generation':'rotated','email':'synthetic@example.invalid'}).encode()).decode().rstrip('=')
  record['tokens']['access_token']='e30.'+payload+'.synthetic'
  with open(source+'.next','w') as f: json.dump(record,f)
  os.chmod(source+'.next',0o600); os.replace(source+'.next',source)

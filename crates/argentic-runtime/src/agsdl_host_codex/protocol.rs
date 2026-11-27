@@ -338,7 +338,8 @@ impl Client {
         {
             user_id = self.managed_user_id(&account).await?;
         }
-        let account_digest = account_digest(&account, user_id, self.external_auth.is_some())?;
+        let identity = account_identity(&account, user_id, self.external_auth.is_some())?;
+        let account_digest = account_digest(&account, &identity)?;
         if let Some(auth) = &self.external_auth {
             let state = auth.lock_current().await?;
             if state.account_digest.as_deref() != Some(&account_digest) {
@@ -356,14 +357,15 @@ impl Client {
         let frame = self.response_frame(id).await?;
         let error = &frame["error"];
         let code = error["code"].as_i64();
-        // Older Codex releases can report unknown RPC methods as a
-        // deserialization error. Other RPC errors block account attestation.
+        // Older releases can reject this RPC during deserialization or at
+        // the experimental capability check. Other errors block attestation.
         if code == Some(-32601)
             || (code == Some(-32600)
                 && error["message"].as_str().is_some_and(|message| {
-                    message.contains(METHOD)
-                        && (message.contains("unknown method")
-                            || message.contains("unknown variant"))
+                    message == "accountSession/list requires experimentalApi capability"
+                        || (message.contains(METHOD)
+                            && (message.contains("unknown method")
+                                || message.contains("unknown variant")))
                 }))
         {
             return Ok(None);
@@ -389,8 +391,8 @@ impl Client {
         if matches.next().is_some()
             || session["isActive"] != true
             || session["selectedWorkspaceAccountId"] != workspace
-            || matches!((session["email"].as_str(), account["account"]["email"].as_str()),
-                (Some(session_email), Some(read_email)) if session_email != read_email)
+            || !matches!((required(session, "email"), required(&account["account"], "email")),
+                (Ok(session_email), Ok(read_email)) if session_email == read_email)
         {
             return Err(inconsistent());
         }
@@ -400,7 +402,11 @@ impl Client {
 
 pub(crate) const ACCOUNT_DIGEST_PREFIX: &str = "sha256:chatgpt-user-v2:";
 
-fn account_digest(account: &Value, user_id: Option<String>, external: bool) -> Result<String> {
+fn account_identity(
+    account: &Value,
+    user_id: Option<String>,
+    external: bool,
+) -> Result<auth::Identity> {
     if account["account"]["type"] != "chatgpt" {
         return Err(failure(
             "CODEX_ACCOUNT_UNQUALIFIED",
@@ -408,23 +414,25 @@ fn account_digest(account: &Value, user_id: Option<String>, external: bool) -> R
             "Codex account identity cannot be attested for this profile",
         ));
     }
-    let (identity_kind, identity) = match user_id {
-        Some(user_id) => ("userId", user_id),
-        None => (
-            "email",
-            required(&account["account"], "email").map_err(|_| {
-                if external {
-                    auth::error("CODEX_AUTH_IDENTITY_UNAVAILABLE")
-                } else {
-                    failure(
-                        "CODEX_ACCOUNT_UNQUALIFIED",
-                        "authentication",
-                        "Codex did not provide a user ID or email for the active ChatGPT user",
-                    )
-                }
-            })?,
-        ),
-    };
+    if let Some(user_id) = user_id {
+        return Ok(auth::Identity::UserId(user_id));
+    }
+    let email = required(&account["account"], "email").map_err(|_| {
+        if external {
+            auth::error("CODEX_AUTH_IDENTITY_UNAVAILABLE")
+        } else {
+            failure(
+                "CODEX_ACCOUNT_UNQUALIFIED",
+                "authentication",
+                "Codex did not provide a user ID or email for the active ChatGPT user",
+            )
+        }
+    })?;
+    Ok(auth::Identity::Email(email))
+}
+
+fn account_digest(account: &Value, identity: &auth::Identity) -> Result<String> {
+    let (identity_kind, identity) = identity.parts();
     let routing = &account["workspaceRouting"];
     Ok(format!(
         "{ACCOUNT_DIGEST_PREFIX}{:x}",
@@ -471,6 +479,7 @@ impl Client {
                 account_id: credential.account_id.clone(),
                 token_fingerprint: credential.fingerprint(),
                 account_digest: None,
+                account_identity: None,
                 valid: false,
             },
         )));
@@ -520,7 +529,15 @@ impl Client {
         if credential.fingerprint() == guard.token_fingerprint {
             return Err(auth::error("CODEX_AUTH_REFRESH_REQUIRED"));
         }
-        guard.token_fingerprint = credential.fingerprint();
+        // Codex can read the previous auth while its refresh task is still
+        // committing this reply. Bind the replacement before giving it to Codex.
+        credential.check_identity(
+            guard
+                .account_identity
+                .as_ref()
+                .ok_or_else(|| auth::error("CODEX_AUTH_IDENTITY_UNAVAILABLE"))?,
+        )?;
+        let fingerprint = credential.fingerprint();
         let result = tokio::time::timeout(auth::TIMEOUT, async {
             // No generic reply guard here: this operation owns it until the
             // renewed credential's real account/routing is attested below.
@@ -528,6 +545,7 @@ impl Client {
             self.check_external_account(&mut guard, None).await
         }).await.map_err(|_| auth::error("CODEX_AUTH_TIMEOUT"))?;
         result?;
+        guard.token_fingerprint = fingerprint;
         guard.valid = true;
         Ok(true)
     }
@@ -540,14 +558,16 @@ impl Client {
         let account = self
             .auth_response("account/read", json!({"refreshToken":false}))
             .await?;
-        let digest =
-            account_digest(&account, required(&account, "userId").ok(), true).map_err(|error| {
+        let identity = account_identity(&account, required(&account, "userId").ok(), true)
+            .map_err(|error| {
                 if error.code == "CODEX_AUTH_IDENTITY_UNAVAILABLE" {
                     error
                 } else {
                     auth::error("CODEX_AUTH_FAILED")
                 }
             })?;
+        let digest =
+            account_digest(&account, &identity).map_err(|_| auth::error("CODEX_AUTH_FAILED"))?;
         if account["workspaceRouting"]["chatgptAccountId"].as_str() != Some(&state.account_id)
             || expected.is_some_and(|expected| expected != digest)
             || state
@@ -593,6 +613,7 @@ impl Client {
             return Err(auth::error("CODEX_AUTH_ACCOUNT_CHANGED"));
         }
         state.account_digest = Some(digest);
+        state.account_identity = Some(identity);
         Ok(())
     }
 

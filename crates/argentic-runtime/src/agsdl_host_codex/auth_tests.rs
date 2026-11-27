@@ -7,7 +7,7 @@ const SERVER: &str = r#"
 import json,sys,base64,os
 source,mode,settings,bootstrap,profile=sys.argv[1:]
 settings=json.loads(settings)
-methods=[]; account='synthetic-account'; refreshed=False; authed=False; exercise=None
+methods=[]; account='synthetic-account'; refreshed=False; replacement_committed=False; authed=False; exercise=None
 def emit(v): print(json.dumps(v),flush=True)
 for line in sys.stdin:
  m=json.loads(line); method=m.get('method'); i=m.get('id'); p=m.get('params',{})
@@ -43,11 +43,17 @@ for line in sys.stdin:
   result={'type':'chatgptAuthTokens'}
  elif method=='account/read':
   if refreshed and mode=='refresh-timeout': continue
+  # The first read after the refresh reply sees the old auth. Commit only
+  # after forming this read's result, without timing or scheduling assumptions.
+  committed=refreshed
+  if refreshed and mode.startswith('delayed-'):
+   committed=replacement_committed
+   replacement_committed=True
   routing={'chatgptAccountId':account,'backendOrigin':'https://chatgpt.com','accountRoutingOverride':'NO_CONSTRAINT'}
   if refreshed and mode=='route-change': routing['backendOrigin']='https://changed.invalid'
   if mode=='missing-routing': routing={}
-  email='other@example.invalid' if refreshed and mode=='user-change' else 'synthetic@example.invalid'
-  if mode in ('no-email','user-id-no-email') or (refreshed and mode=='refresh-no-email'): email=None
+  email='other@example.invalid' if committed and mode in ('user-change','delayed-user-change') else 'synthetic@example.invalid'
+  if mode in ('no-email','user-id-no-email','managed-read-no-email') or (committed and mode in ('refresh-no-email','delayed-no-email')): email=None
   if mode=='user-id-email-change' and refreshed: email='new@example.invalid'
   result={'account':{'type':'chatgpt','email':email},'workspaceRouting':routing}
   if mode.startswith('user-id-'):
@@ -56,20 +62,30 @@ for line in sys.stdin:
   assert p=={'refreshWorkspaceMetadata':False}
   if mode=='managed-unsupported':
    emit({'id':i,'error':{'code':-32601,'message':'unsupported method'}}); continue
+  if mode=='managed-experimental-disabled':
+   emit({'id':i,'error':{'code':-32600,'message':'accountSession/list requires experimentalApi capability'}}); continue
+  if mode=='managed-other-invalid-request':
+   emit({'id':i,'error':{'code':-32600,'message':'accountSession/list received invalid parameters'}}); continue
   if mode=='managed-failed':
    emit({'id':i,'error':{'code':-32603,'message':'failed'}}); continue
   assert mode.startswith('managed-')
   result={'activeSessionId':'active','sessions':[
    {'sessionId':'inactive','isActive':False,'selectedWorkspaceAccountId':account,'userId':'ignored-user'},
-   {'sessionId':'active','isActive':True,'selectedWorkspaceAccountId':'other-account' if mode=='managed-other-workspace' else account,'email':'synthetic@example.invalid','userId':None if mode=='managed-null' else 'synthetic-user'}
+   {'sessionId':'active','isActive':True,'selectedWorkspaceAccountId':'other-account' if mode=='managed-other-workspace' else account,'email':None if mode=='managed-session-no-email' else 'synthetic@example.invalid','userId':None if mode=='managed-null' else 'synthetic-user'}
   ]}
+ elif method=='test/refreshReceived': result=refreshed
  elif method=='exercise':
   if mode=='rpc-unsupported':
    emit({'id':'unknown','method':'item/commandExecution/requestApproval','params':{'message':'SYNTHETIC_NATIVE_SECRET'}}); continue
   exercise=i
   if mode!='same-token':
    record=json.load(open(source))
-   payload=base64.urlsafe_b64encode(json.dumps({'exp':1 if mode=='expired-token' else 18446744073709551615,'generation':'rotated'}).encode()).decode().rstrip('=')
+   claims={'exp':1 if mode=='expired-token' else 18446744073709551615,'generation':'rotated'}
+   if mode not in ('refresh-no-email','delayed-no-email'):
+    claims['https://api.openai.com/profile']={'email':'other@example.invalid' if mode in ('user-change','delayed-user-change') else 'synthetic@example.invalid'}
+   if mode.startswith('user-id-'):
+    claims['https://api.openai.com/auth']={'chatgpt_user_id':'other-user' if mode=='user-id-change' else 'synthetic-user'}
+   payload=base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip('=')
    record['tokens']['access_token']='e30.'+payload+'.synthetic'
    if mode=='source-change': record['tokens']['account_id']='other-account'
    with open(source+'.next','w') as f: json.dump(record,f)
@@ -465,6 +481,67 @@ async fn external_auth_deadlines_leave_process_drainage_owned() {
                 .await
                 .valid
         );
+        f.end().await;
+    }
+}
+
+#[tokio::test]
+async fn external_auth_rejects_replacement_before_a_stale_account_read() {
+    for (mode, code) in [
+        ("delayed-user-change", "CODEX_AUTH_ACCOUNT_CHANGED"),
+        ("delayed-no-email", "CODEX_AUTH_IDENTITY_UNAVAILABLE"),
+    ] {
+        let mut f = Fixture::new(mode);
+        f.bootstrap().await.unwrap();
+        let reply = f.client.reply_sender030();
+        let result = f.client.request("exercise", json!({})).await;
+        assert_eq!(result.unwrap_err().code, code, "{mode}");
+        assert!(f.client.check_auth_current().await.is_err());
+        assert!(reply
+            .answer_request030(json!("approval"), json!({"decision":"accept"}))
+            .await
+            .is_err());
+        assert_eq!(
+            f.client
+                .request("test/refreshReceived", json!({}))
+                .await
+                .unwrap(),
+            json!(false)
+        );
+        f.end().await;
+    }
+}
+
+#[tokio::test]
+async fn managed_account_requires_matching_emails_to_bind_the_active_session() {
+    for mode in ["managed-read-no-email", "managed-session-no-email"] {
+        let mut f = Fixture::new(mode);
+        f.client.use_auth_source(None, None);
+        f.client.initialize().await.unwrap();
+        assert_eq!(
+            f.client.current_account_digest().await.unwrap_err().code,
+            "CODEX_ACCOUNT_UNQUALIFIED",
+            "{mode}"
+        );
+        f.end().await;
+    }
+}
+
+#[tokio::test]
+async fn managed_account_falls_back_only_for_unsupported_session_listing() {
+    for mode in [
+        "managed-experimental-disabled",
+        "managed-other-invalid-request",
+    ] {
+        let mut f = Fixture::new(mode);
+        f.client.use_auth_source(None, None);
+        f.client.initialize().await.unwrap();
+        let result = f.client.current_account_digest().await;
+        if mode == "managed-experimental-disabled" {
+            assert!(result.unwrap().starts_with(ACCOUNT_DIGEST_PREFIX));
+        } else {
+            assert_eq!(result.unwrap_err().code, "CODEX_REQUEST_FAILED");
+        }
         f.end().await;
     }
 }
