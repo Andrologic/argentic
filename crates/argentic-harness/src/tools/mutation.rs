@@ -497,6 +497,8 @@ impl Change {
         let parent = target.revalidate(root)?;
         let Some(content) = &self.content else {
             root.verify_location(parent_path, confined::location(&parent)?)?;
+            // Revalidation can hash the target; honour a Stop that arrived meanwhile.
+            check_cancel(cancel)?;
             return parent.remove_file(name);
         };
         check_size(content.len())?;

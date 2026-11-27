@@ -5,7 +5,8 @@ use serde_json::Value;
 /// Short authentication placeholders do not participate in echo screening.
 pub const MIN_SCREENED_CREDENTIAL_BYTES: usize = 16;
 
-/// Check decoded JSON string values, or literal text when the input is not JSON.
+/// Check decoded JSON strings (values and member names), or literal text when
+/// the input is not JSON.
 pub fn contains_credential(raw: &str, key: &str) -> bool {
     key.len() >= MIN_SCREENED_CREDENTIAL_BYTES
         && serde_json::from_str(raw).map_or_else(
@@ -21,13 +22,14 @@ pub(super) fn value_contains_credential(value: &Value, key: &str) -> bool {
             .iter()
             .any(|value| value_contains_credential(value, key)),
         Value::Object(fields) => fields
-            .values()
-            .any(|value| value_contains_credential(value, key)),
+            .iter()
+            .any(|(name, value)| name.contains(key) || value_contains_credential(value, key)),
         _ => false,
     }
 }
 
-/// Redact a structured result's string values in place before serializing it.
+/// Redact a structured result's strings (values and member names) in place
+/// before serializing it.
 pub fn redact_credential_values(value: &mut Value, key: &str) {
     if key.len() < MIN_SCREENED_CREDENTIAL_BYTES {
         return;
@@ -46,6 +48,18 @@ pub fn redact_credential_values(value: &mut Value, key: &str) {
         Value::Object(fields) => {
             for value in fields.values_mut() {
                 redact_credential_values(value, key);
+            }
+            if fields.keys().any(|name| name.contains(key)) {
+                let mut screened = serde_json::Map::with_capacity(fields.len());
+                for (name, value) in std::mem::take(fields) {
+                    let mut name = redact(&name, key).into_owned();
+                    // Keep every member when two redacted names collide.
+                    while screened.contains_key(&name) {
+                        name.push('_');
+                    }
+                    screened.insert(name, value);
+                }
+                *fields = screened;
             }
         }
         _ => {}
@@ -129,6 +143,19 @@ impl TextScreen {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn member_names_are_screened() {
+        const KEY: &str = "sk-test-0123456789abcdef";
+        let arguments = serde_json::json!({"headers": {KEY: "x"}}).to_string();
+        assert!(contains_credential(&arguments, KEY));
+
+        let mut result = serde_json::json!({"map": {KEY: 1, "[redacted]": 2}, "ok": "value"});
+        redact_credential_values(&mut result, KEY);
+        assert!(!result.to_string().contains(KEY));
+        assert_eq!(result["map"].as_object().map(serde_json::Map::len), Some(2));
+        assert_eq!(result["ok"], "value");
+    }
 
     #[test]
     fn stream_screen_preserves_partial_unicode_and_repetitive_prefixes() {
