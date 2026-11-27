@@ -23,7 +23,7 @@ pub(super) fn definition() -> ToolDefinition {
         description: "Assign a read-only investigation to a fresh sub-agent. Returns its final reply when it ends. Supply the relevant context in the task.".into(),
         parameters: json!({
             "type":"object","required":["task"],"additionalProperties":false,
-            "properties":{"task":{"type":"string","minLength":1,"maxLength":8192}}
+            "properties":{"task":{"type":"string"}}
         }),
     }
 }
