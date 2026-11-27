@@ -488,10 +488,16 @@ impl Profile {
             if source.starts_with(binary) || source.starts_with(&self.bootstrap) {
                 return Err(unsupported());
             }
-            tool_files.insert(
-                source.to_str().ok_or_else(unsupported)?.into(),
-                json!("deny"),
-            );
+            let source = source.to_str().ok_or_else(unsupported)?;
+            // Codex 0.167.0 compiles deny keys with any of these characters as globs.
+            if source.contains(['*', '?', '[', ']']) {
+                return Err(failure(
+                    "CODEX_AUTH_SOURCE_UNSUPPORTED",
+                    "authentication",
+                    "The selected ChatGPT auth file path contains a Codex glob character (*, ?, [, or ])",
+                ));
+            }
+            tool_files.insert(source.into(), json!("deny"));
         }
         // Context discovery stays at the private empty bootstrap. Existing
         // metadata can be read only as explicit workspace data by native tools.

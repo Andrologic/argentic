@@ -163,6 +163,25 @@ async fn external_auth_refuses_sources_in_native_read_grants() {
 }
 
 #[tokio::test]
+async fn external_auth_rejects_glob_characters_in_source_paths() {
+    let f = Fixture::new("ok");
+    for name in [
+        "auth[old].json",
+        "auth].json",
+        "auth*.json",
+        "old?/auth.json",
+    ] {
+        let error = f
+            .profile
+            .app_server_command(&f.root.join("workspace"), true, Some(&f.root.join(name)))
+            .unwrap_err();
+        assert_eq!(error.code, "CODEX_AUTH_SOURCE_UNSUPPORTED");
+        assert!(error.message.contains("glob"), "{error:?}");
+    }
+    f.end().await;
+}
+
+#[tokio::test]
 async fn external_auth_bootstrap_and_refresh_preserve_private_config_and_rpc_order() {
     for notification in [false, true] {
         let mut f = Fixture::new("ok");
