@@ -8,6 +8,14 @@ use super::{
 use crate::policy::Action;
 use cap_fs_ext::{FollowSymlinks, MetadataExt, OpenOptionsFollowExt};
 use cap_std::fs::{Dir, Metadata, OpenOptions};
+#[cfg(any(
+    all(
+        target_os = "linux",
+        any(target_arch = "aarch64", target_arch = "x86_64")
+    ),
+    all(target_os = "macos", target_arch = "aarch64")
+))]
+use ring::digest::{digest, Digest, SHA256};
 use serde::Deserialize;
 use std::{
     collections::{BTreeSet, HashMap},
@@ -277,6 +285,14 @@ pub(super) struct Target {
     relative: PathBuf,
     parent: Metadata,
     before: Option<Metadata>,
+    #[cfg(any(
+        all(
+            target_os = "linux",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ),
+        all(target_os = "macos", target_arch = "aarch64")
+    ))]
+    digest: Option<Digest>,
 }
 
 impl Target {
@@ -293,6 +309,14 @@ impl Target {
             relative,
             parent: parent.dir_metadata()?,
             before,
+            #[cfg(any(
+                all(
+                    target_os = "linux",
+                    any(target_arch = "aarch64", target_arch = "x86_64")
+                ),
+                all(target_os = "macos", target_arch = "aarch64")
+            ))]
+            digest: None,
         })
     }
 
@@ -343,11 +367,17 @@ impl Target {
         ),
         all(target_os = "macos", target_arch = "aarch64")
     ))]
-    pub(super) fn from_snapshot(relative: PathBuf, parent: Metadata, before: Metadata) -> Self {
+    pub(super) fn from_snapshot(
+        relative: PathBuf,
+        parent: Metadata,
+        before: Metadata,
+        digest: Digest,
+    ) -> Self {
         Self {
             relative,
             parent,
             before: Some(before),
+            digest: Some(digest),
         }
     }
 
@@ -378,13 +408,38 @@ impl Target {
 
     fn check_parent(&self, current_parent: &Dir) -> io::Result<()> {
         let current = metadata(current_parent, self.name()?)?;
-        let same_file = match (&self.before, &current) {
+        let unchanged = match (&self.before, &current) {
             (None, None) => true,
             (Some(before), Some(current)) => same_file(before, current)?,
             _ => false,
         };
-        if !same_inode(&self.parent, &current_parent.dir_metadata()?) || !same_file {
+        if !same_inode(&self.parent, &current_parent.dir_metadata()?) || !unchanged {
             return Err(io::Error::other("Mutation target changed concurrently"));
+        }
+        #[cfg(any(
+            all(
+                target_os = "linux",
+                any(target_arch = "aarch64", target_arch = "x86_64")
+            ),
+            all(target_os = "macos", target_arch = "aarch64")
+        ))]
+        if let (Some(expected), Some(before)) = (&self.digest, &self.before) {
+            use std::io::Read;
+
+            let mut file = confined::file(current_parent, self.name()?)?;
+            let changed = || io::Error::other("Mutation target changed concurrently");
+            if !same_file(before, &file.metadata()?)? {
+                return Err(changed());
+            }
+            let mut content = Vec::with_capacity(before.len() as usize);
+            (&mut file)
+                .take(before.len() + 1)
+                .read_to_end(&mut content)?;
+            if digest(&SHA256, &content).as_ref() != expected.as_ref()
+                || !same_file(before, &file.metadata()?)?
+            {
+                return Err(changed());
+            }
         }
         Ok(())
     }
@@ -395,6 +450,14 @@ fn same_inode(a: &Metadata, b: &Metadata) -> bool {
 }
 
 fn same_file(a: &Metadata, b: &Metadata) -> io::Result<bool> {
+    #[cfg(unix)]
+    {
+        use cap_fs_ext::OsMetadataExt;
+
+        if a.ctime() != b.ctime() || a.ctime_nsec() != b.ctime_nsec() {
+            return Ok(false);
+        }
+    }
     Ok(same_inode(a, b) && a.len() == b.len() && a.modified()? == b.modified()?)
 }
 

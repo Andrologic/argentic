@@ -88,7 +88,8 @@ impl Snapshot {
                             )?;
                             verify_file(root, &path, &file, &opened)?;
                             if let Some(hash) = hash {
-                                let target = Target::from_snapshot(path.clone(), parent, opened);
+                                let target =
+                                    Target::from_snapshot(path.clone(), parent, opened, hash);
                                 original.insert(path, (target, hash, mode));
                             }
                         }
@@ -430,8 +431,42 @@ fn walk(
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
-mod performance {
+mod tests {
     use super::*;
+
+    #[test]
+    fn publication_rejects_a_host_edit_with_restored_mtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().canonicalize().unwrap();
+        let file = path.join("file");
+        fs::write(&file, "old").unwrap();
+        let mtime = fs::metadata(&file).unwrap().modified().unwrap();
+        let root = Root {
+            directory: Dir::open_ambient_dir(&path, ambient_authority()).unwrap(),
+            path,
+        };
+        let cancel = CancellationToken::new();
+        let snapshot = Snapshot::new(&root, None, &cancel, true, |_| true).unwrap();
+        fs::write(snapshot.path().join("file"), "new").unwrap();
+        let changes = snapshot.changes(&root, &cancel, |_| true).unwrap();
+        assert_eq!(changes.len(), 1);
+
+        fs::write(&file, "ext").unwrap();
+        fs::File::open(&file).unwrap().set_modified(mtime).unwrap();
+        assert_eq!(fs::metadata(&file).unwrap().modified().unwrap(), mtime);
+        assert!(changes[0].apply(&root, &cancel).is_err());
+        assert_eq!(fs::read_to_string(&file).unwrap(), "ext");
+
+        // Exercise the digest check independently of filesystem timestamp granularity.
+        let target = Target::from_snapshot(
+            "file".into(),
+            root.directory.dir_metadata().unwrap(),
+            root.directory.symlink_metadata("file").unwrap(),
+            digest(&SHA256, b"old"),
+        );
+        assert!(target.bytes(None).apply(&root, &cancel).is_err());
+        assert_eq!(fs::read_to_string(&file).unwrap(), "ext");
+    }
 
     #[test]
     #[ignore = "explicit performance measurement"]
