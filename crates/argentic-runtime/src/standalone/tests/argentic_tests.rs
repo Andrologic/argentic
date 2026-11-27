@@ -1719,7 +1719,39 @@ async fn plan_first_ask_stays_locked_until_human_accepts_a_revision() {
             system_start_id: run.receipt.identity.system_start_id.clone(),
             source: run.capture.source.clone(),
         };
-        send_plan(server.next().await, "Write the memo");
+        let first = server.next().await;
+        if answer == "accept revision" {
+            let tools = [
+                (
+                    "plan",
+                    json!({"steps":[{"step":"Write the memo","status":"pending"}]}),
+                ),
+                (
+                    "plan",
+                    json!({"steps":[{"step":"Bypass the comment","status":"pending"}]}),
+                ),
+                (
+                    "agsdl_submit_result",
+                    json!({"results":{"report":{"body":"done"}}}),
+                ),
+            ];
+            let calls: Vec<_> = tools
+                .into_iter()
+                .enumerate()
+                .map(|(index, (name, args))| {
+                    json!({"index":index,"id":format!("plan-batch-{index}"),
+                    "function":{"name":name,"arguments":args.to_string()}})
+                })
+                .collect();
+            let chunk = json!({"choices":[{"index":0,"delta":{"tool_calls":calls},"finish_reason":"tool_calls"}]});
+            first.send(
+                StatusCode::OK,
+                format!("data: {chunk}\n\ndata: [DONE]\n\n"),
+                "text/event-stream",
+            );
+        } else {
+            send_plan(first, "Write the memo");
+        }
         if answer == "no person" {
             let state = finish(&host, &run).await;
             assert!(state.to_string().contains("PLAN_REJECTED"), "{state}");
@@ -1756,6 +1788,19 @@ async fn plan_first_ask_stays_locked_until_human_accepts_a_revision() {
             assert!(revision.body["messages"]
                 .to_string()
                 .contains("Describe the output first"));
+            for index in 1..=2 {
+                let id = format!("plan-batch-{index}");
+                assert!(revision.body["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|msg| {
+                        msg["tool_call_id"] == id
+                            && msg["content"].as_str().is_some_and(|text| {
+                                text.contains("not executed because the plan must be revised")
+                            })
+                    }));
+            }
             write_memo(revision);
             let blocked = server.next().await;
             assert!(blocked.body["messages"]

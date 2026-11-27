@@ -558,7 +558,18 @@ impl Instance<'_> {
                     .take_while(|call| call.name != SUBMIT_RESULT)
                     .count();
                 let (reads, tail) = pending.split_at(read_count);
-                self.tool_batch(turn, reads, work).await?;
+                if let Some(skipped) = self.tool_batch(turn, reads, work).await? {
+                    for call in skipped.iter().chain(tail) {
+                        self.publish_tool(
+                            turn,
+                            call,
+                            "Call not executed because the plan must be revised.",
+                            &mut work.messages,
+                        )
+                        .await?;
+                    }
+                    break;
+                }
                 let Some((call, tail)) = tail.split_first() else {
                     break;
                 };
@@ -847,12 +858,12 @@ impl Instance<'_> {
         Err(ProviderError::Invalid("Provider ended without a terminal chunk".into()).into())
     }
 
-    async fn tool_batch(
+    async fn tool_batch<'a>(
         &mut self,
         turn: u32,
-        calls: &[ToolCall],
+        calls: &'a [ToolCall],
         work: &mut Work,
-    ) -> Result<(), Failure> {
+    ) -> Result<Option<&'a [ToolCall]>, Failure> {
         let parallelism = self.harness.settings.limit("maxParallelReads") as usize;
         let mut pending = calls;
         while !pending.is_empty() {
@@ -870,9 +881,12 @@ impl Instance<'_> {
             let call = &batch[0];
             if call.name == plan::TOOL && self.harness.plan != PlanMode::Off {
                 self.before(turn, call).await?;
-                let result = self.update_plan(call).await?;
+                let (result, revise) = self.update_plan(call).await?;
                 self.publish_tool(turn, call, &result, &mut work.messages)
                     .await?;
+                if revise {
+                    return Ok(Some(pending));
+                }
                 continue;
             }
             if self.plan_locked
@@ -922,27 +936,30 @@ impl Instance<'_> {
                     .await?;
             }
         }
-        Ok(())
+        Ok(None)
     }
 
-    async fn update_plan(&mut self, call: &ToolCall) -> Result<String, Failure> {
+    async fn update_plan(&mut self, call: &ToolCall) -> Result<(String, bool), Failure> {
         let steps = match plan::parse(&call.arguments) {
             Ok(steps) => steps,
-            Err(error) => return Ok(json!({"error":error}).to_string()),
+            Err(error) => return Ok((json!({"error":error}).to_string(), false)),
         };
         let ask = self.plan_locked && self.harness.plan == PlanMode::Ask;
         match self.port.plan(&steps, ask, self.cancel).await? {
             PlanDecision::Accept => {
                 self.plan_context = Some(plan::context(&steps)?);
                 self.plan_locked = false;
-                Ok(json!({"status":"accepted"}).to_string())
+                Ok((json!({"status":"accepted"}).to_string(), false))
             }
             PlanDecision::Revise(comment) => {
                 self.plan_context = Some(format!(
                     "{}\nPlan review comment: {comment:?}",
                     plan::context(&steps)?
                 ));
-                Ok(json!({"status":"revise","comment":comment}).to_string())
+                Ok((
+                    json!({"status":"revise","comment":comment}).to_string(),
+                    true,
+                ))
             }
             PlanDecision::Reject => Err(Failure::PlanRejected),
         }
