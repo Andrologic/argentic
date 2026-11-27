@@ -1938,6 +1938,127 @@ fn send_text(request: Request, text: &str) {
     );
 }
 
+fn reviewer_fixture(server: &Server) -> (Value, Value) {
+    let mut doc = document();
+    doc["agents"]["worker"]["permissions"] = json!({"preset":"workspace","reviewer":"model","rules":[
+        forbid_shell(), {"action":"write","match":"memo.txt","effect":"ask"}
+    ]});
+    let mut cfg = config(&server.base_url, None);
+    cfg["providers"]["local"]["models"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!("reviewer"));
+    cfg["reviewerModel"] = json!("local/reviewer");
+    (doc, cfg)
+}
+
+fn send_with_usage(request: Request, response: String, tokens: u32) {
+    let usage = json!({"choices":[],"usage":{"prompt_tokens":tokens - 5,"completion_tokens":5}});
+    request.send(
+        StatusCode::OK,
+        response.replace("data: [DONE]", &format!("data: {usage}\n\ndata: [DONE]")),
+        "text/event-stream",
+    );
+}
+
+#[tokio::test]
+async fn argentic_review_reserves_and_charges_shared_tokens() {
+    for first_charge in [8192, 7942, 20] {
+        let mut server = Server::start().await;
+        let (mut doc, cfg) = reviewer_fixture(&server);
+        doc["agents"]["worker"]["harnessSettings"]["maxTotalTokens"] = json!(8192);
+        let f = Fixture::new(&doc.to_string());
+        let host = open(&f, true)
+            .await
+            .with_argentic(serde_json::from_value(cfg).unwrap())
+            .unwrap();
+        let run = start(&host).await;
+        send_with_usage(
+            server.next().await,
+            Request::tool_response(
+                "write",
+                json!({
+                    "path":"memo.txt","content":"approved"
+                }),
+            ),
+            first_charge,
+        );
+
+        if first_charge == 8192 {
+            let state = tokio::select! {
+                req = server.next() => panic!("Unexpected model request with zero tokens left: {}", req.body["model"]),
+                state = finish(&host, &run) => state,
+            };
+            assert_eq!(state["verdict"], "failed");
+        } else {
+            let mut next = server.next().await;
+            let remaining = if first_charge == 20 {
+                assert_eq!(next.body["model"], "reviewer");
+                let reply = json!({"choices":[{"index":0,"delta":{"content":"{\"verdict\":\"DENY\"}"},"finish_reason":"stop"}]});
+                send_with_usage(next, format!("data: {reply}\n\ndata: [DONE]\n\n"), 200);
+                let read = Request::tool_response("list", json!({}));
+                send_with_usage(server.next().await, read, 8192 - 20 - 250);
+                next = server.next().await;
+                50
+            } else {
+                250
+            };
+            assert_eq!(next.body["model"], "gpt-5.5");
+            assert_eq!(next.body["max_completion_tokens"], remaining);
+            send_with_usage(
+                next,
+                Request::tool_response(
+                    "agsdl_submit_result",
+                    json!({
+                        "results":{"report":{"body":"done"}}
+                    }),
+                ),
+                25,
+            );
+            completed(&finish(&host, &run).await);
+        }
+        assert!(!f.workspace.join("memo.txt").exists());
+        close(&host).await;
+    }
+}
+
+#[tokio::test]
+async fn argentic_review_caps_requests_per_turn_and_work() {
+    let mut server = Server::start().await;
+    let (doc, cfg) = reviewer_fixture(&server);
+    let f = Fixture::new(&doc.to_string());
+    let host = open(&f, true)
+        .await
+        .with_argentic(serde_json::from_value(cfg).unwrap())
+        .unwrap();
+    let run = start(&host).await;
+    let mut next = server.next().await;
+    for turn in 0..9 {
+        assert_eq!(next.body["model"], "gpt-5.5");
+        let calls: Vec<_> = (0..5).map(|index| json!({"index":index,"id":format!("write-{turn}-{index}"),
+            "function":{"name":"write","arguments":"{\"path\":\"memo.txt\",\"content\":\"review me\"}"}})).collect();
+        let chunk = json!({"choices":[{"index":0,"delta":{"tool_calls":calls},"finish_reason":"tool_calls"}]});
+        next.send(
+            StatusCode::OK,
+            format!("data: {chunk}\n\ndata: [DONE]\n\n"),
+            "text/event-stream",
+        );
+        if turn < 8 {
+            for _ in 0..4 {
+                let review = server.next().await;
+                assert_eq!(review.body["model"], "reviewer");
+                send_text(review, r#"{"verdict":"DENY"}"#);
+            }
+        }
+        next = server.next().await;
+    }
+    assert_eq!(next.body["model"], "gpt-5.5");
+    submit_done(next);
+    completed(&finish(&host, &run).await);
+    assert!(!f.workspace.join("memo.txt").exists());
+    close(&host).await;
+}
+
 fn delegate_document(effect: &str) -> Value {
     let mut doc = document();
     doc["agents"]["worker"]["permissions"] = json!({

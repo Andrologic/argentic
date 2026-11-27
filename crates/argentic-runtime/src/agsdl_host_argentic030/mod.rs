@@ -512,6 +512,7 @@ impl Executor {
                     .chain(reviewer_credential)
                     .collect(),
                 recent: Mutex::default(),
+                budget: Mutex::default(),
             }))
         } else {
             None

@@ -27,7 +27,7 @@ use crate::{
     config::{Layer, Settings},
     providers::{
         Chunk, DeliveryProgress, DeliveryStatus, Finish, Message, ModelName, Provider,
-        ProviderError, Request, ToolCall, ToolChoice, ToolDefinition,
+        ProviderError, Request, ToolCall, ToolChoice, ToolDefinition, Usage,
     },
     tools::{Registry, SUBMIT_RESULT},
 };
@@ -247,6 +247,9 @@ pub trait Hook: Send + Sync {
         Ok(())
     }
 
+    /// Called after charging the agent response and before running its tools.
+    fn begin_tool_batch(&self, _budget: &ReviewBudget) {}
+
     async fn before_tool_call(
         &self,
         _turn: u32,
@@ -329,7 +332,11 @@ impl Harness {
             .get("maxTotalTokens")
             .filter(|(_, layer)| *layer != Layer::Default)
             .map(|(limit, _)| u64::from(limit));
-        let budget = Arc::new(Mutex::new(Budget { turns, tokens }));
+        let budget = Arc::new(Mutex::new(Budget {
+            turns,
+            tokens,
+            ..Budget::default()
+        }));
         self.run_with_budget(work, port, steer, parent, budget, turns)
             .await
     }
@@ -418,9 +425,13 @@ impl Harness {
 
 const PLAN_REQUIRED: &str = r#"{"error":"Present a plan using the plan tool before proceeding."}"#;
 
+#[derive(Default)]
 struct Budget {
     turns: u32,
     tokens: Option<u64>,
+    reviews: u32,
+    review_turn: u32,
+    reviews_this_turn: u32,
 }
 
 impl Budget {
@@ -436,6 +447,73 @@ impl Budget {
 
     fn exhaust(&mut self) {
         self.charge(u64::MAX);
+    }
+}
+
+const MAX_REVIEWS_PER_TURN: u32 = 4;
+const MAX_REVIEWS_PER_WORK: u32 = 32;
+
+/// Reserves a model review against the same token pool as the agent.
+#[derive(Clone)]
+pub struct ReviewBudget {
+    shared: Arc<Mutex<Budget>>,
+    turn: u32,
+}
+
+impl ReviewBudget {
+    pub fn reserve(&self, prompt_tokens: u64, max_output: u32) -> Option<ReviewReservation> {
+        let mut budget = self.shared.lock().ok()?;
+        let tokens = prompt_tokens.saturating_add(u64::from(max_output));
+        if self.turn < budget.review_turn
+            || budget.reviews >= MAX_REVIEWS_PER_WORK
+            || budget.tokens.is_some_and(|remaining| remaining < tokens)
+        {
+            return None;
+        }
+        if self.turn > budget.review_turn {
+            budget.review_turn = self.turn;
+            budget.reviews_this_turn = 0;
+        }
+        if budget.reviews_this_turn >= MAX_REVIEWS_PER_TURN {
+            return None;
+        }
+        budget.reviews_this_turn += 1;
+        budget.reviews += 1;
+        budget.charge(tokens);
+        Some(ReviewReservation {
+            shared: self.shared.clone(),
+            tokens,
+            max_output,
+        })
+    }
+}
+
+#[must_use]
+pub struct ReviewReservation {
+    shared: Arc<Mutex<Budget>>,
+    tokens: u64,
+    max_output: u32,
+}
+
+impl ReviewReservation {
+    /// Keep the reservation charged if the stream fails or omits usage.
+    pub fn settle(self, usage: Option<Usage>) -> bool {
+        let Ok(mut budget) = self.shared.lock() else {
+            return false;
+        };
+        let Some(remaining) = budget.tokens else {
+            return true;
+        };
+        let Some(usage) = usage else {
+            return false;
+        };
+        let actual = usage.prompt_tokens.saturating_add(usage.completion_tokens);
+        budget.tokens = Some(if actual <= self.tokens {
+            remaining.saturating_add(self.tokens - actual)
+        } else {
+            remaining.saturating_sub(actual - self.tokens)
+        });
+        actual <= self.tokens && usage.completion_tokens <= u64::from(self.max_output)
     }
 }
 
@@ -539,6 +617,15 @@ impl Instance<'_> {
             ))?;
             let finish = response.finish;
             let calls = response.calls;
+            if !calls.is_empty() {
+                let budget = ReviewBudget {
+                    shared: self.budget.clone(),
+                    turn,
+                };
+                for hook in &self.harness.hooks {
+                    hook.begin_tool_batch(&budget);
+                }
+            }
             self.response_text_start = None;
             self.correction_start = None;
             self.force_submission = false;

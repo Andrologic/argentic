@@ -253,6 +253,11 @@ Host records `APPROVE`, `DENY` or `ESCALATE` as a `reviewerDecision` work event.
 The Host rechecks policy before delivering an approval. Provider errors, invalid
 replies and a 15-second deadline yield denial. Shell and MCP asks require a
 person because the reviewer cannot inspect their effects.
+Model reviews are limited to four requests per agent turn and 32 per work.
+With `maxTotalTokens`, the host reserves prompt and output tokens before a
+review and charges the reported usage to the work. A review that cannot fit
+is refused. If usage is missing, the reservation stays charged and the
+model's verdict cannot authorize the action.
 
 Set `"personReviewAvailable": false` in the Host's provider configuration for
 headless runs. Human-only asks and escalations then return a tool refusal.
