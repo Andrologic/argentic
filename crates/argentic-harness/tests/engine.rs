@@ -931,6 +931,9 @@ async fn stop_bounds_pending_steer_settlement() {
     assert!(matches!(report.outcome, Err(Failure::Cancelled)));
     assert!(report.physical_end.forced());
     assert!(receipt.await.is_err());
+    assert!(report
+        .messages
+        .contains(&Message::User("accepted steer".into())));
 }
 
 #[tokio::test]

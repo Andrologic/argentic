@@ -427,6 +427,13 @@ impl Harness {
                     }
                 }
             };
+            // A transport acceptance is history even if Stop interrupted
+            // the host callback. Dropping the sender closes its receipt.
+            while let Some(steer) = instance.pending_steer.pop_front() {
+                if instance.delivery.status() == DeliveryStatus::Accepted {
+                    instance.record_delivered_steer(&steer.id, steer.reference, steer.message);
+                }
+            }
             instance.persist_steer(&mut work.messages);
             let outcome = if cancel.is_cancelled() {
                 Err(Failure::Cancelled)
@@ -434,8 +441,6 @@ impl Harness {
                 outcome.and_then(|outcome| steer_result.map(|()| outcome))
             };
             cancel.cancel();
-            // Closing drops any undelivered steer receipt before joining workers.
-            instance.pending_steer.clear();
             instance.steer.close();
             while instance.steer.try_recv().is_ok() {}
             tracker.close();
@@ -1247,13 +1252,7 @@ impl Instance<'_> {
             self.port.settle_steer(&steer.id, status).await?;
             if let Some(steer) = self.pending_steer.pop_front() {
                 if status == DeliveryStatus::Accepted {
-                    for hook in &self.harness.hooks {
-                        hook.steer_delivered(&steer.id, &steer.message);
-                    }
-                    if let Some(reference) = steer.reference {
-                        self.accepted_steer.push(Message::User(reference));
-                    }
-                    self.accepted_steer.push(Message::User(steer.message));
+                    self.record_delivered_steer(&steer.id, steer.reference, steer.message);
                     let _ = steer.consumed.send(());
                     self.port
                         .event(Event::SteerConsumed { id: &steer.id }, self.cancel)
@@ -1263,6 +1262,16 @@ impl Instance<'_> {
         }
         self.host_steer_pending = false;
         Ok(())
+    }
+
+    fn record_delivered_steer(&mut self, id: &str, reference: Option<String>, message: String) {
+        for hook in &self.harness.hooks {
+            hook.steer_delivered(id, &message);
+        }
+        if let Some(reference) = reference {
+            self.accepted_steer.push(Message::User(reference));
+        }
+        self.accepted_steer.push(Message::User(message));
     }
 
     fn persist_steer(&mut self, messages: &mut Vec<Message>) {
