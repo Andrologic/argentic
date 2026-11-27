@@ -160,7 +160,7 @@ impl Tools {
         vec![ToolDefinition {
             name: SKILL.into(),
             description: format!(
-                "List the selected AgSDL skills, activate one by its key, or read a relative file from an activated skill by providing its key and path. Skills grant no permissions. Selected skills: {}",
+                "List the selected AgSDL skills, activate one by its key, or read a relative file from an activated skill by providing its key and path (a literal relative file name such as notes#2.md, not URI-encoded). Skills grant no permissions. Selected skills: {}",
                 json!(self.catalogue())
             ),
             parameters: json!({

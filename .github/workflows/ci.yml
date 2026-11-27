@@ -118,16 +118,19 @@ jobs:
         working-directory: crates/argentic-harness
         run: cargo test --locked --all-targets
 
-      # The benchmark thresholds are meaningful on controlled runners.
+      # Timing thresholds are meaningful on controlled runners only; hosted
+      # runners report the numbers but still fail on functional errors.
       - name: Measure Argentic staging
         if: runner.os == 'Linux' && inputs.suite != 'reader'
-        continue-on-error: true
+        env:
+          ARGENTIC_PERF_REPORT_ONLY: "1"
         working-directory: crates/argentic-harness
         run: cargo test --locked --lib shell_staging -- --ignored --nocapture
 
       - name: Measure Argentic turn latency
         if: runner.os == 'Linux' && inputs.suite != 'reader'
-        continue-on-error: true
+        env:
+          ARGENTIC_PERF_REPORT_ONLY: "1"
         working-directory: crates/argentic-harness
         run: cargo test --locked --test engine scripted_turn_overhead -- --ignored --nocapture
 

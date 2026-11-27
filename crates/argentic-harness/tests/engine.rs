@@ -1194,5 +1194,8 @@ async fn scripted_turn_overhead() {
     samples.sort_unstable();
     let median = samples[TURNS / 2];
     println!("scripted harness turn: {median:?} median over {TURNS} turns");
-    assert!(median < Duration::from_millis(5));
+    // Hosted CI runners only report timings; controlled runners enforce them.
+    if std::env::var_os("ARGENTIC_PERF_REPORT_ONLY").is_none() {
+        assert!(median < Duration::from_millis(5));
+    }
 }
