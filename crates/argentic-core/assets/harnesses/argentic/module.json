@@ -2,7 +2,7 @@
   "$schema": "https://raw.githubusercontent.com/Andrologic/AgSDL/v0.4.0/schema/harness-module.schema.json",
   "name": "argentic",
   "title": "Argentic",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "contract": "agsdl-0.4.0",
   "harnessVersions": ">=0.1.0 <0.2.0",
   "properties": {
@@ -26,13 +26,13 @@
       "note": "The Host discovers tools using its qualified local stdio and remote Streamable HTTP transports."
     },
     "plan": {
-      "support": "absent"
+      "support": "native"
     },
     "planFirst.auto": {
-      "support": "absent"
+      "support": "native"
     },
     "planFirst.ask": {
-      "support": "absent"
+      "support": "native"
     },
     "reviewer.person": {
       "support": "native"

@@ -22,14 +22,11 @@ pub(super) fn unsupported(pointer: &str, feature: &str) -> crate::persistence::d
 }
 
 pub(super) fn qualify(agent: &Value, pointer: &str) -> Result<()> {
-    for property in ["plan", "planFirst", "completionCheck"] {
-        if agent.get(property).is_some_and(|value| {
-            value != false
-                && !value.as_array().is_some_and(Vec::is_empty)
-                && !value.as_object().is_some_and(serde_json::Map::is_empty)
-        }) {
-            return Err(unsupported(&format!("{pointer}/{property}"), property));
-        }
+    if !agent["completionCheck"].is_null() {
+        return Err(unsupported(
+            &format!("{pointer}/completionCheck"),
+            "completionCheck",
+        ));
     }
     let at = format!("{pointer}/permissions");
     let permissions: RequestedPermissions = serde_json::from_value(agent["permissions"].clone())

@@ -1,6 +1,8 @@
 //! Runs one AgSDL work in a fresh or continuing conversation.
 
 mod compaction;
+mod plan;
+pub use plan::{PlanDecision, PlanMode, PlanStatus, PlanStep};
 
 use std::{
     borrow::Cow,
@@ -48,6 +50,8 @@ pub struct Outcome {
 pub enum Failure {
     #[error(transparent)]
     Provider(#[from] ProviderError),
+    #[error("Plan rejected")]
+    PlanRejected,
     #[error("Work cancelled")]
     Cancelled,
     #[error("Turn limit reached")]
@@ -161,6 +165,19 @@ pub trait WorkPort: Send + Sync {
         Ok(())
     }
 
+    async fn plan(
+        &self,
+        _steps: &[PlanStep],
+        needs_approval: bool,
+        _cancel: &CancellationToken,
+    ) -> Result<PlanDecision, Failure> {
+        Ok(if needs_approval {
+            PlanDecision::Reject
+        } else {
+            PlanDecision::Accept
+        })
+    }
+
     /// Receive the complete visible assistant message before its tools run.
     async fn assistant_message(
         &self,
@@ -260,6 +277,7 @@ pub struct Harness {
     registry: Arc<Registry>,
     settings: Settings,
     context_window: Option<u32>,
+    plan: PlanMode,
     hooks: Vec<Arc<dyn Hook>>,
 }
 
@@ -270,12 +288,18 @@ impl Harness {
             registry,
             settings,
             context_window: None,
+            plan: PlanMode::Off,
             hooks: Vec::new(),
         }
     }
 
     pub fn with_context_window(mut self, context_window: Option<u32>) -> Self {
         self.context_window = context_window;
+        self
+    }
+
+    pub fn with_plan(mut self, mode: PlanMode) -> Self {
+        self.plan = mode;
         self
     }
 
@@ -316,6 +340,8 @@ impl Harness {
             host_steer_pending: false,
             accepted_steer: Vec::new(),
             delivery: DeliveryProgress::default(),
+            plan_locked: self.plan.locked(),
+            plan_context: None,
         };
         let (outcome, forced) = {
             let future = instance.execute(&mut work);
@@ -358,6 +384,8 @@ impl Harness {
     }
 }
 
+const PLAN_REQUIRED: &str = r#"{"error":"Present a plan using the plan tool before proceeding."}"#;
+
 struct Instance<'a> {
     harness: &'a Harness,
     port: &'a dyn WorkPort,
@@ -378,6 +406,8 @@ struct Instance<'a> {
     host_steer_pending: bool,
     accepted_steer: Vec<Message>,
     delivery: DeliveryProgress,
+    plan_locked: bool,
+    plan_context: Option<String>,
 }
 
 impl Instance<'_> {
@@ -390,13 +420,16 @@ impl Instance<'_> {
             .filter(|(_, layer)| *layer != Layer::Default)
             .map(|(limit, _)| u64::from(limit));
         let mut spent = 0u64;
-        let definitions: Vec<_> = self
+        let mut definitions: Vec<_> = self
             .harness
             .registry
             .definitions()
             .map(|(_, def)| def.clone())
             .collect();
-        let tool_bytes = compaction::tool_bytes(&definitions);
+        if self.harness.plan != PlanMode::Off {
+            definitions.push(plan::definition());
+        }
+        let mut extensions_ready = false;
         for turn in 1..=turn_limit {
             self.active()?;
             let remaining = total.map(|limit| limit.saturating_sub(spent));
@@ -408,6 +441,20 @@ impl Instance<'_> {
             if turn == 1 {
                 self.prune_start_history(work).await?;
             }
+            let mut definitions = definitions.clone();
+            if !self.plan_locked {
+                if !extensions_ready {
+                    self.harness
+                        .registry
+                        .prepare_extensions(self.tracker)
+                        .await
+                        .map_err(Failure::Port)?;
+                    extensions_ready = true;
+                }
+                definitions.extend(self.harness.registry.extension_definitions());
+            }
+            let tool_bytes = compaction::tool_bytes(&definitions)
+                .saturating_add(self.plan_context.as_ref().map_or(0, String::len));
             let charged = self
                 .compact(turn, work, tool_bytes, remaining, max_output)
                 .await?;
@@ -456,6 +503,12 @@ impl Instance<'_> {
                     break;
                 };
                 self.before(turn, call).await?;
+                if self.plan_locked {
+                    self.publish_tool(turn, call, PLAN_REQUIRED, &mut work.messages)
+                        .await?;
+                    pending = tail;
+                    continue;
+                }
                 let validation = if self.port.validates_submission() {
                     serde_json::from_str(&call.arguments).map_err(|e| e.to_string())
                 } else {
@@ -513,6 +566,11 @@ impl Instance<'_> {
                 continue;
             }
             if calls.is_empty() && finish == Finish::Stop {
+                if self.plan_locked {
+                    work.messages.push(Message::User(PLAN_REQUIRED.into()));
+                    self.history_end = work.messages.len();
+                    continue;
+                }
                 // An ending work leaves any later arrivals unacknowledged.
                 let validation = work
                     .submission_required
@@ -561,6 +619,9 @@ impl Instance<'_> {
         for hook in &self.harness.hooks {
             hook.prepare_request(turn, &mut messages, self.cancel)
                 .await?;
+        }
+        if let Some(plan) = &self.plan_context {
+            messages.to_mut().push(Message::User(plan.clone()));
         }
         self.active()?;
         let mut guard = None;
@@ -726,6 +787,23 @@ impl Instance<'_> {
                 .count();
             let (batch, remaining) = pending.split_at(parallel_reads.max(1));
             pending = remaining;
+            let call = &batch[0];
+            if call.name == plan::TOOL && self.harness.plan != PlanMode::Off {
+                self.before(turn, call).await?;
+                let result = self.update_plan(call).await?;
+                self.publish_tool(turn, call, &result, messages).await?;
+                continue;
+            }
+            if self.plan_locked
+                && !matches!(
+                    call.name.as_str(),
+                    "read" | "list" | "glob" | "grep" | crate::tools::SKILL
+                )
+            {
+                self.publish_tool(turn, call, PLAN_REQUIRED, messages)
+                    .await?;
+                continue;
+            }
             for call in batch {
                 self.before(turn, call).await?;
             }
@@ -759,6 +837,29 @@ impl Instance<'_> {
             }
         }
         Ok(())
+    }
+
+    async fn update_plan(&mut self, call: &ToolCall) -> Result<String, Failure> {
+        let steps = match plan::parse(&call.arguments) {
+            Ok(steps) => steps,
+            Err(error) => return Ok(json!({"error":error}).to_string()),
+        };
+        let ask = self.plan_locked && self.harness.plan == PlanMode::Ask;
+        match self.port.plan(&steps, ask, self.cancel).await? {
+            PlanDecision::Accept => {
+                self.plan_context = Some(plan::context(&steps)?);
+                self.plan_locked = false;
+                Ok(json!({"status":"accepted"}).to_string())
+            }
+            PlanDecision::Revise(comment) => {
+                self.plan_context = Some(format!(
+                    "{}\nPlan review comment: {comment:?}",
+                    plan::context(&steps)?
+                ));
+                Ok(json!({"status":"revise","comment":comment}).to_string())
+            }
+            PlanDecision::Reject => Err(Failure::PlanRejected),
+        }
     }
 
     async fn before(&self, turn: u32, call: &ToolCall) -> Result<(), Failure> {

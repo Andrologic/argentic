@@ -1604,3 +1604,179 @@ async fn confined_stdio_mcp_lists_and_calls_a_tool_then_joins_on_stop() {
     assert_eq!(finish(&host, &run).await["verdict"], "cancelled");
     close(&host).await;
 }
+
+#[tokio::test]
+async fn plan_tool_reports_structured_progress() {
+    let mut server = Server::start().await;
+    let mut doc = document();
+    doc["agents"]["worker"]["plan"] = json!(true);
+    let f = Fixture::new(&doc.to_string());
+    let host = open(&f, true)
+        .await
+        .with_argentic(server.config(None))
+        .unwrap();
+    let run = start(&host).await;
+    let first = server.next().await;
+    assert!(first.body["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|tool| tool["function"]["name"] == "plan"));
+    let step = json!({"step":"Inspect the memo","status":"in_progress"});
+    first.tool("plan", json!({"steps":[step]}));
+    let next = server.next().await;
+    assert!(next.body["messages"]
+        .to_string()
+        .contains("Current work plan"));
+    let bodies: Vec<String> =
+        sqlx::query_scalar("SELECT ticket_json FROM engine_flow030_work_events WHERE decision_json IS NOT NULL ORDER BY rowid")
+            .fetch_all(&host.pool)
+            .await
+            .unwrap();
+    assert!(
+        bodies
+            .iter()
+            .any(|body| body.contains("planPresented") && body.contains("in_progress")),
+        "{bodies:?}"
+    );
+    submit_done(next);
+    completed(&finish(&host, &run).await);
+    close(&host).await;
+}
+
+fn submit_done(request: Request) {
+    request.tool(
+        "agsdl_submit_result",
+        json!({"results":{"report":{"body":"done"}}}),
+    );
+}
+
+fn plan_write_document(mode: &str) -> Value {
+    let mut doc = document();
+    doc["agents"]["worker"]["planFirst"] = json!(mode);
+    doc["agents"]["worker"]["permissions"] = json!({"preset":"workspace","rules":[forbid_shell()]});
+    doc
+}
+
+fn write_memo(request: Request) {
+    request.tool("write", json!({"path":"memo.txt","content":"approved"}));
+}
+
+fn send_plan(request: Request, step: &str) {
+    request.tool("plan", json!({"steps":[{"step":step,"status":"pending"}]}));
+}
+
+#[tokio::test]
+async fn plan_first_auto_blocks_writes_until_a_plan() {
+    let mut server = Server::start().await;
+    let f = Fixture::new(&plan_write_document("auto").to_string());
+    let host = open(&f, true)
+        .await
+        .with_argentic(server.config(None))
+        .unwrap();
+    let run = start(&host).await;
+    write_memo(server.next().await);
+    let blocked = server.next().await;
+    assert!(blocked.body["messages"]
+        .to_string()
+        .contains("Present a plan"));
+    assert!(!f.workspace.join("memo.txt").exists());
+    send_plan(blocked, "Write the memo");
+    write_memo(server.next().await);
+    submit_done(server.next().await);
+    completed(&finish(&host, &run).await);
+    assert_eq!(
+        std::fs::read_to_string(f.workspace.join("memo.txt")).unwrap(),
+        "approved"
+    );
+    close(&host).await;
+}
+
+#[tokio::test]
+async fn plan_first_ask_stays_locked_until_human_accepts_a_revision() {
+    for answer in ["accept revision", "reject", "timeout"] {
+        let mut server = Server::start().await;
+        let mut doc = plan_write_document("ask");
+        if answer == "timeout" {
+            doc["agents"]["worker"]["answerTimeoutMs"] = json!(250);
+        }
+        let f = Fixture::new(&doc.to_string());
+        let host = open(&f, true)
+            .await
+            .with_argentic(server.config(None))
+            .unwrap();
+        let run = start(&host).await;
+        let scope = persistence::public030::HumanScope030 {
+            system_start_id: run.receipt.identity.system_start_id.clone(),
+            source: run.capture.source.clone(),
+        };
+        send_plan(server.next().await, "Write the memo");
+        let ask = pending_ask(&host, &scope).await;
+        assert!(matches!(
+            ask.content,
+            persistence::public030::HumanContent030::Plan { .. }
+        ));
+        assert!(!f.workspace.join("memo.txt").exists());
+        if answer != "timeout" {
+            answer_person(
+                &host,
+                &scope,
+                ask,
+                "no",
+                if answer == "reject" {
+                    ""
+                } else {
+                    "Describe the output first"
+                },
+            )
+            .await;
+        }
+        if answer != "accept revision" {
+            let state = finish(&host, &run).await;
+            assert!(state.to_string().contains("PLAN_REJECTED"), "{state}");
+            assert!(!f.workspace.join("memo.txt").exists());
+        } else {
+            let revision = server.next().await;
+            assert!(revision.body["messages"]
+                .to_string()
+                .contains("Describe the output first"));
+            write_memo(revision);
+            let blocked = server.next().await;
+            assert!(blocked.body["messages"]
+                .to_string()
+                .contains("Present a plan"));
+            assert!(!f.workspace.join("memo.txt").exists());
+            send_plan(blocked, "Write a short memo about the result");
+            let ask = pending_ask(&host, &scope).await;
+            answer_person(&host, &scope, ask, "yes", "").await;
+            write_memo(server.next().await);
+            submit_done(server.next().await);
+            completed(&finish(&host, &run).await);
+            assert_eq!(
+                std::fs::read_to_string(f.workspace.join("memo.txt")).unwrap(),
+                "approved"
+            );
+        }
+        close(&host).await;
+    }
+}
+
+async fn answer_person(
+    host: &Host,
+    scope: &persistence::public030::HumanScope030,
+    request: persistence::public030::PublicHumanRequest030,
+    decision: &str,
+    comment: &str,
+) {
+    host.submit_person(HumanSubmission {
+        scope: scope.clone(),
+        request_id: request.id,
+        expected_revision: request.revision,
+        answer: api::HumanAnswer030::Decision {
+            decision: decision.into(),
+            comment: comment.into(),
+        },
+    })
+    .await
+    .unwrap();
+}

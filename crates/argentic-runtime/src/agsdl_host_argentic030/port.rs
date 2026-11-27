@@ -12,7 +12,10 @@ use crate::{
 };
 use argentic_harness::{
     providers::{DeliveryStatus, ToolCall},
-    r#loop::{Decision, Event, Failure, Hook, Proposal, Steer, SteerAdmission, WorkPort},
+    r#loop::{
+        Decision, Event, Failure, Hook, PlanDecision, PlanStep, Proposal, Steer, SteerAdmission,
+        WorkPort,
+    },
 };
 use serde_json::{json, Value};
 use std::sync::{
@@ -34,6 +37,8 @@ struct PortState {
     sources: Arc<Mutex<Sources030>>,
     sequence: AtomicU64,
     credential: Option<String>,
+    approvals: Arc<dyn crate::harness::CommandApprovals030>,
+    plan_lock: Option<Arc<crate::harness::NativePlanLock030>>,
 }
 
 #[derive(Default)]
@@ -45,15 +50,19 @@ struct PendingSteer {
 impl Port {
     pub(super) fn new(
         events: WorkEventSink030,
-        work: AgentWork030,
+        work: &AgentWork030,
+        inbox: SteerInbox030,
+        approvals: Arc<dyn crate::harness::CommandApprovals030>,
         sources: Arc<Mutex<Sources030>>,
         credential: Option<String>,
     ) -> Self {
         Self(Arc::new(PortState {
             events,
-            attempt: work.attempt,
-            tasks: work.tasks,
-            inbox: Mutex::new(work.steer),
+            attempt: work.attempt.clone(),
+            tasks: work.tasks.clone(),
+            inbox: Mutex::new(inbox),
+            plan_lock: work.plan_lock.clone(),
+            approvals,
             delivery: Mutex::default(),
             sources,
             sequence: AtomicU64::new(0),
@@ -71,9 +80,24 @@ impl Hook for Port {
     async fn before_tool_call(
         &self,
         _: u32,
-        _: &ToolCall,
+        call: &ToolCall,
         _: &CancellationToken,
     ) -> std::result::Result<(), Failure> {
+        if let Some(lock) = &self.0.plan_lock {
+            let read_only = matches!(
+                call.name.as_str(),
+                "plan"
+                    | "read"
+                    | "list"
+                    | "glob"
+                    | "grep"
+                    | argentic_harness::tools::SKILL
+                    | argentic_harness::tools::SUBMIT_RESULT
+            );
+            lock.authorize(&self.0.attempt, read_only)
+                .await
+                .map_err(port_error)?;
+        }
         self.0
             .sources
             .lock()
@@ -127,6 +151,84 @@ impl WorkPort for Port {
         use std::io::Write;
         let _ = writeln!(std::io::stderr().lock(), "{entry}");
         Ok(())
+    }
+
+    async fn plan(
+        &self,
+        steps: &[PlanStep],
+        needs_approval: bool,
+        cancel: &CancellationToken,
+    ) -> std::result::Result<PlanDecision, Failure> {
+        let mut steps = json!(steps);
+        if let Some(key) = &self.0.credential {
+            for step in steps.as_array_mut().expect("plan steps") {
+                let text = step["step"].as_str().expect("plan step");
+                if text.contains(key) {
+                    step["step"] = json!("Credential removed from plan");
+                }
+            }
+        }
+        let text = steps
+            .as_array()
+            .expect("plan steps")
+            .iter()
+            .map(|step| {
+                format!(
+                    "- [{}] {}",
+                    step["status"].as_str().unwrap(),
+                    step["step"].as_str().unwrap()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let plan_id = format!(
+            "argentic-plan-{}",
+            self.0.sequence.fetch_add(1, Ordering::Relaxed)
+        );
+        let mut payload =
+            json!({"kind":"planPresented","planId":plan_id,"text":text,"steps":steps});
+        let receipt = self
+            .0
+            .events
+            .emit(payload.clone(), cancel)
+            .await
+            .map_err(port_error)?;
+        let mut receipt: Value = serde_json::from_str(&receipt.receipt_json)
+            .map_err(|_| port_error(missing("planReceipt")))?;
+        if needs_approval && receipt["decision"]["kind"] == "planWaiting" {
+            let lock = self
+                .0
+                .plan_lock
+                .as_ref()
+                .ok_or_else(|| port_error(missing("planLock")))?;
+            lock.presented(&self.0.attempt, &plan_id)
+                .await
+                .map_err(port_error)?;
+            payload
+                .as_object_mut()
+                .expect("plan payload")
+                .remove("kind");
+            receipt = self
+                .0
+                .approvals
+                .answer_plan(&self.0.attempt, payload, lock, &self.0.events, cancel)
+                .await
+                .map_err(port_error)?;
+        }
+        match receipt["decision"]["kind"].as_str() {
+            Some("planAccepted") => Ok(PlanDecision::Accept),
+            Some("planRevision") => Ok(PlanDecision::Revise(
+                receipt["decision"]["comment"]
+                    .as_str()
+                    .ok_or_else(|| port_error(missing("planComment")))?
+                    .into(),
+            )),
+            Some("stopping") if receipt["decision"]["code"] == "PLAN_REJECTED" => {
+                Ok(PlanDecision::Reject)
+            }
+            Some("stopping" | "finished") => Err(Failure::Cancelled),
+            _ => Err(port_error(missing("planDecision"))),
+        }
     }
 
     async fn assistant_message(

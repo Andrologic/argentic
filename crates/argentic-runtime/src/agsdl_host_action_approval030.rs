@@ -19,6 +19,25 @@ pub type Respond030<'a> = Box<dyn FnOnce(bool) -> BoxFuture<'a, Result<()>> + Se
 
 /// The existing human broker owns identity, deadlines and the final send gate.
 pub trait CommandApprovals030: Send + Sync {
+    /// Use the same human clock as action approvals. Without a person port,
+    /// resolve the plan as a refusal without comment.
+    fn answer_plan<'a>(
+        &'a self,
+        _work: &'a flow::FlowWorkAttempt030,
+        payload: serde_json::Value,
+        _lock: &'a crate::harness::NativePlanLock030,
+        events: &'a crate::harness::WorkEventSink030,
+        cancel: &'a CancellationToken,
+    ) -> BoxFuture<'a, Result<serde_json::Value>> {
+        Box::pin(async move {
+            let receipt = events.emit(
+                serde_json::json!({"kind":"planResolved","planId":payload["planId"],"decision":"reject"}),
+                cancel,
+            ).await?;
+            Ok(serde_json::from_str(&receipt.receipt_json)?)
+        })
+    }
+
     fn answer<'a>(
         &'a self,
         work: &'a flow::FlowWorkAttempt030,
@@ -29,6 +48,48 @@ pub trait CommandApprovals030: Send + Sync {
 }
 
 impl CommandApprovals030 for AgentActionHumans030 {
+    fn answer_plan<'a>(
+        &'a self,
+        attempt: &'a flow::FlowWorkAttempt030,
+        payload: serde_json::Value,
+        lock: &'a crate::harness::NativePlanLock030,
+        events: &'a crate::harness::WorkEventSink030,
+        cancel: &'a CancellationToken,
+    ) -> BoxFuture<'a, Result<serde_json::Value>> {
+        Box::pin(async move {
+            let host = &self.host;
+            let broker = host
+                .flow030()
+                .human_runtime()
+                .broker(host, &self.pool, attempt.identity())
+                .await?;
+            let ticket = {
+                let _operation = broker.operation.lock().await;
+                let work = broker.admit_agent(host, attempt).await?;
+                broker.pump(host, cancel).await?;
+                let ticket = broker.open(host, &work, "plan", payload).await?;
+                broker.pump(host, cancel).await?;
+                ticket
+            };
+            host.flow030()
+                .supervisor_registry()
+                .wake(&attempt.identity().system_start_id);
+            while !broker.resolution_ready(&ticket).await? {
+                tokio::select! {
+                    _ = cancel.cancelled() => return Err(failure("STOP_PENDING", "plan", "Plan review was stopped")),
+                    _ = tokio::time::sleep(Duration::from_millis(25)) => {}
+                }
+            }
+            let decision = broker.take_resolution(host, &ticket).await?;
+            let receipt = events.emit(decision.plan_event()?, cancel).await?;
+            lock.resolve(attempt, &decision).await?;
+            let _operation = broker.operation.lock().await;
+            broker.acknowledge(host, &decision).await?;
+            broker.pump(host, cancel).await?;
+            Ok(serde_json::from_str(&receipt.receipt_json)?)
+        })
+    }
+
     fn answer<'a>(
         &'a self,
         attempt: &'a crate::agsdl_host_flow030::FlowWorkAttempt030,

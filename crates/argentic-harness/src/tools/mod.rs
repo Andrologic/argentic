@@ -95,6 +95,14 @@ pub trait Authorizer: Send + Sync {
 /// Per-work tools supplied by the embedding host.
 #[async_trait::async_trait]
 pub trait Extensions: Send + Sync {
+    async fn prepare(&self) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn definitions(&self) -> Vec<ToolDefinition> {
+        Vec::new()
+    }
+
     async fn execute(&self, call: &ToolCall, cancel: &CancellationToken) -> Result<Page, String>;
 }
 
@@ -314,6 +322,23 @@ impl Registry {
 
     pub fn definitions(&self) -> impl Iterator<Item = (Exposure, &ToolDefinition)> {
         self.definitions.iter().map(|def| (Exposure::Direct, def))
+    }
+
+    pub(crate) async fn prepare_extensions(&self, tracker: &TaskTracker) -> Result<(), String> {
+        if let Some(tools) = &self.extensions {
+            let tools = tools.clone();
+            tracker
+                .spawn(async move { tools.prepare().await })
+                .await
+                .map_err(|error| error.to_string())??;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn extension_definitions(&self) -> Vec<ToolDefinition> {
+        self.extensions
+            .as_ref()
+            .map_or_else(Vec::new, |tools| tools.definitions())
     }
 
     pub fn validate_submission(&self, arguments: &str) -> Result<Value, String> {
