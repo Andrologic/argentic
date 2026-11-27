@@ -43,6 +43,20 @@ fn parsed(row: &sqlx::sqlite::SqliteRow, key: &str) -> Result<Value> {
 fn rows_json(value: &Value, key: &str) -> Result<Vec<Value>> {
     Ok(value[key].as_array().ok_or("Missing clock array")?.clone())
 }
+fn index_rows(
+    rows: Vec<sqlx::sqlite::SqliteRow>,
+    key: &str,
+) -> Result<BTreeMap<String, sqlx::sqlite::SqliteRow>> {
+    let mut indexed = BTreeMap::new();
+    for row in rows {
+        require(
+            indexed.insert(row.try_get(key)?, row).is_none(),
+            "Duplicate native clock row",
+        )?;
+    }
+    Ok(indexed)
+}
+
 pub(super) async fn verify(
     db: &mut SqliteConnection,
     state: &FlowState030,
@@ -104,7 +118,9 @@ pub(super) async fn verify(
             .await?;
     let events=sqlx::query("SELECT * FROM engine_flow030_clock_events WHERE system_id=? AND invocation_id=? ORDER BY rowid").bind(&id.system_start_id).bind(&id.flow_invocation_id).fetch_all(&mut *db).await?;
     let work_rows=sqlx::query("SELECT * FROM engine_flow030_clock_works WHERE system_id=? AND invocation_id=? ORDER BY rowid").bind(&id.system_start_id).bind(&id.flow_invocation_id).fetch_all(&mut *db).await?;
+    let work_rows = index_rows(work_rows, "activation_id")?;
     let request_rows=sqlx::query("SELECT * FROM engine_flow030_human_requests WHERE system_id=? AND invocation_id=? ORDER BY rowid").bind(&id.system_start_id).bind(&id.flow_invocation_id).fetch_all(&mut *db).await?;
+    let request_rows = index_rows(request_rows, "request_id")?;
     if clocks.is_empty() {
         require(
             !requires_clock && events.is_empty() && work_rows.is_empty() && request_rows.is_empty(),
@@ -131,8 +147,8 @@ pub(super) async fn verify(
     )
     .bind(&id.system_start_id)
     .bind(&id.flow_invocation_id)
-    .bind(native_owner.get::<&str, _>("owner_epoch"))
-    .bind(native_owner.get::<&str, _>("generation"))
+    .bind(native_owner.try_get::<&str, _>("owner_epoch")?)
+    .bind(native_owner.try_get::<&str, _>("generation")?)
     .fetch_all(&mut *db)
     .await?;
     require(stops.len() <= 1, "Duplicate native Stop")?;
@@ -149,9 +165,9 @@ pub(super) async fn verify(
         require(
             state.stopping
                 && receipt.identity == *id
-                && receipt.owner_epoch == native_owner.get::<&str, _>("owner_epoch")
-                && receipt.generation == native_owner.get::<&str, _>("generation")
-                && receipt.request_id == row.get::<&str, _>("request_id")
+                && receipt.owner_epoch == native_owner.try_get::<&str, _>("owner_epoch")?
+                && receipt.generation == native_owner.try_get::<&str, _>("generation")?
+                && receipt.request_id == row.try_get::<&str, _>("request_id")?
                 && request["requestId"] == receipt.request_id
                 && request["systemStartId"] == id.system_start_id
                 && request["activationId"].is_null()
@@ -167,8 +183,8 @@ pub(super) async fn verify(
     } else {
         None
     };
-    let interrupted = native_owner.get::<&str, _>("status") == "revoked"
-        && native_owner.get::<bool, _>("interrupted");
+    let interrupted = native_owner.try_get::<&str, _>("status")? == "revoked"
+        && native_owner.try_get::<bool, _>("interrupted")?;
     let interruption_schema: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='engine_flow030_interruption_clock')",
     ).fetch_one(&mut *db).await?;
@@ -196,18 +212,19 @@ pub(super) async fn verify(
         .as_ref()
         .and_then(|stop| stop.superseded_clock_ticket.as_ref());
     let fenced_stop = plan.versions.contract == argentic_core::AGSDL_040
-        && native_owner.get::<&str, _>("status") == "revoked"
+        && native_owner.try_get::<&str, _>("status")? == "revoked"
         && stop.is_some()
         && superseded.is_none();
     let mut observed_supersession = false;
     let mut superseded_retirement = None;
     require(
-        clock.get::<&str, _>("owner_epoch") == native_owner.get::<&str, _>("owner_epoch")
-            && clock.get::<&str, _>("generation") == native_owner.get::<&str, _>("generation"),
+        clock.try_get::<&str, _>("owner_epoch")?
+            == native_owner.try_get::<&str, _>("owner_epoch")?
+            && clock.try_get::<&str, _>("generation")?
+                == native_owner.try_get::<&str, _>("generation")?,
         "Clock owner differs",
     )?;
-    let owner =
-        json!({"systemStartId":id.system_start_id,"ownerEpoch":clock.get::<&str,_>("owner_epoch")});
+    let owner = json!({"systemStartId":id.system_start_id,"ownerEpoch":clock.try_get::<&str,_>("owner_epoch")?});
     let mut works = Vec::<Work>::new();
     let mut requests = Vec::<Request>::new();
     let mut closed_asks = std::collections::BTreeSet::new();
@@ -223,7 +240,7 @@ pub(super) async fn verify(
         require(
             ticket.identity == *id
                 && serde_json::to_value(&ticket.owner)? == owner
-                && ticket.event_id == row.get::<&str, _>("event_id")
+                && ticket.event_id == row.try_get::<&str, _>("event_id")?
                 && ticket.expected_revision == index.to_string()
                 && ticket.state_json == previous,
             "Clock ticket correlation",
@@ -248,10 +265,7 @@ pub(super) async fn verify(
                     !works.iter().any(|w| w.id == work_id),
                     "Duplicate work clock",
                 )?;
-                let r = work_rows
-                    .iter()
-                    .find(|r| r.get::<&str, _>("activation_id") == work_id)
-                    .ok_or("Clock work row absent")?;
+                let r = work_rows.get(work_id).ok_or("Clock work row absent")?;
                 let work = parsed(r, "work_json")?;
                 let activation = state
                     .activations
@@ -274,7 +288,7 @@ pub(super) async fn verify(
                     .transpose()?
                     .unwrap_or(Value::Null);
 
-                let recorded_timeout: Option<String> = r.get("timeout_json");
+                let recorded_timeout: Option<String> = r.try_get("timeout_json")?;
                 let mut timeout = step.and_then(|s| s.timeout_ms_json.clone());
                 if work_kind == "call" && timeout.is_none() && recorded_timeout.is_some() {
                     if document.is_none() {
@@ -293,15 +307,17 @@ pub(super) async fn verify(
                     host_budget_calls.insert(work_id.to_owned());
                 }
                 require(
-                    r.get::<&str, _>("owner_epoch") == clock.get::<&str, _>("owner_epoch")
-                        && r.get::<&str, _>("generation") == clock.get::<&str, _>("generation")
+                    r.try_get::<&str, _>("owner_epoch")?
+                        == clock.try_get::<&str, _>("owner_epoch")?
+                        && r.try_get::<&str, _>("generation")?
+                            == clock.try_get::<&str, _>("generation")?
                         && work["identity"] == serde_json::to_value(id)?
                         && work["owner"] == owner
-                        && work["generation"] == clock.get::<&str, _>("generation")
+                        && work["generation"] == clock.try_get::<&str, _>("generation")?
                         && work["kind"] == work_kind,
                     "Clock work metadata",
                 )?;
-                let start = r.get::<&str, _>("start_effect_id");
+                let start = r.try_get::<&str, _>("start_effect_id")?;
                 require(
                     activation.start_effect_id.as_deref() == Some(start)
                         && work["reference"]
@@ -310,10 +326,10 @@ pub(super) async fn verify(
                     "Clock work reference/duration",
                 )?;
                 let origin=sqlx::query("SELECT started_ms FROM engine_flow030_handoff_clock WHERE system_id=? AND invocation_id=? AND start_effect_id=? AND owner_epoch=? AND generation=?")
-                    .bind(&id.system_start_id).bind(&id.flow_invocation_id).bind(start).bind(clock.get::<&str,_>("owner_epoch")).bind(clock.get::<&str,_>("generation")).fetch_one(&mut *db).await?;
-                let started = r.get::<&str, _>("admitted_ms");
+                    .bind(&id.system_start_id).bind(&id.flow_invocation_id).bind(start).bind(clock.try_get::<&str,_>("owner_epoch")?).bind(clock.try_get::<&str,_>("generation")?).fetch_one(&mut *db).await?;
+                let started = r.try_get::<&str, _>("admitted_ms")?;
                 require(
-                    origin.get::<&str, _>("started_ms") == started
+                    origin.try_get::<&str, _>("started_ms")? == started
                         && event["startedAtMs"] == started
                         && event["timeoutMs"] == json!(timeout),
                     "Clock origin/duration",
@@ -345,7 +361,7 @@ pub(super) async fn verify(
                     .get("answerTimeoutMs")
                     .map(Value::to_string);
                 require(
-                    r.get::<Option<String>, _>("answer_timeout_json") == answer_limit
+                    r.try_get::<Option<String>, _>("answer_timeout_json")? == answer_limit
                         && event
                             .get("answerTimeoutMs")
                             .map_or(kind == "approval", |limit| *limit == json!(answer_limit)),
@@ -356,7 +372,7 @@ pub(super) async fn verify(
                     kind: work_kind.into(),
                     start: ms(started)?,
                     timeout: recorded_timeout,
-                    answer_timeout: r.get("answer_timeout_json"),
+                    answer_timeout: r.try_get("answer_timeout_json")?,
                     snapshot: json!({}),
                     retired: false,
                 });
@@ -371,10 +387,7 @@ pub(super) async fn verify(
                 !requests.iter().any(|r| r.id == request_id),
                 "Duplicate request",
             )?;
-            let r = request_rows
-                .iter()
-                .find(|r| r.get::<&str, _>("request_id") == request_id)
-                .ok_or("Request row absent")?;
+            let r = request_rows.get(request_id).ok_or("Request row absent")?;
             if kind == "approval" {
                 require(
                     parsed(r, "payload_json")?["choices"] == event["choices"],
@@ -397,9 +410,9 @@ pub(super) async fn verify(
             )?;
             let mut request = Request {
                 id: request_id.into(),
-                kind: r.get("kind"),
+                kind: r.try_get("kind")?,
                 works: ids,
-                opened: ms(r.get("opened_ms"))?,
+                opened: ms(r.try_get("opened_ms")?)?,
                 duration: None,
                 resolution: None,
                 acknowledged: false,
@@ -437,13 +450,13 @@ pub(super) async fn verify(
                 .bind(&id.system_start_id).bind(&id.flow_invocation_id).bind(receipt_id).fetch_one(&mut *db).await?;
             require(
                 !submissions.iter().any(|s| s.id == receipt_id)
-                    && event["requestId"] == row.get::<&str, _>("request_id")
-                    && now == ms(row.get("received_ms"))?,
+                    && event["requestId"] == row.try_get::<&str, _>("request_id")?
+                    && now == ms(row.try_get("received_ms")?)?,
                 "Native answer receipt",
             )?;
-            let answer: HumanAnswer030 = serde_json::from_str(row.get("answer_json"))?;
+            let answer: HumanAnswer030 = serde_json::from_str(row.try_get("answer_json")?)?;
             require(
-                ["person", "synthetic-person"].contains(&row.get::<&str, _>("origin")),
+                ["person", "synthetic-person"].contains(&row.try_get::<&str, _>("origin")?),
                 "Answer origin differs",
             )?;
             let matches = match &answer {
@@ -464,7 +477,7 @@ pub(super) async fn verify(
             require(matches, "Answer event differs from native submission")?;
             submissions.push(Submission {
                 id: receipt_id.into(),
-                request: row.get("request_id"),
+                request: row.try_get("request_id")?,
                 received: now,
                 answer,
                 accepted: None,
@@ -620,8 +633,8 @@ pub(super) async fn verify(
         "Superseded clock ticket differs",
     )?;
     require(
-        clock.get::<&str, _>("revision") == journal.len().to_string()
-            && clock.get::<&str, _>("state_json") == previous
+        clock.try_get::<&str, _>("revision")? == journal.len().to_string()
+            && clock.try_get::<&str, _>("state_json")? == previous
             && parsed(clock, "receipt_json")? == last
             && (journal.is_empty() || retained_observed == observed),
         "Final clock differs",
@@ -636,20 +649,18 @@ pub(super) async fn verify(
         "Orphan native submission",
     )?;
     for row in submission_rows {
+        let receipt: &str = row.try_get("receipt_id")?;
+        let accepted: Option<i64> = row.try_get("accepted")?;
         require(
-            submissions.iter().any(|s| {
-                s.id == row.get::<&str, _>("receipt_id")
-                    && s.accepted == row.get::<Option<bool>, _>("accepted")
-            }),
+            submissions
+                .iter()
+                .any(|s| s.id == receipt && s.accepted.map(i64::from) == accepted),
             "Submission arbitration differs",
         )?;
     }
     let mut projection = HumanProjection030::default();
     for w in &works {
-        let r = work_rows
-            .iter()
-            .find(|r| r.get::<&str, _>("activation_id") == w.id)
-            .unwrap();
+        let r = work_rows.get(&w.id).unwrap();
         require(
             r.try_get::<i64, _>("retired")? == i64::from(w.retired)
                 && parsed(r, "snapshot_json")? == w.snapshot,
@@ -666,10 +677,7 @@ pub(super) async fn verify(
     }
     for r in &requests {
         verify_existing(r, &submissions)?;
-        let row = request_rows
-            .iter()
-            .find(|row| row.get::<&str, _>("request_id") == r.id)
-            .unwrap();
+        let row = request_rows.get(&r.id).unwrap();
         require(
             parsed(row, "work_ids_json")? == json!(r.works)
                 && parsed(row, "deadline_json")?
@@ -685,14 +693,14 @@ pub(super) async fn verify(
             } else {
                 "answerTimeout"
             });
-            let delivery: &str = row.get("delivery");
+            let delivery: &str = row.try_get("delivery")?;
             let fenced_before_delivery = (stop.is_some() || interrupted)
                 && !r.acknowledged
                 && matches!(delivery, "pending" | "reserved");
             // A terminal approval commits its physical proof before the
             // clock acknowledges delivery. A restart fences that exact gap
             // even when the run already has a verdict.
-            let terminal_before_ack = native_owner.get::<&str, _>("status") == "revoked"
+            let terminal_before_ack = native_owner.try_get::<&str, _>("status")? == "revoked"
                 && r.kind == "approval"
                 && !r.acknowledged
                 && delivery == "reserved"
@@ -706,7 +714,7 @@ pub(super) async fn verify(
                 });
             require(
                 parsed(row, "resolution_json")? == expected
-                    && row.get::<&str, _>("revision") == "1"
+                    && row.try_get::<&str, _>("revision")? == "1"
                     && (resolution["operatorCancelled"] == true
                         || resolution["withdrawn"] == true
                         || (delivery == "acknowledged" && r.acknowledged)
@@ -793,7 +801,8 @@ pub(super) async fn verify(
             }
         } else {
             require(
-                row.get::<Option<String>, _>("resolution_json").is_none(),
+                row.try_get::<Option<String>, _>("resolution_json")?
+                    .is_none(),
                 "Invented resolution",
             )?;
         }
@@ -805,12 +814,14 @@ pub(super) async fn verify(
     .bind(&id.flow_invocation_id)
     .fetch_all(&mut *db)
     .await?;
+    let control_ids = controls
+        .iter()
+        .map(|row| row.try_get::<&str, _>("activation_id"))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
     for a in &state.activations {
         if matches!(&a.result,Some(WorkResultRecord030::Failed {error}) if error.code=="TIMEOUT") {
             require(
-                controls
-                    .iter()
-                    .any(|r| r.get::<&str, _>("activation_id") == a.id),
+                control_ids.contains(&a.id.as_str()),
                 "Missing timeout control",
             )?;
         }
@@ -819,14 +830,13 @@ pub(super) async fn verify(
         .as_ref()
         .map(|stop| stop.superseded_timeout_controls.clone())
         .unwrap_or_default();
-    for row in controls {
-        let id = row.get::<&str, _>("activation_id");
+    for (id, row) in control_ids.into_iter().zip(&controls) {
         let w = works
             .iter()
             .find(|w| w.id == id)
             .ok_or("Timeout work absent")?;
         require(
-            w.snapshot["expired"] == true && row.get::<&str, _>("reason") == "TIMEOUT",
+            w.snapshot["expired"] == true && row.try_get::<&str, _>("reason")? == "TIMEOUT",
             "Timeout control differs",
         )?;
         let a = state
@@ -834,10 +844,10 @@ pub(super) async fn verify(
             .iter()
             .find(|a| a.id == id)
             .ok_or("Timed out activation absent")?;
-        let joined = row.get::<i64, _>("joined");
+        let joined = row.try_get::<i64, _>("joined")?;
         if let Some(receipt_id) = stopped_controls.remove(id) {
             require(
-                receipt_id == row.get::<&str, _>("receipt_id"),
+                receipt_id == row.try_get::<&str, _>("receipt_id")?,
                 "Stop deadline receipt differs",
             )?;
             let stop = stop.as_ref().unwrap();
@@ -867,7 +877,7 @@ pub(super) async fn verify(
                 "Timeout terminal differs",
             )?;
         }
-        let observed = row.get::<&str, _>("observed_ms");
+        let observed = row.try_get::<&str, _>("observed_ms")?;
         let mut proven = false;
         for event in events.iter().take(journal.len()) {
             let ticket = parsed(event, "ticket_json")?;

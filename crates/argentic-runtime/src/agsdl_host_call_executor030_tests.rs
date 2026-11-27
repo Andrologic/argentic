@@ -1491,6 +1491,24 @@ async fn shutdown_attests_expired_remote_call_deadlines_for_replay() {
         )
         .await;
         assert!(replay.ok, "{replay:?}");
+        let path = f._temp.path().join("run.db");
+        let pool = crate::sqlite::open_file(&path).await.unwrap();
+        assert_eq!(
+            sqlx::query("UPDATE engine_flow030_clock_controls SET joined='invalid'")
+                .execute(&pool)
+                .await
+                .unwrap()
+                .rows_affected(),
+            1
+        );
+        pool.close().await;
+        let replay = crate::persistence::replay_verify030::verify_path030(
+            &path,
+            &f.identity.system_start_id,
+            &f.identity.flow_invocation_id,
+        )
+        .await;
+        assert_eq!(replay.divergence.unwrap().field, "human.readback");
         server.abort();
     }
 }

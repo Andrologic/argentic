@@ -344,8 +344,8 @@ pub async fn verify_path030(path: &Path, system_id: &str, invocation_id: &str) -
         let result = async {
             verify(&mut tx, system_id, invocation_id).await?;
             let row=sqlx::query("SELECT state_json,plan_json FROM engine_flow030_runs WHERE system_id=? AND invocation_id=?").bind(system_id).bind(invocation_id).fetch_one(&mut *tx).await.map_err(storage)?;
-            let state:FlowState030=parse("human.state",row.get("state_json"))?;
-            let plan:FlowPlan030=parse("human.plan",row.get("plan_json"))?;
+            let state:FlowState030=parse("human.state",row.try_get("state_json").map_err(storage)?)?;
+            let plan:FlowPlan030=parse("human.plan",row.try_get("plan_json").map_err(storage)?)?;
             human::verify(&mut tx,&state,&plan).await.map_err(|e|mismatch("human.readback","valid native clock and human proofs",e.to_string()))
         }.await;
         tx.rollback().await.map_err(storage)?;
