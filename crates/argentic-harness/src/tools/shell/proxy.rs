@@ -2,7 +2,7 @@
 //! a socket connected to an upstream server or access to the host resolver.
 use super::super::{Approval, Registry};
 use crate::{
-    policy::{Action, Effect, Zone},
+    policy::{normalize_network_host, Action, Effect, Zone},
     providers::ToolCall,
 };
 use base64::{
@@ -421,21 +421,7 @@ fn destination(host: &str) -> Option<String> {
         .strip_prefix('[')
         .and_then(|host| host.strip_suffix(']'))
         .unwrap_or(host);
-    let host = host.strip_suffix('.').unwrap_or(host);
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        return Some(ip.to_string());
-    }
-    (host.len() <= 253
-        && host.split('.').all(|label| {
-            !label.is_empty()
-                && label.len() <= 63
-                && !label.starts_with('-')
-                && !label.ends_with('-')
-                && label
-                    .bytes()
-                    .all(|c| c.is_ascii_alphanumeric() || c == b'-')
-        }))
-    .then(|| host.to_ascii_lowercase())
+    normalize_network_host(host)
 }
 
 fn restricted_ip(ip: IpAddr) -> bool {

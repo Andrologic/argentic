@@ -11,6 +11,7 @@ cap-std = "=4.0.3"
 cap-fs-ext = "=4.0.3"
 futures = "0.3"
 httpdate = "1"
+idna = "1"
 jsonschema = { version = "0.46", default-features = false, features = ["arbitrary-precision"] }
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }

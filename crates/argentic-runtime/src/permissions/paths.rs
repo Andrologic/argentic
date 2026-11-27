@@ -169,13 +169,12 @@ impl NormalizedRule {
             return Err(invalid("delegate does not take match"));
         }
         if rule.action == Action::Network {
-            rule.pattern = rule.pattern.map(|pattern| {
-                let pattern = pattern.to_ascii_lowercase();
-                let pattern = pattern.trim_end_matches('.');
-                pattern
-                    .parse::<std::net::IpAddr>()
-                    .map_or_else(|_| pattern.to_owned(), |ip| ip.to_string())
-            });
+            rule.pattern = rule
+                .pattern
+                .as_deref()
+                .map(argentic_harness::policy::normalize_network_pattern)
+                .transpose()
+                .map_err(invalid)?;
         }
         let (logical, physical) = match (&rule.pattern, rule.action) {
             (Some(pattern), Action::Read | Action::Write) => {
@@ -367,28 +366,10 @@ impl Subject {
                 subject.logical = command.clone();
             }
             ActionRequest::Network { host } => {
-                let host = host.to_ascii_lowercase();
-                let host = host.strip_suffix('.').unwrap_or(&host);
-                // Ports, URLs and userinfo are not destination hosts.09 must
-                // supply the actual host again at each redirect/connection.
-                let ip = host.parse::<std::net::IpAddr>();
-                let domain = !host.is_empty()
-                    && host.len() <= 253
-                    && host.split('.').all(|label| {
-                        !label.is_empty()
-                            && label.len() <= 63
-                            && !label.starts_with('-')
-                            && !label.ends_with('-')
-                            && label
-                                .bytes()
-                                .all(|c| c.is_ascii_alphanumeric() || c == b'-')
-                    });
-                if ip.is_err() && !domain {
-                    return Err(invalid(
-                        "Network subject must be a destination IP or ASCII/IDNA host without port",
-                    ));
-                }
-                subject.logical = ip.map_or_else(|_| host.to_owned(), |ip| ip.to_string());
+                subject.logical = argentic_harness::policy::normalize_network_host(host)
+                    .ok_or_else(|| {
+                        invalid("Network subject must be a destination IP or host without port")
+                    })?;
             }
             ActionRequest::Mcp { server, tool } => {
                 check_mcp_identity(server, tool.as_deref())?;

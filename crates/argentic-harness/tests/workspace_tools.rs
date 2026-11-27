@@ -905,3 +905,37 @@ mod shell_proxy_tests {
         assert!(!dir.path().join("late").exists());
     }
 }
+
+#[test]
+fn network_patterns_and_requests_use_the_same_idna_mapping() {
+    let rules = [
+        network_rule("*.BÜCHER。Example.", Effect::Deny),
+        network_rule("straße.example", Effect::Ask),
+    ];
+    let work = tempfile::tempdir().unwrap();
+    let policy =
+        Policy::compile_rules(work.path(), None, Some(Preset::Full), None, &rules).unwrap();
+    for host in ["api.xn--bcher-kva.example", "API.bücher.example."] {
+        assert_eq!(
+            policy.decide(Action::Network, host, Zone::Workspace),
+            Effect::Deny
+        );
+    }
+    assert_eq!(
+        policy.decide(Action::Network, "xn--strae-oqa.example", Zone::Workspace),
+        Effect::Ask
+    );
+    for pattern in [
+        "example.com:443",
+        "*.example.com:443",
+        "[::1]:443",
+        "x..test",
+        "büch*.test",
+    ] {
+        let rules = [network_rule(pattern, Effect::Deny)];
+        assert!(
+            Policy::compile_rules(work.path(), None, None, None, &rules).is_err(),
+            "{pattern}"
+        );
+    }
+}

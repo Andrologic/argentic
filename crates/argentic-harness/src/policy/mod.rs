@@ -3,7 +3,7 @@
 mod network;
 mod shell;
 #[doc(hidden)]
-pub use network::matches_ipv6_spelling;
+pub use network::{matches_ipv6_spelling, normalize_network_host, normalize_network_pattern};
 pub(crate) use shell::parse as parse_shell;
 pub use shell::subcommands;
 
@@ -216,10 +216,7 @@ impl Policy {
                             compile_rule(workspace, home, pattern, rule.effect).map(Matcher::Path)
                         }
                         Action::Network => {
-                            let pattern = pattern.trim_end_matches('.').to_ascii_lowercase();
-                            let pattern = pattern
-                                .parse::<std::net::IpAddr>()
-                                .map_or(pattern, |ip| ip.to_string());
+                            let pattern = normalize_network_pattern(pattern)?;
                             let glob = text_glob(Action::Network, &pattern)
                                 .map_err(|error| error.to_string())?;
                             Ok(Matcher::Network { glob, pattern })
@@ -246,8 +243,13 @@ impl Policy {
     }
 
     pub fn decide(&self, action: Action, subject: &str, zone: Zone) -> Effect {
+        let normalized;
         let subject = if action == Action::Network {
-            subject.trim_end_matches('.')
+            let Some(host) = normalize_network_host(subject) else {
+                return Effect::Deny;
+            };
+            normalized = host;
+            &normalized
         } else {
             subject
         };

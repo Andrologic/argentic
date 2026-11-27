@@ -1,4 +1,54 @@
-//! Match textual IPv6 aliases without enumerating all padded strings.
+//! Normalize network rules and destinations before matching host aliases.
+
+use std::net::IpAddr;
+
+pub fn normalize_network_host(host: &str) -> Option<String> {
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return Some(ip.to_string());
+    }
+    let ascii = idna::domain_to_ascii(host).ok()?;
+    let ascii = ascii.strip_suffix('.').unwrap_or(&ascii);
+    valid_domain(ascii, false).then(|| ascii.to_owned())
+}
+
+pub fn normalize_network_pattern(pattern: &str) -> Result<String, &'static str> {
+    const INVALID: &str = "Expected a network host pattern without a scheme, port, or path";
+    if !pattern.contains('*') {
+        return normalize_network_host(pattern).ok_or(INVALID);
+    }
+    if pattern.bytes().filter(|&byte| byte == b':').count() >= 2
+        && pattern
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() || b":.*".contains(&byte))
+    {
+        // IPv6 globs match textual aliases, including compressed spellings.
+        return Ok(pattern.to_ascii_lowercase());
+    }
+    let ascii = idna::domain_to_ascii(pattern).map_err(|_| INVALID)?;
+    let ascii = ascii.strip_suffix('.').unwrap_or(&ascii);
+    // Punycode encodes whole labels. A glob within an IDN label has no
+    // unambiguous ASCII spelling. Whole labels on either side are fine.
+    let ambiguous = pattern
+        .split(['.', '\u{3002}', '\u{ff0e}', '\u{ff61}'])
+        .any(|label| label.contains('*') && !label.is_ascii());
+    if ambiguous || !valid_domain(ascii, true) {
+        return Err(INVALID);
+    }
+    Ok(ascii.to_owned())
+}
+
+fn valid_domain(host: &str, wildcard: bool) -> bool {
+    host.len() <= 253
+        && host.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || byte == b'-' || (wildcard && byte == b'*')
+                })
+        })
+}
 
 pub fn matches_ipv6_spelling(pattern: &str, ip: std::net::Ipv6Addr) -> bool {
     // Domain-only rules cannot match an IPv6 spelling. Adjacent stars are

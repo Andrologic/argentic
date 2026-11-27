@@ -82,6 +82,7 @@ dependencies = [
  "httpdate",
  "hyper",
  "hyper-util",
+ "idna",
  "jsonschema",
  "libc",
  "regex",
