@@ -1,5 +1,5 @@
 //! Versioned, content-free projection of retained runs, including after restart.
-//! A continuation never survives a flow revision or scope change.
+//! A continuation binds the run, reducer revision and external projection facts.
 use crate::agsdl_host::HostState;
 use crate::persistence::{
     dto::EngineSourceRevision,
@@ -12,7 +12,9 @@ use crate::persistence::{
     Result,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use sqlx::{Row, SqlitePool};
+use std::collections::BTreeSet;
 
 const PAGE_SIZE: usize = 100;
 
@@ -39,6 +41,8 @@ pub struct RuntimeProjectionContinuation030 {
     pub scope: RuntimeProjectionScope030,
     pub revision: String,
     pub offset: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_version: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -89,6 +93,7 @@ fn page(
     scope: RuntimeProjectionScope030,
     continuation: Option<RuntimeProjectionContinuation030>,
     view: RuntimeProjection030,
+    snapshot_version: Option<String>,
 ) -> Result<RuntimeProjectionPage030> {
     if scope.system_start_id != view.system_start_id || scope.snapshot_id != view.snapshot_id {
         return Err(failure(
@@ -99,7 +104,10 @@ fn page(
     }
     let offset = match continuation {
         Some(cursor) => {
-            if cursor.scope != scope || cursor.revision != view.revision {
+            if cursor.scope != scope
+                || cursor.revision != view.revision
+                || cursor.snapshot_version != snapshot_version
+            {
                 return Err(failure(
                     "CONFLICT",
                     "continuation",
@@ -144,6 +152,7 @@ fn page(
         Some(RuntimeProjectionContinuation030 {
             scope: scope.clone(),
             revision: view.revision.clone(),
+            snapshot_version,
             offset: u32::try_from(end)
                 .map_err(|_| failure("INPUT_LIMIT", "continuation", "Projection is too large"))?,
         })
@@ -166,6 +175,16 @@ fn page(
         items,
         next_page,
     })
+}
+
+fn snapshot_version(
+    handoffs: &BTreeSet<String>,
+    interrupted: bool,
+    revoked: bool,
+    mcp_uncertain: bool,
+) -> Result<String> {
+    let facts = serde_json::to_vec(&(handoffs, interrupted, revoked, mcp_uncertain))?;
+    Ok(format!("{:x}", Sha256::digest(facts)))
 }
 
 pub(crate) async fn read(
@@ -222,14 +241,26 @@ pub(crate) async fn read(
                 "Captured flow projection is invalid",
             )
         })?;
-    let mut page = page(scope, continuation, projection)?;
+    let current = plan.versions.contract == argentic_core::AGSDL_040;
+    let interrupted: bool = row.try_get("interrupted")?;
+    let revoked: bool = row.try_get("revoked")?;
+    let mcp_uncertain = current
+        && host
+            .flow030()
+            .supervisor_registry()
+            .outcome(&scope.system_start_id)
+            .is_some_and(|outcome| {
+                outcome.is_err_and(|error| error.code == "MCP_TERMINATION_UNCERTAIN")
+            });
+    let snapshot_version = current
+        .then(|| snapshot_version(&handoffs, interrupted, revoked, mcp_uncertain))
+        .transpose()?;
+    let mut page = page(scope, continuation, projection, snapshot_version)?;
     page.model_overrides = crate::capture::verify_model_overrides(
         &plan,
         &serde_json::from_str(&capture.registry_json)?,
     )?;
-    if plan.versions.contract == argentic_core::AGSDL_040 {
-        let interrupted: bool = row.try_get("interrupted")?;
-        let revoked: bool = row.try_get("revoked")?;
+    if current {
         if interrupted {
             page.verdict = Some("interrupted".into());
             page.stopping = false;
@@ -253,13 +284,6 @@ pub(crate) async fn read(
                 (id.clone(), status)
             })
             .collect();
-        let mcp_uncertain = host
-            .flow030()
-            .supervisor_registry()
-            .outcome(&page.scope.system_start_id)
-            .is_some_and(|outcome| {
-                outcome.is_err_and(|error| error.code == "MCP_TERMINATION_UNCERTAIN")
-            });
         page.termination_uncertain = (interrupted
             || ((revoked || mcp_uncertain) && page.verdict.is_none()))
             && state
@@ -276,7 +300,7 @@ mod tests {
     use crate::persistence::dto::EngineSourceOwner;
 
     #[test]
-    fn continuation_is_bound_to_scope_and_revision() {
+    fn continuation_is_bound_to_scope_revision_and_external_facts() {
         let scope = RuntimeProjectionScope030 {
             system_start_id: "system".into(),
             snapshot_id: "snapshot".into(),
@@ -311,7 +335,9 @@ mod tests {
             groups: vec![],
             paths: vec![],
         };
-        let first = page(scope.clone(), None, view.clone()).unwrap();
+        let handoffs = BTreeSet::new();
+        let version = Some(snapshot_version(&handoffs, false, false, false).unwrap());
+        let first = page(scope.clone(), None, view.clone(), version.clone()).unwrap();
         assert_eq!(first.items.len(), 100);
         let legacy = serde_json::to_value(&first).unwrap();
         assert!(legacy.get("terminationUncertain").is_none());
@@ -327,22 +353,48 @@ mod tests {
         );
         let next = first.next_page.unwrap();
         assert_eq!(
-            page(scope.clone(), Some(next.clone()), view.clone())
-                .unwrap()
-                .items
-                .len(),
+            page(
+                scope.clone(),
+                Some(next.clone()),
+                view.clone(),
+                version.clone()
+            )
+            .unwrap()
+            .items
+            .len(),
             1
         );
+        let admitted = BTreeSet::from(["effect".into()]);
+        for changed_version in [
+            snapshot_version(&admitted, false, false, false).unwrap(),
+            snapshot_version(&handoffs, true, true, false).unwrap(),
+            snapshot_version(&handoffs, false, false, true).unwrap(),
+        ] {
+            assert_eq!(
+                page(
+                    scope.clone(),
+                    Some(next.clone()),
+                    view.clone(),
+                    Some(changed_version)
+                )
+                .unwrap_err()
+                .code,
+                "CONFLICT"
+            );
+        }
         let mut changed = view.clone();
         changed.revision = "8".into();
         assert_eq!(
-            page(scope.clone(), Some(next.clone()), changed)
+            page(scope.clone(), Some(next.clone()), changed, version.clone())
                 .unwrap_err()
                 .code,
             "CONFLICT"
         );
         let mut other = next;
         other.scope.snapshot_id = "other".into();
-        assert_eq!(page(scope, Some(other), view).unwrap_err().code, "CONFLICT");
+        assert_eq!(
+            page(scope, Some(other), view, version).unwrap_err().code,
+            "CONFLICT"
+        );
     }
 }
