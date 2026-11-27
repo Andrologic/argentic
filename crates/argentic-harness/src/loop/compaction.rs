@@ -262,7 +262,16 @@ impl Instance<'_> {
                     Chunk::Text(_) | Chunk::ToolCall(_) => valid = false,
                     Chunk::Reasoning(_) | Chunk::Replay(_) => {}
                     Chunk::End { finish, usage } => {
-                        if !valid || finish != Finish::Stop {
+                        if !valid
+                            || finish != Finish::Stop
+                            || self
+                                .harness
+                                .provider_credential
+                                .as_deref()
+                                .is_some_and(|key| {
+                                    crate::providers::contains_credential(&text, key)
+                                })
+                        {
                             text.clear();
                         }
                         return Some((text, usage));

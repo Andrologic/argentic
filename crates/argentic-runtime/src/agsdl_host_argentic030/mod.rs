@@ -635,7 +635,14 @@ impl Executor {
             _ => PlanMode::Off,
         };
         let inbox = std::mem::replace(&mut work.steer, crate::agsdl_host_steer030::channel030().1);
-        let port = port::Port::new(events, &work, inbox, person, sources.clone(), credential);
+        let port = port::Port::new(
+            events,
+            &work,
+            inbox,
+            person,
+            sources.clone(),
+            credential.clone(),
+        );
         let context = self.host.clone();
         let work_cancel = cancel.child_token();
         let equipment_cancel = work_cancel.clone();
@@ -659,6 +666,7 @@ impl Executor {
             skills,
             setup,
             work_cancel.clone(),
+            credential.clone(),
         ));
         let registry = registry
             .with_extensions(tools.skills_definition(), tools.clone())
@@ -698,6 +706,7 @@ impl Executor {
         let (_send, steer) = tokio::sync::mpsc::channel(1);
         let context_window = self.config.context_window(&model);
         let mut harness = Harness::new(provider, Arc::new(registry), settings)
+            .with_provider_credential(credential)
             .with_context_window(context_window)
             .with_plan(plan_mode)
             .with_delegation()

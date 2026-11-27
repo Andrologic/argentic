@@ -421,7 +421,11 @@ could repeat its effects.
 
 The standalone host registers the adapter when configured and requires explicit
 opt-in. Shared and named instances keep their conversation in memory for the run.
-Compaction runs when the provider entry sets `contextWindowTokens`.
+Compaction runs when the provider entry sets `contextWindowTokens`. When a
+provider has a configured credential, the adapter redacts literal echoes in
+assistant text and reasoning, including echoes split across stream deltas.
+A reply with that credential in a tool call or native replay data is rejected
+before the harness runs its tools or stores the reply in history.
 
 - Agent and message resources appear as origin-labelled, untrusted reference
   data in a separate user message. The Host resolves local URIs under the
@@ -433,7 +437,8 @@ Compaction runs when the provider entry sets `contextWindowTokens`.
 - The Host discovers tools from selected MCP servers and exposes them with
   provider-safe names, typically `mcp__server__tool`. Permissions apply to the
   original `server/tool` name. An `ask` requires a person and never grants
-  lasting access. Local stdio requires macOS ARM64. Remote servers use the
+  lasting access. MCP arguments containing the provider credential are refused
+  before approval or dispatch. Local stdio requires macOS ARM64. Remote servers use the
   Host's authorized Streamable HTTP transport. Stop closes admission and
   joins local sessions. A dispatched remote call whose termination cannot be
   confirmed yields `MCP_TERMINATION_UNCERTAIN`. Operator Hold is unavailable

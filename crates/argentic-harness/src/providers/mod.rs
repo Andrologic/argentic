@@ -1,5 +1,7 @@
 //! Provider-independent conversation and streaming response types.
 
+pub(crate) mod credential;
+pub use credential::contains_credential;
 mod anthropic_messages;
 mod chat_completions;
 mod http;
@@ -118,6 +120,12 @@ impl std::fmt::Debug for Replay {
 }
 
 impl Replay {
+    pub(crate) fn contains_credential(&self, key: &str) -> bool {
+        self.items
+            .iter()
+            .any(|item| contains_credential(&item.to_string(), key))
+    }
+
     /// Approximate serialized size, for history budgets and compaction.
     pub(crate) fn byte_len(&self) -> usize {
         self.items.iter().map(|item| item.to_string().len()).sum()

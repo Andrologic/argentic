@@ -27,8 +27,9 @@ use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use crate::{
     config::{Layer, Settings},
     providers::{
-        Chunk, DeliveryProgress, DeliveryStatus, Finish, Message, ModelName, Provider,
-        ProviderError, Request, ToolCall, ToolChoice, ToolDefinition, Usage,
+        contains_credential, credential::TextScreen, Chunk, DeliveryProgress, DeliveryStatus,
+        Finish, Message, ModelName, Provider, ProviderError, Request, ToolCall, ToolChoice,
+        ToolDefinition, Usage,
     },
     tools::{Registry, SUBMIT_RESULT},
 };
@@ -285,6 +286,7 @@ pub struct Harness {
     registry: Arc<Registry>,
     settings: Settings,
     context_window: Option<u32>,
+    provider_credential: Option<String>,
     plan: PlanMode,
     delegation: bool,
     hooks: Vec<Arc<dyn Hook>>,
@@ -297,10 +299,17 @@ impl Harness {
             registry,
             settings,
             context_window: None,
+            provider_credential: None,
             plan: PlanMode::Off,
             delegation: false,
             hooks: Vec::new(),
         }
+    }
+
+    /// Screen model output for echoes of the configured HTTP header credential.
+    pub fn with_provider_credential(mut self, credential: Option<String>) -> Self {
+        self.provider_credential = credential.filter(|key| !key.is_empty());
+        self
     }
 
     pub fn with_context_window(mut self, context_window: Option<u32>) -> Self {
@@ -923,6 +932,9 @@ impl Instance<'_> {
         let mut stream = opened?;
         let mut text = String::new();
         let mut reasoning = String::new();
+        let credential = self.harness.provider_credential.as_deref();
+        let mut text_screen = TextScreen::default();
+        let mut reasoning_screen = TextScreen::default();
         let mut replay = None;
         let mut calls = Vec::new();
         let mut ids = HashSet::new();
@@ -932,17 +944,14 @@ impl Instance<'_> {
             match chunk? {
                 Chunk::Text(part) => {
                     account_bytes(&mut bytes, part.len())?;
-                    self.port
-                        .event(Event::VisibleText { turn, text: &part }, self.cancel)
-                        .await?;
+                    let part = text_screen.push(part, credential);
+                    self.visible_text(turn, &part).await?;
                     text.push_str(&part);
-                    self.text.push_str(&part);
                 }
                 Chunk::Reasoning(part) => {
                     account_bytes(&mut bytes, part.len())?;
-                    self.port
-                        .event(Event::Reasoning { turn, text: &part }, self.cancel)
-                        .await?;
+                    let part = reasoning_screen.push(part, credential);
+                    self.reasoning_text(turn, &part).await?;
                     reasoning.push_str(&part);
                 }
                 Chunk::ToolCall(call) => {
@@ -953,6 +962,13 @@ impl Instance<'_> {
                             .saturating_add(call.id.len())
                             .saturating_add(call.name.len()),
                     )?;
+                    if credential.is_some_and(|key| {
+                        [&call.id, &call.name, &call.arguments]
+                            .into_iter()
+                            .any(|field| contains_credential(field, key))
+                    }) {
+                        return Err(credential_in_response());
+                    }
                     if calls.len() >= 128
                         || call.id.is_empty()
                         || call.name.is_empty()
@@ -962,8 +978,19 @@ impl Instance<'_> {
                     }
                     calls.push(call);
                 }
-                Chunk::Replay(state) => replay = Some(state),
+                Chunk::Replay(state) => {
+                    if credential.is_some_and(|key| state.contains_credential(key)) {
+                        return Err(credential_in_response());
+                    }
+                    replay = Some(state);
+                }
                 Chunk::End { finish, usage } => {
+                    let tail = text_screen.finish();
+                    self.visible_text(turn, &tail).await?;
+                    text.push_str(&tail);
+                    let tail = reasoning_screen.finish();
+                    self.reasoning_text(turn, &tail).await?;
+                    reasoning.push_str(&tail);
                     self.port
                         .assistant_message(turn, &text, self.cancel)
                         .await?;
@@ -991,6 +1018,25 @@ impl Instance<'_> {
             }
         }
         Err(ProviderError::Invalid("Provider ended without a terminal chunk".into()).into())
+    }
+
+    async fn visible_text(&mut self, turn: u32, text: &str) -> Result<(), Failure> {
+        if !text.is_empty() {
+            self.port
+                .event(Event::VisibleText { turn, text }, self.cancel)
+                .await?;
+            self.text.push_str(text);
+        }
+        Ok(())
+    }
+
+    async fn reasoning_text(&self, turn: u32, text: &str) -> Result<(), Failure> {
+        if !text.is_empty() {
+            self.port
+                .event(Event::Reasoning { turn, text }, self.cancel)
+                .await?;
+        }
+        Ok(())
     }
 
     async fn tool_batch<'a>(
@@ -1115,6 +1161,16 @@ impl Instance<'_> {
         content: &str,
         messages: &mut Vec<Message>,
     ) -> Result<(), Failure> {
+        let content = if self
+            .harness
+            .provider_credential
+            .as_deref()
+            .is_some_and(|key| contains_credential(content, key))
+        {
+            ""
+        } else {
+            content
+        };
         for hook in &self.harness.hooks {
             hook.after_tool_call(turn, call, content, self.cancel)
                 .await?;
@@ -1277,6 +1333,10 @@ struct Response {
     calls: Vec<ToolCall>,
     finish: Finish,
     usage: Option<crate::providers::Usage>,
+}
+
+fn credential_in_response() -> Failure {
+    ProviderError::Invalid("Provider response contains a configured credential".into()).into()
 }
 
 fn account_bytes(bytes: &mut usize, additional: usize) -> Result<(), Failure> {

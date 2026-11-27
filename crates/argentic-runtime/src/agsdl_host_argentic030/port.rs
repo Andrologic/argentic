@@ -249,17 +249,6 @@ impl WorkPort for Port {
         text: &str,
         cancel: &CancellationToken,
     ) -> std::result::Result<(), Failure> {
-        let text = match self.0.credential.as_deref() {
-            Some(key) => {
-                let replacement = if "[redacted]".contains(key) {
-                    ""
-                } else {
-                    "[redacted]"
-                };
-                std::borrow::Cow::Owned(text.replace(key, replacement))
-            }
-            None => std::borrow::Cow::Borrowed(text),
-        };
         if !text.is_empty() {
             self.0.events.emit(
                 json!({"kind":"visibleText","messageId":format!("turn-{turn}"),"textParts":[text]}),
@@ -402,12 +391,9 @@ impl WorkPort for Port {
     ) -> std::result::Result<Decision, Failure> {
         let event = match proposal {
             Proposal::Submit { turn, call } => {
-                let arguments = if self
-                    .0
-                    .credential
-                    .as_deref()
-                    .is_some_and(|key| contains_credential(&call.arguments, key))
-                {
+                let arguments = if self.0.credential.as_deref().is_some_and(|key| {
+                    argentic_harness::providers::contains_credential(&call.arguments, key)
+                }) {
                     // Let the controller request an in-instance correction.
                     "Credential removed from result tool arguments"
                 } else {
@@ -455,20 +441,6 @@ impl WorkPort for Port {
             },
         )
     }
-}
-
-pub(super) fn contains_credential(raw: &str, key: &str) -> bool {
-    fn contains(value: &Value, key: &str) -> bool {
-        match value {
-            Value::String(value) => value.contains(key),
-            Value::Array(values) => values.iter().any(|value| contains(value, key)),
-            Value::Object(fields) => fields
-                .iter()
-                .any(|(name, value)| name.contains(key) || contains(value, key)),
-            _ => false,
-        }
-    }
-    raw.contains(key) || serde_json::from_str(raw).is_ok_and(|value| contains(&value, key))
 }
 
 pub(super) fn prompt_text(value: &Value) -> Result<String> {

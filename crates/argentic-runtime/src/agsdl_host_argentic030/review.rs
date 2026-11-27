@@ -1,4 +1,3 @@
-use super::port::contains_credential;
 use crate::{
     agsdl_host_action_approval030::permits_model_review,
     harness::{
@@ -6,6 +5,7 @@ use crate::{
     },
     persistence::{failure, Result},
 };
+use argentic_harness::providers::contains_credential;
 use argentic_harness::{
     providers::{Chunk, Finish, Message, ModelName, Provider, Request, ToolChoice, TurnLimits},
     r#loop::{Failure, Hook, ReviewBudget},

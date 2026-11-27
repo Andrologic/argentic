@@ -874,6 +874,8 @@ async fn provider_failure_does_not_persist_the_echoed_credential() {
     );
     request.send(StatusCode::OK, stream, "text/event-stream");
     let request = server.next().await;
+    assert!(!request.body.to_string().contains(&credential));
+    assert!(request.body.to_string().contains("[redacted]"));
     request.send(
         StatusCode::UNAUTHORIZED,
         json!({"error":{"message":credential}}).to_string(),
@@ -1653,6 +1655,86 @@ async fn agent_mcp_stops_discovery_when_the_combined_catalogue_is_too_large() {
     assert_eq!(*admitted.lock().unwrap(), ["first", "second"]);
     close(&host).await;
     upstream.abort();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn provider_credential_in_mcp_arguments_never_reaches_approval_or_upstream() {
+    use crate::test_context::mcp::{Peer, REQUIREMENTS};
+    const KEY_ENV: &str = "CARGO_PKG_DESCRIPTION";
+    let credential = std::env::var(KEY_ENV).unwrap();
+    for tool in ["check", "approve"] {
+        let peer = Peer::start().await;
+        let mut server = Server::start().await;
+        let mut doc = document();
+        doc["projectFormat"] = json!("agsdl-project-1");
+        doc["mcpServers"] = peer.servers();
+        doc["secrets"] = json!({"file":"requirements.json"});
+        let worker = &mut doc["agents"]["worker"];
+        worker["mcpServers"] = json!(["first"]);
+        worker["permissions"] = json!({"preset":"read-only", "reviewer":"person", "rules":[
+            {"action":"mcp","match":"first/check","effect":"allow"},
+            {"action":"mcp","match":"first/approve","effect":"ask"}
+        ]});
+        let mut f = Fixture::new("");
+        f.source = f.workspace.with_file_name("project");
+        std::fs::create_dir(&f.source).unwrap();
+        std::fs::write(f.source.join("agsdl.json"), doc.to_string()).unwrap();
+        std::fs::write(f.source.join("requirements.json"), REQUIREMENTS).unwrap();
+        let mut host = open(&f, false)
+            .await
+            .with_argentic(server.config(Some(KEY_ENV)))
+            .unwrap();
+        host.context = peer.configure(host.context);
+        let run = start(&host).await;
+        let request = server.next().await;
+        let alias = format!("mcp__first__{tool}");
+        assert!(has_tool(&request, &alias));
+        let arguments = if tool == "check" {
+            json!({"nested":[{"value":credential}]}).to_string()
+        } else {
+            // Keep the first letter JSON-escaped inside the arguments string.
+            let quoted = json!(credential).to_string();
+            format!(
+                r#"{{"nested":[{{"value":"\u{:04x}{}}}]}}"#,
+                quoted.as_bytes()[1],
+                &quoted[2..]
+            )
+        };
+        assert_eq!(
+            serde_json::from_str::<Value>(&arguments).unwrap()["nested"][0]["value"],
+            credential
+        );
+        let call = json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,
+            "id":"mcp","function":{"name":alias,"arguments":arguments}}]},
+            "finish_reason":"tool_calls"}]});
+        request.send(
+            StatusCode::OK,
+            format!("data: {call}\n\ndata: [DONE]\n\n"),
+            "text/event-stream",
+        );
+
+        // A safe rejection terminates the response. The unfixed allow path
+        // instead calls upstream and asks the provider for another turn.
+        let state = tokio::select! {
+            biased;
+            next = server.next() => panic!("unexpected follow-up request with {} upstream calls and {} messages",
+                peer.calls().len(), next.body["messages"].as_array().unwrap().len()),
+            state = finish(&host, &run) => state,
+        };
+        assert!(peer.calls().is_empty());
+        let asks: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM engine_flow030_human_requests")
+            .fetch_one(&host.pool)
+            .await
+            .unwrap();
+        assert_eq!(asks, 0);
+        assert_eq!(state["verdict"], "failed");
+        close(&host).await;
+        let bytes = std::fs::read(f.data.join("engine.sqlite")).unwrap();
+        assert!(!bytes
+            .windows(credential.len())
+            .any(|window| window == credential.as_bytes()));
+    }
 }
 
 #[cfg(unix)]

@@ -853,6 +853,39 @@ async fn text_only_submission_gets_a_tool_call_correction() {
     }
 }
 
+#[tokio::test]
+async fn credential_in_signed_replay_rejects_the_reply() {
+    const KEY: &str = "provider-fixture-key";
+    let work = work(false);
+    let replay = serde_json::from_value(json!({
+        "format": "Anthropic",
+        "model": work.model,
+        "items": [{"type":"thinking","thinking":"private reasoning","signature":KEY}]
+    }))
+    .unwrap();
+    let (_dir, harness) = fixture(
+        vec![vec![
+            Chunk::Replay(replay),
+            submit("submit", json!({"answer":42})),
+            end(Finish::ToolCalls),
+        ]],
+        json!({}),
+    );
+    let (_, steer) = mpsc::channel(1);
+    let report = harness
+        .with_provider_credential(Some(KEY.into()))
+        .run(work, &(), steer, CancellationToken::new())
+        .await;
+    assert!(matches!(
+        report.outcome,
+        Err(Failure::Provider(ProviderError::Invalid(_)))
+    ));
+    assert_eq!(report.messages.len(), 1);
+    assert!(!serde_json::to_string(&report.messages)
+        .unwrap()
+        .contains(KEY));
+}
+
 #[tokio::test(start_paused = true)]
 async fn stop_bounds_pending_steer_settlement() {
     struct PendingSettlement(CancellationToken);

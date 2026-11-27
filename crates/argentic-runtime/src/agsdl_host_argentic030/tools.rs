@@ -1,5 +1,5 @@
 use argentic_harness::{
-    providers::{ToolCall, ToolDefinition},
+    providers::{contains_credential, ToolCall, ToolDefinition},
     tools::{Extensions, Page, SKILL},
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
@@ -25,6 +25,7 @@ pub(super) struct Tools {
     mcp: OnceCell<McpTools>,
     failure: std::sync::Mutex<Option<crate::persistence::dto::EngineFailure>>,
     cancel: CancellationToken,
+    credential: Option<String>,
 }
 
 struct McpTools {
@@ -96,6 +97,7 @@ impl Tools {
         skills: Vec<SkillDescriptor>,
         setup: futures::future::BoxFuture<'static, HostResult<Equipment>>,
         cancel: CancellationToken,
+        credential: Option<String>,
     ) -> Self {
         Self {
             sources,
@@ -105,6 +107,7 @@ impl Tools {
             mcp: OnceCell::new(),
             failure: std::sync::Mutex::new(None),
             cancel,
+            credential,
         }
     }
 
@@ -212,6 +215,13 @@ impl Extensions for Tools {
 
     async fn execute(&self, call: &ToolCall, cancel: &CancellationToken) -> Result<Page, String> {
         if call.name != SKILL {
+            if self
+                .credential
+                .as_deref()
+                .is_some_and(|key| contains_credential(&call.arguments, key))
+            {
+                return Err("MCP arguments contain a configured provider credential".into());
+            }
             let mcp = self.mcp.get().ok_or("MCP equipment is unavailable")?;
             let tool = mcp
                 .catalogue

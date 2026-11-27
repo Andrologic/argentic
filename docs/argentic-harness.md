@@ -333,7 +333,11 @@ refus d’un réglage par le fournisseur. Un run partage
 ses politiques compilées et ses définitions d’outils par contrat. Le
 catalogue de raisonnement est chargé une fois par processus. Dans les
 requêtes, le plan et le steer peuvent être ajoutés temporairement sans
-dupliquer l’historique.
+dupliquer l’historique. Le harnais masque les échos de la clé du
+fournisseur dans le texte et le raisonnement du modèle, même quand la clé
+est fragmentée dans le flux. Il refuse la réponse si la clé apparaît dans
+un appel d’outil ou dans les données natives de reprise. L’adaptateur MCP
+vérifie aussi les arguments avant toute demande d’approbation ou exécution.
 
 Entre deux travaux, le Host compresse l’historique d’une instance continue
 à partir de 64 Kio si cela économise au moins un quart de sa taille estimée.
