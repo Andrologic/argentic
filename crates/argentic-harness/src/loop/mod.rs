@@ -1241,3 +1241,36 @@ fn account_bytes(bytes: &mut usize, additional: usize) -> Result<(), Failure> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tool_schema_tests {
+    use serde_json::Value;
+
+    /// llama.cpp servers (LM Studio, Ollama) compile tool schemas into
+    /// grammars and expand string lengths into bounded repetitions; a
+    /// `maxLength` of 8192 made LM Studio reject every request. Lengths are
+    /// checked in code instead.
+    fn assert_grammar_friendly(name: &str, schema: &Value) {
+        match schema {
+            Value::Object(fields) => {
+                for key in ["maxLength", "minLength", "pattern"] {
+                    assert!(!fields.contains_key(key), "{name} schema uses {key}");
+                }
+                fields
+                    .values()
+                    .for_each(|value| assert_grammar_friendly(name, value));
+            }
+            Value::Array(items) => items
+                .iter()
+                .for_each(|value| assert_grammar_friendly(name, value)),
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn loop_tool_schemas_avoid_string_length_and_pattern_constraints() {
+        for tool in [super::plan::definition(), super::delegate::definition()] {
+            assert_grammar_friendly(&tool.name, &tool.parameters);
+        }
+    }
+}

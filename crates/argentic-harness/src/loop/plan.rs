@@ -74,7 +74,7 @@ pub(super) fn definition() -> ToolDefinition {
             "type":"object", "required":["steps"], "additionalProperties":false,
             "properties":{"steps":{"type":"array","minItems":1,"maxItems":32,"items":{
                 "type":"object","required":["step","status"],"additionalProperties":false,
-                "properties":{"step":{"type":"string","minLength":1,"maxLength":512},
+                "properties":{"step":{"type":"string"},
                     "status":{"enum":["pending","in_progress","completed"]}}
             }}}
         }),
