@@ -61,15 +61,24 @@ fn rejects_substituted_content_helper_image() {
     let helper = root.join("helper");
     let replacement = root.join("replacement");
     fs::copy(std::env::current_exe().unwrap(), &helper).unwrap();
-    let invalid_image = b"not a Mach-O executable";
-    fs::write(&replacement, invalid_image).unwrap();
+    // A valid Mach-O with another code directory hash: only the launch
+    // requirement can refuse it, unlike a file that cannot execute at all.
+    fs::copy("/usr/bin/true", &replacement).unwrap();
+    let substitute = fs::read(&replacement).unwrap();
     let directory = Dir::open_ambient_dir(&root, ambient_authority()).unwrap();
 
     arm_image_swap(&helper, &replacement).unwrap();
     let refused = Launch::start(&helper, Path::new("fixture.txt"), directory.as_raw_fd());
 
-    assert!(refused.is_err(), "substituted helper image was launched");
-    assert_eq!(fs::read(helper).unwrap(), invalid_image);
+    // 4 is the bridge's launch refusal; 6 would mean the QA swap never ran.
+    let error = refused
+        .err()
+        .expect("substituted helper image was launched");
+    assert!(
+        error.to_string().ends_with("(4)"),
+        "unexpected refusal: {error}"
+    );
+    assert_eq!(fs::read(helper).unwrap(), substitute);
     assert!(!replacement.exists(), "QA replacement was not consumed");
 }
 

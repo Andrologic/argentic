@@ -18,8 +18,9 @@ mod resource;
 pub(crate) mod route;
 pub(crate) mod schema;
 
-// Match the published AgSDL reference validator.
-fn is_json_media(media: &str) -> bool {
+/// Whether an AgSDL result media type carries JSON, exactly as the published
+/// AgSDL reference validator decides it.
+pub fn is_json_media(media: &str) -> bool {
     media == "application/json" || media.ends_with("+json")
 }
 
