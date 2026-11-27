@@ -43,7 +43,7 @@ use tls::Intercept;
 use tokio::{
     io::{unix::AsyncFd, AsyncRead, AsyncWrite, Interest, ReadBuf, Ready},
     net::{lookup_host, TcpStream},
-    sync::{mpsc, Mutex},
+    sync::{mpsc, watch, Mutex},
     task::{JoinHandle, JoinSet},
 };
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
@@ -139,6 +139,7 @@ impl Proxy {
             approvals: Arc::new(Mutex::new(HashMap::new())),
             clock: clock.clone(),
             tls,
+            tunnel_policy: watch::Sender::new(Ok(None)),
             tasks: TaskTracker::new(),
         });
         let task = tokio::spawn(accept(listener, context));
@@ -203,36 +204,43 @@ struct Egress {
     approvals: Arc<Mutex<HashMap<String, bool>>>,
     clock: Arc<Clock>,
     tls: Option<Intercept>,
+    tunnel_policy: watch::Sender<Result<Option<Policy>, Failure>>,
     tasks: TaskTracker,
 }
 
 async fn accept(listener: Listener, context: Arc<Egress>) {
     let mut jobs = JoinSet::new();
-    let mut remaining = MAX_CONNECTIONS;
-    while remaining > 0 || !jobs.is_empty() {
-        tokio::select! {
-            biased;
-            _ = context.cancel.cancelled() => break,
-            _ = jobs.join_next(), if !jobs.is_empty() => {},
-            accepted = listener.accept(), if remaining > 0 && jobs.len() < MAX_CONCURRENT => {
-                let Ok((client, _)) = accepted else { break };
-                remaining -= 1;
-                let context = context.clone();
-                jobs.spawn(async move {
-                    let Ok(fd) = client.as_fd().try_clone_to_owned() else {
-                        return;
-                    };
-                    // SAFETY: The duplicate stays open and unchanged while AsyncFd owns it.
-                    let Ok(fd) = (unsafe { AsyncFd::register(fd) }) else {
-                        return;
-                    };
-                    let base = context.clock.base_after(MAX_CONNECTION_TIME);
-                    tokio::select! {
-                        _ = disconnected(fd) => {},
-                        _ = context.clock.expire(base) => {},
-                        _ = serve(client, context.clone()) => {},
-                    }
-                });
+    // Drop any pending admission refresh before waiting for approval cleanup.
+    {
+        let refresh = context.refresh_tunnel_policy();
+        tokio::pin!(refresh);
+        let mut remaining = MAX_CONNECTIONS;
+        while remaining > 0 || !jobs.is_empty() {
+            tokio::select! {
+                biased;
+                _ = context.cancel.cancelled() => break,
+                _ = &mut refresh, if context.tls.is_none() => break,
+                _ = jobs.join_next(), if !jobs.is_empty() => {},
+                accepted = listener.accept(), if remaining > 0 && jobs.len() < MAX_CONCURRENT => {
+                    let Ok((client, _)) = accepted else { break };
+                    remaining -= 1;
+                    let context = context.clone();
+                    jobs.spawn(async move {
+                        let Ok(fd) = client.as_fd().try_clone_to_owned() else {
+                            return;
+                        };
+                        // SAFETY: The duplicate stays open and unchanged while AsyncFd owns it.
+                        let Ok(fd) = (unsafe { AsyncFd::register(fd) }) else {
+                            return;
+                        };
+                        let base = context.clock.base_after(MAX_CONNECTION_TIME);
+                        tokio::select! {
+                            _ = disconnected(fd) => {},
+                            _ = context.clock.expire(base) => {},
+                            _ = serve(client, context.clone()) => {},
+                        }
+                    });
+                }
             }
         }
     }
@@ -290,16 +298,21 @@ async fn serve(client: impl AsyncRead + AsyncWrite + Unpin + Send + 'static, con
             Tunnel::Opaque(target, mut dialed) => {
                 let copy = tokio::io::copy_bidirectional(&mut client, &mut dialed.stream);
                 tokio::pin!(copy);
-                let mut checks = tokio::time::interval(TUNNEL_POLICY_INTERVAL);
+                // The dial checked live policy. Only consume subsequent refreshes.
+                let mut policy = context.tunnel_policy.subscribe();
                 loop {
                     tokio::select! {
                         biased;
                         _ = lifetime.cancelled() => break,
-                        _ = checks.tick() => {
-                            let Ok(lease) = context.network_policy(&lifetime).await else { break };
+                        changed = policy.changed() => {
+                            if changed.is_err() {
+                                break;
+                            }
+                            let snapshot = policy.borrow_and_update();
+                            let Ok(live) = &*snapshot else { break };
                             if !matches!(
                                 context.required_approval(
-                                    &lease, &target.host, Some(dialed.address), &dialed.approved,
+                                    live.as_ref(), &target.host, Some(dialed.address), &dialed.approved,
                                 ),
                                 Ok(None)
                             ) {
@@ -536,6 +549,25 @@ impl Egress {
         Ok(response.map(BodyExt::boxed_unsync))
     }
 
+    async fn refresh_tunnel_policy(&self) {
+        loop {
+            tokio::select! {
+                _ = self.cancel.cancelled() => return,
+                _ = tokio::time::sleep(TUNNEL_POLICY_INTERVAL) => {}
+            }
+            if self.tunnel_policy.receiver_count() == 0 {
+                continue;
+            }
+            // Publish under the admission lease so new dials cannot race
+            // ahead of an older policy snapshot. Tunnel copies never await it.
+            let mut lease = self.network_policy(&self.cancel).await;
+            let _ = self.tunnel_policy.send(match &mut lease {
+                Ok(lease) => Ok(lease.policy.take()),
+                Err(error) => Err(*error),
+            });
+        }
+    }
+
     async fn network_policy(&self, cancel: &CancellationToken) -> Result<DispatchPolicy, Failure> {
         // The shell worker holds the root gates. Reuse its dispatch policy
         // accessor without acquiring any workspace or path locks here.
@@ -575,12 +607,11 @@ impl Egress {
 
     fn required_approval<'a>(
         &self,
-        lease: &DispatchPolicy,
+        live: Option<&Policy>,
         host: &'a str,
         address: Option<SocketAddr>,
         approved: &HashSet<String>,
     ) -> Result<Option<Cow<'a, str>>, Failure> {
-        let live = lease.policy.as_ref();
         let effect = self.effect(live, host);
         if effect == Effect::Deny {
             return Err(DENIED);
@@ -625,7 +656,8 @@ impl Egress {
     ) -> Result<Option<DispatchPolicy>, Failure> {
         loop {
             let lease = self.network_policy(cancel).await?;
-            let Ok(prompt) = self.required_approval(&lease, host, address, approved) else {
+            let Ok(prompt) = self.required_approval(lease.policy.as_ref(), host, address, approved)
+            else {
                 return Ok(None);
             };
             let Some(prompt) = prompt else {
@@ -688,7 +720,7 @@ impl Egress {
             if let Ok(stream) = result {
                 let lease = self.network_policy(cancel).await?;
                 if self
-                    .required_approval(&lease, host, Some(address), &approved)?
+                    .required_approval(lease.policy.as_ref(), host, Some(address), &approved)?
                     .is_some()
                 {
                     return Err(DENIED);
@@ -887,12 +919,14 @@ mod tests {
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
-        sync::RwLock,
+        sync::{Notify, RwLock},
     };
 
     struct LiveNetwork {
         policy: Arc<RwLock<Policy>>,
         asks: AtomicUsize,
+        checks: AtomicUsize,
+        checking: Notify,
     }
 
     #[async_trait::async_trait]
@@ -920,6 +954,8 @@ mod tests {
                     ..
                 }]
             ));
+            self.checks.fetch_add(1, Ordering::Relaxed);
+            self.checking.notify_waiters();
             let guard = self.policy.clone().read_owned().await;
             let current = guard.clone();
             Ok(DispatchPolicy::new(guard).with_policy(current, false))
@@ -946,6 +982,8 @@ mod tests {
         let live = Arc::new(LiveNetwork {
             policy: Arc::new(RwLock::new(policy.clone())),
             asks: AtomicUsize::new(0),
+            checks: AtomicUsize::new(0),
+            checking: Notify::new(),
         });
         let registry = Registry::new(&[root.to_owned()], policy, serde_json::json!(true))
             .unwrap()
@@ -969,6 +1007,7 @@ mod tests {
             approvals: Arc::new(Mutex::new(HashMap::new())),
             clock: Arc::new(Clock::new()),
             tls: None,
+            tunnel_policy: watch::Sender::new(Ok(None)),
             tasks: TaskTracker::new(),
         });
         (context, live)
@@ -1014,6 +1053,9 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let (context, live) = fixture(root.path(), Effect::Allow);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let _stop = context.cancel.clone().drop_guard();
+        let refresh = context.clone();
+        tokio::spawn(async move { refresh.refresh_tunnel_policy().await });
         let (mut client, header) = connect(context, listener.local_addr().unwrap()).await;
         assert!(header.starts_with("HTTP/1.1 200"), "{header}");
         let (mut upstream, _) = listener.accept().await.unwrap();
@@ -1031,6 +1073,44 @@ mod tests {
             0,
         );
         assert_eq!(upstream.read(&mut byte).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn opaque_tunnels_share_one_refresh_and_forward_while_it_waits() {
+        let root = tempfile::tempdir().unwrap();
+        let (context, live) = fixture(root.path(), Effect::Allow);
+        let _stop = context.cancel.clone().drop_guard();
+        let refresh = context.clone();
+        tokio::spawn(async move { refresh.refresh_tunnel_policy().await });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut tunnels = Vec::new();
+        for _ in 0..2 {
+            let (mut client, header) = connect(context.clone(), addr).await;
+            assert!(header.starts_with("HTTP/1.1 200"), "{header}");
+            let (mut upstream, _) = listener.accept().await.unwrap();
+            client.write_u8(42).await.unwrap();
+            assert_eq!(upstream.read_u8().await.unwrap(), 42);
+            tunnels.push((client, upstream));
+        }
+
+        tokio::time::pause();
+        let _hold_policy = live.policy.write().await;
+        let before = live.checks.load(Ordering::Relaxed);
+        tokio::time::timeout(Duration::from_secs(2), live.checking.notified())
+            .await
+            .unwrap();
+        for (mut client, mut upstream) in tunnels {
+            upstream.write_u8(43).await.unwrap();
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(2), client.read_u8())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                43
+            );
+        }
+        assert_eq!(live.checks.load(Ordering::Relaxed), before + 1);
     }
 
     #[test]

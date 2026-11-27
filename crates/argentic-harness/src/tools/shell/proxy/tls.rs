@@ -210,6 +210,7 @@ mod tests {
             approvals: Arc::new(Mutex::default()),
             clock: Arc::new(super::super::Clock::new()),
             tls: Some(tls),
+            tunnel_policy: tokio::sync::watch::Sender::new(Ok(None)),
             tasks: TaskTracker::new(),
         });
         let upstream_task = tokio::spawn(async move {
