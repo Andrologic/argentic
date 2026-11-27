@@ -203,8 +203,9 @@ prompt before reporting its size.
 `read`, `list`, `glob` and `grep` take a zero-based `root` index and a
 relative `path`. Directory tools default to the root. `glob` matches against
 paths relative to the selected directory. `grep` takes a regular expression
-and returns filenames, one-based line numbers and matching lines. Read calls
-can run in parallel up to `maxParallelReads` when no reviewer is attached.
+and returns filenames, one-based line numbers and matching lines. The 64 MiB
+scan budget counts bytes read from skipped binary and oversized files too.
+Read calls can run in parallel up to `maxParallelReads` when no reviewer is attached.
 Replies retain the provider's call order. Mutations, shell calls and submissions
 are barriers. An accepted submission ends work.
 

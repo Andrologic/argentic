@@ -576,7 +576,7 @@ impl Registry {
         let raw_path = args.path.as_deref().unwrap_or(".");
         let text = match call.name.as_str() {
             "read" if args.path.is_some() => self
-                .read_one(root, path, cancel)
+                .read_one(root, path, cancel, &mut 0, usize::MAX)
                 .map(|text| text.replace("\r\n", "\n")),
             "list" => self.scan(root, path, Search::List, cancel),
             "glob" => {
@@ -602,9 +602,16 @@ impl Registry {
             .map_err(|e| e.to_string())
     }
 
-    fn read_one(&self, root: &Root, path: &Path, cancel: &CancellationToken) -> io::Result<String> {
+    fn read_one(
+        &self,
+        root: &Root,
+        path: &Path,
+        cancel: &CancellationToken,
+        bytes_read: &mut usize,
+        limit: usize,
+    ) -> io::Result<String> {
         let file = confined::file(&root.directory, path)?;
-        self.read_open_file(root, path, file, cancel)
+        self.read_open_file(root, path, file, cancel, bytes_read, limit)
     }
 
     fn read_open_file(
@@ -613,9 +620,11 @@ impl Registry {
         path: &Path,
         mut file: File,
         cancel: &CancellationToken,
+        bytes_read: &mut usize,
+        limit: usize,
     ) -> io::Result<String> {
         root.verify_location(path, confined::location(&file)?)?;
-        let text = file_text(&mut file, cancel)?;
+        let text = bounded_file_text(&mut file, cancel, bytes_read, limit)?;
         root.verify_location(path, confined::location(&file)?)?;
         Ok(text)
     }
@@ -680,15 +689,14 @@ impl Registry {
                     records.push((display, 0, String::new()))
                 }
                 Search::Grep(pattern) if kind.is_file() => {
-                    let Ok(content) = self.read_one(root, &child, cancel) else {
+                    let content =
+                        self.read_one(root, &child, cancel, &mut bytes_read, MAX_SCAN_BYTES);
+                    if bytes_read > MAX_SCAN_BYTES {
+                        return Err(scan_budget_exceeded());
+                    }
+                    let Ok(content) = content else {
                         continue;
                     };
-                    bytes_read += content.len();
-                    if bytes_read > MAX_SCAN_BYTES {
-                        return Err(io::Error::other(
-                            "Search byte budget exceeded. Select a narrower directory",
-                        ));
-                    }
                     for (index, line) in content.lines().enumerate() {
                         check_cancel(cancel)?;
                         if pattern.is_match(line) {
@@ -825,12 +833,31 @@ fn check_cancel(cancel: &CancellationToken) -> io::Result<()> {
     Ok(())
 }
 
+fn scan_budget_exceeded() -> io::Error {
+    io::Error::other("Search byte budget exceeded. Select a narrower directory")
+}
+
 fn file_text(file: &mut File, cancel: &CancellationToken) -> io::Result<String> {
+    bounded_file_text(file, cancel, &mut 0, usize::MAX)
+}
+
+fn bounded_file_text(
+    file: &mut File,
+    cancel: &CancellationToken,
+    bytes_read: &mut usize,
+    limit: usize,
+) -> io::Result<String> {
     let mut bytes = Vec::new();
     let mut chunk = [0; 16 * 1024];
     loop {
         check_cancel(cancel)?;
-        let len = file.read(&mut chunk)?;
+        // Read at most one byte past the budget to distinguish EOF.
+        let capacity = chunk.len().min((limit - *bytes_read).saturating_add(1));
+        let len = file.read(&mut chunk[..capacity])?;
+        *bytes_read += len;
+        if *bytes_read > limit {
+            return Err(scan_budget_exceeded());
+        }
         if len == 0 {
             break;
         }
@@ -868,7 +895,14 @@ mod tests {
         #[cfg(windows)]
         let relative = Path::new("other").join("memo.txt");
         let error = registry
-            .read_open_file(root, &relative, file, &CancellationToken::new())
+            .read_open_file(
+                root,
+                &relative,
+                file,
+                &CancellationToken::new(),
+                &mut 0,
+                usize::MAX,
+            )
             .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
     }
