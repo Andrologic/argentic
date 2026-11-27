@@ -18,7 +18,16 @@ pub struct Page {
 impl Page {
     /// Bound a tool response without a cursor that would repeat the action.
     pub fn one_shot(text: &str, scope: &str) -> io::Result<Self> {
-        let mut page = paginate(text, scope, None, None)?;
+        Self::one_shot_screened(text, scope, None)
+    }
+
+    /// Bound a one-shot response after screening its complete contents.
+    pub fn one_shot_screened(
+        text: &str,
+        scope: &str,
+        credential: Option<&str>,
+    ) -> io::Result<Self> {
+        let mut page = paginate(text, scope, None, None, credential)?;
         page.next_cursor = None;
         Ok(page)
     }
@@ -35,7 +44,12 @@ pub(super) fn paginate(
     scope: &str,
     cursor: Option<&str>,
     limit: Option<usize>,
+    credential: Option<&str>,
 ) -> io::Result<Page> {
+    let screened = credential
+        .filter(|key| key.len() >= crate::providers::MIN_SCREENED_CREDENTIAL_BYTES)
+        .map(|key| crate::providers::credential::redact(text, key));
+    let text = screened.as_deref().unwrap_or(text);
     let hash = fingerprint(scope);
     let prefix = format!("v1:{hash:016x}:");
     let invalid = || io::Error::new(io::ErrorKind::InvalidInput, "Invalid or mismatched cursor");

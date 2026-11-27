@@ -477,15 +477,14 @@ struct Sse {
 }
 
 impl Sse {
-    fn push(&mut self, bytes: &[u8]) -> Result<Vec<String>, ProviderError> {
-        let mut events = Vec::new();
+    fn push(&mut self, bytes: &[u8], events: &mut Vec<String>) -> Result<(), ProviderError> {
         for &byte in bytes {
             if std::mem::take(&mut self.after_cr) && byte == b'\n' {
                 continue;
             }
             if matches!(byte, b'\r' | b'\n') {
                 self.after_cr = byte == b'\r';
-                self.line_end(&mut events)?;
+                self.line_end(events)?;
             } else {
                 self.line.push(byte);
                 if self.line.len() + self.data.len() > MAX_EVENT_BYTES {
@@ -493,7 +492,7 @@ impl Sse {
                 }
             }
         }
-        Ok(events)
+        Ok(())
     }
 
     fn line_end(&mut self, events: &mut Vec<String>) -> Result<(), ProviderError> {
@@ -519,11 +518,9 @@ impl Sse {
         Ok(())
     }
 
-    fn finish(&mut self) -> Result<Vec<String>, ProviderError> {
-        let mut events = Vec::new();
-        self.line_end(&mut events)?;
-        self.line_end(&mut events)?;
-        Ok(events)
+    fn finish(&mut self, events: &mut Vec<String>) -> Result<(), ProviderError> {
+        self.line_end(events)?;
+        self.line_end(events)
     }
 }
 
@@ -585,9 +582,10 @@ fn decode<E: Events>(
 
                 let next = budget.chunk(&cancel, &mut response).await?;
                 let eof = next.is_none();
-                let frames = match next {
-                    Some(bytes) => state.sse.push(bytes.as_ref())?,
-                    None => state.sse.finish()?,
+                let mut frames = Vec::new();
+                let framing = match next {
+                    Some(bytes) => state.sse.push(bytes.as_ref(), &mut frames),
+                    None => state.sse.finish(&mut frames),
                 };
                 for frame in frames {
                     match state.assembled.frame(&frame, &mut state.output) {
@@ -603,6 +601,9 @@ fn decode<E: Events>(
                             break;
                         }
                     }
+                }
+                if state.error.is_none() && !state.ended {
+                    state.error = framing.err().map(Into::into);
                 }
                 if state.error.is_none() && (eof || state.ended) {
                     if let Err(error) = state.assembled.end(&mut state.output, state.ended, &model)

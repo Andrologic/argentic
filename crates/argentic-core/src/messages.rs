@@ -8,6 +8,7 @@ use super::{
         values::{clone, decimal},
         Object, Value,
     },
+    is_json_media,
     route::{
         object, object_path, string, InstructionAuthority, ItemContext, PromptProvenance,
         ResultMetadata, RouteSource, RouteTarget, SourceKind,
@@ -51,19 +52,6 @@ pub(crate) enum SelectedValue {
 pub(crate) struct ResolvedMessage {
     pub(crate) message_json: String,
     pub(crate) prompt_provenance: PromptProvenance,
-}
-fn json_media(media: &str) -> bool {
-    if media == "application/json" {
-        return true;
-    }
-    let Some((head, tail)) = media.split_once('/') else {
-        return false;
-    };
-    !head.is_empty()
-        && !tail.contains('/')
-        && tail
-            .strip_suffix("+json")
-            .is_some_and(|prefix| !prefix.is_empty())
 }
 /// Raw traversal deliberately has no item namespace.
 pub(crate) fn read_path(current: &Value, path: &Value) -> Result<Value> {
@@ -146,7 +134,7 @@ pub(crate) fn select_value(
         }
     }
     if let Some(entry) = &result {
-        if !json_media(&entry.media_type) && !entry.media_type.starts_with("text/") {
+        if !is_json_media(&entry.media_type) && !entry.media_type.starts_with("text/") {
             let uri = exact::text(Some(&value), "")?;
             // Only acceptance is observed. Never emit the parser's normalized URL.
             if url::Url::parse(uri).is_err() {
@@ -738,4 +726,26 @@ fn resolve_route_message_using(
         message_json: exact::encode(&Value::Object(message)),
         prompt_provenance: r.prompt,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn structured_json_result_is_selected_inline() {
+        let path = r#"["result"]"#;
+        let metadata = ResultMetadata::declared(path.into(), "application/+json".into());
+        let selected = select_value(
+            r#"{"result":{"answer":42}}"#,
+            path,
+            &ItemContext::Absent,
+            &[metadata],
+        )
+        .unwrap();
+        assert!(matches!(
+            selected,
+            SelectedValue::Inline { value_json, .. } if value_json == r#"{"answer":42}"#
+        ));
+    }
 }

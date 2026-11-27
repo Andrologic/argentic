@@ -94,13 +94,22 @@ fn agsdl_040_comments_and_join_selections() {
 }
 
 #[test]
-#[ignore = "requires the reference corpus exported from the published tag"]
 fn agsdl_040_full_static_corpus() {
-    let dir = std::path::PathBuf::from(std::env::var_os("AGSDL_040_CONFORMANCE").unwrap());
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/conformance-040");
     let expected: Value =
         serde_json::from_slice(&fs::read(dir.join("expected.json")).unwrap()).unwrap();
     let expected = expected.as_object().unwrap();
     assert_eq!(expected.len(), 147);
+    let actual_cases: BTreeSet<_> = dir
+        .join("cases")
+        .read_dir()
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    assert_eq!(
+        actual_cases,
+        expected.keys().map(|name| format!("{name}.json")).collect()
+    );
     let example = fs::read(dir.join("modules/example/module.json")).unwrap();
     let limited = fs::read(dir.join("modules/limited/module.json")).unwrap();
     for (name, expected) in expected {
@@ -109,6 +118,8 @@ fn agsdl_040_full_static_corpus() {
             &validate_document_json(&bytes, Some(&[&example, &limited])).unwrap(),
         )
         .unwrap();
+        // The 0.4.0 reference validator accepts a single edition. Argentic
+        // dispatches this valid legacy fixture to its 0.3.0 validator.
         if name == "shape-wrong-contract" {
             assert_eq!(expected["errors"], json!(["SHAPE"]));
             assert_eq!(report["contract"], "agsdl-0.3.0");

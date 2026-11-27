@@ -2,6 +2,7 @@ use super::*;
 use crate::argentic_core::{
     contract,
     exact::{Object, Value as E},
+    is_json_media,
     native::a,
     valueschema::port,
 };
@@ -122,7 +123,7 @@ pub(crate) fn validate_submission(contract: &Value, raw: &Value) -> Result<Value
                 .get("mediaType")
                 .and_then(E::as_str)
                 .unwrap_or("application/json");
-            if media == "application/json" || media.ends_with("+json") {
+            if is_json_media(media) {
                 if let Some(schema) = rule.get("schema") {
                     let issues =
                         port::validate_value_schema030(value, schema, &p).map_err(|_| {

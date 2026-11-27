@@ -1,11 +1,12 @@
-use super::port::contains_credential;
 use crate::{
     agsdl_host_action_approval030::permits_model_review,
     harness::{
-        AgentOperator030, CommandApprovals030, FlowWorkAttempt030, Respond030, WorkEventSink030,
+        AgentOperator030, CommandApprovals030, FlowWorkAttempt030, Respond030, RespondArgentic030,
+        WorkEventSink030,
     },
     persistence::{failure, Result},
 };
+use argentic_harness::providers::contains_credential;
 use argentic_harness::{
     providers::{Chunk, Finish, Message, ModelName, Provider, Request, ToolChoice, TurnLimits},
     r#loop::{Failure, Hook, ReviewBudget},
@@ -193,9 +194,24 @@ impl CommandApprovals030 for ModelReviewer {
     fn answer<'a>(
         &'a self,
         work: &'a FlowWorkAttempt030,
-        mut payload: Value,
+        payload: Value,
         cancel: &'a CancellationToken,
         respond: Respond030<'a>,
+    ) -> BoxFuture<'a, Result<()>> {
+        self.answer_argentic(
+            work,
+            payload,
+            cancel,
+            Box::new(move |source| respond(source.is_some())),
+        )
+    }
+
+    fn answer_argentic<'a>(
+        &'a self,
+        work: &'a FlowWorkAttempt030,
+        mut payload: Value,
+        cancel: &'a CancellationToken,
+        respond: RespondArgentic030<'a>,
     ) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             let native = &payload["nativeRequest"];
@@ -208,7 +224,7 @@ impl CommandApprovals030 for ModelReviewer {
                 (Verdict::Deny, "reviewUnavailable")
             };
             if cancel.is_cancelled() {
-                return respond(false).await;
+                return respond(None).await;
             }
             let verdict = match decision {
                 Verdict::Approve => "APPROVE",
@@ -233,7 +249,7 @@ impl CommandApprovals030 for ModelReviewer {
                 .await?;
             let receipt: Value = serde_json::from_str(&receipt.receipt_json)?;
             if receipt["decision"]["kind"] != "waiting" || cancel.is_cancelled() {
-                return respond(false).await;
+                return respond(None).await;
             }
 
             let request_id = native["id"].clone();
@@ -245,10 +261,16 @@ impl CommandApprovals030 for ModelReviewer {
                     .ok_or_else(|| failure("CORRELATION", "review", "Approval arguments absent"))?
                     .remove("reviewArguments");
             }
+            use argentic_harness::tools::ApprovalSource;
+            let approved_by = if matches!(decision, Verdict::Approve) {
+                ApprovalSource::Model
+            } else {
+                ApprovalSource::Person
+            };
             let mut allowed = false;
             let respond: Respond030<'_> = Box::new(|yes| {
                 allowed = yes;
-                respond(yes)
+                respond(yes.then_some(approved_by))
             });
             let result = match (decision, &self.person) {
                 (Verdict::Approve, _) => {

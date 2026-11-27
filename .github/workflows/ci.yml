@@ -26,6 +26,29 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  advisories:
+    name: Audit Cargo lockfiles
+    if: inputs.suite != 'reader'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+    env:
+      RUSTUP_TOOLCHAIN: '1.97.1'
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - name: Install cargo-audit
+        run: |
+          rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+          cargo install cargo-audit --version 0.23.0 --locked
+      - name: Audit each crate
+        run: |
+          status=0
+          for lockfile in crates/*/Cargo.lock; do
+            cargo audit --deny unsound --file "$lockfile" || status=1
+          done
+          exit "$status"
+
   cargo:
     name: Cargo (${{ matrix.platform }})
     runs-on: >-
@@ -60,7 +83,7 @@ jobs:
           rustc -Vv
 
       - name: Check Rust formatting and Clippy
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && inputs.suite != 'reader'
         run: |
           rustup component add rustfmt clippy
           for crate in argentic-harness argentic-core argentic-runtime; do
@@ -81,7 +104,7 @@ jobs:
           swiftc --version
 
       - name: Install Bubblewrap and enable unprivileged user namespaces
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && inputs.suite != 'reader'
         run: |
           sudo apt-get update
           sudo apt-get install -y bubblewrap curl
@@ -91,11 +114,12 @@ jobs:
           echo "ARGENTIC_REQUIRE_BWRAP=1" >> "$GITHUB_ENV"
 
       - name: Test argentic-harness
+        if: inputs.suite != 'reader'
         working-directory: crates/argentic-harness
         run: cargo test --locked --all-targets
 
       - name: Measure Argentic staging and turn latency
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && inputs.suite != 'reader'
         working-directory: crates/argentic-harness
         run: |
           cargo test --locked --lib shell_staging -- --ignored --nocapture
@@ -112,6 +136,11 @@ jobs:
         if: inputs.suite == 'reader'
         working-directory: crates/argentic-runtime
         run: cargo test --locked --test content_reader
+
+      - name: Test macOS debug content reader
+        if: runner.os == 'macOS'
+        working-directory: crates/argentic-runtime
+        run: cargo test --locked --features agsdl-content-qa --test content_reader
 
       - name: Test argentic-runtime
         if: inputs.suite != 'reader'

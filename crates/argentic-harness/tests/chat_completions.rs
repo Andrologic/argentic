@@ -219,6 +219,41 @@ async fn a_truncated_stream_cannot_return_a_completed_tool_call() {
 }
 
 #[tokio::test]
+async fn completed_sse_event_precedes_a_framing_error() {
+    let mock = Mock::start(vec![(
+        StatusCode::OK,
+        None,
+        vec![b"data: {\"choices\":[{\"delta\":{\"content\":\"started\"}}]}\n\ndata: \xff\n\n"],
+    )])
+    .await;
+    let model = "openai/model".parse().unwrap();
+    let mut output = mock
+        .client
+        .stream(
+            Request {
+                model: &model,
+                messages: &[],
+                reasoning_effort: Some("high"),
+                tools: &[],
+                tool_choice: Default::default(),
+                tool_choice_rejected: None,
+                max_output_tokens: 100,
+                limits: TurnLimits::default(),
+                delivery: Default::default(),
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        output.next().await.unwrap().unwrap(),
+        Chunk::Text("started".into())
+    );
+    assert!(output.next().await.unwrap().is_err());
+    assert_eq!(mock.requests.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
 async fn effort_error_after_visible_text_does_not_replay_the_turn() {
     let mock = Mock::start(vec![(StatusCode::OK, None, vec![
         b"data: {\"choices\":[{\"delta\":{\"content\":\"started\"}}]}\n\ndata: {\"error\":{\"message\":\"Unsupported parameter: reasoning_effort\"}}\n\n"

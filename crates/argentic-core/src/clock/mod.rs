@@ -110,9 +110,10 @@ fn object(value: &Value) -> Result<()> {
     }
 }
 fn keys(value: &Value, allowed: &[&str]) -> Result<()> {
-    if value
-        .object()
-        .unwrap()
+    let Some(entries) = value.object() else {
+        return plain("expected an object.");
+    };
+    if entries
         .iter()
         .any(|(k, _)| !allowed.iter().any(|s| k.eq_str(s)))
     {

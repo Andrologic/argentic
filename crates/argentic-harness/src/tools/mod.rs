@@ -24,7 +24,7 @@ use cap_std::{
     ambient_authority,
     fs::{Dir, File, OpenOptions},
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
@@ -69,6 +69,7 @@ pub struct Registry {
     policy: Arc<[Policy]>,
     toolbox: Toolbox,
     authorizer: Option<Arc<dyn Authorizer>>,
+    approval_prompts: bool,
     extensions: Option<Arc<dyn Extensions>>,
     shell_staging_directory: Option<PathBuf>,
     shell_network: ShellNetwork,
@@ -185,6 +186,43 @@ pub enum Approval<'a> {
     Network(&'a str),
 }
 
+/// The reviewer who actually approved this exact action.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ApprovalSource {
+    Person,
+    Model,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct DispatchAction<'a> {
+    pub action: Approval<'a>,
+    pub approved_by: Option<ApprovalSource>,
+}
+
+/// Holds the current policy steady until the worker finishes its protected I/O.
+pub struct DispatchPolicy {
+    _guard: Box<dyn Send + Sync>,
+    policy: Option<Policy>,
+    read_only: bool,
+}
+
+impl DispatchPolicy {
+    pub fn new(guard: impl Send + Sync + 'static) -> Self {
+        Self {
+            _guard: Box::new(guard),
+            policy: None,
+            read_only: false,
+        }
+    }
+
+    pub fn with_policy(mut self, policy: Policy, read_only: bool) -> Self {
+        self.policy = Some(policy);
+        self.read_only = read_only;
+        self
+    }
+}
+
 #[async_trait::async_trait]
 pub trait Authorizer: Send + Sync {
     async fn approve(
@@ -193,6 +231,50 @@ pub trait Authorizer: Send + Sync {
         action: Approval<'_>,
         cancel: &CancellationToken,
     ) -> Result<bool, String>;
+
+    fn can_prompt(&self) -> bool {
+        true
+    }
+
+    async fn approval_source(
+        &self,
+        call: &ToolCall,
+        action: Approval<'_>,
+        cancel: &CancellationToken,
+    ) -> Result<Option<ApprovalSource>, String> {
+        self.approve(call, action, cancel)
+            .await
+            .map(|allowed| allowed.then_some(ApprovalSource::Person))
+    }
+
+    /// Recheck file and shell actions after tool locks are held. Include the
+    /// exact approval source for each action prompted under the captured policy.
+    async fn revalidate_dispatch(
+        &self,
+        call: &ToolCall,
+        actions: &[DispatchAction<'_>],
+    ) -> Result<DispatchPolicy, String> {
+        if actions
+            .iter()
+            .all(|action| matches!(action.action, Approval::Read(_) | Approval::Write(_)))
+        {
+            let actions: Vec<_> = actions.iter().map(|action| action.action).collect();
+            return self
+                .revalidate_files(call, &actions)
+                .await
+                .map(DispatchPolicy::new);
+        }
+        Ok(DispatchPolicy::new(()))
+    }
+
+    /// Compatibility hook for embedders that already revalidate file dispatch.
+    async fn revalidate_files(
+        &self,
+        _call: &ToolCall,
+        _actions: &[Approval<'_>],
+    ) -> Result<Box<dyn Send + Sync>, String> {
+        Ok(Box::new(()))
+    }
 }
 
 /// Per-work tools supplied by the embedding host.
@@ -265,6 +347,7 @@ impl Registry {
             policy,
             toolbox,
             authorizer: None,
+            approval_prompts: true,
             extensions: None,
             shell_staging_directory: None,
             shell_network: ShellNetwork::default(),
@@ -319,7 +402,11 @@ impl Registry {
     }
 
     pub(crate) fn has_authorizer(&self) -> bool {
-        self.authorizer.is_some()
+        self.approval_prompts
+            && self
+                .authorizer
+                .as_ref()
+                .is_some_and(|authorizer| authorizer.can_prompt())
     }
 
     fn path_effect(&self, root: &Root, action: Action, path: &Path) -> Effect {
@@ -332,6 +419,22 @@ impl Registry {
             .map(|policy| policy.path_effect(action, path, zone))
             .max()
             .unwrap_or(Effect::Deny)
+    }
+
+    fn live_path_effect(
+        &self,
+        policy: &DispatchPolicy,
+        root: &Root,
+        action: Action,
+        path: &Path,
+    ) -> Effect {
+        if action == Action::Write && policy.read_only {
+            return Effect::Deny;
+        }
+        let captured = self.path_effect(root, action, path);
+        policy.policy.as_ref().map_or(captured, |policy| {
+            captured.max(policy.path_effect(action, path, self.base_zone(path)))
+        })
     }
 
     fn base_zone(&self, path: &Path) -> Zone {
@@ -349,16 +452,26 @@ impl Registry {
         action: Approval<'_>,
         cancel: &CancellationToken,
     ) -> Result<(), String> {
+        self.authorize_action(effect, call, action, cancel)
+            .await
+            .map(|_| ())
+    }
+
+    async fn authorize_action<'a>(
+        &self,
+        effect: Effect,
+        call: &ToolCall,
+        action: Approval<'a>,
+        cancel: &CancellationToken,
+    ) -> Result<DispatchAction<'a>, String> {
         check_cancel(cancel).map_err(|error| error.to_string())?;
-        let allowed = match effect {
-            Effect::Allow => true,
-            Effect::Deny => false,
-            Effect::Ask => match &self.authorizer {
-                Some(authorizer) => authorizer.approve(call, action, cancel).await?,
-                None => false,
-            },
+        let approved_by = match (effect, &self.authorizer) {
+            (Effect::Ask, Some(authorizer)) if self.approval_prompts => {
+                authorizer.approval_source(call, action, cancel).await?
+            }
+            _ => None,
         };
-        if !allowed {
+        if effect != Effect::Allow && approved_by.is_none() {
             let action = match action {
                 Approval::Read(_) => "Read",
                 Approval::Write(_) => "Write",
@@ -368,7 +481,27 @@ impl Registry {
             };
             return Err(format!("{action} permission denied"));
         }
-        check_cancel(cancel).map_err(|error| error.to_string())
+        check_cancel(cancel).map_err(|error| error.to_string())?;
+        Ok(DispatchAction {
+            action,
+            approved_by,
+        })
+    }
+
+    async fn lock_dispatch(
+        &self,
+        call: &ToolCall,
+        actions: &[DispatchAction<'_>],
+        cancel: &CancellationToken,
+    ) -> Result<DispatchPolicy, String> {
+        let Some(authorizer) = &self.authorizer else {
+            return Ok(DispatchPolicy::new(()));
+        };
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => Err("Tool cancelled".into()),
+            result = authorizer.revalidate_dispatch(call, actions) => result,
+        }
     }
 
     fn delegation_effect(&self) -> Effect {
@@ -382,7 +515,7 @@ impl Registry {
     pub(crate) fn may_delegate(&self) -> bool {
         match self.delegation_effect() {
             Effect::Allow => true,
-            Effect::Ask => self.authorizer.is_some(),
+            Effect::Ask => self.has_authorizer(),
             Effect::Deny => false,
         }
     }
@@ -424,12 +557,10 @@ impl Registry {
         let mut policies = self.policy.to_vec();
         policies.push(child_policy);
         let mut registry = Self::with_open_roots(roots, policies, json!(false))?;
+        registry.authorizer = self.authorizer.clone();
+        registry.approval_prompts = false;
         Arc::make_mut(&mut registry.toolbox.definitions).retain(|tool| tool.name != SUBMIT_RESULT);
         Ok(registry)
-    }
-
-    fn allows(&self, root: &Root, path: &Path) -> bool {
-        self.path_effect(root, Action::Read, path) == Effect::Allow
     }
 
     pub fn definitions(&self) -> impl Iterator<Item = (Exposure, &ToolDefinition)> {
@@ -469,7 +600,7 @@ impl Registry {
         cancel: CancellationToken,
     ) -> Result<Page, String> {
         let tracker = TaskTracker::new();
-        let output = self.execute(call, cancel, &tracker).await;
+        let output = self.execute(call, cancel, &tracker, None).await;
         tracker.close();
         tracker.wait().await;
         output
@@ -480,12 +611,13 @@ impl Registry {
         call: ToolCall,
         cancel: CancellationToken,
         tracker: &TaskTracker,
+        credential: Option<&str>,
     ) -> Result<Page, String> {
         if call.name == "shell" {
-            return self.shell(call, cancel, tracker).await;
+            return self.shell(call, cancel, tracker, credential).await;
         }
         if matches!(call.name.as_str(), "write" | "edit" | "apply_patch") {
-            return self.mutate(call, cancel, tracker).await;
+            return self.mutate(call, cancel, tracker, credential).await;
         }
         if !matches!(call.name.as_str(), "read" | "list" | "glob" | "grep") {
             check_cancel(&cancel).map_err(|error| error.to_string())?;
@@ -502,16 +634,17 @@ impl Registry {
         } else {
             root.path.join(&path)
         };
-        self.authorize(
-            self.path_effect(root, Action::Read, &absolute),
-            &call,
-            Approval::Read(&absolute),
-            &cancel,
-        )
-        .await?;
+        let effect = self.path_effect(root, Action::Read, &absolute);
+        let action = self
+            .authorize_action(effect, &call, Approval::Read(&absolute), &cancel)
+            .await?;
+        let policy = self.lock_dispatch(&call, &[action], &cancel).await?;
         let registry = self.clone();
+        let credential = credential.map(str::to_owned);
         tracker
-            .spawn_blocking(move || registry.read_sync(&call, args, &path, &cancel))
+            .spawn_blocking(move || {
+                registry.read_sync(&call, args, &path, &cancel, &policy, credential.as_deref())
+            })
             .await
             .map_err(|e| e.to_string())?
     }
@@ -521,6 +654,7 @@ impl Registry {
         call: ToolCall,
         cancel: CancellationToken,
         tracker: &TaskTracker,
+        credential: Option<&str>,
     ) -> Result<Page, String> {
         if !self.toolbox.writes {
             return Err("Mutation tools are disabled".into());
@@ -540,13 +674,17 @@ impl Registry {
             }
             requests.push((absolute, action, effect));
         }
+        let mut approvals = Vec::with_capacity(requests.len());
         for (path, action, effect) in &requests {
-            let request = match action {
+            let action = match action {
                 Action::Read => Approval::Read(path),
                 Action::Write => Approval::Write(path),
                 _ => unreachable!("mutation requested a non-file action"),
             };
-            self.authorize(*effect, &call, request, &cancel).await?;
+            approvals.push(
+                self.authorize_action(*effect, &call, action, &cancel)
+                    .await?,
+            );
         }
         let workspace = tokio::select! {
             biased;
@@ -554,12 +692,15 @@ impl Registry {
             guard = self.root_gates[index].clone().read_owned() => guard,
         };
         let guards = mutation::lock_paths(locks, &cancel).await?;
+        let policy = self.lock_dispatch(&call, &approvals, &cancel).await?;
         let registry = self.clone();
+        let credential = credential.map(str::to_owned);
         tracker
             .spawn_blocking(move || {
-                let (_guards, _workspace) = (guards, workspace);
+                let (_guards, _workspace, _policy) = (guards, workspace, policy);
                 let text = mutation.run(&registry.roots[index], &cancel)?;
-                output::paginate(&text, &call.id, None, None).map_err(|error| error.to_string())
+                output::paginate(&text, &call.id, None, None, credential.as_deref())
+                    .map_err(|error| error.to_string())
             })
             .await
             .map_err(|error| error.to_string())?
@@ -571,18 +712,20 @@ impl Registry {
         args: Arguments,
         path: &Path,
         cancel: &CancellationToken,
+        policy: &DispatchPolicy,
+        credential: Option<&str>,
     ) -> Result<Page, String> {
         let root = &self.roots[args.root];
         let raw_path = args.path.as_deref().unwrap_or(".");
         let text = match call.name.as_str() {
             "read" if args.path.is_some() => self
-                .read_one(root, path, cancel)
+                .read_one(root, path, cancel, &mut 0, usize::MAX)
                 .map(|text| text.replace("\r\n", "\n")),
-            "list" => self.scan(root, path, Search::List, cancel),
+            "list" => self.scan(root, path, Search::List, cancel, policy),
             "glob" => {
                 let pattern = args.pattern.as_deref().ok_or("glob requires pattern")?;
                 let glob = PathGlob::compile(pattern).map_err(|e| e.to_string())?;
-                self.scan(root, path, Search::Glob(glob), cancel)
+                self.scan(root, path, Search::Glob(glob), cancel, policy)
             }
             "grep" => {
                 let pattern = args
@@ -591,20 +734,33 @@ impl Registry {
                     .filter(|pattern| !pattern.is_empty())
                     .ok_or("grep requires a nonempty pattern")?;
                 let pattern = regex::Regex::new(pattern).map_err(|e| e.to_string())?;
-                self.scan(root, path, Search::Grep(pattern), cancel)
+                self.scan(root, path, Search::Grep(pattern), cancel, policy)
             }
             _ => return Err("Unknown read tool or missing arguments".into()),
         }
         .map_err(|e| e.to_string())?;
         let scope = json!([call.name, args.root, raw_path, args.pattern]).to_string();
         check_cancel(cancel).map_err(|e| e.to_string())?;
-        output::paginate(&text, &scope, args.cursor.as_deref(), args.limit)
-            .map_err(|e| e.to_string())
+        output::paginate(
+            &text,
+            &scope,
+            args.cursor.as_deref(),
+            args.limit,
+            credential,
+        )
+        .map_err(|e| e.to_string())
     }
 
-    fn read_one(&self, root: &Root, path: &Path, cancel: &CancellationToken) -> io::Result<String> {
+    fn read_one(
+        &self,
+        root: &Root,
+        path: &Path,
+        cancel: &CancellationToken,
+        bytes_read: &mut usize,
+        limit: usize,
+    ) -> io::Result<String> {
         let file = confined::file(&root.directory, path)?;
-        self.read_open_file(root, path, file, cancel)
+        self.read_open_file(root, path, file, cancel, bytes_read, limit)
     }
 
     fn read_open_file(
@@ -613,9 +769,11 @@ impl Registry {
         path: &Path,
         mut file: File,
         cancel: &CancellationToken,
+        bytes_read: &mut usize,
+        limit: usize,
     ) -> io::Result<String> {
         root.verify_location(path, confined::location(&file)?)?;
-        let text = file_text(&mut file, cancel)?;
+        let text = bounded_file_text(&mut file, cancel, bytes_read, limit)?;
         root.verify_location(path, confined::location(&file)?)?;
         Ok(text)
     }
@@ -626,6 +784,7 @@ impl Registry {
         path: &Path,
         search: Search,
         cancel: &CancellationToken,
+        policy: &DispatchPolicy,
     ) -> io::Result<String> {
         let directory = confined::directory(&root.directory, path)?;
         root.verify_location(path, confined::location(&directory)?)?;
@@ -658,7 +817,9 @@ impl Registry {
                 continue;
             };
             let child = parent.join(&name);
-            if !self.allows(root, &root.path.join(&child)) {
+            if self.live_path_effect(policy, root, Action::Read, &root.path.join(&child))
+                != Effect::Allow
+            {
                 continue;
             }
             let kind = entry.file_type()?;
@@ -680,15 +841,14 @@ impl Registry {
                     records.push((display, 0, String::new()))
                 }
                 Search::Grep(pattern) if kind.is_file() => {
-                    let Ok(content) = self.read_one(root, &child, cancel) else {
+                    let content =
+                        self.read_one(root, &child, cancel, &mut bytes_read, MAX_SCAN_BYTES);
+                    if bytes_read > MAX_SCAN_BYTES {
+                        return Err(scan_budget_exceeded());
+                    }
+                    let Ok(content) = content else {
                         continue;
                     };
-                    bytes_read += content.len();
-                    if bytes_read > MAX_SCAN_BYTES {
-                        return Err(io::Error::other(
-                            "Search byte budget exceeded. Select a narrower directory",
-                        ));
-                    }
                     for (index, line) in content.lines().enumerate() {
                         check_cancel(cancel)?;
                         if pattern.is_match(line) {
@@ -825,12 +985,31 @@ fn check_cancel(cancel: &CancellationToken) -> io::Result<()> {
     Ok(())
 }
 
+fn scan_budget_exceeded() -> io::Error {
+    io::Error::other("Search byte budget exceeded. Select a narrower directory")
+}
+
 fn file_text(file: &mut File, cancel: &CancellationToken) -> io::Result<String> {
+    bounded_file_text(file, cancel, &mut 0, usize::MAX)
+}
+
+fn bounded_file_text(
+    file: &mut File,
+    cancel: &CancellationToken,
+    bytes_read: &mut usize,
+    limit: usize,
+) -> io::Result<String> {
     let mut bytes = Vec::new();
     let mut chunk = [0; 16 * 1024];
     loop {
         check_cancel(cancel)?;
-        let len = file.read(&mut chunk)?;
+        // Read at most one byte past the budget to distinguish EOF.
+        let capacity = chunk.len().min((limit - *bytes_read).saturating_add(1));
+        let len = file.read(&mut chunk[..capacity])?;
+        *bytes_read += len;
+        if *bytes_read > limit {
+            return Err(scan_budget_exceeded());
+        }
         if len == 0 {
             break;
         }
@@ -868,7 +1047,14 @@ mod tests {
         #[cfg(windows)]
         let relative = Path::new("other").join("memo.txt");
         let error = registry
-            .read_open_file(root, &relative, file, &CancellationToken::new())
+            .read_open_file(
+                root,
+                &relative,
+                file,
+                &CancellationToken::new(),
+                &mut 0,
+                usize::MAX,
+            )
             .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
     }

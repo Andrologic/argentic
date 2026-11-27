@@ -611,16 +611,15 @@ impl Executor {
                 registry = registry.with_shell_staging_directory(directory.clone());
             }
         }
-        if let Some(approvals) = &approvals {
-            registry = registry.with_authorizer(Arc::new(approval::ToolApprovals {
-                approvals: approvals.clone(),
-                person: person.clone(),
-                attempt: work.attempt.clone(),
-                sequence: std::sync::atomic::AtomicU64::new(0),
-                credential: credential.clone(),
-                model: model_reviewer.is_some(),
-            }));
-        }
+        registry = registry.with_authorizer(Arc::new(approval::ToolApprovals {
+            approvals: approvals.clone(),
+            person: person.clone().filter(|_| approvals.is_some()),
+            live_policy: self.approvals.clone(),
+            attempt: work.attempt.clone(),
+            sequence: std::sync::atomic::AtomicU64::new(0),
+            credential: credential.clone(),
+            model: model_reviewer.is_some(),
+        }));
         let skills = sources.skills().await?;
         let sources = Arc::new(tokio::sync::Mutex::new(sources));
         let scope: Value = serde_json::from_str(required(&private, "callScopeJson")?)?;
@@ -635,7 +634,14 @@ impl Executor {
             _ => PlanMode::Off,
         };
         let inbox = std::mem::replace(&mut work.steer, crate::agsdl_host_steer030::channel030().1);
-        let port = port::Port::new(events, &work, inbox, person, sources.clone(), credential);
+        let port = port::Port::new(
+            events,
+            &work,
+            inbox,
+            person,
+            sources.clone(),
+            credential.clone(),
+        );
         let context = self.host.clone();
         let work_cancel = cancel.child_token();
         let equipment_cancel = work_cancel.clone();
@@ -659,6 +665,7 @@ impl Executor {
             skills,
             setup,
             work_cancel.clone(),
+            credential.clone(),
         ));
         let registry = registry
             .with_extensions(tools.skills_definition(), tools.clone())
@@ -698,6 +705,7 @@ impl Executor {
         let (_send, steer) = tokio::sync::mpsc::channel(1);
         let context_window = self.config.context_window(&model);
         let mut harness = Harness::new(provider, Arc::new(registry), settings)
+            .with_provider_credential(credential)
             .with_context_window(context_window)
             .with_plan(plan_mode)
             .with_delegation()
@@ -789,7 +797,7 @@ fn submission_schema(agent: &Value, contract: &Value) -> Value {
     let mut required = Vec::new();
     for (name, result) in agent["results"].as_object().into_iter().flatten() {
         let media = result["mediaType"].as_str().unwrap_or("application/json");
-        let mut schema = if media == "application/json" || media.ends_with("+json") {
+        let mut schema = if argentic_core::is_json_media(media) {
             result.get("schema").cloned().unwrap_or_else(|| json!({}))
         } else {
             json!({"type":"string"})

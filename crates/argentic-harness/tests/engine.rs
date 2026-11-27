@@ -854,6 +854,213 @@ async fn text_only_submission_gets_a_tool_call_correction() {
 }
 
 #[tokio::test]
+async fn short_keys_and_tool_metadata_do_not_trigger_screening() {
+    for key in ["42", "agsdl_submit_result"] {
+        let work = work(true);
+        let replay = serde_json::from_value(json!({
+            "format": "Responses",
+            "model": work.model,
+            "items": [{"type":"function_call","id":key,"call_id":key,
+                       "name":"agsdl_submit_result","arguments":"{\"results\":{\"answer\":42}}"}]
+        }))
+        .unwrap();
+        let (_dir, harness) = fixture(
+            vec![vec![
+                submit(key, json!({"answer":42})),
+                Chunk::Replay(replay),
+                end(Finish::ToolCalls),
+            ]],
+            json!({}),
+        );
+        let (_, steer) = mpsc::channel(1);
+        let report = harness
+            .with_provider_credential(Some(key.into()))
+            .run(work, &(), steer, CancellationToken::new())
+            .await;
+        assert_eq!(
+            report.outcome.unwrap().submission,
+            Some(json!({"results":{"answer":42}}))
+        );
+    }
+}
+
+#[tokio::test]
+async fn screened_tool_arguments_receive_same_work_corrections() {
+    const KEY: &str = "provider-fixture-key";
+    let work = work(true);
+    let replay = serde_json::from_value(json!({
+        "format": "Responses",
+        "model": work.model,
+        "items": [{"type":"function_call","call_id":"unsafe-submit",
+                   "name":"agsdl_submit_result","arguments":format!(r#"{{"results":{{"answer":"\u0070{}"}}}}"#, &KEY[1..])}]
+    }))
+    .unwrap();
+    let (_dir, harness) = fixture(
+        vec![
+            vec![
+                call("unsafe-read", "read", json!({"path":KEY})),
+                submit("unsafe-submit", json!({"answer":KEY})),
+                Chunk::Replay(replay),
+                end(Finish::ToolCalls),
+            ],
+            vec![
+                submit("fixed-submit", json!({"answer":42})),
+                end(Finish::ToolCalls),
+            ],
+        ],
+        json!({}),
+    );
+    let (_, steer) = mpsc::channel(1);
+    let report = harness
+        .with_provider_credential(Some(KEY.into()))
+        .run(work, &(), steer, CancellationToken::new())
+        .await;
+    assert_eq!(
+        report.outcome.unwrap().submission,
+        Some(json!({"results":{"answer":42}}))
+    );
+    let messages = serde_json::to_string(&report.messages).unwrap();
+    assert!(messages.contains("configured provider credential"));
+    assert!(messages.contains("Correct the result arguments"));
+    assert!(!messages.contains(KEY));
+    assert!(!messages.contains(&KEY[1..]));
+}
+
+#[tokio::test]
+async fn tool_overflow_artifact_is_screened_before_pagination() {
+    const KEY: &str = "provider-fixture-key";
+    let (dir, harness) = fixture(
+        vec![
+            vec![
+                call("page", "read", json!({"path":"notes.txt"})),
+                end(Finish::ToolCalls),
+            ],
+            vec![end(Finish::Stop)],
+        ],
+        json!({}),
+    );
+    std::fs::write(
+        dir.path().join("notes.txt"),
+        format!("{}{}\n", "x".repeat(70_000), KEY),
+    )
+    .unwrap();
+    let (_, steer) = mpsc::channel(1);
+    let report = harness
+        .with_provider_credential(Some(KEY.into()))
+        .run(work(false), &(), steer, CancellationToken::new())
+        .await;
+    assert!(report.outcome.is_ok());
+    assert_eq!(report.artifacts.len(), 1);
+    let text = std::fs::read_to_string(report.artifacts[0].file.path()).unwrap();
+    assert!(text.ends_with("[redacted]\n"));
+    assert!(!text.contains(KEY));
+}
+
+#[tokio::test]
+async fn response_budget_counts_screened_stream_bytes() {
+    let key = format!("{}z", "a".repeat(2048));
+    let repeated = key.repeat(8 * 1024 * 1024 / key.len() + 1);
+    let expected = "[redacted]".repeat(repeated.len() / key.len());
+    let (_dir, harness) = fixture(
+        vec![vec![
+            Chunk::Text(repeated[..1024].into()),
+            Chunk::Text(repeated[1024..].into()),
+            end(Finish::Stop),
+        ]],
+        json!({}),
+    );
+    let (_, steer) = mpsc::channel(1);
+    let report = harness
+        .with_provider_credential(Some(key))
+        .run(work(false), &(), steer, CancellationToken::new())
+        .await;
+    assert_eq!(report.outcome.unwrap().text, expected);
+}
+
+#[tokio::test]
+async fn credential_in_signed_replay_rejects_the_reply() {
+    const KEY: &str = "provider-fixture-key";
+    let work = work(false);
+    let replay = serde_json::from_value(json!({
+        "format": "Anthropic",
+        "model": work.model,
+        "items": [{"type":"thinking","thinking":"private reasoning","signature":KEY}]
+    }))
+    .unwrap();
+    let (_dir, harness) = fixture(
+        vec![vec![
+            Chunk::Replay(replay),
+            submit("submit", json!({"answer":42})),
+            end(Finish::ToolCalls),
+        ]],
+        json!({}),
+    );
+    let (_, steer) = mpsc::channel(1);
+    let report = harness
+        .with_provider_credential(Some(KEY.into()))
+        .run(work, &(), steer, CancellationToken::new())
+        .await;
+    assert!(matches!(
+        report.outcome,
+        Err(Failure::Provider(ProviderError::Invalid(_)))
+    ));
+    assert_eq!(report.messages.len(), 1);
+    assert!(!serde_json::to_string(&report.messages)
+        .unwrap()
+        .contains(KEY));
+}
+
+#[tokio::test(start_paused = true)]
+async fn stop_bounds_pending_steer_settlement() {
+    struct PendingSettlement(CancellationToken);
+
+    #[async_trait]
+    impl WorkPort for PendingSettlement {
+        async fn settle_steer(
+            &self,
+            id: &str,
+            status: argentic_harness::providers::DeliveryStatus,
+        ) -> Result<(), Failure> {
+            assert_eq!(id, "offer");
+            assert_eq!(
+                status,
+                argentic_harness::providers::DeliveryStatus::Accepted
+            );
+            self.0.cancel();
+            std::future::pending().await
+        }
+    }
+
+    let (_dir, harness) = fixture(
+        vec![vec![end(Finish::Stop)], vec![end(Finish::Stop)]],
+        json!({"cancelGraceMs": 10}),
+    );
+    let (send, steer) = mpsc::channel(1);
+    let (consumed, receipt) = oneshot::channel();
+    send.try_send(Steer {
+        id: "offer".into(),
+        reference: None,
+        message: "accepted steer".into(),
+        consumed,
+    })
+    .unwrap();
+    let cancel = CancellationToken::new();
+    let port = PendingSettlement(cancel.clone());
+    let report = tokio::time::timeout(
+        Duration::from_millis(100),
+        harness.run(work(false), &port, steer, cancel),
+    )
+    .await
+    .expect("Stop must return within the cancellation grace period");
+    assert!(matches!(report.outcome, Err(Failure::Cancelled)));
+    assert!(report.physical_end.forced());
+    assert!(receipt.await.is_err());
+    assert!(report
+        .messages
+        .contains(&Message::User("accepted steer".into())));
+}
+
+#[tokio::test]
 async fn steer_is_not_acknowledged_or_retained_when_the_next_request_fails() {
     let (_dir, harness) = fixture(vec![vec![end(Finish::Stop)]], json!({}));
     let (send, steer) = mpsc::channel(1);

@@ -1,7 +1,8 @@
 use crate::{
     agsdl_host_work_admission030::pointer_token030,
     permissions::{
-        Action, DirectoryAccess, Effect, EffectivePolicy, Outside, Preset, RequestedPermissions,
+        Action, DirectoryAccess, Effect, EffectivePolicy, NormalizedPolicy, Outside, Preset,
+        RequestedPermissions,
     },
     persistence::{failure, Result},
 };
@@ -237,85 +238,84 @@ pub(super) fn extra_roots(
 }
 
 pub(super) fn compile_policy(policy: &EffectivePolicy) -> Result<Vec<Policy>> {
-    policy
-        .policies()
-        .map(|layer| {
-            let paths = layer.context();
-            let rules = layer
-                .rules()
-                .iter()
-                .flat_map(|rule| {
-                    let effect = match rule.effect {
-                        Effect::Allow => NativeEffect::Allow,
-                        Effect::Ask => NativeEffect::Ask,
-                        Effect::Deny => NativeEffect::Deny,
-                    };
-                    let action = match rule.action {
-                        Action::Read => NativeAction::Read,
-                        Action::Write => NativeAction::Write,
-                        Action::Shell => NativeAction::Shell,
-                        Action::Network => NativeAction::Network,
-                        Action::Mcp => NativeAction::Mcp,
-                        Action::Delegate => NativeAction::Delegate,
-                    };
-                    let patterns = if matches!(rule.action, Action::Read | Action::Write) {
-                        let logical = rule.logical_pattern();
-                        let physical = rule.physical_pattern();
-                        // Tools reject aliases, so an alias cannot grant access.
-                        // Restrictive rules still cover both captured names.
-                        if logical == physical {
-                            vec![logical]
-                        } else if effect == NativeEffect::Allow {
-                            vec![]
-                        } else {
-                            vec![logical, physical]
-                        }
-                    } else {
-                        vec![rule.pattern.as_deref()]
-                    };
-                    patterns.into_iter().map(move |pattern| Rule {
-                        action,
-                        pattern: pattern.map(str::to_owned),
-                        effect,
-                    })
-                })
-                .collect::<Vec<_>>();
-            let preset = layer.preset().map(|preset| match preset {
-                Preset::ReadOnly => NativePreset::ReadOnly,
-                Preset::Workspace => NativePreset::Workspace,
-                Preset::Full => NativePreset::Full,
-            });
-            Policy::compile_rules(
-                &paths.workspace,
-                Some(&paths.home),
-                preset,
-                if layer.explicitly_denies_outside_reads() {
-                    Some(false)
-                } else if layer.outside() == Outside::Read {
-                    Some(true)
+    policy.policies().map(compile_layer).collect()
+}
+
+pub(super) fn compile_layer(layer: &NormalizedPolicy) -> Result<Policy> {
+    let paths = layer.context();
+    let rules = layer
+        .rules()
+        .iter()
+        .flat_map(|rule| {
+            let effect = match rule.effect {
+                Effect::Allow => NativeEffect::Allow,
+                Effect::Ask => NativeEffect::Ask,
+                Effect::Deny => NativeEffect::Deny,
+            };
+            let action = match rule.action {
+                Action::Read => NativeAction::Read,
+                Action::Write => NativeAction::Write,
+                Action::Shell => NativeAction::Shell,
+                Action::Network => NativeAction::Network,
+                Action::Mcp => NativeAction::Mcp,
+                Action::Delegate => NativeAction::Delegate,
+            };
+            let patterns = if matches!(rule.action, Action::Read | Action::Write) {
+                let logical = rule.logical_pattern();
+                let physical = rule.physical_pattern();
+                // Tools reject aliases, so an alias cannot grant access.
+                // Restrictive rules still cover both captured names.
+                if logical == physical {
+                    vec![logical]
+                } else if effect == NativeEffect::Allow {
+                    vec![]
                 } else {
-                    None
-                },
-                &rules,
-            )
-            .map(|policy| {
-                policy.with_directories(
-                    layer
-                        .directories()
-                        .iter()
-                        .map(|directory| {
-                            let zone = match directory.access {
-                                DirectoryAccess::Read => Zone::ReadDirectory,
-                                DirectoryAccess::Write => Zone::WriteDirectory,
-                            };
-                            (directory.canonical.clone(), zone)
-                        })
-                        .collect(),
-                )
+                    vec![logical, physical]
+                }
+            } else {
+                vec![rule.pattern.as_deref()]
+            };
+            patterns.into_iter().map(move |pattern| Rule {
+                action,
+                pattern: pattern.map(str::to_owned),
+                effect,
             })
-            .map_err(|error| failure("PERMISSION", "/permissions", &error))
         })
-        .collect()
+        .collect::<Vec<_>>();
+    let preset = layer.preset().map(|preset| match preset {
+        Preset::ReadOnly => NativePreset::ReadOnly,
+        Preset::Workspace => NativePreset::Workspace,
+        Preset::Full => NativePreset::Full,
+    });
+    Policy::compile_rules(
+        &paths.workspace,
+        Some(&paths.home),
+        preset,
+        if layer.explicitly_denies_outside_reads() {
+            Some(false)
+        } else if layer.outside() == Outside::Read {
+            Some(true)
+        } else {
+            None
+        },
+        &rules,
+    )
+    .map(|policy| {
+        policy.with_directories(
+            layer
+                .directories()
+                .iter()
+                .map(|directory| {
+                    let zone = match directory.access {
+                        DirectoryAccess::Read => Zone::ReadDirectory,
+                        DirectoryAccess::Write => Zone::WriteDirectory,
+                    };
+                    (directory.canonical.clone(), zone)
+                })
+                .collect(),
+        )
+    })
+    .map_err(|error| failure("PERMISSION", "/permissions", &error))
 }
 
 pub(super) fn agent_pointer(name: &str) -> String {
