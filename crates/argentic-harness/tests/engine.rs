@@ -5,7 +5,7 @@ use std::{
 
 use argentic_harness::{
     config::Settings,
-    policy::{Preset, ReadPolicy},
+    policy::{Action, Effect, Preset, ReadPolicy, Rule},
     providers::{
         Chunk, Finish, Message, Provider, ProviderError, ProviderStream, Request, ScriptedProvider,
         ToolCall, ToolChoice, Usage,
@@ -1070,6 +1070,43 @@ async fn editable_native_replay_masks_assistant_text() {
             json!([screened])
         );
     }
+}
+
+#[tokio::test]
+async fn child_budget_exhaustion_stops_the_parent_tool_batch() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let policy = ReadPolicy::compile_rules(
+        &root,
+        None,
+        Some(Preset::ReadOnly),
+        None,
+        &[Rule {
+            action: Action::Delegate,
+            pattern: None,
+            effect: Effect::Allow,
+        }],
+    )
+    .unwrap();
+    let registry = Registry::new(&[root], policy, json!(true)).unwrap();
+    let provider = scripted(vec![
+        vec![
+            call("child", "delegate", json!({"task":"Inspect the workspace"})),
+            submit("submit", json!({"answer":42})),
+            end(Finish::ToolCalls),
+        ],
+        vec![Chunk::Text("Child reply".into()), end(Finish::Stop)],
+    ]);
+    let settings =
+        Settings::resolve(&json!({}), &json!({}), &json!({"maxTotalTokens":29})).unwrap();
+    let harness = Harness::new(Arc::new(provider), Arc::new(registry), settings).with_delegation();
+    let trace = Trace::default();
+    let (_, steer) = mpsc::channel(1);
+    let report = harness
+        .run(work(true), &trace, steer, CancellationToken::new())
+        .await;
+    assert!(matches!(report.outcome, Err(Failure::TokenLimit)));
+    assert!(trace.0.lock().unwrap().is_empty());
 }
 
 #[tokio::test]

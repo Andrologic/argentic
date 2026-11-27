@@ -1,4 +1,4 @@
-use super::{Harness, Hook, Instance, Work};
+use super::{Failure, Harness, Hook, Instance, Work};
 use crate::{
     providers::{Message, ToolCall, ToolDefinition},
     tools::Page,
@@ -17,6 +17,17 @@ struct Arguments {
     task: String,
 }
 
+pub(super) enum DelegateError {
+    Tool(String),
+    Budget(Failure),
+}
+
+impl From<String> for DelegateError {
+    fn from(error: String) -> Self {
+        Self::Tool(error)
+    }
+}
+
 pub(super) fn definition() -> ToolDefinition {
     ToolDefinition {
         name: TOOL.into(),
@@ -29,17 +40,29 @@ pub(super) fn definition() -> ToolDefinition {
 }
 
 impl Instance<'_> {
-    pub(super) async fn delegate(&self, work: &Work, call: &ToolCall) -> Result<Page, String> {
+    pub(super) async fn delegate(
+        &self,
+        work: &Work,
+        call: &ToolCall,
+    ) -> Result<Page, DelegateError> {
         if !self.harness.delegation {
-            return Err("Delegation permission denied".into());
+            return Err(DelegateError::Tool("Delegation permission denied".into()));
         }
-        let args: Arguments =
-            serde_json::from_str(&call.arguments).map_err(|_| "Invalid delegation arguments")?;
+        let args: Arguments = serde_json::from_str(&call.arguments)
+            .map_err(|_| "Invalid delegation arguments".to_owned())?;
         if args.task.trim().is_empty() || args.task.len() > 8192 {
-            return Err("Supply a task between 1 and 8192 bytes".into());
+            return Err(DelegateError::Tool(
+                "Supply a task between 1 and 8192 bytes".into(),
+            ));
         }
-        if !self.budget().map_err(|error| error.to_string())?.has_turn() {
-            return Err("No parent budget remains for delegation".into());
+        {
+            let budget = self.budget().map_err(DelegateError::Budget)?;
+            if budget.tokens == Some(0) {
+                return Err(DelegateError::Budget(Failure::TokenLimit));
+            }
+            if budget.turns == 0 {
+                return Err(DelegateError::Budget(Failure::TurnLimit));
+            }
         }
         self.harness
             .registry
@@ -79,13 +102,13 @@ impl Instance<'_> {
                     .await
             })
             .await
-            .map_err(|_| "Sub-agent task failed")?;
+            .map_err(|_| "Sub-agent task failed".to_owned())?;
         result.outcome.map_err(|error| match error {
-            super::Failure::TokenLimit
-            | super::Failure::MissingUsage
-            | super::Failure::TurnLimit => "Sub-agent exhausted its budget",
-            super::Failure::Cancelled => "Sub-agent cancelled",
-            _ => "Sub-agent failed",
+            Failure::TokenLimit | Failure::MissingUsage | Failure::TurnLimit => {
+                DelegateError::Budget(error)
+            }
+            Failure::Cancelled => "Sub-agent cancelled".to_owned().into(),
+            _ => "Sub-agent failed".to_owned().into(),
         })?;
         let text = result
             .messages
@@ -96,7 +119,7 @@ impl Instance<'_> {
                 _ => None,
             })
             .unwrap_or_default();
-        Page::one_shot(text, &call.id).map_err(|error| error.to_string())
+        Page::one_shot(text, &call.id).map_err(|error| error.to_string().into())
     }
 }
 
