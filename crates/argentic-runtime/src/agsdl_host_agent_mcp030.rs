@@ -641,8 +641,7 @@ async fn lock_tool_policy(
     captured: Effect,
 ) -> Result<(Effect, (HostPolicyLease, ProjectPolicyLease))> {
     // Use the same ceiling -> project -> operator order as the approval broker.
-    let ceiling = host.lock_agsdl_host_permissions().await?;
-    let project = host.lock_execution_tools(project_id).await?;
+    let (ceiling, project) = host.lock_ceiling_and_project(project_id).await?;
     let request = ActionRequest::Mcp {
         server: server.into(),
         tool: Some(tool.into()),
