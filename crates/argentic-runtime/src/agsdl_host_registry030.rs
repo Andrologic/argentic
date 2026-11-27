@@ -7,7 +7,9 @@ use futures::future::BoxFuture;
 use serde_json::Value;
 use std::{collections::BTreeMap, sync::Arc};
 
-pub use crate::agsdl_host_action_approval030::{CommandApprovals030, Respond030};
+pub use crate::agsdl_host_action_approval030::{
+    CommandApprovals030, Respond030, RespondArgentic030,
+};
 pub use crate::agsdl_host_argentic030::{ArgenticAdapter030, ArgenticConfig030};
 pub use crate::agsdl_host_flow030::operator030::AgentOperator030;
 pub use crate::agsdl_host_flow030::FlowWorkAttempt030;

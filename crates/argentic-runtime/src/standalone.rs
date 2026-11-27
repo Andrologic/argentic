@@ -243,22 +243,46 @@ impl ActionPolicySource for Policies {
             if native["method"] == "argentic/tool/requestApproval" {
                 let requests: Vec<ActionRequest> =
                     serde_json::from_value(native["params"]["actions"].clone())?;
+                use argentic_harness::tools::ApprovalSource;
+                let proofs = payload
+                    .get("approvalProofs")
+                    .cloned()
+                    .map(serde_json::from_value::<Vec<Option<ApprovalSource>>>)
+                    .transpose()?;
+                let person_required = policy.reviewer() == Some(Reviewer::Person);
+                let read_only = guard.policy.read_only;
                 let allowed = !requests.is_empty()
-                    && !(payload["reviewer"] == "model"
-                        && policy.reviewer() == Some(Reviewer::Person))
-                    && requests.iter().all(|request| {
+                    && proofs
+                        .as_ref()
+                        .is_none_or(|proofs| proofs.len() == requests.len())
+                    && !(payload["reviewer"] == "model" && person_required)
+                    && requests.iter().enumerate().all(|(index, request)| {
+                        let action = request.action();
                         matches!(
-                            request.action(),
+                            action,
                             Action::Read
                                 | Action::Write
                                 | Action::Shell
                                 | Action::Network
                                 | Action::Delegate
-                        ) && (!guard.policy.read_only || request.action() != Action::Write)
-                            && evaluate_requested(&policy, request)
-                                .is_ok_and(|effect| effect != Effect::Deny)
+                        ) && (!read_only || action != Action::Write)
+                            && evaluate_requested(&policy, request).is_ok_and(|effect| {
+                                if let Some(proofs) = &proofs {
+                                    let approved_by = proofs[index];
+                                    (approved_by != Some(ApprovalSource::Model) || !person_required)
+                                        && match effect {
+                                            Effect::Allow => true,
+                                            Effect::Ask => approved_by.is_some(),
+                                            Effect::Deny => false,
+                                        }
+                                } else {
+                                    effect != Effect::Deny
+                                }
+                            })
                     });
-                return Ok(ActionPolicyLease::new(allowed, guard));
+                return Ok(
+                    ActionPolicyLease::new(allowed, guard).with_argentic_policy(policy, read_only)
+                );
             }
             let path = payload
                 .pointer("/nativeRequest/params/additionalPermissions/fileSystem/write/0")

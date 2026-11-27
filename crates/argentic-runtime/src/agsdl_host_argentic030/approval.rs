@@ -5,19 +5,19 @@ use crate::{
 };
 use argentic_harness::{
     providers::{contains_credential, ToolCall},
-    tools::{Approval, Authorizer},
+    tools::{Approval, ApprovalSource, Authorizer, DispatchAction, DispatchPolicy},
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::path::Path;
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicU64, Ordering},
     Arc,
 };
 use tokio_util::sync::CancellationToken;
 
 pub(super) struct ToolApprovals {
-    pub approvals: Arc<dyn CommandApprovals030>,
+    pub approvals: Option<Arc<dyn CommandApprovals030>>,
     pub live_policy: Arc<dyn CommandApprovals030>,
     pub person: Option<Arc<dyn CommandApprovals030>>,
     pub attempt: FlowWorkAttempt030,
@@ -67,15 +67,30 @@ impl Authorizer for ToolApprovals {
         action: Approval<'_>,
         cancel: &CancellationToken,
     ) -> Result<bool, String> {
+        self.approval_source(call, action, cancel)
+            .await
+            .map(|src| src.is_some())
+    }
+
+    fn can_prompt(&self) -> bool {
+        self.approvals.is_some() || self.person.is_some()
+    }
+
+    async fn approval_source(
+        &self,
+        call: &ToolCall,
+        action: Approval<'_>,
+        cancel: &CancellationToken,
+    ) -> Result<Option<ApprovalSource>, String> {
         // Proxy connections run outside the agent task that owns reviewer
         // journal events. The human broker owns the connection's approval.
         let approvals = if matches!(action, Approval::Network(_)) {
-            let Some(person) = &self.person else {
-                return Ok(false);
-            };
-            person
+            self.person.as_ref()
         } else {
-            &self.approvals
+            self.approvals.as_ref()
+        };
+        let Some(approvals) = approvals else {
+            return Ok(None);
         };
         let (title, actions) = match action {
             Approval::Read(path) | Approval::Write(path) => {
@@ -108,57 +123,74 @@ impl Authorizer for ToolApprovals {
         if self.credential.as_deref().is_some_and(|key| {
             contains_credential(&title, key) || contains_credential(&call.arguments, key)
         }) {
-            return Ok(false);
+            return Ok(None);
         }
         let mut payload = self.payload(call, title, actions);
         if self.model && permits_model_review(&payload["nativeRequest"]) {
             payload["nativeRequest"]["params"]["reviewArguments"] = json!(call.arguments);
         }
-        let permit = AtomicBool::new(false);
+        let mut source = None;
         approvals
-            .answer(
+            .answer_argentic(
                 &self.attempt,
                 payload,
                 cancel,
-                Box::new(|yes| {
-                    let permit = &permit;
-                    Box::pin(async move {
-                        permit.store(yes, Ordering::Relaxed);
-                        Ok(())
-                    })
+                Box::new(|granted| {
+                    source = granted;
+                    Box::pin(async { Ok(()) })
                 }),
             )
             .await
             .map_err(|error| error.code)?;
-        Ok(permit.load(Ordering::Relaxed) && !cancel.is_cancelled())
+        Ok(source.filter(|_| !cancel.is_cancelled()))
     }
 
-    async fn revalidate_files(
+    async fn revalidate_dispatch(
         &self,
         call: &ToolCall,
-        actions: &[Approval<'_>],
-    ) -> Result<Box<dyn Send + Sync>, String> {
-        let actions = actions
-            .iter()
-            .map(|action| match action {
+        dispatch: &[DispatchAction<'_>],
+    ) -> Result<DispatchPolicy, String> {
+        let mut actions = Vec::new();
+        let mut proofs = Vec::new();
+        for &DispatchAction {
+            action,
+            approved_by,
+        } in dispatch
+        {
+            let start = actions.len();
+            match action {
                 Approval::Read(path) | Approval::Write(path) => {
-                    file_request(path, matches!(action, Approval::Write(_)))
-                        .map(|(_, action)| action)
+                    actions.push(file_request(path, matches!(action, Approval::Write(_)))?.1);
                 }
-                _ => Err("Expected a file action".into()),
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut payload = self.payload(call, "Revalidate file access".into(), actions);
-        if self.model {
-            payload["reviewer"] = json!("model");
+                Approval::Shell(command) => {
+                    actions.extend(
+                        argentic_harness::policy::subcommands(command)?
+                            .into_iter()
+                            .map(|command| ActionRequest::Shell {
+                                command: command.into(),
+                            }),
+                    );
+                }
+                _ => return Err("Expected a file or shell action".into()),
+            }
+            proofs.extend(std::iter::repeat_n(approved_by, actions.len() - start));
         }
-        let lease = self
+        let mut payload = self.payload(call, "Revalidate tool access".into(), actions);
+        payload["approvalProofs"] = json!(proofs);
+        let mut lease = self
             .live_policy
-            .lock_argentic_files(&self.attempt, &payload)
+            .lock_argentic_dispatch(&self.attempt, &payload)
             .await
             .map_err(|error| error.code)?
-            .ok_or("File permission denied by current policy")?;
-        Ok(Box::new(lease))
+            .ok_or("Tool permission denied by current policy")?;
+        let policy = lease.argentic.take();
+        let dispatch = DispatchPolicy::new(lease);
+        if let Some((policy, read_only)) = policy {
+            let policy = super::admission::compile_layer(&policy).map_err(|error| error.code)?;
+            Ok(dispatch.with_policy(policy, read_only))
+        } else {
+            Ok(dispatch)
+        }
     }
 }
 

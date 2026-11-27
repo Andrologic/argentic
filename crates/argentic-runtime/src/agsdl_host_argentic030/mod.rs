@@ -611,17 +611,15 @@ impl Executor {
                 registry = registry.with_shell_staging_directory(directory.clone());
             }
         }
-        if let Some(approvals) = &approvals {
-            registry = registry.with_authorizer(Arc::new(approval::ToolApprovals {
-                approvals: approvals.clone(),
-                person: person.clone(),
-                live_policy: self.approvals.clone(),
-                attempt: work.attempt.clone(),
-                sequence: std::sync::atomic::AtomicU64::new(0),
-                credential: credential.clone(),
-                model: model_reviewer.is_some(),
-            }));
-        }
+        registry = registry.with_authorizer(Arc::new(approval::ToolApprovals {
+            approvals: approvals.clone(),
+            person: person.clone().filter(|_| approvals.is_some()),
+            live_policy: self.approvals.clone(),
+            attempt: work.attempt.clone(),
+            sequence: std::sync::atomic::AtomicU64::new(0),
+            credential: credential.clone(),
+            model: model_reviewer.is_some(),
+        }));
         let skills = sources.skills().await?;
         let sources = Arc::new(tokio::sync::Mutex::new(sources));
         let scope: Value = serde_json::from_str(required(&private, "callScopeJson")?)?;

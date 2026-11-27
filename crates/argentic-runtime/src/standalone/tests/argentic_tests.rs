@@ -2468,6 +2468,156 @@ async fn argentic_review_caps_requests_per_turn_and_work() {
     close(&host).await;
 }
 
+async fn answer_next_argentic_ask(host: &Host, run: &RetainedStart030) {
+    let scope = persistence::public030::HumanScope030 {
+        system_start_id: run.receipt.identity.system_start_id.clone(),
+        source: run.capture.source.clone(),
+    };
+    let ask = pending_ask(host, &scope).await;
+    host.submit_person(HumanSubmission {
+        scope,
+        request_id: ask.id,
+        expected_revision: ask.revision,
+        answer: api::HumanAnswer030::Decision {
+            decision: "yes".into(),
+            comment: String::new(),
+        },
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn mixed_patch_revalidation_requires_proof_for_each_new_ask() {
+    let mut server = Server::start().await;
+    let mut doc = document();
+    doc["agents"]["worker"]["permissions"] = json!({
+        "preset":"workspace", "reviewer":"person", "rules":[forbid_shell(),
+            {"action":"write","match":"first","effect":"ask"}
+        ]
+    });
+    let f = Fixture::new(&doc.to_string());
+    let host = open(&f, true)
+        .await
+        .with_argentic(server.config(None))
+        .unwrap();
+    let run = start(&host).await;
+    let patch =
+        "*** Begin Patch\n*** Add File: first\n+one\n*** Add File: second\n+two\n*** End Patch";
+    let request = server.next().await;
+    host.policies.0.write().await.policy.permissions = serde_json::from_value(json!({
+        "preset":"workspace", "rules":[{"action":"write","match":"second","effect":"ask"}]
+    }))
+    .unwrap();
+    request.tool("apply_patch", json!({"patch_text":patch}));
+    answer_next_argentic_ask(&host, &run).await;
+    let next = server.next().await;
+    assert!(next.body["messages"]
+        .to_string()
+        .contains("permission denied"));
+    assert!(!f.workspace.join("first").exists());
+    assert!(!f.workspace.join("second").exists());
+    submit_done(next);
+    completed(&finish(&host, &run).await);
+    close(&host).await;
+}
+
+#[tokio::test]
+async fn implicitly_allowed_file_call_rechecks_live_policy_without_a_reviewer() {
+    let mut server = Server::start().await;
+    let mut doc = document();
+    doc["agents"]["worker"]["permissions"] = json!({
+        "preset":"workspace", "rules":[forbid_shell()]
+    });
+    let f = Fixture::new(&doc.to_string());
+    let host = open(&f, true)
+        .await
+        .with_argentic(server.config(None))
+        .unwrap();
+    let run = start(&host).await;
+    let request = server.next().await;
+    host.policies.0.write().await.policy.permissions = serde_json::from_value(json!({
+        "preset":"workspace", "rules":[{"action":"write","match":"memo.txt","effect":"ask"}]
+    }))
+    .unwrap();
+    write_memo(request);
+    let next = server.next().await;
+    assert!(next.body["messages"]
+        .to_string()
+        .contains("permission denied"));
+    assert!(!f.workspace.join("memo.txt").exists());
+    submit_done(next);
+    completed(&finish(&host, &run).await);
+    close(&host).await;
+}
+
+#[tokio::test]
+async fn approved_search_uses_live_policy_for_descendants() {
+    let mut server = Server::start().await;
+    let mut doc = document();
+    doc["agents"]["worker"]["permissions"] = json!({
+        "preset":"read-only", "reviewer":"person", "rules":[
+            {"action":"read","match":"tree","effect":"ask"}
+        ]
+    });
+    let f = Fixture::new(&doc.to_string());
+    let tree = f.workspace.join("tree");
+    std::fs::create_dir(&tree).unwrap();
+    for name in ["public.txt", "private.txt", "unapproved.txt"] {
+        std::fs::write(tree.join(name), "match").unwrap();
+    }
+    let host = open(&f, false)
+        .await
+        .with_argentic(server.config(None))
+        .unwrap();
+    let run = start(&host).await;
+    let request = server.next().await;
+    host.policies.0.write().await.policy.permissions = serde_json::from_value(json!({
+        "preset":"read-only", "rules":[
+            {"action":"read","match":"tree/private.txt","effect":"deny"},
+            {"action":"read","match":"tree/unapproved.txt","effect":"ask"}
+        ]
+    }))
+    .unwrap();
+    request.tool("grep", json!({"path":"tree", "pattern":"match"}));
+    answer_next_argentic_ask(&host, &run).await;
+    let next = server.next().await;
+    let messages = next.body["messages"].to_string();
+    assert!(messages.contains("public.txt"), "{messages}");
+    assert!(!messages.contains("private.txt"), "{messages}");
+    assert!(!messages.contains("unapproved.txt"), "{messages}");
+    submit_done(next);
+    completed(&finish(&host, &run).await);
+    close(&host).await;
+}
+
+#[tokio::test]
+async fn escalated_person_approval_satisfies_live_person_requirement() {
+    let mut server = Server::start().await;
+    let (doc, cfg) = reviewer_fixture(&server);
+    let f = Fixture::new(&doc.to_string());
+    let host = open(&f, true)
+        .await
+        .with_argentic(serde_json::from_value(cfg).unwrap())
+        .unwrap();
+    let run = start(&host).await;
+    write_memo(server.next().await);
+    let review = server.next().await;
+    assert_eq!(review.body["model"], "reviewer");
+    host.policies.0.write().await.policy.permissions = serde_json::from_value(json!({
+        "preset":"workspace", "reviewer":"person",
+        "rules":[{"action":"write","match":"memo.txt","effect":"ask"}]
+    }))
+    .unwrap();
+    send_text(review, r#"{"verdict":"ESCALATE"}"#);
+    answer_next_argentic_ask(&host, &run).await;
+    let next = server.next().await;
+    assert!(f.workspace.join("memo.txt").is_file(), "{}", next.body);
+    submit_done(next);
+    completed(&finish(&host, &run).await);
+    close(&host).await;
+}
+
 #[tokio::test]
 async fn argentic_review_records_a_refusal_at_final_policy_check() {
     let mut server = Server::start().await;
