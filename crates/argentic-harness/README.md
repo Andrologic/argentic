@@ -296,6 +296,12 @@ denial.
 
 ### Shell networking
 
+On Linux, building the shell network relay requires a C linker and the target's
+libc development files. The build tries static linking first, then dynamic
+linking against the system libraries mounted in the sandbox. If both attempts
+fail, the crate still builds and isolated shell commands remain available.
+Preflight refuses shell networking until the relay can be built.
+
 Set `shellNetwork` in the host's Argentic provider configuration. It defaults
 to `"blanket"`. In that mode a shell can use the proxy only if every policy
 layer grants network access unconditionally. Qualification rejects network

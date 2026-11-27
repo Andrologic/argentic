@@ -8,7 +8,7 @@ use std::{
         fd::{AsRawFd, RawFd},
         unix::{net::UnixStream, process::ExitStatusExt},
     },
-    process::{self, Command},
+    process::{self, Command, ExitStatus},
     sync::Arc,
     thread,
 };
@@ -26,6 +26,7 @@ struct PollFd {
 }
 
 extern "C" {
+    fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32;
     fn poll(fds: *mut PollFd, len: usize, timeout_ms: i32) -> i32;
 }
 
@@ -150,6 +151,24 @@ fn forward(mut client: TcpStream) -> io::Result<()> {
     }
 }
 
+fn wait_for_shell(shell_pid: u32) -> io::Result<ExitStatus> {
+    loop {
+        let mut status = 0;
+        // PID 1 also inherits orphaned grandchildren. Reap them as they exit.
+        let pid = unsafe { waitpid(-1, &mut status, 0) };
+        if pid == -1 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        if pid as u32 == shell_pid {
+            return Ok(ExitStatus::from_raw(status));
+        }
+    }
+}
+
 fn main() -> io::Result<()> {
     let mut args = env::args_os().skip(1);
     let port = args
@@ -170,7 +189,8 @@ fn main() -> io::Result<()> {
             }
         }
     })?;
-    let status = Command::new(program).args(args).status()?;
+    let shell = Command::new(program).args(args).spawn()?;
+    let status = wait_for_shell(shell.id())?;
     process::exit(
         status
             .code()

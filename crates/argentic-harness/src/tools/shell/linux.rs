@@ -17,7 +17,13 @@ use super::{
 };
 
 pub(super) const RELAY_PORT: u16 = 18999;
-const RELAY: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/argentic-shell-relay"));
+#[cfg(argentic_shell_relay)]
+const RELAY: Option<&[u8]> = Some(include_bytes!(concat!(
+    env!("OUT_DIR"),
+    "/argentic-shell-relay"
+)));
+#[cfg(not(argentic_shell_relay))]
+const RELAY: Option<&[u8]> = None;
 const SETUP_LIMIT: Duration = Duration::from_secs(5);
 const STAGING_CHECK_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -181,6 +187,15 @@ fn run_inner(
     cancel: &CancellationToken,
 ) -> io::Result<String> {
     super::super::check_cancel(cancel)?;
+    let relay_binary = socket
+        .map(|_| {
+            RELAY.ok_or_else(|| {
+                io::Error::other(
+                    "The shell network relay was unavailable at build time. Install a C linker and target libc development files, then rebuild Argentic.",
+                )
+            })
+        })
+        .transpose()?;
     let mut budgets = mounts
         .iter()
         .filter(|(_, write)| *write)
@@ -191,10 +206,10 @@ fn run_inner(
     let (mut info, info_writer) = io::pipe()?;
     let (gate_reader, mut gate) = io::pipe()?;
     nonblocking(info.as_raw_fd())?;
-    let relay = socket
-        .map(|_| -> io::Result<File> {
+    let relay = relay_binary
+        .map(|bytes| -> io::Result<File> {
             let mut file = tempfile::tempfile()?;
-            file.write_all(RELAY)?;
+            file.write_all(bytes)?;
             file.rewind()?;
             Ok(file)
         })
@@ -433,4 +448,74 @@ fn run_inner(
         out.into_text(),
         err.into_text()
     ))
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[cfg(not(argentic_shell_relay))]
+    #[test]
+    fn missing_relay_refuses_networking_but_allows_isolated_shell() {
+        if binary().is_err() {
+            return;
+        }
+        preflight(false).unwrap();
+        let error = preflight(true).unwrap_err();
+        assert!(
+            error.contains("Install a C linker and target libc development files"),
+            "{error}"
+        );
+    }
+
+    #[cfg(argentic_shell_relay)]
+    #[test]
+    fn relay_reaps_orphans_and_preserves_shell_status() {
+        let program = match binary() {
+            Ok(program) => program,
+            Err(error) => {
+                assert_ne!(
+                    std::env::var("ARGENTIC_REQUIRE_BWRAP").as_deref(),
+                    Ok("1"),
+                    "{error}"
+                );
+                return;
+            }
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("probe.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let run = |command| {
+            run_inner(
+                program,
+                command,
+                &[(dir.path(), false)],
+                Some(&socket),
+                None,
+                5_000,
+                &CancellationToken::new(),
+            )
+            .unwrap()
+        };
+        // The subshell exits while its child still sleeps, making the relay
+        // the child's new parent. Keep the main shell alive while it exits.
+        let output = run(r#"
+            pid=$(bash -c 'sleep 0.2 >/dev/null 2>&1 & echo $!')
+            for ((attempt=0; attempt<100; attempt++)); do
+                if [[ ! -e /proc/$pid ]]; then
+                    echo reaped
+                    exit 23
+                fi
+                sleep 0.02
+            done
+            exit 1
+        "#);
+        assert!(
+            output.starts_with("Exit status: 23\nstdout:\nreaped\n"),
+            "{output}"
+        );
+        let output = run("kill -TERM $$");
+        assert!(output.starts_with("Exit status: 143\n"), "{output}");
+    }
 }
