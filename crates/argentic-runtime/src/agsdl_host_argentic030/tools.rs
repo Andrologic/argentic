@@ -1,5 +1,5 @@
 use argentic_harness::{
-    providers::{contains_credential, ToolCall, ToolDefinition},
+    providers::{contains_credential, redact_credential_values, ToolCall, ToolDefinition},
     tools::{Extensions, Page, SKILL},
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
@@ -236,7 +236,10 @@ impl Extensions for Tools {
             if mcp.equipment.turn_cancel().is_cancelled() {
                 self.cancel.cancel();
             }
-            let reply = reply.ok_or("MCP call denied, cancelled or unavailable")?;
+            let mut reply = reply.ok_or("MCP call denied, cancelled or unavailable")?;
+            if let Some(key) = &self.credential {
+                redact_credential_values(&mut reply, key);
+            }
             return Page::one_shot(&reply.to_string(), &call.id).map_err(|error| error.to_string());
         }
         if self.skills.is_empty() {
@@ -248,7 +251,11 @@ impl Extensions for Tools {
             if args.path.is_some() {
                 return Err("A skill key is required to read a skill resource".into());
             }
-            return Page::one_shot(&json!(self.catalogue()).to_string(), &call.id)
+            let mut catalogue = json!(self.catalogue());
+            if let Some(key) = &self.credential {
+                redact_credential_values(&mut catalogue, key);
+            }
+            return Page::one_shot(&catalogue.to_string(), &call.id)
                 .map_err(|error| error.to_string());
         };
         let skill = self
@@ -267,7 +274,8 @@ impl Extensions for Tools {
                     .skill_resource(skill, active, &path)
                     .await
                     .map_err(|error| format!("{}: Could not read skill resource", error.code))?;
-                return Page::one_shot(&text, &call.id).map_err(|error| error.to_string());
+                return Page::one_shot_screened(&text, &call.id, self.credential.as_deref())
+                    .map_err(|error| error.to_string());
             }
             let active = sources
                 .load_skill(skill)

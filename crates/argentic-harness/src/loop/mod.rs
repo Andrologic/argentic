@@ -308,7 +308,8 @@ impl Harness {
 
     /// Screen model output for echoes of the configured HTTP header credential.
     pub fn with_provider_credential(mut self, credential: Option<String>) -> Self {
-        self.provider_credential = credential.filter(|key| !key.is_empty());
+        self.provider_credential =
+            credential.filter(|key| key.len() >= crate::providers::MIN_SCREENED_CREDENTIAL_BYTES);
         self
     }
 
@@ -702,7 +703,10 @@ impl Instance<'_> {
                     .take_while(|call| call.name != SUBMIT_RESULT)
                     .count();
                 let (reads, tail) = pending.split_at(read_count);
-                if let Some(skipped) = self.tool_batch(turn, reads, work).await? {
+                if let Some(skipped) = self
+                    .tool_batch(turn, reads, &response.refused, work)
+                    .await?
+                {
                     for call in skipped.iter().chain(tail) {
                         self.publish_tool(
                             turn,
@@ -724,7 +728,9 @@ impl Instance<'_> {
                     pending = tail;
                     continue;
                 }
-                let validation = if self.port.validates_submission() {
+                let validation = if response.refused.contains(&call.id) {
+                    Err(CREDENTIAL_ARGUMENTS.into())
+                } else if self.port.validates_submission() {
                     serde_json::from_str(&call.arguments).map_err(|e| e.to_string())
                 } else {
                     self.harness.registry.validate_submission(&call.arguments)
@@ -938,28 +944,35 @@ impl Instance<'_> {
         let mut text = String::new();
         let mut reasoning = String::new();
         let credential = self.harness.provider_credential.as_deref();
-        let mut text_screen = TextScreen::default();
-        let mut reasoning_screen = TextScreen::default();
+        let mut text_screen = TextScreen::new(credential);
+        let mut reasoning_screen = TextScreen::new(credential);
         let mut replay = None;
         let mut calls = Vec::new();
         let mut ids = HashSet::new();
+        let mut refused = HashSet::new();
         let mut bytes = 0usize;
         while let Some(chunk) = stream.next().await {
             self.active()?;
             match chunk? {
                 Chunk::Text(part) => {
+                    let part = text_screen.push(part);
                     account_bytes(&mut bytes, part.len())?;
-                    let part = text_screen.push(part, credential);
                     self.visible_text(turn, &part).await?;
                     text.push_str(&part);
                 }
                 Chunk::Reasoning(part) => {
+                    let part = reasoning_screen.push(part);
                     account_bytes(&mut bytes, part.len())?;
-                    let part = reasoning_screen.push(part, credential);
                     self.reasoning_text(turn, &part).await?;
                     reasoning.push_str(&part);
                 }
-                Chunk::ToolCall(call) => {
+                Chunk::ToolCall(mut call) => {
+                    if credential.is_some_and(|key| contains_credential(&call.arguments, key)) {
+                        refused.insert(call.id.clone());
+                        // Invalid JSON asks the Host's submission controller for its normal
+                        // correction without sending the credential to the controller.
+                        call.arguments.clear();
+                    }
                     account_bytes(
                         &mut bytes,
                         call.arguments
@@ -967,13 +980,6 @@ impl Instance<'_> {
                             .saturating_add(call.id.len())
                             .saturating_add(call.name.len()),
                     )?;
-                    if credential.is_some_and(|key| {
-                        [&call.id, &call.name, &call.arguments]
-                            .into_iter()
-                            .any(|field| contains_credential(field, key))
-                    }) {
-                        return Err(credential_in_response());
-                    }
                     if calls.len() >= 128
                         || call.id.is_empty()
                         || call.name.is_empty()
@@ -983,17 +989,19 @@ impl Instance<'_> {
                     }
                     calls.push(call);
                 }
-                Chunk::Replay(state) => {
-                    if credential.is_some_and(|key| state.contains_credential(key)) {
+                Chunk::Replay(mut state) => {
+                    if credential.is_some_and(|key| !state.screen(key)) {
                         return Err(credential_in_response());
                     }
                     replay = Some(state);
                 }
                 Chunk::End { finish, usage } => {
                     let tail = text_screen.finish();
+                    account_bytes(&mut bytes, tail.len())?;
                     self.visible_text(turn, &tail).await?;
                     text.push_str(&tail);
                     let tail = reasoning_screen.finish();
+                    account_bytes(&mut bytes, tail.len())?;
                     self.reasoning_text(turn, &tail).await?;
                     reasoning.push_str(&tail);
                     self.port
@@ -1014,6 +1022,7 @@ impl Instance<'_> {
                                 reasoning,
                                 replay,
                                 calls,
+                                refused,
                                 finish,
                                 usage,
                             })
@@ -1048,11 +1057,23 @@ impl Instance<'_> {
         &mut self,
         turn: u32,
         calls: &'a [ToolCall],
+        refused: &HashSet<String>,
         work: &mut Work,
     ) -> Result<Option<&'a [ToolCall]>, Failure> {
         let parallelism = self.harness.settings.limit("maxParallelReads") as usize;
         let mut pending = calls;
         while !pending.is_empty() {
+            if refused.contains(&pending[0].id) {
+                self.publish_tool(
+                    turn,
+                    &pending[0],
+                    &json!({"error": CREDENTIAL_ARGUMENTS}).to_string(),
+                    &mut work.messages,
+                )
+                .await?;
+                pending = &pending[1..];
+                continue;
+            }
             let parallel_reads = pending
                 .iter()
                 .take(if self.harness.registry.has_authorizer() {
@@ -1060,7 +1081,10 @@ impl Instance<'_> {
                 } else {
                     parallelism
                 })
-                .take_while(|call| matches!(call.name.as_str(), "read" | "list" | "glob" | "grep"))
+                .take_while(|call| {
+                    !refused.contains(&call.id)
+                        && matches!(call.name.as_str(), "read" | "list" | "glob" | "grep")
+                })
                 .count();
             let (batch, remaining) = pending.split_at(parallel_reads.max(1));
             pending = remaining;
@@ -1093,9 +1117,12 @@ impl Instance<'_> {
             } else {
                 stream::iter(batch.iter().cloned())
                     .map(|call| {
-                        self.harness
-                            .registry
-                            .execute(call, self.cancel.child_token(), self.tracker)
+                        self.harness.registry.execute(
+                            call,
+                            self.cancel.child_token(),
+                            self.tracker,
+                            self.harness.provider_credential.as_deref(),
+                        )
                     })
                     .buffered(batch.len())
                     .collect::<Vec<_>>()
@@ -1340,9 +1367,13 @@ struct Response {
     text: String,
     reasoning: String,
     calls: Vec<ToolCall>,
+    refused: HashSet<String>,
     finish: Finish,
     usage: Option<crate::providers::Usage>,
 }
+
+const CREDENTIAL_ARGUMENTS: &str =
+    "Tool arguments contain a configured provider credential. Remove it and retry.";
 
 fn credential_in_response() -> Failure {
     ProviderError::Invalid("Provider response contains a configured credential".into()).into()

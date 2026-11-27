@@ -30,7 +30,7 @@ mod proxy;
 ))]
 mod workspace;
 
-use super::{output, Page, Registry};
+use super::{Page, Registry};
 use crate::{
     policy::{Action, Effect, Policy},
     providers::ToolCall,
@@ -178,6 +178,7 @@ impl Registry {
         call: ToolCall,
         cancel: CancellationToken,
         tracker: &TaskTracker,
+        credential: Option<&str>,
     ) -> Result<Page, String> {
         if !self.toolbox.shell {
             return Err("Shell tool is disabled".into());
@@ -230,16 +231,15 @@ impl Registry {
             });
         }
         let registry = self.clone();
+        let credential = credential.map(str::to_owned);
         tracker
             .spawn_blocking(move || {
                 let _guards = guards;
                 let text = run(registry, &args, network, &call, &cancel)?;
                 // Shell output starts with its status and is retained once. Replaying
                 // a shell call to retrieve a cursor would repeat its effects.
-                let mut page =
-                    output::paginate(&text, &call.id, None, None).map_err(|e| e.to_string())?;
-                page.next_cursor = None;
-                Ok(page)
+                Page::one_shot_screened(&text, &call.id, credential.as_deref())
+                    .map_err(|error| error.to_string())
             })
             .await
             .map_err(|e| e.to_string())?

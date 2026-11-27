@@ -335,11 +335,17 @@ refus d’un réglage par le fournisseur. Un run partage
 ses politiques compilées et ses définitions d’outils par contrat. Le
 catalogue de raisonnement est chargé une fois par processus. Dans les
 requêtes, le plan et le steer peuvent être ajoutés temporairement sans
-dupliquer l’historique. Le harnais masque les échos de la clé du
-fournisseur dans le texte et le raisonnement du modèle, même quand la clé
-est fragmentée dans le flux. Il refuse la réponse si la clé apparaît dans
-un appel d’outil ou dans les données natives de reprise. L’adaptateur MCP
-vérifie aussi les arguments avant toute demande d’approbation ou exécution.
+dupliquer l’historique. Le harnais filtre les clés de fournisseur d’au
+moins 16 octets. Une clé plus courte comme `lm-studio` peut servir à
+l’authentification locale et reste hors du filtre. Le harnais masque les
+échos dans le texte et le raisonnement, y compris entre deux fragments.
+Le budget de réponse du harnais compte les octets après filtrage. Pour les
+données JSON, le filtre examine les valeurs textuelles décodées. Les
+identifiants, les noms d’outils et la syntaxe du protocole restent intacts.
+Des arguments refusés donnent lieu à une correction dans la même instance,
+y compris pour `agsdl_submit_result`. Un écho dans les données signées de
+reprise invalide la réponse. Les résultats d’outils sont filtrés avant la
+pagination et l’écriture des fichiers de débordement.
 
 Entre deux travaux, le Host compresse l’historique d’une instance continue
 à partir de 64 Kio si cela économise au moins un quart de sa taille estimée.

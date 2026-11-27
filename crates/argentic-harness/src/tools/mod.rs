@@ -497,7 +497,7 @@ impl Registry {
         cancel: CancellationToken,
     ) -> Result<Page, String> {
         let tracker = TaskTracker::new();
-        let output = self.execute(call, cancel, &tracker).await;
+        let output = self.execute(call, cancel, &tracker, None).await;
         tracker.close();
         tracker.wait().await;
         output
@@ -508,12 +508,13 @@ impl Registry {
         call: ToolCall,
         cancel: CancellationToken,
         tracker: &TaskTracker,
+        credential: Option<&str>,
     ) -> Result<Page, String> {
         if call.name == "shell" {
-            return self.shell(call, cancel, tracker).await;
+            return self.shell(call, cancel, tracker, credential).await;
         }
         if matches!(call.name.as_str(), "write" | "edit" | "apply_patch") {
-            return self.mutate(call, cancel, tracker).await;
+            return self.mutate(call, cancel, tracker, credential).await;
         }
         if !matches!(call.name.as_str(), "read" | "list" | "glob" | "grep") {
             check_cancel(&cancel).map_err(|error| error.to_string())?;
@@ -537,10 +538,11 @@ impl Registry {
             .lock_file_dispatch(&call, &[(effect, action)], &cancel)
             .await?;
         let registry = self.clone();
+        let credential = credential.map(str::to_owned);
         tracker
             .spawn_blocking(move || {
                 let _policy = policy;
-                registry.read_sync(&call, args, &path, &cancel)
+                registry.read_sync(&call, args, &path, &cancel, credential.as_deref())
             })
             .await
             .map_err(|e| e.to_string())?
@@ -551,6 +553,7 @@ impl Registry {
         call: ToolCall,
         cancel: CancellationToken,
         tracker: &TaskTracker,
+        credential: Option<&str>,
     ) -> Result<Page, String> {
         if !self.toolbox.writes {
             return Err("Mutation tools are disabled".into());
@@ -592,11 +595,13 @@ impl Registry {
         let guards = mutation::lock_paths(locks, &cancel).await?;
         let policy = self.lock_file_dispatch(&call, &approvals, &cancel).await?;
         let registry = self.clone();
+        let credential = credential.map(str::to_owned);
         tracker
             .spawn_blocking(move || {
                 let (_guards, _workspace, _policy) = (guards, workspace, policy);
                 let text = mutation.run(&registry.roots[index], &cancel)?;
-                output::paginate(&text, &call.id, None, None).map_err(|error| error.to_string())
+                output::paginate(&text, &call.id, None, None, credential.as_deref())
+                    .map_err(|error| error.to_string())
             })
             .await
             .map_err(|error| error.to_string())?
@@ -608,6 +613,7 @@ impl Registry {
         args: Arguments,
         path: &Path,
         cancel: &CancellationToken,
+        credential: Option<&str>,
     ) -> Result<Page, String> {
         let root = &self.roots[args.root];
         let raw_path = args.path.as_deref().unwrap_or(".");
@@ -635,8 +641,14 @@ impl Registry {
         .map_err(|e| e.to_string())?;
         let scope = json!([call.name, args.root, raw_path, args.pattern]).to_string();
         check_cancel(cancel).map_err(|e| e.to_string())?;
-        output::paginate(&text, &scope, args.cursor.as_deref(), args.limit)
-            .map_err(|e| e.to_string())
+        output::paginate(
+            &text,
+            &scope,
+            args.cursor.as_deref(),
+            args.limit,
+            credential,
+        )
+        .map_err(|e| e.to_string())
     }
 
     fn read_one(
