@@ -70,14 +70,26 @@ fn rejects_substituted_content_helper_image() {
     arm_image_swap(&helper, &replacement).unwrap();
     let refused = Launch::start(&helper, Path::new("fixture.txt"), directory.as_raw_fd());
 
-    // 4 is the bridge's launch refusal; 6 would mean the QA swap never ran.
-    let error = refused
-        .err()
-        .expect("substituted helper image was launched");
-    assert!(
-        error.to_string().ends_with("(4)"),
-        "unexpected refusal: {error}"
-    );
+    // The launch requirement either makes Process.run fail (bridge code 4;
+    // 6 would mean the QA swap never ran) or lets the kernel kill the image
+    // before it runs. A clean exit means the substitute actually ran.
+    match refused {
+        Err(error) => assert!(
+            error.to_string().ends_with("(4)"),
+            "unexpected refusal: {error}"
+        ),
+        Ok(mut launch) => {
+            let exit = launch
+                .wait(Duration::from_secs(5))
+                .unwrap()
+                .expect("substituted helper did not terminate");
+            assert!(
+                exit.signal,
+                "substituted helper image ran and exited with status {}",
+                exit.status
+            );
+        }
+    }
     assert_eq!(fs::read(helper).unwrap(), substitute);
     assert!(!replacement.exists(), "QA replacement was not consumed");
 }
