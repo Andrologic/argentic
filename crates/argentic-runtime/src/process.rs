@@ -19,7 +19,9 @@ use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use windows_sys::Win32::Foundation::ERROR_PROCESS_ABORTED;
 #[cfg(windows)]
 use windows_sys::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject, TerminateJobObject,
+    AssignProcessToJobObject, CreateJobObjectW, JobObjectBasicAccountingInformation,
+    QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
+    JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -479,15 +481,28 @@ impl ContainedBackgroundProcess {
 
     #[cfg(windows)]
     async fn terminate_windows(&mut self, grace_period: Duration) -> io::Result<ExitStatus> {
-        // Descendants can remain in the job after its original leader exits.
-        // Terminating an empty job is harmless, so never gate this on child.id().
-        unsafe { TerminateJobObject(self.job_object.as_raw_handle() as _, ERROR_PROCESS_ABORTED) };
         let reap_timeout = if grace_period.is_zero() {
             HARD_REAP_TIMEOUT
         } else {
             grace_period
         };
-        match tokio::time::timeout(reap_timeout, self.child.wait()).await {
+        let deadline = tokio::time::Instant::now() + reap_timeout;
+        // The leader may already have exited while descendants remain active.
+        if unsafe {
+            TerminateJobObject(self.job_object.as_raw_handle() as _, ERROR_PROCESS_ABORTED)
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        match tokio::time::timeout_at(deadline, async {
+            let status = self.child.wait().await?;
+            while windows_job_active_processes(&self.job_object)? != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Ok(status)
+        })
+        .await
+        {
             Ok(status) => status,
             Err(_) => Err(io::Error::new(
                 io::ErrorKind::TimedOut,
@@ -495,6 +510,24 @@ impl ContainedBackgroundProcess {
             )),
         }
     }
+}
+
+#[cfg(windows)]
+fn windows_job_active_processes(job: &JobObjectHandle) -> io::Result<u32> {
+    let mut info = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+    if unsafe {
+        QueryInformationJobObject(
+            job.as_raw_handle() as _,
+            JobObjectBasicAccountingInformation,
+            (&mut info as *mut JOBOBJECT_BASIC_ACCOUNTING_INFORMATION).cast(),
+            std::mem::size_of_val(&info) as u32,
+            std::ptr::null_mut(),
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(info.ActiveProcesses)
 }
 
 /// Observe the same processes discovered and suspended by the existing tree
@@ -2391,28 +2424,71 @@ mod tests {
     #[cfg(windows)]
     #[tokio::test]
     async fn contained_process_captures_an_immediate_windows_descendant() {
-        use super::{background_contained_tokio_command, ContainedBackgroundProcess};
+        use super::{
+            background_contained_tokio_command, windows_job_active_processes,
+            ContainedBackgroundProcess,
+        };
         use std::time::Duration;
-        let temp = tempfile::TempDir::new().expect("temp dir");
-        let marker = temp.path().join("escaped-descendant.txt");
-        let child_script = format!(
-            "Start-Sleep -Milliseconds 750; Set-Content -LiteralPath '{}' -Value escaped",
-            marker.to_string_lossy().replace('\'', "''")
-        );
-        let parent_script = format!(
-            "Start-Process -WindowStyle Hidden -FilePath powershell.exe -ArgumentList @('-NoProfile','-Command','{}')",
-            child_script.replace('\'', "''")
-        );
+        let parent_script = "Start-Process -WindowStyle Hidden -FilePath powershell.exe -ArgumentList '-NoProfile -Command Start-Sleep -Seconds 60'";
         let mut command = background_contained_tokio_command("powershell.exe");
-        command.args(["-NoProfile", "-Command", &parent_script]);
+        command.args(["-NoProfile", "-Command", parent_script]);
         let mut process = ContainedBackgroundProcess::spawn(command).expect("spawn parent");
-        process.wait().await.expect("wait parent");
+        assert!(process.wait().await.expect("wait parent").success());
+        assert!(
+            windows_job_active_processes(&process.job_object).unwrap() > 0,
+            "descendant must outlive the leader"
+        );
         process
             .terminate_with_grace(Duration::ZERO)
             .await
             .expect("terminate job");
-        tokio::time::sleep(Duration::from_millis(1_000)).await;
-        assert!(!marker.exists(), "descendant escaped its Windows job");
+        assert_eq!(
+            windows_job_active_processes(&process.job_object).unwrap(),
+            0,
+            "cleanup returned with a live job member"
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_cleanup_rejects_a_failed_job_termination() {
+        use super::{background_contained_tokio_command, ContainedBackgroundProcess};
+        use std::{
+            os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
+            time::Duration,
+        };
+        use windows_sys::Win32::{
+            Foundation::{DuplicateHandle, ERROR_ACCESS_DENIED},
+            System::Threading::GetCurrentProcess,
+        };
+        let mut command = background_contained_tokio_command("cmd.exe");
+        command.args(["/C", "exit", "0"]);
+        let mut process = ContainedBackgroundProcess::spawn(command).expect("spawn command");
+        assert!(process.wait().await.expect("wait command").success());
+        let mut reduced = std::ptr::null_mut();
+        let current = unsafe { GetCurrentProcess() };
+        // Duplicate with zero access rights to exercise a real Win32 failure
+        // after the leader's exit has already been observed.
+        assert_ne!(
+            unsafe {
+                DuplicateHandle(
+                    current,
+                    process.job_object.as_raw_handle() as _,
+                    current,
+                    &mut reduced,
+                    0,
+                    0,
+                    0,
+                )
+            },
+            0
+        );
+        process.job_object = unsafe { OwnedHandle::from_raw_handle(reduced as _) };
+        let error = process
+            .terminate_with_grace(Duration::ZERO)
+            .await
+            .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(ERROR_ACCESS_DENIED as i32));
     }
 
     #[cfg(unix)]
