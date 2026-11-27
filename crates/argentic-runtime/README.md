@@ -78,5 +78,6 @@ authority or credentials. Codex execution is an explicit operator action.
 `sqlite::open_file` checks the existing standalone revision and complete DDL
 without initializing or migrating it. `standalone::Host` also owns the exclusive
 process lock and fences previous unfinished runs. Macro retains its own opening
-and migration path. The default standalone suites and executable are covered by
-the `argentic` CI profile and the native/full profiles.
+and migration path. Push and pull-request CI and manual `full` runs execute the
+standalone suites and build `argentic-host`. Manual `reader` runs exercise native
+content reads.
