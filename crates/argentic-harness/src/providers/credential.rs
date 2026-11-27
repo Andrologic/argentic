@@ -69,30 +69,27 @@ pub(crate) fn redact<'a>(text: &'a str, key: &str) -> Cow<'a, str> {
     Cow::Owned(text.replace(key, replacement(key)))
 }
 
-/// Hold a KMP prefix across deltas. Each byte is matched in amortized constant time.
-pub(crate) struct TextScreen<'a> {
-    key: Option<&'a str>,
+/// Hold a KMP prefix across deltas. Each character is matched in amortized constant time.
+pub(crate) struct TextScreen {
+    pattern: Vec<char>,
     replacement: &'static str,
     prefix: Vec<usize>,
     matched: usize,
 }
 
-impl<'a> TextScreen<'a> {
-    pub(crate) fn new(key: Option<&'a str>) -> Self {
-        let mut prefix = Vec::new();
-        if let Some(key) = key {
-            let key = key.as_bytes();
-            prefix.resize(key.len(), 0);
-            for index in 1..key.len() {
-                let mut matched = prefix[index - 1];
-                while matched != 0 && key[index] != key[matched] {
-                    matched = prefix[matched - 1];
-                }
-                prefix[index] = matched + usize::from(key[index] == key[matched]);
+impl TextScreen {
+    pub(crate) fn new(key: Option<&str>) -> Self {
+        let pattern: Vec<char> = key.unwrap_or_default().chars().collect();
+        let mut prefix = vec![0; pattern.len()];
+        for index in 1..pattern.len() {
+            let mut matched = prefix[index - 1];
+            while matched != 0 && pattern[index] != pattern[matched] {
+                matched = prefix[matched - 1];
             }
+            prefix[index] = matched + usize::from(pattern[index] == pattern[matched]);
         }
         Self {
-            key,
+            pattern,
             replacement: key.map_or("", replacement),
             prefix,
             matched: 0,
@@ -100,34 +97,32 @@ impl<'a> TextScreen<'a> {
     }
 
     pub(crate) fn push(&mut self, part: String) -> String {
-        let Some(key) = self.key else {
+        if self.pattern.is_empty() {
             return part;
-        };
-        let pattern = key.as_bytes();
-        let mut output = Vec::with_capacity(part.len());
-        for byte in part.bytes() {
-            while self.matched != 0 && byte != pattern[self.matched] {
+        }
+        let mut output = String::with_capacity(part.len());
+        for ch in part.chars() {
+            while self.matched != 0 && ch != self.pattern[self.matched] {
                 let fallback = self.prefix[self.matched - 1];
-                output.extend_from_slice(&pattern[..self.matched - fallback]);
+                output.extend(&self.pattern[..self.matched - fallback]);
                 self.matched = fallback;
             }
-            if byte == pattern[self.matched] {
+            if ch == self.pattern[self.matched] {
                 self.matched += 1;
-                if self.matched == pattern.len() {
-                    output.extend_from_slice(self.replacement.as_bytes());
+                if self.matched == self.pattern.len() {
+                    output.push_str(self.replacement);
                     self.matched = 0;
                 }
             } else {
-                output.push(byte);
+                output.push(ch);
             }
         }
-        // A pending prefix starts on a UTF-8 boundary and each fragment ends on one.
-        String::from_utf8(output).expect("screened text remains UTF-8")
+        output
     }
 
     pub(crate) fn finish(&mut self) -> String {
         let matched = std::mem::take(&mut self.matched);
-        self.key.unwrap_or_default()[..matched].to_owned()
+        self.pattern[..matched].iter().collect()
     }
 }
 
