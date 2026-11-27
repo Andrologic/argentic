@@ -217,6 +217,8 @@ pub struct ContainedBackgroundProcess {
 
 impl ContainedBackgroundProcess {
     pub fn spawn(mut command: tokio::process::Command) -> io::Result<Self> {
+        #[cfg(target_os = "linux")]
+        LinuxPidFd::require_support()?;
         apply_background_containment(&mut command);
         #[cfg(unix)]
         let containment_id = next_containment_id();
@@ -428,10 +430,9 @@ impl ContainedBackgroundProcess {
                 #[cfg(target_os = "linux")]
                 let status = {
                     if !status.success() {
-                        return Err(io::Error::other("Linux reaper did not confirm tree exit"));
-                    }
-                    if let Some(error) = inspection_error {
-                        tracing::debug!(error = %error, "Linux reaper confirmed exit after incomplete process inspection");
+                        return Err(inspection_error.unwrap_or_else(|| {
+                            io::Error::other("Linux reaper did not confirm tree exit")
+                        }));
                     }
                     self.wait().await?
                 };
@@ -441,12 +442,38 @@ impl ContainedBackgroundProcess {
                 // Retire only after all observed processes disappeared.
                 // Drop must not scan the machine again or signal a reused PID.
                 self.process_group_id = None;
+                #[cfg(target_os = "linux")]
+                if let Some(error) = inspection_error {
+                    let only_inventory_failed = error
+                        .get_ref()
+                        .and_then(|detail| detail.downcast_ref::<ProcessTreeInspectionDiagnostic>())
+                        .is_some_and(|detail| {
+                            !detail
+                                .failures
+                                .0
+                                .iter()
+                                .any(|(source, _)| *source == ProcessInspector::ProcessHandle)
+                        });
+                    if !only_inventory_failed {
+                        return Err(error);
+                    }
+                    tracing::debug!(error = %error, "Linux reaper confirmed exit after incomplete process inspection");
+                }
                 Ok(status)
             }
-            Err(_) => Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "contained process tree did not exit after SIGKILL",
-            )),
+            Err(_) => {
+                #[cfg(target_os = "linux")]
+                if let Some(error) = inspection_error {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        IncompleteProcessTreeInspection(error),
+                    ));
+                }
+                Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "contained process tree did not exit after SIGKILL",
+                ))
+            }
         }
     }
 
@@ -762,6 +789,10 @@ pub fn process_error_diagnostic(error: &io::Error) -> String {
         if let Some(detail) = detail.downcast_ref::<InspectionTimeout>() {
             return detail.to_string();
         }
+        #[cfg(target_os = "linux")]
+        if let Some(detail) = detail.downcast_ref::<LinuxPidFdRequired>() {
+            return detail.to_string();
+        }
     }
     let message = error.to_string();
     let cause = match message.as_str() {
@@ -773,6 +804,9 @@ pub fn process_error_diagnostic(error: &io::Error) -> String {
         "ps failed while reading process descendants" => "process table command failed",
         "process containment inspection failed" => "containment command failed",
         "process marker inspection panicked" => "marker inspection panicked",
+        "terminal process group ownership could not be verified" => {
+            "terminal process group ownership could not be verified"
+        }
         "contained process tree did not exit after SIGKILL" => "process tree reap timed out",
         "contained process tree did not exit after job termination" => {
             "process tree reap timed out"
@@ -1217,6 +1251,8 @@ pub struct TerminalProcessTree {
 #[cfg(unix)]
 impl TerminalProcessTree {
     pub fn new() -> io::Result<Self> {
+        #[cfg(target_os = "linux")]
+        LinuxPidFd::require_support()?;
         let containment_id = next_containment_id();
         let marker = UnixContainmentMarker::create(&containment_id)?;
         Ok(Self {
@@ -1314,13 +1350,50 @@ fn terminate_unix_process_tree(
     (targets, error)
 }
 
+#[cfg(all(test, target_os = "linux"))]
+thread_local! {
+    static FAIL_PIDFD_OPEN: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct LinuxPidFdRequired(io::Error);
+
+#[cfg(target_os = "linux")]
+impl std::fmt::Display for LinuxPidFdRequired {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Linux pidfd support is required for process containment ({})",
+            process_error_diagnostic(&self.0)
+        )
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl std::error::Error for LinuxPidFdRequired {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
 #[cfg(target_os = "linux")]
 struct LinuxPidFd(std::os::fd::OwnedFd);
 
 #[cfg(target_os = "linux")]
 impl LinuxPidFd {
+    fn require_support() -> io::Result<()> {
+        Self::open(std::process::id())
+            .and_then(|target| target.signal(0))
+            .map_err(|error| io::Error::new(error.kind(), LinuxPidFdRequired(error)))
+    }
+
     fn open(pid: u32) -> io::Result<Self> {
         use std::os::fd::FromRawFd;
+        #[cfg(test)]
+        if let Some(errno) = FAIL_PIDFD_OPEN.get() {
+            return Err(io::Error::from_raw_os_error(errno));
+        }
         let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0_u32) };
         if fd == -1 {
             return Err(io::Error::last_os_error());
@@ -1428,6 +1501,7 @@ fn suspend_linux_candidates(
 ) -> io::Result<bool> {
     let own_pid = std::process::id();
     let mut opened = Vec::new();
+    let mut incomplete = None;
     for pid in candidates {
         check_process_inspection_deadline(deadline)?;
         if pid == own_pid {
@@ -1443,7 +1517,9 @@ fn suspend_linux_candidates(
         match LinuxPidFd::open(pid) {
             Ok(target) => opened.push((pid, target)),
             Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {}
-            Err(error) => return Err(error),
+            Err(error) => {
+                incomplete.get_or_insert(error);
+            }
         }
     }
 
@@ -1512,10 +1588,17 @@ fn suspend_linux_candidates(
         if roots.contains(&record.process_id) || descendants.contains(&record.process_id) {
             target.signal(libc::SIGSTOP)?;
             targets.insert(record.process_id, target);
+        } else if root_id == Some(record.process_group_id) {
+            // On Linux a numeric PTY group ID can outlive the leader or be
+            // recycled. A live member without ownership evidence leaves Stop
+            // incomplete even after all the attested targets are killed.
+            incomplete.get_or_insert_with(|| {
+                io::Error::other("terminal process group ownership could not be verified")
+            });
         }
     }
 
-    Ok(targets.len() != previous_len)
+    incomplete.map_or(Ok(targets.len() != previous_len), Err)
 }
 
 #[cfg(unix)]
@@ -1800,11 +1883,117 @@ mod tests {
         replacement.kill().unwrap();
         replacement.wait().unwrap();
         tree.process_group_id = None;
-        assert!(error.is_none(), "{error:?}");
+        assert!(error.unwrap().to_string().contains("group ownership"));
         assert!(
             targets.is_empty(),
             "stale group ID selected an unrelated child"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn terminal_stop_reports_incomplete_ownership_after_leader_reap() {
+        use std::os::unix::process::CommandExt;
+        use std::process::Command;
+
+        let mut tree = super::TerminalProcessTree::new().unwrap();
+        let mut leader = Command::new("/bin/sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let group = leader.id();
+        tree.process_group_id = Some(group);
+        let mut member = Command::new("/bin/sleep")
+            .arg("30")
+            .process_group(group as i32)
+            .spawn()
+            .unwrap();
+        leader.kill().unwrap();
+        leader.wait().unwrap();
+
+        let result = tree.try_terminate();
+        let remained = tree.process_group_id;
+        let survived = member.try_wait().unwrap().is_none();
+        if survived {
+            member.kill().unwrap();
+            member.wait().unwrap();
+        }
+        assert!(survived, "signaled a group without proof of ownership");
+        assert!(result.unwrap_err().to_string().contains("group ownership"));
+        assert_eq!(remained, Some(group));
+        tree.try_terminate().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn linux_containment_requires_pidfd_support_before_launch() {
+        use super::{background_contained_tokio_command, ContainedBackgroundProcess};
+
+        for errno in [libc::ENOSYS, libc::EPERM] {
+            super::FAIL_PIDFD_OPEN.set(Some(errno));
+            let terminal = super::TerminalProcessTree::new();
+            let background =
+                ContainedBackgroundProcess::spawn(background_contained_tokio_command("/bin/true"));
+            super::FAIL_PIDFD_OPEN.set(None);
+            let background_error = match background {
+                Ok(mut process) => {
+                    process.terminate_bounded().await.unwrap();
+                    panic!("background command launched without pidfd support ({errno})");
+                }
+                Err(error) => error,
+            };
+            for error in [terminal.err().unwrap(), background_error] {
+                assert!(error
+                    .to_string()
+                    .contains("Linux pidfd support is required"));
+                assert!(super::process_error_diagnostic(&error)
+                    .contains(&format!("errno=Some({errno})")));
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn contained_stop_preserves_pidfd_open_failure_with_or_without_reap() {
+        use super::{background_contained_tokio_command, ContainedBackgroundProcess};
+        use std::time::Duration;
+
+        for errno in [libc::ENOSYS, libc::EPERM] {
+            for reaper_suspended in [false, true] {
+                let mut command = background_contained_tokio_command("/bin/sleep");
+                command.arg("30");
+                let mut process = ContainedBackgroundProcess::spawn(command).unwrap();
+                let supervisor = super::LinuxPidFd::open(process.id().unwrap()).unwrap();
+                if reaper_suspended {
+                    supervisor.signal(libc::SIGSTOP).unwrap();
+                }
+                let grace = if reaper_suspended {
+                    Duration::from_millis(50)
+                } else {
+                    Duration::from_secs(2)
+                };
+                super::FAIL_PIDFD_OPEN.set(Some(errno));
+                let result = process.terminate_with_grace(grace).await;
+                super::FAIL_PIDFD_OPEN.set(None);
+                if reaper_suspended {
+                    supervisor.signal(libc::SIGCONT).unwrap();
+                    process.terminate_bounded().await.unwrap();
+                }
+
+                let error = result.unwrap_err();
+                if reaper_suspended {
+                    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+                }
+                let diagnostic = super::process_error_diagnostic(&error);
+                assert!(diagnostic.contains("ProcessHandle"), "{diagnostic}");
+                assert!(
+                    diagnostic.contains(&format!("errno=Some({errno})")),
+                    "{diagnostic}"
+                );
+                assert!(process.unix_process_group_id().is_none());
+            }
+        }
     }
 
     #[cfg(unix)]

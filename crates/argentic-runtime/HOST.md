@@ -528,8 +528,9 @@ again to recapture account evidence from earlier digest formats.
 Argentic holds non-final agent text until the turn ends. A turn that queues
 more than 1,000 items or 4,000,000 encoded bytes fails with `NATIVE_UNCERTAIN`.
 
-On Linux, Argentic waits for the process supervisor to reap its adopted
-children before confirming that the contained process tree has stopped.
+Linux process containment requires the `pidfd_open` and `pidfd_send_signal`
+system calls. Argentic checks them before launch and waits for the background
+process supervisor to reap its adopted children before confirming Stop.
 
 For Codex 0.171.0 on macOS ARM64 or Linux ARM64, use the read-only host
 profile and the private login. On Linux, provision the login outside
