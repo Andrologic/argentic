@@ -228,6 +228,7 @@ pub(crate) fn encode(value: &Value) -> String {
 }
 
 /// `exactValues.equal`: decode the left text, then the right, then compare.
+#[cfg(test)]
 pub(crate) fn equal_texts(left: &str, right: &str) -> Result<bool, Failure> {
     let left = decode(left)?;
     let right = decode(right)?;
@@ -258,10 +259,6 @@ pub(crate) fn text<'a>(value: Option<&'a Value>, pointer: &str) -> Result<&'a st
 /// `exact.at`: escape `~` first, then `/`.
 pub(crate) fn at(pointer: &str, key: &str) -> String {
     format!("{pointer}/{}", key.replace('~', "~0").replace('/', "~1"))
-}
-
-pub(crate) fn has(object: &Object, key: &str) -> bool {
-    object.contains_key(key)
 }
 
 #[cfg(test)]

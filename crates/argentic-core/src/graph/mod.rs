@@ -492,7 +492,6 @@ pub(crate) struct Scope<'a> {
     pub(crate) composition: Option<String>,
     pub(crate) bindings: OrderedMap<String, Option<String>>,
     pub(crate) compose: Option<String>,
-    pub(crate) parent: Option<usize>,
     pub(crate) compose_name: Option<String>,
 }
 
@@ -684,7 +683,6 @@ impl<'a> Graph<'a> {
             composition: None,
             bindings: OrderedMap::new(),
             compose: None,
-            parent: None,
             compose_name: None,
         });
         graph.add_scope(scope, &[], budget)?;
@@ -779,7 +777,6 @@ impl<'a> Graph<'a> {
             composition: composition.map(str::to_owned),
             bindings: OrderedMap::new(),
             compose: None,
-            parent: None,
             compose_name: None,
         });
         for (name, decl) in steps.iter() {
@@ -883,7 +880,6 @@ impl<'a> Graph<'a> {
             composition: Some(name.to_owned()),
             bindings: OrderedMap::new(),
             compose: None,
-            parent: None,
             compose_name: None,
         });
         graph.add_scope(scope, &[name.to_owned()], budget)?;
@@ -986,7 +982,6 @@ impl<'a> Graph<'a> {
                 composition: Some(target.to_owned()),
                 bindings,
                 compose: Some(addr.clone()),
-                parent: Some(scope),
                 compose_name,
             });
             self.composes.set(
@@ -1371,15 +1366,14 @@ impl<'a> Graph<'a> {
     }
 }
 
+type RouteGroups = OrderedMap<(RouteKind, Option<String>), Vec<String>>;
+
 /// `route_groups(graph, addr, succ)`: destinations by `[kind, key]`.
-pub(crate) fn route_groups(
-    graph: &Graph<'_>,
-    addr: &str,
-) -> GraphResult<OrderedMap<(RouteKind, Option<String>), Vec<String>>> {
+pub(crate) fn route_groups(graph: &Graph<'_>, addr: &str) -> GraphResult<RouteGroups> {
     let outgoing = graph.outgoing(addr)?;
     graph.work(1 + outgoing.len())?;
     graph.bytes(outgoing.len() * 96)?;
-    let mut groups: OrderedMap<(RouteKind, Option<String>), Vec<String>> = OrderedMap::new();
+    let mut groups: RouteGroups = OrderedMap::new();
     for &edge in outgoing {
         let edge = &graph.edges[edge];
         match groups.get_mut(&edge.group()) {

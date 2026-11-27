@@ -679,8 +679,8 @@ fn receivers<'g>(graph: &'g Graph<'_>) -> Result<std::collections::HashSet<&'g s
 
 pub(crate) type Use = (String, String, Option<Vec<String>>);
 pub(crate) fn used_properties(agent: &Object, p: &str, step_uses: &[Use]) -> Result<Vec<Use>> {
-    let mut used: OrderedMap<String, OrderedMap<String, (String, Option<Vec<String>>)>> =
-        OrderedMap::new();
+    type UseSites = OrderedMap<String, (String, Option<Vec<String>>)>;
+    let mut used: OrderedMap<String, UseSites> = OrderedMap::new();
     let mut add = |name: &str, where_: String, step: Option<Vec<String>>| {
         if !used.contains_key(name) {
             used.set(name.to_owned(), OrderedMap::new());

@@ -416,5 +416,5 @@ pub fn document_tokens_equal(a: &str, b: &str) -> serde_json::Result<bool> {
     }
     validate(a)?;
     validate(b)?;
-    Ok(compare(a, b)?)
+    compare(a, b)
 }

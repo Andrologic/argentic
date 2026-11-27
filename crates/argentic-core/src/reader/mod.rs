@@ -58,6 +58,7 @@ pub(crate) const BUNDLED_VERSION_PROBES: &[(&str, &str, &str)] = &[
 #[derive(Clone, Copy)]
 pub(crate) enum Modules<'m> {
     Pinned,
+    #[cfg(test)]
     Explicit(&'m ModuleMap),
     Encoded(&'m [&'m [u8]]),
 }
@@ -137,6 +138,7 @@ fn registry_with_budget(
             .iter()
             .map(|(name, module)| (name.as_str(), module))
             .collect(),
+        #[cfg(test)]
         Modules::Explicit(map) => map
             .iter()
             .map(|(name, module)| (name.as_str(), module))
@@ -179,6 +181,7 @@ fn parse_report(message: String) -> Report {
 }
 
 /// `read(bytes, options)`.
+#[cfg(test)]
 pub(crate) fn read(bytes: &[u8], modules: Modules<'_>) -> Result<Report, ReadError> {
     read_budgeted(bytes, modules, &SourceBudget::default())
 }

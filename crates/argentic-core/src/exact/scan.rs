@@ -35,6 +35,7 @@ enum KeyOrder {
 }
 
 /// Source byte range of one value, keyed by its JSON pointer.
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Span {
     pub(crate) pointer: String,
@@ -44,12 +45,15 @@ pub(crate) struct Span {
 
 pub(crate) struct Parsed {
     pub(crate) tree: Value,
+    #[cfg(test)]
     /// Path tree: `(parent, escaped segment)`; entry 0 is the root pointer.
     paths: Vec<(usize, String)>,
+    #[cfg(test)]
     /// `(path, start, end)` in the insertion order of the JS `spans` map.
     spans: Vec<(usize, usize, usize)>,
 }
 
+#[cfg(test)]
 impl Parsed {
     /// Materializes the pointers of the JS `spans` map, in its order.
     pub(crate) fn spans(&self) -> Vec<Span> {
@@ -89,12 +93,6 @@ fn escape(key: &str) -> String {
 
 /// `shared/json.mjs` `parse`, used by `exact.decode`.
 pub(crate) fn parse_shared(bytes: &[u8]) -> Result<Parsed, ParseError> {
-    parse(bytes, KeyOrder::Js)
-}
-
-/// `experimental/readers/javascript/json.mjs` `parse`: same algorithm and
-/// object order as the shared scanner.
-pub(crate) fn parse_experimental(bytes: &[u8]) -> Result<Parsed, ParseError> {
     parse(bytes, KeyOrder::Js)
 }
 
@@ -138,7 +136,9 @@ struct Frame {
     items: Vec<Value>,
     entries: Vec<(String, Value)>,
     keys: HashSet<String>,
+    #[cfg(test)]
     path: usize,
+    #[cfg(test)]
     start: usize,
     state: State,
 }
@@ -336,11 +336,12 @@ impl Scanner<'_> {
     /// Reads a scalar, or opens a container frame and returns `None`.
     fn value(
         &mut self,
-        path: usize,
+        #[cfg(test)] path: usize,
         frames: &mut Vec<Frame>,
-        spans: &mut Vec<(usize, usize, usize)>,
+        #[cfg(test)] spans: &mut Vec<(usize, usize, usize)>,
     ) -> Result<Option<Value>, ParseError> {
         self.ws();
+        #[cfg(test)]
         let start = self.i;
         let value = match self.peek() {
             Some(open @ (b'{' | b'[')) => {
@@ -350,7 +351,9 @@ impl Scanner<'_> {
                     items: Vec::new(),
                     entries: Vec::new(),
                     keys: HashSet::new(),
+                    #[cfg(test)]
                     path,
+                    #[cfg(test)]
                     start,
                     state: State::First,
                 });
@@ -378,6 +381,7 @@ impl Scanner<'_> {
             Some(b'-' | b'0'..=b'9') => Value::Number(self.number()?),
             _ => return bad(self.i),
         };
+        #[cfg(test)]
         spans.push((path, start, self.i));
         Ok(Some(value))
     }
@@ -401,10 +405,18 @@ fn attach(frames: &mut [Frame], value: Value) -> Option<Value> {
 
 fn parse(bytes: &[u8], order: KeyOrder) -> Result<Parsed, ParseError> {
     let mut scanner = Scanner { b: bytes, i: 0 };
+    #[cfg(test)]
     let mut paths = vec![(0, String::new())];
+    #[cfg(test)]
     let mut spans = Vec::new();
     let mut frames: Vec<Frame> = Vec::new();
-    let mut root = scanner.value(0, &mut frames, &mut spans)?;
+    let mut root = scanner.value(
+        #[cfg(test)]
+        0,
+        &mut frames,
+        #[cfg(test)]
+        &mut spans,
+    )?;
     while let Some(frame) = frames.last_mut() {
         scanner.ws();
         let close = if frame.object { b'}' } else { b']' };
@@ -420,6 +432,7 @@ fn parse(bytes: &[u8], order: KeyOrder) -> Result<Parsed, ParseError> {
         if scanner.peek() == Some(close) && frame.state != State::Next {
             scanner.i += 1;
             if let Some(closed) = frames.pop() {
+                #[cfg(test)]
                 spans.push((closed.path, closed.start, scanner.i));
                 if let Some(value) = attach(&mut frames, closed.finish(order)) {
                     root = Some(value);
@@ -427,7 +440,9 @@ fn parse(bytes: &[u8], order: KeyOrder) -> Result<Parsed, ParseError> {
             }
             continue;
         }
-        let segment = if frame.object {
+        #[cfg(test)]
+        let segment;
+        if frame.object {
             if scanner.peek() != Some(b'"') {
                 return bad(scanner.i);
             }
@@ -442,17 +457,30 @@ fn parse(bytes: &[u8], order: KeyOrder) -> Result<Parsed, ParseError> {
             if colon != Some(b':') {
                 return bad(scanner.i - 1);
             }
-            let segment = escape(&key);
+            #[cfg(test)]
+            {
+                segment = escape(&key);
+            }
             frame.keys.insert(key.clone());
             frame.entries.push((key, Value::Null));
-            segment
         } else {
-            frame.items.len().to_string()
-        };
+            #[cfg(test)]
+            {
+                segment = frame.items.len().to_string();
+            }
+        }
         frame.state = State::After;
+        #[cfg(test)]
         paths.push((frame.path, segment));
+        #[cfg(test)]
         let path = paths.len() - 1;
-        if let Some(value) = scanner.value(path, &mut frames, &mut spans)? {
+        if let Some(value) = scanner.value(
+            #[cfg(test)]
+            path,
+            &mut frames,
+            #[cfg(test)]
+            &mut spans,
+        )? {
             attach(&mut frames, value);
         }
     }
@@ -461,7 +489,13 @@ fn parse(bytes: &[u8], order: KeyOrder) -> Result<Parsed, ParseError> {
         return bad(scanner.i);
     }
     match root {
-        Some(tree) => Ok(Parsed { tree, paths, spans }),
+        Some(tree) => Ok(Parsed {
+            tree,
+            #[cfg(test)]
+            paths,
+            #[cfg(test)]
+            spans,
+        }),
         // A completed scan always yields a root value.
         None => bad(scanner.i),
     }

@@ -361,6 +361,10 @@ record!(RouteBarrier030 {activation_id:String,path_id:String,groups:Vec<String>,
     rename_all_fields = "camelCase",
     deny_unknown_fields
 )]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "Boxing a variant changes the public continuation type"
+)]
 pub enum Continuation030 {
     Join,
     Route {

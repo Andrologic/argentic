@@ -257,6 +257,7 @@ type EmitProblem<'a> = dyn FnMut(&str, &dyn Fn() -> String) -> Result<(), Outsid
 
 /// `consistency(schema, path)`: object children before the parent bounds,
 /// array items after them, problems in visit order.
+#[cfg(test)]
 pub(crate) fn consistency(
     schema: &Value,
     path: &[PointerPart],
@@ -533,6 +534,7 @@ pub(crate) enum Descent {
 }
 
 /// `descend(schema, path)`.
+#[cfg(test)]
 pub(crate) fn descend(schema: &Value, path: &[PointerPart]) -> Result<Descent, OutsideShape> {
     let budget = SourceBudget::default();
     check_shape(schema, &budget)?;
@@ -595,6 +597,7 @@ pub(crate) fn descend_checked(
 }
 
 /// `kind_at(schema, path)`.
+#[cfg(test)]
 pub(crate) fn kind_at(
     schema: &Value,
     path: &[PointerPart],
