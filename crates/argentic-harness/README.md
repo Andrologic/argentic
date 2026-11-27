@@ -219,10 +219,13 @@ and denies an `ask` without a reviewer.
 The engine can enable `write`, `edit` and `apply_patch` for paths relative to
 the selected root. Edits and patch updates require read and write permission.
 Patch moves also require permission on the destination. Writes use per-file queues
-and atomic replacement. For an approved file operation, the Host rechecks every
-requested path against the live policy after the tool acquires its locks. It holds
-that policy lease through file I/O and publication. A patch validates its whole
-plan before changing files.
+and atomic replacement. The Host revalidates every requested file action
+against the current policy after the tool acquires its locks, including
+implicitly allowed actions. A current `ask` requires approval for that exact
+action from a reviewer the current policy accepts. The lease lasts through
+file I/O and publication. List, glob and grep check each discovered path
+against the policy held by the lease. A patch validates its whole plan
+before changing files.
 An I/O failure during publication can leave some files changed, and the reply
 reports how many changes were applied. Parent directories must already exist.
 
@@ -354,6 +357,11 @@ The default outside denial leaves the system runtime readable as AgSDL
 specifies. Qualification refuses shell with an explicit `outside: "deny"`
 or any read denial or approval rule that overlaps a required runtime mount.
 The executor checks all effective policy layers before enabling shell.
+
+After acquiring the root locks, the Host revalidates the command against the
+current policy and holds that lease while staging the workspace. It releases
+the lease before starting Bash. Before publishing, it takes a fresh lease and
+checks the command and each proposed change against the current policy.
 
 Bash starts in a private copy built from verified directory and file handles.
 On Linux the copy is mounted at `/workspace`. Each staged root can contain up

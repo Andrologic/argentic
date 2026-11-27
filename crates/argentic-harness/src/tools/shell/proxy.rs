@@ -8,7 +8,7 @@ use clock::Clock;
 use super::super::{Approval, Registry};
 use super::ShellNetwork;
 use crate::{
-    policy::{normalize_network_host, Action, Effect, Zone},
+    policy::{normalize_network_host, Action, Effect, Policy, Zone},
     providers::ToolCall,
 };
 use base64::{
@@ -83,6 +83,7 @@ pub(super) struct Proxy {
 impl Proxy {
     pub(super) fn start(
         registry: Arc<Registry>,
+        live_policy: Option<Policy>,
         call: ToolCall,
         cancel: &CancellationToken,
     ) -> io::Result<Self> {
@@ -125,6 +126,7 @@ impl Proxy {
         let clock = Arc::new(Clock::new());
         let context = Arc::new(Egress {
             registry,
+            live_policy,
             call,
             cancel: cancel.clone(),
             auth,
@@ -187,6 +189,7 @@ impl Drop for Proxy {
 
 struct Egress {
     registry: Arc<Registry>,
+    live_policy: Option<Policy>,
     call: ToolCall,
     cancel: CancellationToken,
     auth: String,
@@ -497,6 +500,7 @@ impl Egress {
         self.registry
             .policy
             .iter()
+            .chain(self.live_policy.iter())
             .map(|policy| policy.decide(Action::Network, host, Zone::Workspace))
             .max()
             .unwrap_or(Effect::Deny)
@@ -532,6 +536,7 @@ impl Egress {
                 .registry
                 .policy
                 .iter()
+                .chain(self.live_policy.iter())
                 .map(|policy| policy.network_address_rules(ip))
                 .fold((None, false), |(effect, grant), (next, exact)| {
                     (effect.max(next), grant || exact)

@@ -195,6 +195,7 @@ mod tests {
         let registry =
             Registry::new(&[work.path().to_path_buf()], policy, serde_json::json!({})).unwrap();
         let context = Arc::new(super::super::Egress {
+            live_policy: None,
             registry: Arc::new(registry),
             call: ToolCall {
                 id: "test".into(),
