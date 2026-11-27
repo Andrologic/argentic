@@ -30,6 +30,7 @@ use super::{
 };
 use crate::{
     calculation::Failure,
+    is_json_media,
     resource::{
         encode_string, excerpt, number_excerpt, quoted_bytes, value_excerpt,
         DIAGNOSTIC_LIMIT_MESSAGE, MAX_DIAGNOSTICS, MAX_DIAGNOSTIC_BYTES,
@@ -585,10 +586,6 @@ fn repr_part(part: &PointerPart) -> String {
         PointerPart::Index(index) => index.to_string(),
         PointerPart::Number(token) => number_excerpt(token.raw()),
     }
-}
-
-fn is_json_media(media: &str) -> bool {
-    media == "application/json" || media.ends_with("+json")
 }
 
 fn instance_label(instance: Option<&str>) -> String {
