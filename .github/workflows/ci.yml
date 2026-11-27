@@ -103,57 +103,6 @@ jobs:
           test "$(uname -m)" = arm64
           swiftc --version
 
-      - name: TEMP diagnose launch requirement enforcement
-        if: runner.os == 'macOS'
-        continue-on-error: true
-        run: |
-          set -x
-          sw_vers
-          csrutil status || true
-          csrutil authenticated-root status || true
-          nvram boot-args || true
-          sysctl kern.bootargs || true
-          sysctl security.mac.amfi 2>/dev/null || true
-          d="$(mktemp -d)"
-          cp /usr/bin/true "$d/adhoc-true"
-          codesign -s - -f "$d/adhoc-true"
-          codesign -dv /usr/bin/true "$d/adhoc-true" 2>&1 | grep -E 'CDHash=|Signature|flags' || true
-          cat > "$d/probe.swift" <<'EOF'
-          import Foundation
-          import LightweightCodeRequirements
-          import Security
-          func cdhash(_ path: String) -> Data {
-              var code: SecStaticCode?
-              precondition(SecStaticCodeCreateWithPath(URL(fileURLWithPath: path) as CFURL, [], &code) == errSecSuccess)
-              var info: CFDictionary?
-              precondition(SecCodeCopySigningInformation(code!, SecCSFlags(rawValue: kSecCSSigningInformation), &info) == errSecSuccess)
-              return (info as! [String: Any])[kSecCodeInfoUnique as String] as! Data
-          }
-          func probe(_ label: String, _ path: String, _ hash: Data) {
-              let process = Process()
-              process.executableURL = URL(fileURLWithPath: path)
-              do {
-                  process.launchRequirement = try LaunchCodeRequirement.allOf { CodeDirectoryHash(hash) }
-                  try process.run()
-                  process.waitUntilExit()
-                  print("PROBE \(label): ran, status \(process.terminationStatus), reason \(process.terminationReason.rawValue)")
-              } catch {
-                  print("PROBE \(label): refused: \(error)")
-              }
-          }
-          let adhoc = CommandLine.arguments[1]
-          probe("true with own cdhash", "/usr/bin/true", cdhash("/usr/bin/true"))
-          probe("true with false cdhash", "/usr/bin/true", cdhash("/usr/bin/false"))
-          probe("adhoc with own cdhash", adhoc, cdhash(adhoc))
-          probe("adhoc with true cdhash", adhoc, cdhash("/usr/bin/true"))
-          let selfPath = CommandLine.arguments[2]
-          probe("adhoc with probe cdhash", adhoc, cdhash(selfPath))
-          EOF
-          swiftc -target arm64-apple-macosx14.4 -o "$d/probe" "$d/probe.swift"
-          "$d/probe" "$d/adhoc-true" "$d/probe"
-          rustup component add clippy
-          (cd crates/argentic-runtime && cargo clippy --locked --all-targets --features agsdl-content-qa -- -D warnings && cargo clippy --locked --all-targets -- -D warnings)
-
       - name: Install Bubblewrap and enable unprivileged user namespaces
         if: runner.os == 'Linux' && inputs.suite != 'reader'
         run: |
