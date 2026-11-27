@@ -901,12 +901,11 @@ impl Session {
                         }
                         Ok(format!("{{{base}{extra}}}"))
                     })();
-                    let handoff = match params {
-                        Ok(params) => self.handoff_tool(&params, control, None).await,
-                        Err(error) => Err(error),
-                    };
-                    let (id, response) = complete_human(host, human, handoff).await?;
-                    raw = self.receive_tool(id, response, host, identity, control).await?;
+                    let delivery = async {
+                        let (id, response) = self.handoff_tool(&params?, control, None).await?;
+                        self.receive_tool(id, response, host, identity, control).await
+                    }.await;
+                    raw = complete_human(host, human, delivery).await?;
                 }
                 Some("task") => return Err(CallError::new("UNCERTAIN", "MCP task requires a captured task completion adapter; remote effect may remain active")),
                 None | Some("complete") => {

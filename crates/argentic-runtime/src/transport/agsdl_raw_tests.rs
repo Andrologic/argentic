@@ -121,7 +121,7 @@ async fn http_handler(
             }
             if state.mode == "redirect" { return (axum::http::StatusCode::TEMPORARY_REDIRECT, [("location", "/other")]).into_response(); }
             if state.mode == "lost" { return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response(); }
-            if state.mode == "modern" || state.mode == "modern-bad-state" {
+            if matches!(state.mode, "modern" | "modern-bad-state" | "modern-rejected-input") {
                 assert_eq!(headers.get("mcp-protocol-version").unwrap(), "2026-07-28");
                 assert_eq!(headers.get("mcp-method").unwrap(), "tools/call");
                 assert_eq!(headers.get("mcp-name").unwrap(), "synthetic");
@@ -130,6 +130,12 @@ async fn http_handler(
                 else {
                     assert!(body.contains("\"requestState\":\"opaque-9007199254740993\""));
                     assert!(value["params"].get("inputResponses").is_some());
+                    if state.mode == "modern-rejected-input" {
+                        return (
+                            [("content-type", "application/json")],
+                            format!(r#"{{"jsonrpc":"2.0","id":{id},"error":{{"code":-32602,"message":"Input rejected"}}}}"#),
+                        ).into_response();
+                    }
                     r#"{"resultType":"complete","content":[],"structuredContent":{"large":9007199254740993},"isError":true}"#.into()
                 }
             } else if matches!(state.mode, "sse" | "rejected-human-response") {
@@ -660,6 +666,18 @@ async fn legacy_get_request_is_answered_before_post_response_headers() {
     ));
     task.abort();
     let _ = task.await;
+}
+
+#[tokio::test]
+async fn rejected_modern_continuation_does_not_acknowledge_delivery() {
+    let (server, fixture, task) = http_fixture("modern-rejected-input").await;
+    let host = dummy_host();
+    let (result, _) = isolated(&host, server).await;
+    assert!(result.is_err());
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(host.human_closed.load(Ordering::SeqCst), 1);
+    assert_eq!(host.human_delivered.load(Ordering::SeqCst), 0);
+    task.abort();
 }
 
 #[tokio::test]
