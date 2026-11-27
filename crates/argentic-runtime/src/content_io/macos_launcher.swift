@@ -6,6 +6,8 @@ import Security
 
 private let helperArgument = "--macro-internal-agsdl-content-read"
 
+// 14.4 is the qualified floor, not an API requirement: the Security calls
+// predate it and the pipes need macOS 13.
 @_cdecl("agsdl_content_macos_available")
 public func agsdlContentMacosAvailable() -> Int32 {
     if #available(macOS 14.4, *) { return 1 }

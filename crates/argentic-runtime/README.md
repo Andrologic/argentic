@@ -38,8 +38,9 @@ uses Security.framework to compare the loaded child's code directory hash with
 the running host's. It resumes a matching child and kills and reaps a rejected
 child before returning a launch error. Checking the loaded process closes the
 race between checking a path and executing it. This protects against replacement
-of the executable at its path and assumes other processes cannot interfere with
-the suspended child, for example by sending it `SIGCONT`. The launcher does
+of the executable at its path. A process able to signal the suspended child,
+for example with `SIGCONT`, can let a substitute run briefly with the inherited
+descriptors before it is refused, but the launcher never uses its output. The launcher does
 not use `Process.launchRequirement`: AMFI enforces launch constraints only when
 System Integrity Protection is enabled, and a substitute ran on a CI runner
 where it was disabled.

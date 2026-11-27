@@ -71,6 +71,7 @@ fn rejects_substituted_content_helper_image() {
         "#include <stdio.h>\nint main(void) { puts(\"qa probe\"); }\n",
     )
     .unwrap();
+    // Needs the Command Line Tools, present on CI runners and QA machines.
     assert!(Command::new("/usr/bin/cc")
         .args([source.as_os_str(), "-o".as_ref(), adhoc.as_os_str()])
         .status()
@@ -95,7 +96,8 @@ fn rejects_substituted_content_helper_image() {
             None => launch.wait(Duration::from_secs(5)).unwrap().unwrap(),
         };
         let mut bytes = Vec::new();
-        fs::File::from(launch.output)
+        // Launch reaps on drop, so its fields cannot be moved out.
+        fs::File::from(launch.output.try_clone().unwrap())
             .read_to_end(&mut bytes)
             .unwrap();
         (exit, bytes)

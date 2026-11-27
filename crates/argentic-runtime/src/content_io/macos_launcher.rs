@@ -103,16 +103,25 @@ impl Launch {
                 "Content helper launch failed ({code})"
             )));
         }
-        if pid <= 0 || output < 0 || control < 0 {
-            return Err(io::Error::other(
-                "Content helper returned invalid process or descriptors",
-            ));
+        // Own whatever was returned first so an invalid answer cannot leak a
+        // valid descriptor or child.
+        let output = (output >= 0).then(|| unsafe { OwnedFd::from_raw_fd(output) });
+        let control = (control >= 0).then(|| unsafe { OwnedFd::from_raw_fd(control) });
+        match (pid > 0, output) {
+            (true, Some(output)) if control.is_some() => Ok(Self {
+                pid: Some(pid),
+                output,
+                control,
+            }),
+            (valid_pid, _) => {
+                if valid_pid {
+                    reap(pid);
+                }
+                Err(io::Error::other(
+                    "Content helper returned invalid process or descriptors",
+                ))
+            }
         }
-        Ok(Self {
-            pid: Some(pid),
-            output: unsafe { OwnedFd::from_raw_fd(output) },
-            control: Some(unsafe { OwnedFd::from_raw_fd(control) }),
-        })
     }
 
     /// Closing the only parent writer requests self-termination in the helper.
@@ -141,6 +150,15 @@ impl Launch {
             match unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) } {
                 -1 => {
                     let error = io::Error::last_os_error();
+                    if error.raw_os_error() == Some(libc::ECHILD) {
+                        // A host that ignores SIGCHLD lets the kernel reap the
+                        // child: it has exited, with an unknown status.
+                        self.pid = None;
+                        return Ok(Some(Exit {
+                            status: -1,
+                            signal: false,
+                        }));
+                    }
                     if error.kind() != io::ErrorKind::Interrupted {
                         return Err(error);
                     }
@@ -166,6 +184,24 @@ impl Launch {
             std::thread::sleep(remaining.min(Duration::from_millis(20)));
         }
     }
+}
+
+impl Drop for Launch {
+    /// Never leave a zombie behind, even if the launch is dropped unwaited.
+    fn drop(&mut self) {
+        if let Some(pid) = self.pid.take() {
+            reap(pid);
+        }
+    }
+}
+
+/// Kill an owned, unreaped child and wait for it.
+fn reap(pid: libc::pid_t) {
+    unsafe { libc::kill(pid, libc::SIGKILL) };
+    let mut status = 0;
+    while unsafe { libc::waitpid(pid, &mut status, 0) } == -1
+        && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted
+    {}
 }
 
 /// The worker retains ownership until it reaps the child,
