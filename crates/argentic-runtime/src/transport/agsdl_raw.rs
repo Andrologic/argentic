@@ -432,6 +432,7 @@ struct Body {
     response: reqwest::Response,
     buffer: Vec<u8>,
     sse: bool,
+    framing: SseFraming,
     eof: bool,
     last_event_id: Option<String>,
     retry_ms: u64,
@@ -1459,6 +1460,7 @@ impl HttpWire {
             response,
             buffer: Vec::new(),
             sse,
+            framing: SseFraming::default(),
             eof: false,
             last_event_id: None,
             retry_ms: 1000,
@@ -1532,6 +1534,7 @@ impl HttpWire {
                     response,
                     buffer: Vec::new(),
                     sse: true,
+                    framing: SseFraming::default(),
                     eof: false,
                     last_event_id: cursor.clone(),
                     retry_ms: delay,
@@ -1804,6 +1807,7 @@ impl Wire {
                             response,
                             buffer: Vec::new(),
                             sse: true,
+                            framing: SseFraming::default(),
                             eof: false,
                             last_event_id: Some(id),
                             retry_ms: body.retry_ms,
@@ -1814,29 +1818,53 @@ impl Wire {
         }
     }
 }
+#[derive(Default)]
+struct SseFraming {
+    scanned: usize,
+    line_start: usize,
+    skip_lf: bool,
+}
+
+impl SseFraming {
+    fn take_event(&mut self, buffer: &mut Vec<u8>) -> Option<Vec<u8>> {
+        // A CR ends a line immediately. Its optional LF may arrive in a later chunk,
+        // including after an event has already been returned to the caller.
+        if self.scanned == 0 && self.skip_lf && !buffer.is_empty() {
+            self.skip_lf = false;
+            if buffer[0] == b'\n' {
+                buffer.remove(0);
+            }
+        }
+        while let Some(&byte) = buffer.get(self.scanned) {
+            let position = self.scanned;
+            self.scanned += 1;
+            if std::mem::take(&mut self.skip_lf) && byte == b'\n' {
+                self.line_start = self.scanned;
+                continue;
+            }
+            if matches!(byte, b'\r' | b'\n') {
+                self.skip_lf = byte == b'\r';
+                if position == self.line_start {
+                    let event = buffer.drain(..self.scanned).collect();
+                    self.scanned = 0;
+                    self.line_start = 0;
+                    return Some(event);
+                }
+                self.line_start = self.scanned;
+            }
+        }
+        None
+    }
+}
+
 impl Body {
     async fn next(&mut self) -> Result<Option<String>> {
         loop {
             if self.sse {
-                // SSE LF and CRLF framing; data fields join with LF. Heartbeats
-                // and non-message events do not fabricate a JSON-RPC response.
-                let end = self
-                    .buffer
-                    .windows(2)
-                    .position(|w| w == b"\n\n")
-                    .map(|p| (p, 2))
-                    .into_iter()
-                    .chain(
-                        self.buffer
-                            .windows(4)
-                            .position(|w| w == b"\r\n\r\n")
-                            .map(|p| (p, 4)),
-                    )
-                    .min_by_key(|v| v.0);
-                if let Some((end, separator)) = end {
-                    let event = String::from_utf8(self.buffer.drain(..end + separator).collect())
+                if let Some(event) = self.framing.take_event(&mut self.buffer) {
+                    let event = String::from_utf8(event)
                         .map_err(|_| CallError::transport("MCP SSE is not UTF-8"))?;
-                    for line in event.lines() {
+                    for line in event.split(['\r', '\n']) {
                         if let Some(value) = line.strip_prefix("id:") {
                             let value = value.strip_prefix(' ').unwrap_or(value);
                             if !value.contains('\0') {
@@ -1856,7 +1884,7 @@ impl Body {
                         }
                     }
                     let data: Vec<_> = event
-                        .lines()
+                        .split(['\r', '\n'])
                         .filter_map(|line| {
                             line.strip_prefix("data:")
                                 .map(|v| v.strip_prefix(' ').unwrap_or(v))
