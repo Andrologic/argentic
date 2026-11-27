@@ -330,8 +330,21 @@ pub(crate) fn evaluate_host(
         ("options", o([("maxSliceMs", slice.clone())])),
         ("entries", a(entries)),
     ]);
+    // Every receipt repeats the retired clocks, requests and answers so far,
+    // so the journal grows quadratically with the works it has admitted.
+    let state_json = next.stringify();
+    if crate::resource::quoted_bytes(&state_json) > crate::MAX_HUMAN_CLOCK_JOURNAL_BYTES {
+        return Err(Error::Failure(native::Error::new(
+            "INPUT_LIMIT",
+            "/stateJson",
+            format!(
+                "The human-clock journal of this flow invocation would exceed {} bytes.",
+                crate::MAX_HUMAN_CLOCK_JOURNAL_BYTES
+            ),
+        )));
+    }
     Ok(o([
-        ("stateJson", s(next.stringify())),
+        ("stateJson", s(state_json)),
         ("receiptJson", s(receipt)),
     ]))
 }

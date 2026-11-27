@@ -262,3 +262,56 @@ fn human_clock_reproduces_a_journal_written_by_the_previous_engine() {
         entries.len() + 1
     );
 }
+
+#[test]
+fn human_clock_refuses_a_journal_the_host_could_not_submit() {
+    // A long work identity makes every receipt large, so a few transitions
+    // reach the ceiling that hundreds of ordinary works would.
+    let work = "w".repeat(1_400_000);
+    let event = |id: usize, body: Value| {
+        json!({"owner": clock_owner(), "eventId": format!("e{id}"),
+            "nowMs": (id * 10).to_string(), "event": body})
+        .to_string()
+    };
+    let admit = event(
+        0,
+        json!({"kind": "admit", "workId": work,
+        "timeoutMs": null, "answerTimeoutMs": null}),
+    );
+    let (_, output) = clock_step("", 0, &admit);
+    let mut state = output.unwrap().0;
+    let mut revision = 1;
+    loop {
+        let tick = event(revision, json!({"kind": "tick"}));
+        let (report, output) = clock_step(&state, revision, &tick);
+        match output {
+            Some((next, _)) => {
+                state = next;
+                revision += 1;
+                assert!(revision < 10, "the journal never reached its limit");
+            }
+            None => {
+                assert_eq!(report["kind"], "failed", "{report}");
+                assert_eq!(report["code"], "INPUT_LIMIT", "{report}");
+                assert_eq!(report["pointer"], "/stateJson", "{report}");
+                break;
+            }
+        }
+    }
+    // The last accepted journal still fits the host's clock input with the
+    // refused event, so the refusal comes from the engine, not the transport.
+    let refused = event(revision, json!({"kind": "tick"}));
+    let input = json!({"operation": "humanClock", "input": {
+        "identity": {"systemStartId": "system", "flowInvocationId": "flow",
+            "snapshotId": "snapshot", "epoch": "epoch"},
+        "owner": clock_owner(), "eventId": format!("e{revision}"),
+        "expectedRevision": revision.to_string(), "stateJson": state,
+        "eventJson": refused, "optionsJson": CLOCK_OPTIONS,
+    }})
+    .to_string();
+    assert!(
+        serde_json::to_string(&state).unwrap().len()
+            <= argentic_core::MAX_HUMAN_CLOCK_JOURNAL_BYTES
+    );
+    assert!(input.len() < 8_000_000, "{}", input.len());
+}

@@ -15,6 +15,12 @@ pub const MAX_SOURCE_JSON_DEPTH: usize = 128;
 /// runtime's 8,000,000-byte route transport limit, so preparation fails while
 /// building instead of producing a result the host would refuse.
 pub const MAX_ROUTE_RESULT_BYTES: usize = 8_000_000;
+/// Maximum size of one flow invocation's human-clock journal, counted as the
+/// JSON string (`stateJson`) that carries it. The runtime refuses a clock
+/// input above 8,000,000 bytes; the difference leaves room for the next event
+/// and its envelope, so a transition is refused before the journal it
+/// produces could no longer be submitted.
+pub const MAX_HUMAN_CLOCK_JOURNAL_BYTES: usize = 7_500_000;
 
 /// Budget for one source operation. Clones share the same counters. Hosts that
 /// parse and assemble components can pass the same budget to validation.
