@@ -279,9 +279,10 @@ goes through the configured reviewer. Each call starts one child conversation
 with the parent's provider and model, the supplied task and read-only access
 under the parent's effective policy. The child has no shell or network tools.
 It has up to eight turns within the parent's remaining turn and token budgets.
-The parent receives the child's final text or a tool error. Stop cancels the child and the engine
-waits for its provider stream and tool workers before recording physical
-termination.
+The parent receives the child's final text or a tool error. If the child
+exhausts its budget, the parent stops before executing another call in the
+batch, including a submission. Stop cancels the child and the engine waits for
+its provider stream and tool workers before recording physical termination.
 
 ## Shell sandbox
 
@@ -339,11 +340,16 @@ invocation's local proxy port. Argentic sets proxy environment variables and
 clears both forms of `NO_PROXY`. Clients that ignore the proxy cannot reach
 the network directly.
 
-The proxy resolves names on the host and connects to checked IP addresses.
+The proxy checks the requested host and resolved addresses against the current
+policy before each upstream connection. It rechecks open opaque CONNECT
+tunnels every 250 ms and closes them if access is revoked. The proxy resolves
+names on the host and connects to checked IP addresses.
 Private, loopback and link-local addresses need an exact IP grant. Unspecified
 addresses are always blocked. In intercept mode an `ask` requires a person's
 decision. The proxy remembers each answer for that host for the lifetime of
-the invocation and withdraws pending requests when the client or shell exits.
+the invocation while the current policy calls for approval. A current denial
+overrides a remembered approval. The proxy withdraws pending requests when the
+client or shell exits.
 Human wait time pauses the shell and proxy machine deadlines.
 
 Each invocation can use up to 128 proxy connections, with 16 active at once
@@ -437,11 +443,14 @@ Credential screening covers provider keys of at least 16 bytes. Short local
 placeholders such as `lm-studio` can still authenticate a request. The
 harness masks literal echoes in assistant text and reasoning across stream
 deltas and counts the filtered bytes toward its response budget. Structured
-screening checks decoded JSON string values. Protocol IDs, tool names, object
-keys and JSON syntax remain intact. Screened tool arguments receive a
-correction in the same conversation, including `agsdl_submit_result`.
-A credential in signed replay data invalidates the reply. Tool results are
-screened before pagination and overflow-file creation.
+screening checks decoded JSON string values and member names. Screened tool
+arguments receive a correction in the same conversation, including
+`agsdl_submit_result`. Native replay keeps tool protocol IDs and tool names and
+masks echoes in editable Anthropic and Responses assistant text. A credential
+in a native replay member name or in signed or opaque replay data invalidates
+the reply. Tool results are screened before pagination and overflow-file
+creation. OpenAI Chat Completions and Responses emit refusal text as visible
+text and surface an explicit refusal as a filtered finish.
 
 - Agent and message resources appear as origin-labelled, untrusted reference
   data in a separate user message. The Host resolves local URIs under the
