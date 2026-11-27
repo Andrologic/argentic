@@ -66,5 +66,4 @@ fn main() {
     assert!(status.success(), "Swift content helper archiving failed");
     println!("cargo:rustc-link-search=native={}", out.display());
     println!("cargo:rustc-link-lib=static=argentic_content_launcher");
-    println!("cargo:rustc-link-arg=-Wl,-weak_framework,LightweightCodeRequirements");
 }

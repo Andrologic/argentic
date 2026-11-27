@@ -1,12 +1,11 @@
 //! Native, authenticated launch primitives. Callers must provide physical
 //! termination and reap before this can be used for content reads.
-use std::ffi::{c_char, c_void, CString};
+use std::ffi::{c_char, CString};
 use std::io;
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
-use std::ptr::NonNull;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(all(feature = "agsdl-content-qa", debug_assertions))]
 type QaOutputHook = (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>);
@@ -36,15 +35,9 @@ unsafe extern "C" {
         executable: *const c_char,
         component: *const c_char,
         parent_fd: i32,
-        result: *mut *mut c_void,
+        pid: *mut libc::pid_t,
         output_fd: *mut i32,
         control_fd: *mut i32,
-    ) -> i32;
-    fn agsdl_content_macos_wait_bounded(
-        handle: *mut c_void,
-        timeout_milliseconds: u32,
-        status: *mut i32,
-        signal: *mut i32,
     ) -> i32;
 }
 
@@ -70,14 +63,10 @@ pub fn arm_image_swap(target: &Path, replacement: &Path) -> io::Result<()> {
 }
 
 pub struct Launch {
-    handle: Option<NonNull<c_void>>,
+    pid: Option<libc::pid_t>,
     pub output: OwnedFd,
     control: Option<OwnedFd>,
 }
-
-// The native handle is used by one Rust owner and must not be accessed in
-// parallel. Foundation's wait API may be called from a blocking worker.
-unsafe impl Send for Launch {}
 
 pub struct Exit {
     pub status: i32,
@@ -85,11 +74,6 @@ pub struct Exit {
 }
 
 impl Launch {
-    #[cfg(all(feature = "agsdl-content-qa", debug_assertions))]
-    pub fn qa_handle_identity(&self) -> Option<usize> {
-        self.handle.map(|handle| handle.as_ptr() as usize)
-    }
-
     #[cfg(all(feature = "agsdl-content-qa", debug_assertions))]
     pub fn qa_control_open(&self) -> bool {
         self.control.is_some()
@@ -101,7 +85,7 @@ impl Launch {
         })?;
         let name = CString::new(name.as_os_str().as_bytes())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Invalid file component"))?;
-        let mut handle = std::ptr::null_mut();
+        let mut pid = -1;
         let mut output = -1;
         let mut control = -1;
         let code = unsafe {
@@ -109,7 +93,7 @@ impl Launch {
                 executable.as_ptr(),
                 name.as_ptr(),
                 parent_fd,
-                &mut handle,
+                &mut pid,
                 &mut output,
                 &mut control,
             )
@@ -119,18 +103,25 @@ impl Launch {
                 "Content helper launch failed ({code})"
             )));
         }
-        let handle = NonNull::new(handle)
-            .ok_or_else(|| io::Error::other("Content helper returned no process"))?;
-        if output < 0 || control < 0 {
-            return Err(io::Error::other(
-                "Content helper returned invalid descriptors",
-            ));
+        // Own whatever was returned first so an invalid answer cannot leak a
+        // valid descriptor or child.
+        let output = (output >= 0).then(|| unsafe { OwnedFd::from_raw_fd(output) });
+        let control = (control >= 0).then(|| unsafe { OwnedFd::from_raw_fd(control) });
+        match (pid > 0, output) {
+            (true, Some(output)) if control.is_some() => Ok(Self {
+                pid: Some(pid),
+                output,
+                control,
+            }),
+            (valid_pid, _) => {
+                if valid_pid {
+                    reap(pid);
+                }
+                Err(io::Error::other(
+                    "Content helper returned invalid process or descriptors",
+                ))
+            }
         }
-        Ok(Self {
-            handle: Some(handle),
-            output: unsafe { OwnedFd::from_raw_fd(output) },
-            control: Some(unsafe { OwnedFd::from_raw_fd(control) }),
-        })
     }
 
     /// Closing the only parent writer requests self-termination in the helper.
@@ -148,34 +139,72 @@ impl Launch {
         }
     }
 
-    /// A timeout does not consume the native handle. On completion Foundation
-    /// reaps the process and the bridge consumes the handle exactly once.
+    /// A timeout leaves the child owned by this launch. An exit is reaped once.
     pub fn wait(&mut self, timeout: Duration) -> io::Result<Option<Exit>> {
-        let handle = self
-            .handle
+        let pid = self
+            .pid
             .ok_or_else(|| io::Error::other("Helper already reaped"))?;
-        let millis = timeout.as_millis().min(u32::MAX as u128) as u32;
-        let mut status = 0;
-        let mut signal = 0;
-        match unsafe {
-            agsdl_content_macos_wait_bounded(handle.as_ptr(), millis, &mut status, &mut signal)
-        } {
-            0 => {
-                self.handle = None;
-                Ok(Some(Exit {
-                    status,
-                    signal: signal != 0,
-                }))
+        let started = Instant::now();
+        loop {
+            let mut status = 0;
+            match unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) } {
+                -1 => {
+                    let error = io::Error::last_os_error();
+                    if error.raw_os_error() == Some(libc::ECHILD) {
+                        // A host that ignores SIGCHLD lets the kernel reap the
+                        // child: it has exited, with an unknown status.
+                        self.pid = None;
+                        return Ok(Some(Exit {
+                            status: -1,
+                            signal: false,
+                        }));
+                    }
+                    if error.kind() != io::ErrorKind::Interrupted {
+                        return Err(error);
+                    }
+                    continue;
+                }
+                0 => {}
+                _ => {
+                    self.pid = None;
+                    return Ok(Some(Exit {
+                        status: if libc::WIFSIGNALED(status) {
+                            libc::WTERMSIG(status)
+                        } else {
+                            libc::WEXITSTATUS(status)
+                        },
+                        signal: libc::WIFSIGNALED(status),
+                    }));
+                }
             }
-            5 => Ok(None),
-            code => Err(io::Error::other(format!(
-                "Content helper wait failed ({code})"
-            ))),
+            let remaining = timeout.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                return Ok(None);
+            }
+            std::thread::sleep(remaining.min(Duration::from_millis(20)));
         }
     }
 }
 
-/// The worker retains the native handle until Foundation proves process exit,
+impl Drop for Launch {
+    /// Never leave a zombie behind, even if the launch is dropped unwaited.
+    fn drop(&mut self) {
+        if let Some(pid) = self.pid.take() {
+            reap(pid);
+        }
+    }
+}
+
+/// Kill an owned, unreaped child and wait for it.
+fn reap(pid: libc::pid_t) {
+    unsafe { libc::kill(pid, libc::SIGKILL) };
+    let mut status = 0;
+    while unsafe { libc::waitpid(pid, &mut status, 0) } == -1
+        && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted
+    {}
+}
+
+/// The worker retains ownership until it reaps the child,
 /// including after reporting uncertain termination to the asynchronous caller.
 pub fn read_supervised(
     executable: &Path,
@@ -185,7 +214,6 @@ pub fn read_supervised(
     sender: tokio::sync::oneshot::Sender<io::Result<Vec<u8>>>,
 ) {
     use std::os::fd::AsRawFd;
-    use std::time::Instant;
 
     if cancel.is_cancelled() {
         let _ = sender.send(Err(io::Error::other("Content read cancelled")));

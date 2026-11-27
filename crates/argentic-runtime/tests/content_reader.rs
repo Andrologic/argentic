@@ -54,33 +54,112 @@ fn main() {
 #[cfg(all(target_os = "macos", feature = "agsdl-content-qa", debug_assertions))]
 fn rejects_substituted_content_helper_image() {
     use argentic_runtime::content_io::macos_launcher::{arm_image_swap, Launch};
+    use std::io::Read;
     use std::os::fd::AsRawFd;
+    use std::process::Command;
 
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().canonicalize().unwrap();
     let helper = root.join("helper");
-    let replacement = root.join("replacement");
-    fs::copy(std::env::current_exe().unwrap(), &helper).unwrap();
-    // This only proves the QA swap hook runs right before Process.run: the
-    // substitute cannot execute at all. A valid Mach-O substitute currently
-    // runs despite the launch requirement; that defect is fixed separately.
-    let substitute = b"not a Mach-O executable";
-    fs::write(&replacement, substitute).unwrap();
+    let source = root.join("probe.c");
+    let adhoc = root.join("adhoc");
+    let resigned = root.join("resigned");
+    let fixture = b"helper fixture\n";
+    fs::write(root.join("fixture.txt"), fixture).unwrap();
+    fs::write(
+        &source,
+        "#include <stdio.h>\nint main(void) { puts(\"qa probe\"); }\n",
+    )
+    .unwrap();
+    // Needs the Command Line Tools, present on CI runners and QA machines.
+    assert!(Command::new("/usr/bin/cc")
+        .args([source.as_os_str(), "-o".as_ref(), adhoc.as_os_str()])
+        .status()
+        .unwrap()
+        .success());
+    // The same helper code under a new ad hoc signature has another code
+    // directory hash. If launched, it would read the fixture like the real one.
+    fs::copy(std::env::current_exe().unwrap(), &resigned).unwrap();
+    assert!(Command::new("/usr/bin/codesign")
+        .args(["-s", "-", "-f"])
+        .arg(&resigned)
+        .status()
+        .unwrap()
+        .success());
     let directory = Dir::open_ambient_dir(&root, ambient_authority()).unwrap();
 
-    arm_image_swap(&helper, &replacement).unwrap();
-    let refused = Launch::start(&helper, Path::new("fixture.txt"), directory.as_raw_fd());
+    let read_launch = |mut launch: Launch| {
+        let exit = launch.wait(Duration::from_secs(5)).unwrap();
+        launch.cancel();
+        let exit = match exit {
+            Some(exit) => exit,
+            None => launch.wait(Duration::from_secs(5)).unwrap().unwrap(),
+        };
+        let mut bytes = Vec::new();
+        // Launch reaps on drop, so its fields cannot be moved out.
+        fs::File::from(launch.output.try_clone().unwrap())
+            .read_to_end(&mut bytes)
+            .unwrap();
+        (exit, bytes)
+    };
 
-    // 4 is the bridge's launch failure; 6 would mean the QA swap never ran.
-    let error = refused
-        .err()
-        .expect("substituted helper image was launched");
-    assert!(
-        error.to_string().ends_with("(4)"),
-        "unexpected refusal: {error}"
-    );
-    assert_eq!(fs::read(helper).unwrap(), substitute);
-    assert!(!replacement.exists(), "QA replacement was not consumed");
+    // A byte-identical copy keeps the code identity and must still launch.
+    fs::copy(std::env::current_exe().unwrap(), &helper).unwrap();
+    let launch = Launch::start(&helper, Path::new("fixture.txt"), directory.as_raw_fd()).unwrap();
+    let (exit, bytes) = read_launch(launch);
+    assert!(!exit.signal && exit.status == 0, "copied helper failed");
+    assert_eq!(bytes, fixture);
+    fs::remove_file(&helper).unwrap();
+
+    let mut failures = Vec::new();
+    // The first two replacements run on their own. The re-signed helper needs
+    // the launcher's descriptors, so its new signature is verified instead.
+    for (image, runnable) in [
+        (Path::new("/bin/echo"), true),
+        (adhoc.as_path(), true),
+        (resigned.as_path(), false),
+    ] {
+        let replacement = root.join("replacement");
+        fs::copy(std::env::current_exe().unwrap(), &helper).unwrap();
+        fs::copy(image, &replacement).unwrap();
+        if runnable {
+            let probe = Command::new(&replacement).arg("qa probe").output().unwrap();
+            assert!(probe.status.success());
+            assert_eq!(probe.stdout, b"qa probe\n");
+        } else {
+            assert!(Command::new("/usr/bin/codesign")
+                .args(["--verify", "--strict"])
+                .arg(&replacement)
+                .status()
+                .unwrap()
+                .success());
+        }
+
+        arm_image_swap(&helper, &replacement).unwrap();
+        let result = Launch::start(&helper, Path::new("fixture.txt"), directory.as_raw_fd());
+        match result {
+            // The bridge refuses before resuming the child, so it never ran
+            // and the output pipe was closed without a byte.
+            Err(error) if error.to_string().ends_with("(7)") => {}
+            Err(error) => {
+                failures.push(format!("{}: unexpected refusal: {error}", image.display()))
+            }
+            Ok(launch) => {
+                let (exit, bytes) = read_launch(launch);
+                failures.push(format!(
+                    "{}: substituted helper was launched (status {}, signal {}, output {:?})",
+                    image.display(),
+                    exit.status,
+                    exit.signal,
+                    String::from_utf8_lossy(&bytes)
+                ));
+            }
+        }
+        assert_eq!(fs::read(&helper).unwrap(), fs::read(image).unwrap());
+        assert!(!replacement.exists(), "QA replacement was not consumed");
+        fs::remove_file(&helper).unwrap();
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
 async fn exercise_reader() {
