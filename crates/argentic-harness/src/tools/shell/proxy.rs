@@ -1,6 +1,12 @@
 //! One HTTP/1 egress proxy per shell invocation. The sandbox never receives
 //! a socket connected to an upstream server or access to the host resolver.
+mod clock;
+mod tls;
+
+use clock::Clock;
+
 use super::super::{Approval, Registry};
+use super::ShellNetwork;
 use crate::{
     policy::{normalize_network_host, Action, Effect, Zone},
     providers::ToolCall,
@@ -9,6 +15,7 @@ use base64::{
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
     Engine,
 };
+use http::uri::Authority;
 use http_body_util::{combinators::UnsyncBoxBody, BodyExt, Full};
 use hyper::{
     body::{Body, Bytes, Incoming},
@@ -18,8 +25,11 @@ use hyper::{
 };
 use hyper_util::rt::{TokioIo, TokioTimer};
 use std::{
+    collections::HashMap,
     io::{self, Read},
     net::{IpAddr, SocketAddr},
+    os::fd::AsFd,
+    path::PathBuf,
     pin::Pin,
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -28,8 +38,9 @@ use std::{
     task::{Context, Poll},
     time::Duration,
 };
+use tls::Intercept;
 use tokio::{
-    io::{AsyncRead, AsyncWrite, ReadBuf},
+    io::{unix::AsyncFd, AsyncRead, AsyncWrite, Interest, ReadBuf, Ready},
     net::{lookup_host, TcpStream},
     sync::{mpsc, Mutex},
     task::{JoinHandle, JoinSet},
@@ -59,11 +70,13 @@ type Listener = tokio::net::TcpListener;
 pub(super) struct Proxy {
     cancel: CancellationToken,
     task: Option<JoinHandle<()>>,
+    #[cfg(target_os = "macos")]
     pub(super) port: u16,
     url: String,
     #[cfg(target_os = "linux")]
     pub(super) socket: std::path::PathBuf,
-    #[cfg(target_os = "linux")]
+    pub(super) ca_bundle: Option<PathBuf>,
+    pub(super) clock: Arc<Clock>,
     _directory: tempfile::TempDir,
 }
 
@@ -79,13 +92,26 @@ impl Proxy {
         std::fs::File::open("/dev/urandom")?.read_exact(&mut nonce)?;
         let password = URL_SAFE_NO_PAD.encode(nonce);
         let auth = format!("Basic {}", STANDARD.encode(format!("argentic:{password}")));
+        let directory = tempfile::tempdir_in("/tmp")?;
+        let ca_bundle = (registry.shell_network == ShellNetwork::Intercept)
+            .then(|| {
+                directory
+                    .path()
+                    .canonicalize()
+                    .map(|path| path.join("ca.pem"))
+            })
+            .transpose()?;
+        let tls = ca_bundle.as_deref().map(Intercept::new).transpose()?;
         #[cfg(target_os = "linux")]
-        let (listener, directory, socket, port) = {
-            let directory = tempfile::tempdir_in("/tmp")?;
+        let (listener, socket, port) = {
             let socket = directory.path().join("proxy.sock");
             let listener = std::os::unix::net::UnixListener::bind(&socket)?;
             listener.set_nonblocking(true)?;
-            (Listener::from_std(listener)?, directory, socket, 18999)
+            (
+                Listener::from_std(listener)?,
+                socket,
+                super::linux::RELAY_PORT,
+            )
         };
         #[cfg(target_os = "macos")]
         let (listener, port) = {
@@ -96,6 +122,7 @@ impl Proxy {
         };
         let url = format!("http://argentic:{password}@127.0.0.1:{port}");
         let cancel = cancel.child_token();
+        let clock = Arc::new(Clock::new());
         let context = Arc::new(Egress {
             registry,
             call,
@@ -103,18 +130,22 @@ impl Proxy {
             auth,
             host_tcp_port: cfg!(target_os = "macos").then_some(port),
             bytes: Arc::new(AtomicUsize::new(MAX_BYTES)),
-            approvals: Mutex::new(()),
-            upstreams: TaskTracker::new(),
+            approvals: Arc::new(Mutex::new(HashMap::new())),
+            clock: clock.clone(),
+            tls,
+            tasks: TaskTracker::new(),
         });
         let task = tokio::spawn(accept(listener, context));
         Ok(Self {
             cancel,
             task: Some(task),
+            #[cfg(target_os = "macos")]
             port,
             url,
             #[cfg(target_os = "linux")]
             socket,
-            #[cfg(target_os = "linux")]
+            ca_bundle,
+            clock,
             _directory: directory,
         })
     }
@@ -124,6 +155,23 @@ impl Proxy {
             .iter()
             .map(|&key| (key, self.url.as_str()))
             .chain([("no_proxy", ""), ("NO_PROXY", "")])
+            .chain(self.ca_bundle.iter().flat_map(|path| {
+                #[cfg(target_os = "macos")]
+                let bundle = path.to_str().unwrap_or_default();
+                #[cfg(target_os = "linux")]
+                let bundle = {
+                    let _ = path;
+                    "/run/argentic-ca.pem"
+                };
+                [
+                    "SSL_CERT_FILE",
+                    "REQUESTS_CA_BUNDLE",
+                    "NODE_EXTRA_CA_CERTS",
+                    "CURL_CA_BUNDLE",
+                    "GIT_SSL_CAINFO",
+                ]
+                .map(|key| (key, bundle))
+            }))
     }
 }
 
@@ -144,8 +192,10 @@ struct Egress {
     auth: String,
     host_tcp_port: Option<u16>,
     bytes: Arc<AtomicUsize>,
-    approvals: Mutex<()>,
-    upstreams: TaskTracker,
+    approvals: Arc<Mutex<HashMap<String, bool>>>,
+    clock: Arc<Clock>,
+    tls: Option<Intercept>,
+    tasks: TaskTracker,
 }
 
 async fn accept(listener: Listener, context: Arc<Egress>) {
@@ -161,18 +211,40 @@ async fn accept(listener: Listener, context: Arc<Egress>) {
                 remaining -= 1;
                 let context = context.clone();
                 jobs.spawn(async move {
-                    let _ = tokio::time::timeout(MAX_CONNECTION_TIME, serve(client, context)).await;
+                    let Ok(fd) = client.as_fd().try_clone_to_owned().and_then(AsyncFd::new) else {
+                        return;
+                    };
+                    let base = context.clock.base_after(MAX_CONNECTION_TIME);
+                    tokio::select! {
+                        _ = disconnected(fd) => {},
+                        _ = context.clock.expire(base) => {},
+                        _ = serve(client, context.clone()) => {},
+                    }
                 });
             }
         }
     }
     jobs.shutdown().await;
-    context.upstreams.close();
-    context.upstreams.wait().await;
+    context.tasks.close();
+    context.tasks.wait().await;
+}
+
+// Watch the transport independently of Hyper's body backpressure. An EOF
+// must withdraw an ask even if the client sent body bytes before disconnecting.
+async fn disconnected(fd: AsyncFd<std::os::fd::OwnedFd>) {
+    while let Ok(mut ready) = fd.ready(Interest::READABLE).await {
+        if ready.ready().is_read_closed() {
+            break;
+        }
+        ready.clear_ready_matching(Ready::READABLE);
+    }
 }
 
 type ProxyBody = UnsyncBoxBody<Bytes, hyper::Error>;
-type Tunnel = (hyper::upgrade::OnUpgrade, TcpStream);
+enum Tunnel {
+    Opaque(TcpStream),
+    Intercept(Target),
+}
 
 async fn serve(client: impl AsyncRead + AsyncWrite + Unpin + Send + 'static, context: Arc<Egress>) {
     let lifetime = context.cancel.child_token();
@@ -199,9 +271,37 @@ async fn serve(client: impl AsyncRead + AsyncWrite + Unpin + Send + 'static, con
         .serve_connection(TokioIo::new(client), service)
         .with_upgrades()
         .await;
-    if let Ok((upgrade, mut upstream)) = tunnel_rx.try_recv() {
-        if let Ok(client) = upgrade.await {
-            let _ = tokio::io::copy_bidirectional(&mut TokioIo::new(client), &mut upstream).await;
+    if let Ok((upgrade, tunnel)) = tunnel_rx.try_recv() {
+        let Ok(client) = upgrade.await else { return };
+        let mut client = TokioIo::new(client);
+        match tunnel {
+            Tunnel::Opaque(mut upstream) => {
+                let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+            }
+            Tunnel::Intercept(target) => {
+                let Some(tls) = &context.tls else { return };
+                let Ok(Ok(client)) =
+                    tokio::time::timeout(MAX_DIAL_TIME, tls.accept(client, &target.host)).await
+                else {
+                    return;
+                };
+                let service = service_fn(|request| {
+                    let (context, lifetime) = (context.clone(), lifetime.clone());
+                    let target = &target;
+                    async move {
+                        let outcome = context.forward_tls(request, target, &lifetime).await;
+                        Ok::<_, std::convert::Infallible>(
+                            outcome.unwrap_or_else(|(status, error)| message(status, error)),
+                        )
+                    }
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .max_buf_size(MAX_HEADER_BYTES)
+                    .timer(TokioTimer::new())
+                    .header_read_timeout(Duration::from_secs(5))
+                    .serve_connection(TokioIo::new(client), service)
+                    .await;
+            }
         }
     }
 }
@@ -230,11 +330,43 @@ const UPSTREAM: Failure = (
     "Argentic could not reach this destination\n",
 );
 
+#[derive(PartialEq, Eq)]
+struct Target {
+    host: String,
+    port: u16,
+}
+
+impl Target {
+    fn new(authority: &Authority, default_port: Option<u16>) -> Result<Self, Failure> {
+        if authority.as_str().contains('@') {
+            return Err(BAD_TARGET);
+        }
+        let port = if authority.as_str() == authority.host() {
+            default_port
+        } else {
+            authority.port_u16()
+        }
+        .filter(|port| *port != 0)
+        .ok_or(BAD_TARGET)?;
+        let host = destination(authority.host()).ok_or(BAD_TARGET)?;
+        Ok(Self { host, port })
+    }
+
+    fn host_header(&self) -> Result<HeaderValue, Failure> {
+        let host = if self.host.contains(':') {
+            format!("[{}]", self.host)
+        } else {
+            self.host.clone()
+        };
+        HeaderValue::from_str(&format!("{host}:{}", self.port)).map_err(|_| BAD_TARGET)
+    }
+}
+
 impl Egress {
     async fn forward(
         &self,
         mut request: Request<Incoming>,
-        tunnel: mpsc::Sender<Tunnel>,
+        tunnel: mpsc::Sender<(hyper::upgrade::OnUpgrade, Tunnel)>,
         lifetime: CancellationToken,
     ) -> Result<Response<ProxyBody>, Failure> {
         if !request
@@ -252,58 +384,89 @@ impl Egress {
             );
             return Ok(response);
         }
-        let connect = request.method() == Method::CONNECT;
-        let target = request.uri();
-        let authority = target
-            .authority()
-            .filter(|value| !value.as_str().contains('@'))
-            .ok_or(BAD_TARGET)?;
-        let port = if connect {
-            if target.scheme().is_some()
-                || target.path_and_query().is_some()
+        let uri = request.uri();
+        let authority = uri.authority().ok_or(BAD_TARGET)?;
+        if request.method() == Method::CONNECT {
+            if uri.scheme().is_some()
+                || uri.path_and_query().is_some()
                 || request.body().size_hint().exact() != Some(0)
             {
                 return Err(BAD_TARGET);
             }
-            authority
-                .port_u16()
-                .filter(|port| *port != 0)
-                .ok_or(BAD_TARGET)?
-        } else {
-            if target.scheme_str() != Some("http") {
-                return Err(BAD_TARGET);
-            }
-            if authority.as_str() == authority.host() {
-                80
+            let target = Target::new(authority, None)?;
+            let destination = if self.tls.is_some() {
+                if self.effect(&target.host) == Effect::Deny {
+                    return Err(DENIED);
+                }
+                Tunnel::Intercept(target)
             } else {
-                authority
-                    .port_u16()
-                    .filter(|port| *port != 0)
-                    .ok_or(BAD_TARGET)?
-            }
-        };
-        let host = destination(authority.host()).ok_or(BAD_TARGET)?;
-        let upstream = self.dial(&host, port, &lifetime).await?;
-        if connect {
+                Tunnel::Opaque(self.dial(&target.host, target.port, &lifetime).await?)
+            };
             tunnel
-                .try_send((hyper::upgrade::on(&mut request), upstream))
+                .try_send((hyper::upgrade::on(&mut request), destination))
                 .map_err(|_| UPSTREAM)?;
             return Ok(message(StatusCode::OK, ""));
         }
 
-        let path: Uri = target
+        if uri.scheme_str() != Some("http") {
+            return Err(BAD_TARGET);
+        }
+        let target = Target::new(authority, Some(80))?;
+        let upstream = self.dial(&target.host, target.port, &lifetime).await?;
+        self.send(request, &target, upstream, &lifetime).await
+    }
+
+    async fn forward_tls(
+        &self,
+        request: Request<Incoming>,
+        target: &Target,
+        lifetime: &CancellationToken,
+    ) -> Result<Response<ProxyBody>, Failure> {
+        let uri = request.uri();
+        if request.method() == Method::CONNECT
+            || uri.scheme().is_some()
+            || uri.authority().is_some()
+            || !uri.path().starts_with('/')
+        {
+            return Err(BAD_TARGET);
+        }
+        let mut hosts = request.headers().get_all(header::HOST).iter();
+        let authority = hosts
+            .next()
+            .and_then(|value| Authority::try_from(value.as_bytes()).ok())
+            .ok_or(BAD_TARGET)?;
+        if hosts.next().is_some() || Target::new(&authority, Some(443))? != *target {
+            return Err(DENIED);
+        }
+        let tcp = self.dial(&target.host, target.port, lifetime).await?;
+        let tls = self.tls.as_ref().ok_or(UPSTREAM)?;
+        let upstream = tokio::time::timeout(MAX_DIAL_TIME, tls.connect(tcp, &target.host))
+            .await
+            .map_err(|_| UPSTREAM)?
+            .map_err(|_| UPSTREAM)?;
+        self.send(request, target, upstream, lifetime).await
+    }
+
+    async fn send(
+        &self,
+        request: Request<Incoming>,
+        target: &Target,
+        upstream: impl AsyncRead + AsyncWrite + Unpin + Send + 'static,
+        lifetime: &CancellationToken,
+    ) -> Result<Response<ProxyBody>, Failure> {
+        let path: Uri = request
+            .uri()
             .path_and_query()
             .map_or("/", |value| value.as_str())
             .parse()
             .map_err(|_| BAD_TARGET)?;
-        let host_header = HeaderValue::from_str(authority.as_str()).map_err(|_| BAD_TARGET)?;
         // The destination and Host header always come from the same authority.
         // Hyper supplies fresh framing and never follows redirects on our behalf.
         let (mut parts, body) = request.into_parts();
         parts.uri = path;
         parts.version = hyper::Version::HTTP_11;
         strip_hop_headers(&mut parts.headers);
-        parts.headers.insert(header::HOST, host_header);
+        parts.headers.insert(header::HOST, target.host_header()?);
         parts
             .headers
             .insert(header::CONNECTION, HeaderValue::from_static("close"));
@@ -312,7 +475,8 @@ impl Egress {
             .handshake(TokioIo::new(upstream))
             .await
             .map_err(|_| UPSTREAM)?;
-        self.upstreams.spawn(async move {
+        let lifetime = lifetime.clone();
+        self.tasks.spawn(async move {
             tokio::select! {
                 _ = lifetime.cancelled() => {},
                 _ = connection => {},
@@ -329,20 +493,22 @@ impl Egress {
         Ok(response.map(BodyExt::boxed_unsync))
     }
 
+    fn effect(&self, host: &str) -> Effect {
+        self.registry
+            .policy
+            .iter()
+            .map(|policy| policy.decide(Action::Network, host, Zone::Workspace))
+            .max()
+            .unwrap_or(Effect::Deny)
+    }
+
     async fn dial(
         &self,
         host: &str,
         port: u16,
         cancel: &CancellationToken,
     ) -> Result<TcpStream, Failure> {
-        let effect = self
-            .registry
-            .policy
-            .iter()
-            .map(|policy| policy.decide(Action::Network, host, Zone::Workspace))
-            .max()
-            .unwrap_or(Effect::Deny);
-        self.authorize(effect, host, cancel).await?;
+        self.authorize(self.effect(host), host, cancel).await?;
 
         let addresses = match host.parse::<IpAddr>() {
             Ok(ip) => vec![SocketAddr::new(ip, port)],
@@ -398,20 +564,47 @@ impl Egress {
         host: &str,
         cancel: &CancellationToken,
     ) -> Result<(), Failure> {
-        // One approval at a time for this work attempt. A queued request
-        // cannot open a new ticket after its connection has expired.
-        let _gate = if effect == Effect::Ask {
-            Some(tokio::select! {
-                biased;
-                _ = cancel.cancelled() => return Err(DENIED),
-                gate = self.approvals.lock() => gate,
-            })
-        } else {
-            None
+        if effect != Effect::Ask || !self.registry.has_authorizer() {
+            return self
+                .registry
+                .authorize(effect, &self.call, Approval::Network(host), cancel)
+                .await
+                .map_err(|_| DENIED);
+        }
+        // One prompt per canonical host and a hard cap per invocation. Mark
+        // it refused before opening the ticket, including on disconnect.
+        let mut decisions = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(DENIED),
+            guard = self.approvals.clone().lock_owned() => guard,
         };
-        self.registry
-            .authorize(effect, &self.call, Approval::Network(host), cancel)
+        if let Some(&allowed) = decisions.get(host) {
+            return allowed.then_some(()).ok_or(DENIED);
+        }
+        if decisions.len() >= MAX_CONNECTIONS {
+            return Err(DENIED);
+        }
+        decisions.insert(host.to_owned(), false);
+        let (registry, call, host, cancel) = (
+            self.registry.clone(),
+            self.call.clone(),
+            host.to_owned(),
+            cancel.clone(),
+        );
+        let pause = self.clock.pause();
+        // Dropping a connection cancels its token. Keep the broker's future
+        // alive until it has withdrawn the ticket and released the clocks.
+        self.tasks
+            .spawn(async move {
+                let result = registry
+                    .authorize(Effect::Ask, &call, Approval::Network(&host), &cancel)
+                    .await;
+                decisions.insert(host, result.is_ok());
+                drop(pause);
+                result
+            })
             .await
+            .map_err(|_| DENIED)?
             .map_err(|_| DENIED)
     }
 }
@@ -546,6 +739,7 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for Metered<T> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

@@ -29,9 +29,14 @@ libc = "0.2"
 
 [target.'cfg(any(all(target_os = "linux", any(target_arch = "aarch64", target_arch = "x86_64")), all(target_os = "macos", target_arch = "aarch64")))'.dependencies]
 base64 = "0.22"
+http = "1"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
+rcgen = "0.14"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-native-certs = "0.8"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 tokio = { version = "1", features = ["net", "io-util"] }
 
 [target.'cfg(windows)'.dependencies]

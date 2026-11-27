@@ -35,7 +35,7 @@ use crate::{
     policy::{Action, Effect, Policy},
     providers::ToolCall,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
@@ -131,16 +131,36 @@ pub fn shell_read_conflict(policy: &Policy, network: bool) -> Option<ShellReadCo
         })
 }
 
-pub fn shell_network_allowed(policies: &[Policy]) -> bool {
-    !policies.is_empty() && policies.iter().all(|policy| policy.may_use_network())
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ShellNetwork {
+    #[default]
+    Blanket,
+    Intercept,
+}
+
+pub const SHELL_NETWORK_PATTERN: &str =
+    "Shell network host patterns require the Argentic host setting shellNetwork: \"intercept\"";
+
+pub fn shell_network_allowed(policies: &[Policy], mode: ShellNetwork) -> bool {
+    let allows = match mode {
+        ShellNetwork::Blanket => Policy::blanket_network,
+        ShellNetwork::Intercept => Policy::may_use_network,
+    };
+    !policies.is_empty() && policies.iter().all(allows)
 }
 
 pub fn preflight() -> Result<(), String> {
+    preflight_network(false)
+}
+
+pub fn preflight_network(network: bool) -> Result<(), String> {
+    let _ = network;
     #[cfg(all(
         target_os = "linux",
         any(target_arch = "aarch64", target_arch = "x86_64")
     ))]
-    return linux::preflight();
+    return linux::preflight(network);
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     return macos::preflight();
     #[cfg(not(any(
@@ -171,8 +191,16 @@ impl Registry {
             .map(|policy| policy.parsed_shell_effect(&parsed))
             .max()
             .unwrap_or(Effect::Deny);
-        let network = shell_network_allowed(&self.policy);
+        let network = shell_network_allowed(&self.policy, self.shell_network);
         if effect != Effect::Deny {
+            if self.shell_network == ShellNetwork::Blanket
+                && self
+                    .policy
+                    .iter()
+                    .any(|policy| policy.first_network_pattern().is_some())
+            {
+                return Err(SHELL_NETWORK_PATTERN.into());
+            }
             for policy in &self.policy {
                 if let Some(conflict) = shell_read_conflict(policy, network) {
                     return Err(conflict.to_string());

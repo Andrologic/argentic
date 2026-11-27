@@ -76,7 +76,7 @@
       "allow": "sandbox",
       "ask": "sandbox",
       "deny": "sandbox",
-      "note": "The OS blocks direct shell egress. HTTP and HTTPS clients use the local Argentic proxy, which applies every effective host rule and requires a person for ask. Clients that ignore the proxy environment have no network access. Private addresses require an explicit IP rule."
+      "note": "The OS blocks direct shell egress. The default shellNetwork mode, blanket, requires an unconditional grant in every policy layer. Shell host patterns require shellNetwork: \"intercept\" and are refused at qualification otherwise. Intercept mode enforces host rules for HTTP/1.1 and decrypts HTTPS in the host process using a per-invocation CA."
     },
     "mcp": {
       "allow": "harness",

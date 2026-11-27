@@ -1245,6 +1245,7 @@ async fn shell_executes_and_stop_reaps_the_namespace_before_physical_end() {
     std::fs::create_dir(&staging).unwrap();
     let mut config = config(&server.base_url, None);
     config["shellStagingDirectory"] = json!(staging);
+    config["shellNetwork"] = json!("intercept");
     let mut policy: Value = serde_json::from_slice(&std::fs::read(&f.policy).unwrap()).unwrap();
     policy["permissions"] = json!("full");
     let bytes = serde_json::to_vec(&policy).unwrap();
@@ -1277,14 +1278,14 @@ async fn shell_executes_and_stop_reaps_the_namespace_before_physical_end() {
         "sandboxed"
     );
 
-    // Hold a tunnel open until Stop. The target must see no connection
+    // Hold an approved connection until Stop. The target must see no connection
     // before the shared approval port authorizes this destination.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     request.tool(
         "shell",
         json!({"command":format!(
-            "curl -sS --max-time 30 --proxytunnel http://127.0.0.1:{port}/ & wait"
+            "curl -sS --max-time 30 http://127.0.0.1:{port}/ & wait"
         )}),
     );
     let scope = persistence::public030::HumanScope030 {
@@ -1326,7 +1327,7 @@ async fn shell_executes_and_stop_reaps_the_namespace_before_physical_end() {
     let mut request = Vec::new();
     tokio::time::timeout(WAIT_FOR, stream.read_to_end(&mut request))
         .await
-        .expect("proxy tunnel did not close on Stop")
+        .expect("proxy connection did not close on Stop")
         .unwrap();
     assert_eq!(std::fs::read_dir(&staging).unwrap().count(), 0);
     let physical: i64 = sqlx::query_scalar(

@@ -207,7 +207,7 @@ impl Policy {
                     .pattern
                     .as_deref()
                     .filter(|pattern| {
-                        matches!(rule.action, Action::Read | Action::Write)
+                        matches!(rule.action, Action::Read | Action::Write | Action::Network)
                             || pattern.is_empty()
                             || !pattern.bytes().all(|byte| byte == b'*')
                     })
@@ -362,11 +362,27 @@ impl Policy {
             && self.blanket_allow(action, zone)
     }
 
+    pub fn first_network_pattern(&self) -> Option<usize> {
+        self.rules
+            .iter()
+            .position(|(action, matcher, _)| *action == Action::Network && matcher.is_some())
+    }
+
+    pub(crate) fn blanket_network(&self) -> bool {
+        self.first_network_pattern().is_none()
+            && self.decide(Action::Network, "localhost", Zone::Workspace) == Effect::Allow
+    }
+
     pub(crate) fn may_use_network(&self) -> bool {
         let permits = |effect| effect != Effect::Deny;
         let mut allowed = permits(self.default_effect(Action::Network, Zone::Workspace));
         for (_, matcher, effect) in self.rules.iter().filter(|rule| rule.0 == Action::Network) {
-            if matcher.is_none() && !permits(*effect) {
+            let global = match matcher {
+                None => true,
+                Some(Matcher::Network { pattern, .. }) => pattern.bytes().all(|b| b == b'*'),
+                _ => false,
+            };
+            if global && !permits(*effect) {
                 return false;
             }
             allowed |= permits(*effect);

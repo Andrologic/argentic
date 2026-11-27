@@ -1,7 +1,12 @@
 """Relay HTTP proxy traffic from private loopback to the mounted Unix socket."""
 
-import asyncio
 import sys
+
+if sys.version_info < (3, 11):
+    sys.exit("Argentic Linux shell network relay requires system Python 3.11 or later")
+
+import asyncio
+import select
 
 
 async def copy(source, destination):
@@ -15,19 +20,28 @@ async def main():
     connections = set()
 
     async def relay(reader, writer):
-        async with asyncio.timeout(120):
-            upstream, out = await asyncio.open_unix_connection("/run/argentic-proxy.sock")
-            try:
-                async with asyncio.TaskGroup() as group:
-                    group.create_task(copy(reader, out))
-                    group.create_task(copy(upstream, writer))
-            finally:
-                out.close()
+        upstream, out = await asyncio.open_unix_connection("/run/argentic-proxy.sock")
+
+        async def disconnect():
+            poll = select.poll()
+            poll.register(writer.get_extra_info("socket").fileno(), select.POLLRDHUP)
+            while not poll.poll(0):
+                await asyncio.sleep(0.05)
+            out.transport.abort()
+
+        watch = asyncio.create_task(disconnect())
+        try:
+            async with asyncio.TaskGroup() as group:
+                group.create_task(copy(reader, out))
+                group.create_task(copy(upstream, writer))
+        finally:
+            watch.cancel()
+            out.close()
 
     async def serve(reader, writer):
         try:
             await relay(reader, writer)
-        except (OSError, TimeoutError, ExceptionGroup):
+        except (OSError, ExceptionGroup):
             pass
         finally:
             writer.close()

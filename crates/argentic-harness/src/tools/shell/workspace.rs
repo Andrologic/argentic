@@ -178,7 +178,7 @@ impl Budget {
     pub(super) fn check(
         &mut self,
         cancel: &CancellationToken,
-        deadline: Instant,
+        deadline: &impl Fn() -> Instant,
     ) -> io::Result<()> {
         self.entries = 0;
         self.bytes = 0;
@@ -190,11 +190,11 @@ impl Budget {
         dir: &Dir,
         depth: usize,
         cancel: &CancellationToken,
-        deadline: Instant,
+        deadline: &impl Fn() -> Instant,
     ) -> io::Result<()> {
         for entry in dir.entries()? {
             check_cancel(cancel)?;
-            if Instant::now() >= deadline {
+            if Instant::now() >= deadline() {
                 return Err(io::Error::other("Shell command timed out"));
             }
             self.entries += 1;

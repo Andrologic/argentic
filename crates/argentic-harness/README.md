@@ -248,26 +248,47 @@ denial.
 
 ### Shell networking
 
-Argentic exposes HTTP and HTTPS through a per-invocation proxy. It sets the
-uppercase and lowercase proxy variables and clears `NO_PROXY` and `no_proxy`.
-Linux keeps the private network namespace. A loopback bridge using system
-Python 3.11 or later forwards to a single read-only-mounted Unix socket.
-Seatbelt allows outbound TCP to the invocation's localhost proxy port.
-Clients that ignore the proxy variables have no network access. The
-proxy accepts HTTP/1 requests and CONNECT tunnels. It checks the CONNECT
-destination and forwards tunnel bytes without inspecting TLS.
+Set `shellNetwork` in the host's Argentic provider configuration. It defaults
+to `"blanket"`. In that mode a shell can use the proxy only if every policy
+layer grants network access unconditionally. Qualification rejects network
+rules with a host match when the agent can run shell commands. Blanket mode
+passes CONNECT bytes through without inspecting TLS or checking the
+authorities inside the tunnel.
 
-The proxy applies the most restrictive effective host rule before it resolves
-the host. A redirect causes the client to make a new request and the proxy
-checks the new target. An `ask` requires a one-time decision from a person.
+Set `shellNetwork: "intercept"` to use host patterns. Argentic terminates
+client TLS with a CA generated for the shell invocation. It keeps the CA
+private key in memory and exposes a read-only trust bundle containing the
+system roots and the invocation CA. This lets the host process read HTTPS
+request and response contents, including any credentials the command sends.
+Clients must trust the bundle and support HTTP/1.1. Certificate pinning or
+clients that require a different trust store can cause connections to fail.
+
+Intercept mode requires the TLS SNI and each HTTP request's authority to match
+the CONNECT host, with the usual absence of SNI on IP literal connections.
+It checks each request against the effective network policy and verifies the
+upstream certificate against the host's trust roots. It offers only HTTP/1.1
+over TLS. Redirects that clients follow go through the same checks as new
+requests. Rules and request hosts use the same IDNA normalization. Use a host
+pattern without a scheme, path, or port.
+
+The OS blocks direct egress in both modes. On Linux, a relay using system
+Python 3.11 or later starts inside the private network namespace and forwards
+to a read-only-mounted Unix socket. Seatbelt restricts outbound TCP to the
+invocation's local proxy port. Argentic sets proxy environment variables and
+clears both forms of `NO_PROXY`. Clients that ignore the proxy cannot reach
+the network directly.
+
 The proxy resolves names on the host and connects to checked IP addresses.
-Private, loopback and link-local addresses require an exact IP rule even with
-the `full` preset, and address-specific restrictions still apply.
+Private, loopback and link-local addresses need an exact IP grant. Unspecified
+addresses are always blocked. In intercept mode an `ask` requires a person's
+decision. The proxy remembers each answer for that host for the lifetime of
+the invocation and withdraws pending requests when the client or shell exits.
+Human wait time pauses the shell and proxy machine deadlines.
 
-Each shell invocation can use up to 128 proxy connections, with 16 active at
-once and a shared 64 MiB wire budget. Each connection lasts at most two minutes,
-subject to the shell deadline. DNS resolution and dialing each have a
-ten-second timeout.
+Each invocation can use up to 128 proxy connections, with 16 active at once
+and a shared 64 MiB wire budget. Each connection has a two-minute machine-time
+budget, subject to the shell deadline. DNS resolution, dialing, and TLS
+handshakes each have a ten-second timeout.
 
 ### Staging and publication
 
