@@ -222,11 +222,51 @@ and atomic replacement. A patch validates its whole plan before changing files.
 An I/O failure during publication can leave some files changed, and the reply
 reports how many changes were applied. Parent directories must already exist.
 
-Use `reviewer: "person"` to have the engine ask about a direct read, write,
-shell or MCP call. The reply covers that specific action in that call. A refused or
-expired answer returns a tool error. Engine Stop closes pending questions.
-`answerTimeoutMs` bounds the human wait, which the engine excludes from step
-machine time.
+## Planning, review and delegation
+
+Set `"plan": true` to give the agent a `plan` tool. It accepts a nonempty
+`steps` array with `step` and `status` fields. A status is `pending`,
+`in_progress` or `completed`. The Host journals each update as a
+`planPresented` work event. The current plan remains verbatim in model
+requests even when compaction summarizes its original tool call.
+
+`"planFirst": "auto"` enables the same tool and accepts its first valid plan
+for the work. `"planFirst": "ask"` submits that plan for human review. Until
+acceptance, the agent can read files and selected skills. Writes, shell, MCP
+discovery and calls, delegation and final submission remain blocked. A refusal
+with a comment asks the agent to revise. A refusal without a comment, an
+`answerTimeoutMs` expiry or an unavailable person ends the work with
+`PLAN_REJECTED`.
+
+Set `"reviewer": "person"` inside `permissions` to send an action with effect
+`ask` through the engine's human request broker. An answer applies to one
+action in one call. Refused or expired requests return tool errors. The engine
+excludes the human wait from step machine time and closes pending requests on
+Stop.
+
+For `"reviewer": "model"`, set `"reviewerModel": "local/reviewer-model"` at the
+top level of the Host's provider configuration and list `reviewer-model` in
+that provider's `models`. The reviewer receives the exact action and arguments,
+the policy context and bounded excerpts from the recent conversation. It has
+no tools and must return a JSON object such as `{"verdict":"APPROVE"}`. The
+Host records `APPROVE`, `DENY` or `ESCALATE` as a `reviewerDecision` work event.
+The Host rechecks policy before delivering an approval. Provider errors, invalid
+replies and a 15-second deadline yield denial. Shell and MCP asks require a
+person because the reviewer cannot inspect their effects.
+
+Set `"personReviewAvailable": false` in the Host's provider configuration for
+headless runs. Human-only asks and escalations then return a tool refusal.
+`planFirst: "ask"` fails with `PLAN_REJECTED` when the agent presents its plan.
+The setting defaults to `true`.
+
+An effective `delegate` grant exposes `delegate({ "task": "…" })`. An `ask`
+goes through the configured reviewer. Each call starts one child conversation
+with the parent's provider and model, the supplied task and read-only access
+under the parent's effective policy. The child has up to eight turns within
+the parent's remaining turn and token budgets. The parent receives the
+child's final text or a tool error. Stop cancels the child and the engine
+waits for its provider stream and tool workers before recording physical
+termination.
 
 ## Linux shell
 
@@ -311,7 +351,9 @@ could repeat its effects.
 | Visible text | Emit one `visibleText` frame per complete assistant message through `WorkPort::assistant_message`. Stream fragments remain available to harness consumers through `Event::VisibleText`. |
 | Submit and logical turn end | Project `Proposal::Submit` and `Proposal::EndTurn` into the native work protocol. The controller validates the raw arguments and returns acceptance or a correction in the current conversation. |
 | Steer | Pull from the admitted inbox at a safe point and gate the next request with `wire_admission`. For HTTP, acknowledge on 2xx response headers. An explicit refusal or a connection failure before sending leaves the steer eligible for queue fallback. Missing evidence after a possible send leaves delivery uncertain. |
-| Approvals | Deliver one-shot action decisions through the shared engine human broker. |
+| Plan | Journal structured `planPresented` events. Plan-first ask uses the native plan lock and the human broker. |
+| Approvals | Review exact asks with the configured model or deliver one-shot decisions through the shared engine human broker. |
+| Delegation | Execute a read-only child in the same process under a narrower registry and the same work budget. |
 | Physical termination | After `RunReport::physical_end`, return from the owned executor future. The native registry and its join generate durable `physicalEnded` evidence. |
 
 The standalone host registers the adapter when configured and requires explicit
@@ -340,8 +382,9 @@ Compaction runs when the provider entry sets `contextWindowTokens`.
   Work admission refuses overlapping shell roots and roots covering private
   Host data.
 
-The adapter's AgSDL module describes support for planning, reviewers and
-completion checks.
+The [Host's Argentic module](../argentic-core/assets/harnesses/argentic/module.json)
+declares native planning and reviewers and harness enforcement for delegation.
+`completionCheck` is unavailable in this adapter.
 
 After a missing required submission, Argentic forces the result tool by name
 by default. If the provider rejects the named choice, Argentic retries with

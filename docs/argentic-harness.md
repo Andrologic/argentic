@@ -194,7 +194,7 @@ action et effet, inutilisé. Il servira à prouver le profil du module.
 | 2 | Moteur de politique, outils d’écriture, shell sous sandbox Linux, `reviewer.person`. | Matrice action × effet prouvée par `enforcement.rs` sur Linux. |
 | 3 | Steer et livraison, instances partagées et nommées, compaction, effort, Anthropic Messages et Responses. | Scénarios steer et arrêt de la 0.4.0 verts. |
 | 4 | MCP, skills, `resources`, `directories`, proxy réseau, Seatbelt macOS. | Profil complet sur Linux et macOS. |
-| 5 | `plan`, `planFirst` auto et ask, `reviewer.model`, délégation. | Toutes les propriétés `native`. |
+| 5 | `plan`, `planFirst` auto et ask, `reviewer.model`, délégation. | Propriétés du lot `native`, délégation appliquée par le harnais. |
 | 6 | Performance : pools partagés, données immuables partagées, hibernation. | Mesures mémoire et latence par session, suivies en CI. |
 
 
@@ -226,3 +226,53 @@ filtrées. Il publie leurs modifications lorsque chaque politique effective
 accorde la lecture et l’écriture sans restriction sur le répertoire concerné.
 L’admission refuse les racines qui se recouvrent pour le shell ou recouvrent
 les données privées du Host.
+
+### Lot 5
+
+`plan: true` expose un outil `plan` avec des étapes et leurs statuts. Chaque
+mise à jour est un événement `planPresented` dans le journal du travail.
+La boucle réinjecte le plan courant dans les requêtes au modèle, hors de
+l’historique que la compaction peut résumer.
+[AgSDL 0.4.0, plan](https://github.com/Andrologic/AgSDL/blob/v0.4.0/spec/agents.md#plan)
+
+Le verrou de `planFirst` est recréé pour chaque travail, y compris sur une
+instance partagée ou nommée. Tant qu’il est actif, la boucle refuse les mutations,
+le shell, les appels MCP et la délégation. Elle diffère aussi la découverte MCP,
+car l’initialisation d’un serveur peut avoir des effets externes. En mode
+`auto`, la présentation lève le verrou. En mode `ask`, le Host traite la
+réponse humaine avec le courtier d’approbation et le verrou natif du moteur.
+Un refus commenté conserve le verrou et restitue le commentaire. Un refus
+sans commentaire, une échéance atteinte ou l’absence de relecteur humain
+termine le travail avec `PLAN_REJECTED`.
+[AgSDL 0.4.0, plan first](https://github.com/Andrologic/AgSDL/blob/v0.4.0/spec/agents.md#plan-first)
+
+Le Host sélectionne le relecteur dans son catalogue de fournisseurs avec
+`reviewerModel`. Le modèle reçoit l’action exacte, son contexte de politique
+et des extraits bornés de la conversation. Sa réponse JSON est limitée à
+`APPROVE`, `DENY` ou `ESCALATE`. Une erreur, un délai dépassé ou une réponse
+invalide produit un refus. Le Host exige une personne pour les demandes
+`ask` du shell et de MCP. Il vérifie la politique courante avant d’appliquer
+une acceptation. Le journal conserve le verdict et sa provenance. Les
+arguments bruts transmis au relecteur ne figurent pas dans
+`reviewerDecision`.
+[AgSDL 0.4.0, reviewer](https://github.com/Andrologic/AgSDL/blob/v0.4.0/spec/agents.md#reviewer)
+
+`delegate` applique les plafonds effectifs du parent à l’action de
+délégation. Le sous-agent reçoit une conversation neuve et un registre de
+lecture seule intersecté avec les plafonds du parent. Il peut lire les
+racines admises sous les règles de lecture héritées. Les lectures `ask`
+sont refusées dans le sous-agent. Une délégation est synchrone, à une
+profondeur de un, avec un maximum de huit tours par enfant. Les tours et les
+jetons facturés à l’enfant sont décomptés du budget du parent. Le parent
+reçoit la réponse finale de l’enfant ou une erreur d’outil. Stop annule le
+flux du fournisseur et attend les lecteurs de fichiers de l’enfant avant de
+confirmer la fin physique. La restriction à la lecture seule évite toute
+publication de changements ou copie du workspace.
+[AgSDL 0.4.0, règles des hôtes](https://github.com/Andrologic/AgSDL/blob/v0.4.0/spec/agents.md#rules-for-hosts) et [arrêt d’un travail](https://github.com/Andrologic/AgSDL/blob/v0.4.0/spec/flow.md)
+
+Le module 1.2.0 du Host déclare `plan`, `planFirst.auto`, `planFirst.ask` et
+`reviewer.model` comme `native`. Les trois effets de `delegate` sont
+appliqués par le harnais. Le lot reprend le principe des trois verdicts de
+Hermes Agent et l’objectif d’isolation d’oh-my-pi en Rust, sans reprendre
+leur code.
+[AgSDL 0.4.0, modules de harnais](https://github.com/Andrologic/AgSDL/blob/v0.4.0/spec/harnesses.md)
