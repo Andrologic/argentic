@@ -6,8 +6,11 @@ use argentic_runtime::{
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::{collections::BTreeSet, path::PathBuf};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt};
+use std::{collections::BTreeSet, future::Future, io, path::PathBuf, time::Duration};
+use tokio::{
+    io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt},
+    sync::{mpsc, oneshot},
+};
 
 #[derive(Deserialize)]
 #[serde(
@@ -52,10 +55,6 @@ enum Command {
     Quit {
         approved: Vec<String>,
     },
-}
-fn output(value: Value) -> bool {
-    use std::io::Write;
-    writeln!(std::io::stdout().lock(), "{value}").is_ok()
 }
 async fn retire(host: &Host, approved: &[String]) -> persistence::Result<()> {
     tokio::time::timeout(std::time::Duration::from_secs(10), host.shutdown(approved))
@@ -187,51 +186,104 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         host
     };
-    let ready = output(
-        json!({"ready":true,"source":host.source().await,"runs":host.runs().await.map_err(|e|e.code)?}),
-    );
-    let mut input = tokio::io::BufReader::new(tokio::io::stdin());
-    let interrupt = tokio::signal::ctrl_c();
-    tokio::pin!(interrupt);
-    if ready {
-        loop {
-            let mut line = String::new();
-            let mut bounded = (&mut input).take(8 * 1024 * 1024 + 1);
-            let read = tokio::select! {read=bounded.read_line(&mut line)=>read,signal=&mut interrupt=>{if let Err(e)=signal {eprintln!("Signal listener failed: {e}");}break;}};
-            match read {
-                Ok(0) => break,
-                Ok(_) => (),
-                Err(e) => {
-                    eprintln!("Input error: {e}");
+    serve(
+        &host,
+        &allowed,
+        tokio::io::BufReader::new(tokio::io::stdin()),
+        move |value| {
+            use std::io::Write;
+            writeln!(io::stdout().lock(), "{value}").is_ok()
+        },
+        tokio::signal::ctrl_c(),
+    )
+    .await
+}
+
+type Output = mpsc::Sender<(Value, oneshot::Sender<bool>)>;
+
+async fn write_output(output: &Output, value: Value) -> bool {
+    let (written, receipt) = oneshot::channel();
+    output.send((value, written)).await.is_ok() && receipt.await.unwrap_or(false)
+}
+
+async fn write_final_output(output: &Output, value: Value) {
+    let _ = tokio::time::timeout(Duration::from_secs(1), write_output(output, value)).await;
+}
+
+async fn serve(
+    host: &Host,
+    allowed: &BTreeSet<String>,
+    mut input: impl AsyncBufRead + Unpin,
+    mut write: impl FnMut(Value) -> bool + Send + 'static,
+    interrupt: impl Future<Output = io::Result<()>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (output, mut pending) = mpsc::channel::<(Value, oneshot::Sender<bool>)>(1);
+    // Keep the writer outside Tokio's blocking pool. It may stay in write()
+    // until the process exits. If the thread cannot start, the channel closes.
+    let _writer = std::thread::Builder::new()
+        .name("argentic-host-stdout".into())
+        .spawn(move || {
+            while let Some((value, written)) = pending.blocking_recv() {
+                let ok = write(value);
+                let _ = written.send(ok);
+                if !ok {
                     break;
                 }
             }
-            if line.len() > 8 * 1024 * 1024 {
-                output(
-                    json!({"error":{"code":"INPUT_LIMIT","message":"Command exceeds 8 MiB; closing input and draining owned runs."}}),
-                );
-                break;
-            }
-            let command = serde_json::from_str::<Command>(&line).map_err(|e| e.to_string());
-            let writable = match command {
-                Err(e) => output(
-                    json!({"error":{"code":"INVALID_COMMAND","message":e},"shutdownStarted":host.shutdown_started()}),
-                ),
-                Ok(command) => match execute(&host, command, &allowed).await {
-                    Ok((value, quit)) => {
-                        let writable = output(json!({"result":value}));
-                        if quit {
-                            return Ok(());
-                        }
-                        writable
-                    }
-                    Err(e) => output(json!({"error":e,"shutdownStarted":host.shutdown_started()})),
-                },
-            };
-            if !writable {
+        });
+    let interrupt = async {
+        if let Err(error) = interrupt.await {
+            eprintln!("Signal listener failed: {error}");
+        }
+    };
+    tokio::pin!(interrupt);
+    let mut response = json!({
+        "ready":true,"source":host.source().await,"runs":host.runs().await.map_err(|e|e.code)?
+    });
+    loop {
+        let writable = tokio::select! {
+            biased;
+            _ = &mut interrupt => break,
+            written = write_output(&output, response) => written,
+        };
+        if !writable {
+            break;
+        }
+        let mut line = String::new();
+        let mut bounded = (&mut input).take(8 * 1024 * 1024 + 1);
+        let read = tokio::select! {
+            biased;
+            _ = &mut interrupt => break,
+            read = bounded.read_line(&mut line) => read,
+        };
+        match read {
+            Ok(0) => break,
+            Ok(_) => (),
+            Err(e) => {
+                eprintln!("Input error: {e}");
                 break;
             }
         }
+        if line.len() > 8 * 1024 * 1024 {
+            let _ = output.try_send((
+                json!({"error":{"code":"INPUT_LIMIT","message":"Command exceeds 8 MiB; closing input and draining owned runs."}}),
+                oneshot::channel().0,
+            ));
+            break;
+        }
+        response = match serde_json::from_str::<Command>(&line) {
+            Err(e) => {
+                json!({"error":{"code":"INVALID_COMMAND","message":e.to_string()},"shutdownStarted":host.shutdown_started()})
+            }
+            Ok(command) => match execute(host, command, allowed).await {
+                Ok((value, true)) => {
+                    write_final_output(&output, json!({"result":value})).await;
+                    return Ok(());
+                }
+                Ok((value, false)) => json!({"result":value}),
+                Err(e) => json!({"error":e,"shutdownStarted":host.shutdown_started()}),
+            },
+        };
     }
     // EOF/Ctrl-C/output loss never abandons physical owners. The explicit startup
     // consent covers these runs. Retry the same retirement until it is joined.
@@ -244,13 +296,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .await;
         match result {
             Ok(()) => {
-                output(json!({"drained":true}));
+                write_final_output(&output, json!({"drained":true})).await;
                 return Ok(());
             }
             Err(e) => {
-                output(
+                let _ = output.try_send((
                     json!({"error":e,"shutdownStarted":host.shutdown_started(),"retryingDrain":true}),
-                );
+                    oneshot::channel().0,
+                ));
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             }
         }
@@ -347,5 +400,81 @@ mod tests {
                 .unwrap()
                 .success()
         );
+    }
+}
+
+#[cfg(test)]
+mod output_tests {
+    use super::*;
+    use sha2::{Digest, Sha256};
+    use tokio::io::AsyncWriteExt;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn interrupt_drains_host_while_output_is_stalled() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        let source = dir.path().join("source.json");
+        let policy = dir.path().join("policy.json");
+        let data = dir.path().join("data");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::write(
+            &source,
+            br#"{"contract":"agsdl-0.3.0","id":"stdio","agents":{},"flow":{"entry":"wait","steps":{"wait":{"type":"approval","title":"Continue?","timeoutMs":86400000,"next":{"yes":[],"no":[]}}}}}"#,
+        )
+        .unwrap();
+        let bytes = br#"{"owner":{"projectId":"project","planId":"plan","branch":"standalone"},"sourceRevision":"1","permissions":"workspace","readOnly":false}"#;
+        std::fs::write(&policy, bytes).unwrap();
+        let digest = format!("{:x}", Sha256::digest(bytes));
+        let host = Host::open(&data, &workspace, &source, &policy, &digest)
+            .await
+            .unwrap();
+        let (read, mut controller) = tokio::io::duplex(1024);
+        controller
+            .write_all(
+                b"{\"op\":\"start\",\"requestId\":\"start-1\",\"entry\":{\"deliveryId\":\"entry\",\"messageJson\":\"{}\"}}\n",
+            )
+            .await
+            .unwrap();
+        let (interrupt, interrupted) = oneshot::channel();
+        let (writing, stalled) = oneshot::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let mut writing = Some(writing);
+        let mut serve = tokio::spawn(async move {
+            super::serve(
+                &host,
+                &BTreeSet::new(),
+                tokio::io::BufReader::new(read),
+                move |value| {
+                    if value["ready"] != true {
+                        if let Some(writing) = writing.take() {
+                            let _ = writing.send(value);
+                            let _ = blocked.recv();
+                        }
+                    }
+                    true
+                },
+                async { interrupted.await.map_err(io::Error::other) },
+            )
+            .await
+            .map_err(|e| e.to_string())
+        });
+        let response = tokio::time::timeout(Duration::from_secs(10), stalled)
+            .await
+            .expect("Start must produce a response")
+            .unwrap();
+        assert!(response.pointer("/result/receipt").is_some(), "{response}");
+        interrupt.send(()).unwrap();
+        let drained = tokio::time::timeout(Duration::from_secs(10), &mut serve).await;
+        release.send(()).unwrap();
+        drained
+            .expect("shutdown must finish while the writer is blocked")
+            .unwrap()
+            .unwrap();
+        let reopened = Host::open(&data, &workspace, &source, &policy, &digest)
+            .await
+            .unwrap();
+        assert!(reopened.active_runs().await.unwrap().is_empty());
+        reopened.shutdown(&[]).await.unwrap();
+        reopened.close().await.unwrap();
     }
 }
