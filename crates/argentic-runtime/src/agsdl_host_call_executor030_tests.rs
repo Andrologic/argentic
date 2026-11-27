@@ -744,7 +744,10 @@ async fn retained_stdio_refuses_unverified_programs_and_reserved_secrets_before_
 }
 
 #[cfg(unix)]
-struct RetainedStdio(crate::host::HostContext);
+struct RetainedStdio(
+    crate::host::HostContext,
+    Arc<dyn crate::agsdl_host_calls::HostPort>,
+);
 
 #[cfg(unix)]
 impl crate::agsdl_host_call_executor030::CallTransport030 for RetainedStdio {
@@ -759,26 +762,114 @@ impl crate::agsdl_host_call_executor030::CallTransport030 for RetainedStdio {
     ) -> crate::agsdl_host_calls::Result<
         BoxFuture<'static, Result<crate::persistence::call_protocol030::CallEnd030>>,
     > {
-        use crate::agsdl_host_call_executor030::{
-            mcp_server, run_transport, NoHuman, StartedTransport,
-        };
+        use crate::agsdl_host_call_executor030::{mcp_server, run_transport, StartedTransport};
         let crate::agsdl_host_calls030::PreparedCall030::Mcp { server, .. } = &prepared else {
             unreachable!();
         };
         let config = mcp_server(&self.0, grant, &capture, server)?;
         let started = crate::agsdl_host_calls::raw_mcp::start_test_stdio(config)?;
+        let humans = self.1.clone();
         Ok(Box::pin(async move {
             run_transport(
                 StartedTransport::Mcp(Box::new(started)),
                 &prepared,
                 &attempt,
                 &control,
-                Arc::new(NoHuman),
+                humans,
                 admit_tool,
             )
             .await
         }))
     }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn stdio_failed_human_reply_stays_reserved_and_replays_after_reopen() {
+    let server = r#"set -eu
+IFS= read -r init
+printf '%s\n' '{"jsonrpc":"2.0","id":"1","result":{"protocolVersion":"2025-11-25","capabilities":{},"serverInfo":{"name":"fixture","version":"1"}}}'
+IFS= read -r initialized
+IFS= read -r call
+exec 0<&-
+printf '%s\n' '{"jsonrpc":"2.0","id":"person","method":"elicitation/create","params":{"message":"Continue?","requestedSchema":{"type":"object"}}}'
+"#;
+    let mut doc = document(json!({"type":"call","mcp":{"server":"local","tool":"check"}}));
+    doc["contract"] = json!(argentic_core::AGSDL_040);
+    doc["mcpServers"] = json!({"local":{"command":["/bin/sh","-c",server]}});
+    let f = Fixture::new(&json!({"document":doc,"entry":{},"timeline":[]}).to_string()).await;
+    let humans = Arc::new(crate::agsdl_host_human_executor030::CallHumans030 {
+        app: f.host.clone(),
+        pool: f.pool.clone(),
+        identity: f.identity.clone(),
+    });
+    let _tasks = start_calls(
+        &f,
+        f.config.clone(),
+        Arc::new(RetainedStdio(f.config.clone(), humans)),
+    );
+    let scope = crate::persistence::public030::HumanScope030 {
+        system_start_id: f.identity.system_start_id.clone(),
+        source: serde_json::from_value(f.plan.source.clone()).unwrap(),
+    };
+    let request_id = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let page = crate::agsdl_host_human_projection030::read(&f.pool, scope.clone(), None)
+                .await
+                .unwrap();
+            if let Some(request) = page.requests.first() {
+                break request.id.clone();
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    f.host
+        .submit_person(
+            &f.pool,
+            crate::api::HumanSubmission {
+                scope,
+                request_id: request_id.clone(),
+                expected_revision: "0".into(),
+                answer: crate::api::HumanAnswer030::Question {
+                    answer_json: r#"{"action":"accept","content":{}}"#.into(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let view = finish(&f).await;
+    assert_eq!(view.state.verdict.as_deref(), Some("failed"));
+    assert!(
+        matches!(&view.state.activations[0].result, Some(WorkResultRecord030::Failed { error }) if error.code == "CALL_FAILED")
+    );
+
+    let path = f._temp.path().join("run.db");
+    let reopened = crate::sqlite::open_file(&path).await.unwrap();
+    crate::api::interrupt_previous_runs(&reopened)
+        .await
+        .unwrap();
+    let delivery: String =
+        sqlx::query_scalar("SELECT delivery FROM engine_flow030_human_requests WHERE request_id=?")
+            .bind(request_id)
+            .fetch_one(&reopened)
+            .await
+            .unwrap();
+    assert_eq!(delivery, "reserved");
+    let interrupted: i64 = sqlx::query_scalar("SELECT count(*) FROM engine_flow030_interruptions")
+        .fetch_one(&reopened)
+        .await
+        .unwrap();
+    assert_eq!(interrupted, 0);
+    reopened.close().await;
+    let replay = crate::persistence::replay_verify030::verify_path030(
+        &path,
+        &f.identity.system_start_id,
+        &f.identity.flow_invocation_id,
+    )
+    .await;
+    assert!(replay.ok, "{replay:?}");
 }
 
 #[cfg(unix)]
@@ -850,7 +941,14 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":"2","result":{{"structuredContent":{{"chec
             assert_eq!(names, [key]);
             Some(BTreeMap::from([(key.into(), value.into())]))
         }));
-    let _tasks = start_calls(&f, config.clone(), Arc::new(RetainedStdio(config)));
+    let _tasks = start_calls(
+        &f,
+        config.clone(),
+        Arc::new(RetainedStdio(
+            config,
+            Arc::new(crate::agsdl_host_call_executor030::NoHuman),
+        )),
+    );
     let view = finish(&f).await;
     assert_eq!(view.state.verdict.as_deref(), Some("succeeded"));
     assert_eq!(*seen.lock().unwrap(), ["first", "second"]);

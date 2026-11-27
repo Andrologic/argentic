@@ -1760,6 +1760,70 @@ pub(crate) async fn read_diagnostic_tx<A: CallAuthority030>(
     }))
 }
 
+/// A resolved MCP question can remain reserved when the call fails while
+/// returning the answer. Replay authenticates the joined failure even after
+/// startup fencing revoked the live owner.
+pub(crate) async fn verify_joined_mcp_failure_tx(
+    db: &mut SqliteConnection,
+    state: &FlowState030,
+    work_id: &str,
+    owner_epoch: &str,
+    generation: &str,
+) -> Result<bool> {
+    let id = &state.identity;
+    let row: Option<(String, String, String, String)> = sqlx::query_as(
+        "SELECT call_id,attempt_json,received_json,receipt_json FROM engine_flow030_calls
+         WHERE system_id=? AND invocation_id=? AND activation_id=? AND status='terminal'",
+    )
+    .bind(&id.system_start_id)
+    .bind(&id.flow_invocation_id)
+    .bind(work_id)
+    .fetch_optional(db)
+    .await?;
+    let Some((call_id, attempt, received, receipt)) = row else {
+        return Ok(false);
+    };
+    let receipt = decode_receipt(&receipt)?;
+    let attempt = decode_attempt(&attempt)?;
+    let received = decode_received(&received)?;
+    let declaration: Value = serde_json::from_str(attempt.declaration_json())?;
+    if receipt.attempt != attempt
+        || receipt.received != received
+        || attempt.identity != *id
+        || attempt.owner_epoch != owner_epoch
+        || attempt.generation != generation
+        || attempt.call_id != call_id
+        || receipt.event_id != format!("call:{call_id}:terminal")
+        || !declaration["mcp"].is_object()
+        || !matches!(&received.physical, CallPhysical030::Joined { receipt_id } if !receipt_id.is_empty())
+        || !matches!(
+            received.end,
+            CallEnd030::Returned {
+                event: CallEvent030::StartFailed
+            }
+        )
+        || receipt.result != CallResult030::failure("CALL_FAILED")
+    {
+        return Ok(false);
+    }
+    let work = attempt.work();
+    let Some(event) = state.events.get(&receipt.event_id) else {
+        return Ok(false);
+    };
+    let event: Value = serde_json::from_str(&event.event_json)?;
+    Ok(work.activation_id == work_id
+        && event["identity"] == serde_json::to_value(id)?
+        && event["eventId"] == receipt.event_id
+        && event["kind"]
+            == serde_json::to_value(FlowEventKind030::WorkResult {
+                work: work.clone(),
+                result: WorkResult030::Failed {
+                    error: super::flow030::Failure030::new("CALL_FAILED"),
+                },
+                physical: Some(receipt.physical()),
+            })?)
+}
+
 /// Read-only source authority for both normal and error call routes. Authenticates
 /// complete capture/epoch/owner/Start/visit AND the committed reducer event.
 /// No physical capability, outbox claim or worker job is minted by a read.

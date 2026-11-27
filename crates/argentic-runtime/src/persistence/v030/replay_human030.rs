@@ -712,6 +712,28 @@ pub(super) async fn verify(
                                 && proof.descendants_joined)
                     })
                 });
+            let call_failed_before_ack = if r.kind == "question"
+                && delivery == "reserved"
+                && !r.acknowledged
+                && !fenced_before_delivery
+            {
+                let [work] = r.works.as_slice() else {
+                    return Err("MCP question has no unique work".into());
+                };
+                // An unsuccessful transport send leaves the answer reserved.
+                // Only a correlated, joined call failure closes this gap.
+                crate::persistence::call_protocol030::verify_joined_mcp_failure_tx(
+                    db,
+                    state,
+                    work,
+                    native_owner.try_get("owner_epoch")?,
+                    native_owner.try_get("generation")?,
+                )
+                .await
+                .map_err(|error| error.message)?
+            } else {
+                false
+            };
             require(
                 parsed(row, "resolution_json")? == expected
                     && row.try_get::<&str, _>("revision")? == "1"
@@ -720,7 +742,8 @@ pub(super) async fn verify(
                         || (delivery == "acknowledged" && r.acknowledged)
                         || (delivery == "reserved" && closed_asks.contains(&r.id))
                         || fenced_before_delivery
-                        || terminal_before_ack),
+                        || terminal_before_ack
+                        || call_failed_before_ack),
                 "Resolution/readback differs",
             )?;
             let proof=sqlx::query("SELECT p.resolution_json,e.output_json FROM engine_flow030_human_resolution_proofs p JOIN engine_flow030_clock_events e USING(system_id,invocation_id,event_id) WHERE p.system_id=? AND p.invocation_id=? AND p.request_id=?")
