@@ -1050,7 +1050,7 @@ async fn native_http_mcp_isolates_server_secrets_and_rejects_echoes_before_persi
 
 #[cfg(unix)]
 #[tokio::test]
-async fn native_http_mcp_stop_leaves_unconfirmed_tool_in_stopping_state() {
+async fn native_http_mcp_stop_remains_uncertain_after_reopen() {
     remote_mcp_unconfirmed(false).await;
 }
 
@@ -1393,6 +1393,30 @@ async fn remote_mcp_unconfirmed(expire: bool) {
         assert!(replay.ok, "{:?}", replay.divergence);
     }
     f.pool.close().await;
+    if !expire {
+        let reopened = crate::sqlite::open_file(&f._temp.path().join("run.db"))
+            .await
+            .unwrap();
+        crate::api::interrupt_previous_runs(&reopened)
+            .await
+            .unwrap();
+        let engine = crate::Engine::new();
+        crate::agsdl_host_flow030::recover_pending_stops030(&engine, &reopened)
+            .await
+            .unwrap();
+        let stop = engine
+            .ensure_stop(
+                &reopened,
+                &crate::tasks::StreamTasks::default(),
+                &f.identity.system_start_id,
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(stop, crate::persistence::public::PublicStopState::Uncertain { request_id } if request_id == "stop-remote")
+        );
+        reopened.close().await;
+    }
     assert_no_secrets(&f._temp.path().join("run.db"));
 }
 
