@@ -978,6 +978,101 @@ async fn response_budget_counts_screened_stream_bytes() {
 }
 
 #[tokio::test]
+async fn native_replay_rejects_credential_member_names() {
+    const KEY: &str = "provider-fixture-key";
+    for (format, item) in [
+        (
+            "Anthropic",
+            json!({"type":"thinking",(KEY):"opaque metadata"}),
+        ),
+        (
+            "Anthropic",
+            json!({"type":"thinking","extra":[{(KEY):"opaque metadata"}]}),
+        ),
+        ("Anthropic", json!({"type":"thinking","id":KEY})),
+        (
+            "Responses",
+            json!({"type":"function_call","status":{(KEY):"malformed metadata"}}),
+        ),
+        (
+            "Responses",
+            json!({"type":"function_call","arguments":{(KEY):"malformed arguments"}}),
+        ),
+    ] {
+        let work = work(false);
+        let replay = serde_json::from_value(json!({
+            "format": format,
+            "model": work.model,
+            "items": [item],
+        }))
+        .unwrap();
+        let (_dir, harness) = fixture(
+            vec![vec![Chunk::Replay(replay), end(Finish::Stop)]],
+            json!({}),
+        );
+        let (_, steer) = mpsc::channel(1);
+        let report = harness
+            .with_provider_credential(Some(KEY.into()))
+            .run(work, &(), steer, CancellationToken::new())
+            .await;
+        assert!(matches!(
+            report.outcome,
+            Err(Failure::Provider(ProviderError::Invalid(_)))
+        ));
+        assert_eq!(report.messages.len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn editable_native_replay_masks_assistant_text() {
+    const KEY: &str = "provider-fixture-key";
+    for (format, item, screened) in [
+        (
+            "Anthropic",
+            json!({"type":"text","text":KEY}),
+            json!({"type":"text","text":"[redacted]"}),
+        ),
+        (
+            "Responses",
+            json!({"type":"message","role":"assistant","id":"msg_1","content":[
+                {"type":"output_text","text":KEY,"annotations":[]},
+                {"type":"refusal","refusal":KEY}
+            ]}),
+            json!({"type":"message","role":"assistant","id":"msg_1","content":[
+                {"type":"output_text","text":"[redacted]","annotations":[]},
+                {"type":"refusal","refusal":"[redacted]"}
+            ]}),
+        ),
+    ] {
+        let work = work(false);
+        let replay = serde_json::from_value(json!({
+            "format": format,
+            "model": work.model,
+            "items": [item],
+        }))
+        .unwrap();
+        let (_dir, harness) = fixture(
+            vec![vec![
+                Chunk::Text(KEY.into()),
+                Chunk::Replay(replay),
+                end(Finish::Stop),
+            ]],
+            json!({}),
+        );
+        let (_, steer) = mpsc::channel(1);
+        let report = harness
+            .with_provider_credential(Some(KEY.into()))
+            .run(work, &(), steer, CancellationToken::new())
+            .await;
+        assert_eq!(report.outcome.unwrap().text, "[redacted]");
+        assert_eq!(
+            serde_json::to_value(&report.messages[1]).unwrap()["Assistant"]["replay"]["items"],
+            json!([screened])
+        );
+    }
+}
+
+#[tokio::test]
 async fn credential_in_signed_replay_rejects_the_reply() {
     const KEY: &str = "provider-fixture-key";
     let work = work(false);
