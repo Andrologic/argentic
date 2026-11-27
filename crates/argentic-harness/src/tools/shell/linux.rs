@@ -1,6 +1,6 @@
 use std::{
     fs::{self, File},
-    io::{self, Read, Write},
+    io::{self, Read, Seek, Write},
     os::fd::{AsRawFd, FromRawFd, RawFd},
     os::unix::process::CommandExt,
     path::Path,
@@ -17,6 +17,7 @@ use super::{
 };
 
 pub(super) const RELAY_PORT: u16 = 18999;
+const RELAY: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/argentic-shell-relay"));
 const SETUP_LIMIT: Duration = Duration::from_secs(5);
 const STAGING_CHECK_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -54,7 +55,7 @@ pub(super) fn preflight(network: bool) -> Result<(), String> {
     })
     .map_err(|error| {
         if network {
-            format!("Argentic Linux shell network relay is unavailable (requires system Python 3.11 or later): {error}")
+            format!("Argentic Linux shell network relay is unavailable: {error}")
         } else {
             format!("Argentic shell sandbox is unavailable: {error}")
         }
@@ -190,6 +191,15 @@ fn run_inner(
     let (mut info, info_writer) = io::pipe()?;
     let (gate_reader, mut gate) = io::pipe()?;
     nonblocking(info.as_raw_fd())?;
+    let relay = socket
+        .map(|_| -> io::Result<File> {
+            let mut file = tempfile::tempfile()?;
+            file.write_all(RELAY)?;
+            file.rewind()?;
+            Ok(file)
+        })
+        .transpose()?;
+    let relay_fd = relay.as_ref().map(AsRawFd::as_raw_fd);
     let fds = [
         filter.as_raw_fd(),
         info_writer.as_raw_fd(),
@@ -221,7 +231,11 @@ fn run_inner(
     for &system in super::RUNTIME_DIRS.iter().chain(&[super::LOADER_CACHE]) {
         child.args(["--ro-bind-try", system, system]);
     }
-    if let Some(socket) = socket {
+    if let (Some(socket), Some(relay_fd)) = (socket, relay_fd) {
+        child
+            .args(["--perms", "0555", "--file"])
+            .arg(relay_fd.to_string())
+            .arg("/run/argentic-shell-relay");
         child
             .args(["--ro-bind"])
             .arg(socket)
@@ -279,20 +293,16 @@ fn run_inner(
     child.arg("--");
     if socket.is_some() {
         child.args([
-            "/usr/bin/python3",
-            "-I",
-            "-S",
-            "-c",
-            include_str!("linux/bridge.py"),
+            "/run/argentic-shell-relay",
             &RELAY_PORT.to_string(),
         ]);
     }
     child.args(super::BASH_ARGS).arg(command);
     // Only the execution child gets these descriptors. Ambient host fds stay
-    // close-on-exec, and bwrap consumes the three sandbox setup descriptors.
+    // close-on-exec, and bwrap consumes the sandbox setup descriptors.
     unsafe {
         child.pre_exec(move || {
-            for fd in fds {
+            for fd in fds.into_iter().chain(relay_fd) {
                 inheritable(fd)?;
             }
             for (resource, ceiling) in [
@@ -320,6 +330,7 @@ fn run_inner(
         supervisor: child.spawn()?,
         namespace: None,
     };
+    drop(relay);
     drop(filter);
     drop(info_writer);
     drop(gate_reader);
