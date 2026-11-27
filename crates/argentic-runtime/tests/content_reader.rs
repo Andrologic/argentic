@@ -54,33 +54,64 @@ fn main() {
 #[cfg(all(target_os = "macos", feature = "agsdl-content-qa", debug_assertions))]
 fn rejects_substituted_content_helper_image() {
     use argentic_runtime::content_io::macos_launcher::{arm_image_swap, Launch};
+    use std::io::Read;
     use std::os::fd::AsRawFd;
+    use std::process::Command;
 
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().canonicalize().unwrap();
     let helper = root.join("helper");
-    let replacement = root.join("replacement");
-    fs::copy(std::env::current_exe().unwrap(), &helper).unwrap();
-    // This only proves the QA swap hook runs right before Process.run: the
-    // substitute cannot execute at all. A valid Mach-O substitute currently
-    // runs despite the launch requirement; that defect is fixed separately.
-    let substitute = b"not a Mach-O executable";
-    fs::write(&replacement, substitute).unwrap();
+    let source = root.join("probe.c");
+    let adhoc = root.join("adhoc");
+    fs::write(
+        &source,
+        "#include <stdio.h>\nint main(void) { puts(\"qa probe\"); }\n",
+    )
+    .unwrap();
+    assert!(Command::new("/usr/bin/cc")
+        .args([source.as_os_str(), "-o".as_ref(), adhoc.as_os_str()])
+        .status()
+        .unwrap()
+        .success());
     let directory = Dir::open_ambient_dir(&root, ambient_authority()).unwrap();
 
-    arm_image_swap(&helper, &replacement).unwrap();
-    let refused = Launch::start(&helper, Path::new("fixture.txt"), directory.as_raw_fd());
+    let mut failures = Vec::new();
+    for image in [Path::new("/bin/echo"), adhoc.as_path()] {
+        let replacement = root.join("replacement");
+        fs::copy(std::env::current_exe().unwrap(), &helper).unwrap();
+        fs::copy(image, &replacement).unwrap();
+        let probe = Command::new(&replacement).arg("qa probe").output().unwrap();
+        assert!(probe.status.success());
+        assert_eq!(probe.stdout, b"qa probe\n");
 
-    // 4 is the bridge's launch failure; 6 would mean the QA swap never ran.
-    let error = refused
-        .err()
-        .expect("substituted helper image was launched");
-    assert!(
-        error.to_string().ends_with("(4)"),
-        "unexpected refusal: {error}"
-    );
-    assert_eq!(fs::read(helper).unwrap(), substitute);
-    assert!(!replacement.exists(), "QA replacement was not consumed");
+        arm_image_swap(&helper, &replacement).unwrap();
+        let result = Launch::start(&helper, Path::new("fixture.txt"), directory.as_raw_fd());
+        match result {
+            Err(error) if error.to_string().ends_with("(4)") => {}
+            Err(error) => {
+                failures.push(format!("{}: unexpected refusal: {error}", image.display()))
+            }
+            Ok(mut launch) => {
+                launch.cancel();
+                let exit = launch.wait(Duration::from_secs(5)).unwrap().unwrap();
+                let mut bytes = Vec::new();
+                fs::File::from(launch.output)
+                    .read_to_end(&mut bytes)
+                    .unwrap();
+                failures.push(format!(
+                    "{}: substituted helper was launched (status {}, signal {}, output {:?})",
+                    image.display(),
+                    exit.status,
+                    exit.signal,
+                    String::from_utf8_lossy(&bytes)
+                ));
+            }
+        }
+        assert_eq!(fs::read(&helper).unwrap(), fs::read(image).unwrap());
+        assert!(!replacement.exists(), "QA replacement was not consumed");
+        fs::remove_file(&helper).unwrap();
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
 async fn exercise_reader() {
