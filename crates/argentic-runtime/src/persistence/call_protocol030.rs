@@ -1776,7 +1776,9 @@ pub(crate) async fn read_diagnostic_tx<A: CallAuthority030>(
 pub(crate) async fn verify_joined_mcp_failure_tx(
     db: &mut SqliteConnection,
     state: &FlowState030,
+    capture_json: &str,
     work_id: &str,
+    question_call_id: &str,
     owner_epoch: &str,
     generation: &str,
 ) -> Result<bool> {
@@ -1788,7 +1790,7 @@ pub(crate) async fn verify_joined_mcp_failure_tx(
     .bind(&id.system_start_id)
     .bind(&id.flow_invocation_id)
     .bind(work_id)
-    .fetch_optional(db)
+    .fetch_optional(&mut *db)
     .await?;
     let Some((call_id, attempt, received, receipt)) = row else {
         return Ok(false);
@@ -1803,6 +1805,7 @@ pub(crate) async fn verify_joined_mcp_failure_tx(
         || attempt.owner_epoch != owner_epoch
         || attempt.generation != generation
         || attempt.call_id != call_id
+        || attempt.call_id != question_call_id
         || receipt.event_id != format!("call:{call_id}:terminal")
         || !declaration["mcp"].is_object()
         || !matches!(&received.physical, CallPhysical030::Joined { receipt_id } if !receipt_id.is_empty())
@@ -1816,6 +1819,11 @@ pub(crate) async fn verify_joined_mcp_failure_tx(
     {
         return Ok(false);
     }
+    let capture: StartCapture030 = serde_json::from_str(capture_json)?;
+    if capture.identity != *id {
+        return Ok(false);
+    }
+    verify_captured_start_tx(db, &attempt, &capture, state).await?;
     let work = attempt.work();
     let Some(event) = state.events.get(&receipt.event_id) else {
         return Ok(false);

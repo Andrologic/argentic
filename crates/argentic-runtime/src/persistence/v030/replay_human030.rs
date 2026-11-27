@@ -61,6 +61,7 @@ pub(super) async fn verify(
     db: &mut SqliteConnection,
     state: &FlowState030,
     plan: &FlowPlan030,
+    capture_json: &str,
 ) -> Result<HumanProjection030> {
     let id = &state.identity;
     let mut document = None;
@@ -725,7 +726,11 @@ pub(super) async fn verify(
                 crate::persistence::call_protocol030::verify_joined_mcp_failure_tx(
                     db,
                     state,
+                    capture_json,
                     work,
+                    parsed(row, "payload_json")?["nativeCallId"]
+                        .as_str()
+                        .ok_or("MCP question native call ID absent")?,
                     native_owner.try_get("owner_epoch")?,
                     native_owner.try_get("generation")?,
                 )

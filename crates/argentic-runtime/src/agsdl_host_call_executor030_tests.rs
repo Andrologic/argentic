@@ -789,6 +789,89 @@ impl crate::agsdl_host_call_executor030::CallTransport030 for RetainedStdio {
 #[cfg(unix)]
 #[tokio::test]
 async fn stdio_failed_human_reply_stays_reserved_and_replays_after_reopen() {
+    let (f, _) = stdio_failed_human_reply_reserved().await;
+    let replay = crate::persistence::replay_verify030::verify_path030(
+        &f._temp.path().join("run.db"),
+        &f.identity.system_start_id,
+        &f.identity.flow_invocation_id,
+    )
+    .await;
+    assert!(replay.ok, "{replay:?}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn replay_ties_reserved_mcp_question_to_its_call_receipt_and_capture() {
+    let (f, request_id) = stdio_failed_human_reply_reserved().await;
+    let path = f._temp.path().join("run.db");
+    // Rewrites one table with its immutability triggers set aside, as a
+    // damaged or forged file would present it.
+    let forge = |name: &str, table: &'static str, sql: &'static str| {
+        let forged = f._temp.path().join(name);
+        std::fs::copy(&path, &forged).unwrap();
+        let request_id = request_id.clone();
+        async move {
+            let pool = crate::sqlite::open_file(&forged).await.unwrap();
+            let triggers: Vec<(String, String)> = sqlx::query_as(
+                "SELECT name,sql FROM sqlite_master WHERE type='trigger' AND tbl_name=?",
+            )
+            .bind(table)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            for (name, _) in &triggers {
+                sqlx::raw_sql(sqlx::AssertSqlSafe(format!("DROP TRIGGER \"{name}\"")))
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+            let changed = sqlx::query(sql)
+                .bind(&request_id)
+                .execute(&pool)
+                .await
+                .unwrap()
+                .rows_affected();
+            assert_eq!(changed, 1, "{sql}");
+            for (_, sql) in &triggers {
+                sqlx::raw_sql(sqlx::AssertSqlSafe(sql.as_str()))
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+            pool.close().await;
+            forged
+        }
+    };
+    let forged = [
+        forge(
+            "question-call.db",
+            "engine_flow030_human_requests",
+            "UPDATE engine_flow030_human_requests SET payload_json=json_set(payload_json,'$.nativeCallId','forged-call') WHERE request_id=?",
+        )
+        .await,
+        forge(
+            "declaration.db",
+            "engine_flow030_calls",
+            "UPDATE engine_flow030_calls SET
+                attempt_json=json_set(attempt_json,'$.declarationJson',''||json_set(json_extract(attempt_json,'$.declarationJson'),'$.mcp.tool','forged')),
+                receipt_json=json_set(receipt_json,'$.attempt.declarationJson',''||json_set(json_extract(receipt_json,'$.attempt.declarationJson'),'$.mcp.tool','forged'))
+             WHERE ?<>'' AND status='terminal'",
+        )
+        .await,
+    ];
+    for path in forged {
+        let replay = crate::persistence::replay_verify030::verify_path030(
+            &path,
+            &f.identity.system_start_id,
+            &f.identity.flow_invocation_id,
+        )
+        .await;
+        assert!(!replay.ok, "{path:?} replayed");
+    }
+}
+
+#[cfg(unix)]
+async fn stdio_failed_human_reply_reserved() -> (Fixture, String) {
     let server = r#"set -eu
 IFS= read -r init
 printf '%s\n' '{"jsonrpc":"2.0","id":"1","result":{"protocolVersion":"2025-11-25","capabilities":{},"serverInfo":{"name":"fixture","version":"1"}}}'
@@ -857,7 +940,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":"person","method":"elicitation/create","par
         .unwrap();
     let delivery: String =
         sqlx::query_scalar("SELECT delivery FROM engine_flow030_human_requests WHERE request_id=?")
-            .bind(request_id)
+            .bind(&request_id)
             .fetch_one(&reopened)
             .await
             .unwrap();
@@ -868,13 +951,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":"person","method":"elicitation/create","par
         .unwrap();
     assert_eq!(interrupted, 0);
     reopened.close().await;
-    let replay = crate::persistence::replay_verify030::verify_path030(
-        &path,
-        &f.identity.system_start_id,
-        &f.identity.flow_invocation_id,
-    )
-    .await;
-    assert!(replay.ok, "{replay:?}");
+    (f, request_id)
 }
 
 #[cfg(unix)]
