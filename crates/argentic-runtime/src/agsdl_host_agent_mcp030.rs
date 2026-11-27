@@ -1,6 +1,5 @@
-//! Filtered per-work MCP sessions. Codex sees a loopback server with only the
-//! admitted tools. Upstream credentials and processes belong to Argentic.
-use super::{AgentWork030, CommandApprovals030};
+//! Filtered per-work MCP sessions. The Codex adapter also uses a private loopback listener.
+use crate::{agsdl_host_action_approval030::CommandApprovals030, harness::AgentWork030};
 use crate::{
     agsdl_host_call_executor030::{agent_mcp_grant, mcp_server, remote_mcp, NoHuman},
     agsdl_host_calls::{raw_mcp, CallIdentity, Control, PhysicalEvidence},
@@ -35,6 +34,14 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 pub(crate) const TOKEN_ENV: &str = "ARGENTIC_MCP_BRIDGE_TOKEN";
+const MAX_CATALOGUE_TOOLS: usize = 256;
+const MAX_CATALOGUE_BYTES: usize = 1_000_000;
+
+#[derive(Clone, Copy)]
+pub(crate) enum MissingApproval {
+    OmitTool,
+    FailDiscovery,
+}
 
 #[derive(Clone)]
 pub(crate) struct SessionConfig {
@@ -48,7 +55,7 @@ impl SessionConfig {
     }
 }
 
-pub(super) struct Equipment {
+pub(crate) struct Equipment {
     state: Arc<Bridge>,
     server: Option<JoinHandle<std::io::Result<()>>>,
     config: Option<SessionConfig>,
@@ -78,7 +85,7 @@ enum Dispatch {
 
 impl Equipment {
     #[allow(clippy::too_many_arguments)]
-    pub(super) async fn start(
+    pub(crate) async fn discover(
         context: &HostContext,
         work: &AgentWork030,
         document: &Value,
@@ -87,18 +94,20 @@ impl Equipment {
         read_only: bool,
         authored_budget: bool,
         approvals: Option<Arc<dyn CommandApprovals030>>,
+        missing_approval: MissingApproval,
         cancel: &CancellationToken,
     ) -> Result<Self> {
-        let token = uuid::Uuid::new_v4().to_string();
         let mut state = Bridge::new(
             work,
             (!authored_budget)
                 .then(|| Duration::from_millis(context.remote_mcp_tool_budget_ms().get())),
             approvals,
             cancel,
-            format!("Bearer {token}"),
+            String::new(),
         );
         let result = async {
+            let mut catalogue_tools = 0;
+            let mut catalogue_bytes = 0;
             for name in agent["mcpServers"].as_array().into_iter().flatten() {
                 let name = name.as_str().ok_or_else(|| {
                     mcp_error("MCP_CORRELATION", "Invalid captured MCP server name")
@@ -122,6 +131,11 @@ impl Equipment {
                     let grant = agent_mcp_grant(context, &work.capture, scope, name, read_only)?;
                     let server =
                         mcp_server(context, grant, &work.capture, name).map_err(transport_error)?;
+                    #[cfg(test)]
+                    state.admission.test_yield("mcp.discovery.prepared").await;
+                    let _admission = state.admit(&control).await?;
+                    #[cfg(test)]
+                    state.admission.test_yield("mcp.discovery.spawn").await;
                     raw_mcp::start(server).map_err(transport_error)?
                 };
                 let upstream = Upstream::new(session, &work.attempt);
@@ -151,19 +165,98 @@ impl Equipment {
                     let decision =
                         evaluate_effective(&work.policy, &request, ExecutionPurpose::Agent)
                             .map_err(|_| invalid())?;
-                    if decision.effect == Effect::Ask && state.approvals.is_none() {
+                    match decision.effect {
+                        Effect::Deny => continue,
+                        Effect::Ask if state.approvals.is_none() => match missing_approval {
+                            MissingApproval::OmitTool => continue,
+                            MissingApproval::FailDiscovery => {
+                                return Err(mcp_error(
+                                    "MCP_APPROVAL_UNAVAILABLE",
+                                    "Host MCP action approvals are unavailable",
+                                ));
+                            }
+                        },
+                        Effect::Allow | Effect::Ask => {}
+                    }
+                    catalogue_tools += 1;
+                    catalogue_bytes += tool.to_string().len();
+                    if catalogue_tools > MAX_CATALOGUE_TOOLS
+                        || catalogue_bytes > MAX_CATALOGUE_BYTES
+                    {
                         return Err(mcp_error(
-                            "MCP_APPROVAL_UNAVAILABLE",
-                            "Host MCP action approvals are unavailable",
+                            "MCP_TOOL_LIST",
+                            "The combined MCP tool catalogue exceeds the provider input bound",
                         ));
                     }
-                    if decision.effect != Effect::Deny {
-                        upstream
-                            .tools
-                            .insert(tool_name.to_owned(), (decision.effect, tool));
-                    }
+                    upstream
+                        .tools
+                        .insert(tool_name.to_owned(), (decision.effect, tool));
                 }
             }
+            Ok(())
+        }
+        .await;
+        let equipment = Self {
+            state: Arc::new(state),
+            server: None,
+            config: None,
+        };
+        if let Err(error) = result {
+            equipment.close().await?;
+            return Err(error);
+        }
+        Ok(equipment)
+    }
+
+    pub(crate) fn tools(&self) -> impl Iterator<Item = (&str, &str, &Value)> {
+        self.state.upstreams.iter().flat_map(|(server, upstream)| {
+            upstream
+                .tools
+                .iter()
+                .map(move |(name, (_, tool))| (server.as_str(), name.as_str(), tool))
+        })
+    }
+
+    pub(crate) async fn call(&self, server: &str, tool: &str, arguments: Value) -> Option<Value> {
+        let upstream = self.state.upstreams.get(server)?;
+        self.state
+            .call(
+                upstream,
+                server,
+                &json!({"name":tool,"arguments":arguments}),
+            )
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn start(
+        context: &HostContext,
+        work: &AgentWork030,
+        document: &Value,
+        agent: &Value,
+        scope: &Value,
+        read_only: bool,
+        authored_budget: bool,
+        approvals: Option<Arc<dyn CommandApprovals030>>,
+        cancel: &CancellationToken,
+    ) -> Result<Self> {
+        let token = uuid::Uuid::new_v4().to_string();
+        let mut equipment = Self::discover(
+            context,
+            work,
+            document,
+            agent,
+            scope,
+            read_only,
+            authored_budget,
+            approvals,
+            MissingApproval::FailDiscovery,
+            cancel,
+        )
+        .await?;
+        let state = Arc::get_mut(&mut equipment.state).expect("new MCP equipment");
+        state.auth = format!("Bearer {token}");
+        let result = async {
             if state
                 .upstreams
                 .values()
@@ -212,11 +305,6 @@ impl Equipment {
             )))
         }
         .await;
-        let mut equipment = Self {
-            state: Arc::new(state),
-            server: None,
-            config: None,
-        };
         match result {
             Ok(Some((listener, config))) => {
                 let stop = equipment.state.stop.clone();
@@ -239,15 +327,15 @@ impl Equipment {
         }
     }
 
-    pub(super) fn config(&self) -> Option<&SessionConfig> {
+    pub(crate) fn config(&self) -> Option<&SessionConfig> {
         self.config.as_ref()
     }
 
-    pub(super) fn turn_cancel(&self) -> &CancellationToken {
+    pub(crate) fn turn_cancel(&self) -> &CancellationToken {
         &self.state.stop
     }
 
-    pub(super) async fn close(mut self) -> Result<()> {
+    pub(crate) async fn close(mut self) -> Result<()> {
         self.state.stop.cancel();
         let mut uncertain = false;
         for upstream in self.state.upstreams.values() {

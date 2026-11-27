@@ -38,6 +38,8 @@ pub(super) enum Mutation {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WriteArgs {
+    #[serde(default)]
+    root: usize,
     path: String,
     content: String,
 }
@@ -45,6 +47,8 @@ struct WriteArgs {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct EditArgs {
+    #[serde(default)]
+    root: usize,
     path: String,
     old_text: String,
     new_text: String,
@@ -55,6 +59,8 @@ struct EditArgs {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PatchArgs {
+    #[serde(default)]
+    root: usize,
     patch_text: String,
 }
 
@@ -67,7 +73,7 @@ fn file_path(raw: &str) -> Result<PathBuf, String> {
 }
 
 impl Mutation {
-    pub(super) fn parse(name: &str, args: &str) -> Result<Self, String> {
+    pub(super) fn parse(name: &str, args: &str) -> Result<(usize, Self), String> {
         let parse_error = |error: serde_json::Error| error.to_string();
         if args.len() > MAX_FILE_BYTES {
             return Err("Mutation exceeds the 8 MiB input budget".into());
@@ -75,22 +81,28 @@ impl Mutation {
         Ok(match name {
             "write" => {
                 let args: WriteArgs = serde_json::from_str(args).map_err(parse_error)?;
-                Self::Write {
-                    path: file_path(&args.path)?,
-                    content: args.content,
-                }
+                (
+                    args.root,
+                    Self::Write {
+                        path: file_path(&args.path)?,
+                        content: args.content,
+                    },
+                )
             }
             "edit" => {
                 let args: EditArgs = serde_json::from_str(args).map_err(parse_error)?;
                 if args.old_text.is_empty() {
                     return Err("old_text must be nonempty".into());
                 }
-                Self::Edit {
-                    path: file_path(&args.path)?,
-                    old: args.old_text,
-                    new: args.new_text,
-                    all: args.replace_all,
-                }
+                (
+                    args.root,
+                    Self::Edit {
+                        path: file_path(&args.path)?,
+                        old: args.old_text,
+                        new: args.new_text,
+                        all: args.replace_all,
+                    },
+                )
             }
             "apply_patch" => {
                 let args: PatchArgs = serde_json::from_str(args).map_err(parse_error)?;
@@ -98,7 +110,7 @@ impl Mutation {
                 if ops.len() > 128 {
                     return Err("A patch may touch at most 128 source files".into());
                 }
-                Self::Patch(ops)
+                (args.root, Self::Patch(ops))
             }
             _ => return Err("Unknown mutation tool".into()),
         })

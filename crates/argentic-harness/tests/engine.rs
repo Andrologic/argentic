@@ -394,6 +394,7 @@ async fn steer_arriving_during_summary_reaches_the_next_agent_request() {
     let (early, early_receipt) = oneshot::channel();
     let (late, late_receipt) = oneshot::channel();
     send.try_send(Steer {
+        reference: None,
         id: "early".into(),
         message: "Earlier steer".into(),
         consumed: early,
@@ -415,6 +416,7 @@ async fn steer_arriving_during_summary_reaches_the_next_agent_request() {
         },
         send,
         late: Mutex::new(Some(Steer {
+            reference: None,
             id: "late".into(),
             message: "Steer during summary".into(),
             consumed: late,
@@ -661,6 +663,7 @@ async fn mid_tool_steer_waits_for_results() {
         pause.entered.notified().await;
         let (consumed, mut receipt) = oneshot::channel();
         send.send(Steer {
+            reference: None,
             id: "s1".into(),
             message: "From reviewer: include units".into(),
             consumed,
@@ -856,6 +859,7 @@ async fn steer_is_not_acknowledged_or_retained_when_the_next_request_fails() {
     let (send, steer) = mpsc::channel(1);
     let (consumed, receipt) = oneshot::channel();
     send.send(Steer {
+        reference: None,
         id: "offer".into(),
         message: "steer to retry".into(),
         consumed,
@@ -940,6 +944,7 @@ async fn steer_admitted_after_missing_submission_can_request_a_tool() {
         late: Mutex::new(Some(Steer {
             id: "late".into(),
             message: "Read notes.txt before you submit.".into(),
+            reference: None,
             consumed: late,
         })),
     });

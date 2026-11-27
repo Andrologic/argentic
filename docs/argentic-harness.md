@@ -196,3 +196,33 @@ action et effet, inutilisé. Il servira à prouver le profil du module.
 | 4 | MCP, skills, `resources`, `directories`, proxy réseau, Seatbelt macOS. | Profil complet sur Linux et macOS. |
 | 5 | `plan`, `planFirst` auto et ask, `reviewer.model`, délégation. | Toutes les propriétés `native`. |
 | 6 | Performance : pools partagés, données immuables partagées, hibernation. | Mesures mémoire et latence par session, suivies en CI. |
+
+
+### Lot 4a
+
+Les ressources de l’agent et celles des messages sont transmises dans un message
+de référence distinct de la mission. Le message indique leur origine et leur
+absence d’autorité. Le résolveur commun ouvre les URI locales sous les permissions
+de lecture du destinataire. L’adaptateur accepte le texte et le JSON.
+
+L’outil `skill` présente les noms et descriptions des skills sélectionnés. Il
+active le corps d’un skill sur demande et donne accès à ses fichiers texte ou
+JSON, sous les mêmes permissions de lecture. La compaction conserve l’échange
+d’activation.
+
+Argentic et Codex partagent la découverte et l’exécution des outils MCP. Argentic
+associe chaque nom exposé au modèle au couple `serveur/outil` du document.
+Une règle `ask` suspend l’appel jusqu’à la décision d’une personne. Sans
+relecteur humain, l’appel est refusé. Le transport stdio confiné reste qualifié
+sur macOS ARM64. Streamable HTTP utilise l’autorisation du Host et son délai
+d’appel. Lors d’un Stop, un appel distant déjà transmis et dont la fin ne peut
+être attestée produit `MCP_TERMINATION_UNCERTAIN`. La mise en pause opérateur
+est indisponible pour les runs qui sélectionnent des serveurs MCP.
+
+Le workspace conserve l’indice 0. Les autres répertoires autorisés sont
+accessibles par indice dans les outils fichiers et montés sous
+`/directories/<indice>` dans le shell Linux. Le shell utilise des copies
+filtrées. Il publie leurs modifications lorsque chaque politique effective
+accorde la lecture et l’écriture sans restriction sur le répertoire concerné.
+L’admission refuse les racines qui se recouvrent pour le shell ou recouvrent
+les données privées du Host.

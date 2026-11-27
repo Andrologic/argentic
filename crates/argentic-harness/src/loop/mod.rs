@@ -99,6 +99,7 @@ impl PhysicalEnd {
 pub struct Steer {
     pub id: String,
     pub message: String,
+    pub reference: Option<String>,
     pub consumed: oneshot::Sender<()>,
 }
 
@@ -569,6 +570,9 @@ impl Instance<'_> {
             match self.port.admit_steer(&steer.id, self.cancel).await? {
                 SteerAdmission::Admit(admitted) => {
                     guard = admitted;
+                    if let Some(reference) = &steer.reference {
+                        messages.to_mut().push(Message::User(reference.clone()));
+                    }
                     messages.to_mut().push(Message::User(steer.message.clone()));
                     index += 1;
                 }
@@ -848,6 +852,9 @@ impl Instance<'_> {
             self.port.settle_steer(&steer.id, status).await?;
             if let Some(steer) = self.pending_steer.pop_front() {
                 if status == DeliveryStatus::Accepted {
+                    if let Some(reference) = steer.reference {
+                        self.accepted_steer.push(Message::User(reference));
+                    }
                     self.accepted_steer.push(Message::User(steer.message));
                     let _ = steer.consumed.send(());
                     self.port

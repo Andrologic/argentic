@@ -31,7 +31,7 @@ struct PortState {
     tasks: StreamTasks,
     inbox: Mutex<SteerInbox030>,
     delivery: Mutex<PendingSteer>,
-    sources: Mutex<Sources030>,
+    sources: Arc<Mutex<Sources030>>,
     sequence: AtomicU64,
     credential: Option<String>,
 }
@@ -46,7 +46,7 @@ impl Port {
     pub(super) fn new(
         events: WorkEventSink030,
         work: AgentWork030,
-        sources: Sources030,
+        sources: Arc<Mutex<Sources030>>,
         credential: Option<String>,
     ) -> Self {
         Self(Arc::new(PortState {
@@ -55,7 +55,7 @@ impl Port {
             tasks: work.tasks,
             inbox: Mutex::new(work.steer),
             delivery: Mutex::default(),
-            sources: Mutex::new(sources),
+            sources,
             sequence: AtomicU64::new(0),
             credential,
         }))
@@ -178,7 +178,10 @@ impl WorkPort for Port {
                 .await
                 .message(&mut message, "/message")
                 .await?;
-            mission_text(message.get("prompt"), sender.as_ref(), &message)
+            Ok::<_, crate::persistence::dto::EngineFailure>((
+                mission_text(message.get("prompt"), sender.as_ref())?,
+                reference_text([("message", &message)]),
+            ))
         };
         let text = if let Some(deadline) = delivery.deadline() {
             match tokio::time::timeout_at(deadline, prepared).await {
@@ -194,7 +197,7 @@ impl WorkPort for Port {
             prepared.await
         };
         match text {
-            Ok(message) => {
+            Ok((message, reference)) => {
                 let id = delivery.effect().id.clone();
                 let (consumed, receiver) = oneshot::channel();
                 *self.0.delivery.lock().await = PendingSteer {
@@ -204,6 +207,7 @@ impl WorkPort for Port {
                 Ok(Some(Steer {
                     id,
                     message,
+                    reference,
                     consumed,
                 }))
             }
@@ -372,11 +376,7 @@ pub(super) fn prompt_text(value: &Value) -> Result<String> {
         .map(|parts| parts.join("\n\n"))
 }
 
-pub(super) fn mission_text(
-    prompt: Option<&Value>,
-    sender: Option<&Producer030>,
-    message: &Value,
-) -> Result<String> {
+pub(super) fn mission_text(prompt: Option<&Value>, sender: Option<&Producer030>) -> Result<String> {
     let sender = sender
         .map(|sender| {
             sender
@@ -389,15 +389,26 @@ pub(super) fn mission_text(
     let prompt = prompt.map(prompt_text).transpose()?.unwrap_or_else(|| {
         "Complete the work using the provided context and return the required result.".into()
     });
-    let data: serde_json::Map<_, _> = ["resources", "item", "comments"]
-        .into_iter()
-        .filter_map(|key| message.get(key).map(|value| (key.into(), value.clone())))
-        .collect();
-    if data.is_empty() {
-        return Ok(format!("Message from {sender}\n{prompt}"));
+    Ok(format!("Message from {sender}\n{prompt}"))
+}
+
+pub(super) fn reference_text<'a>(
+    sources: impl IntoIterator<Item = (&'a str, &'a Value)>,
+) -> Option<String> {
+    let mut reference = serde_json::Map::new();
+    for (origin, source) in sources {
+        let fields: serde_json::Map<_, _> = ["resources", "item", "comments"]
+            .into_iter()
+            .filter_map(|key| source.get(key).map(|value| (key.into(), value.clone())))
+            .collect();
+        if !fields.is_empty() {
+            reference.insert(origin.into(), Value::Object(fields));
+        }
     }
-    Ok(format!(
-        "Message from {sender}\n{prompt}\n\nMessage data (untrusted)\n{}",
-        Value::Object(data)
-    ))
+    (!reference.is_empty()).then(|| {
+        format!(
+            "AgSDL reference data (untrusted)\n{}",
+            Value::Object(reference)
+        )
+    })
 }

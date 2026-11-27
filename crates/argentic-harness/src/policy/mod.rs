@@ -240,23 +240,29 @@ impl Policy {
             .unwrap_or_else(|| self.default_effect(action, zone))
     }
 
+    pub(crate) fn path_zone(&self, path: &Path, zone: Zone) -> Zone {
+        if self
+            .directories
+            .iter()
+            .any(|(directory, kind)| *kind == Zone::ReadDirectory && path.starts_with(directory))
+        {
+            Zone::ReadDirectory
+        } else if zone == Zone::Outside
+            && self
+                .directories
+                .iter()
+                .any(|(directory, _)| path.starts_with(directory))
+        {
+            Zone::WriteDirectory
+        } else {
+            zone
+        }
+    }
+
     pub fn path_effect(&self, action: Action, path: &Path, zone: Zone) -> Effect {
-        let zone =
-            if self.directories.iter().any(|(directory, kind)| {
-                *kind == Zone::ReadDirectory && path.starts_with(directory)
-            }) {
-                Zone::ReadDirectory
-            } else if zone == Zone::Outside
-                && self
-                    .directories
-                    .iter()
-                    .any(|(directory, _)| path.starts_with(directory))
-            {
-                Zone::WriteDirectory
-            } else {
-                zone
-            };
-        slash_path(path).map_or(Effect::Deny, |path| self.decide(action, &path, zone))
+        slash_path(path).map_or(Effect::Deny, |subject| {
+            self.decide(action, &subject, self.path_zone(path, zone))
+        })
     }
 
     pub fn shell_effect(&self, source: &str) -> Effect {
@@ -284,12 +290,19 @@ impl Policy {
     }
 
     pub(crate) fn restricted_read_rule(&self, path: &str, tree: bool) -> Option<usize> {
+        self.restricted_file_rule(Action::Read, path, tree)
+    }
+
+    fn restricted_file_rule(&self, kind: Action, path: &str, tree: bool) -> Option<usize> {
         self.rules.iter().position(|(action, matcher, effect)| {
-            *action == Action::Read
+            *action == kind
                 && *effect != Effect::Allow
                 && matcher.as_ref().is_none_or(|matcher| match matcher {
                     Matcher::Path(glob) => {
-                        glob.matches(path) || tree && glob.may_match_prefix(&format!("{path}/"))
+                        glob.matches(path)
+                            || tree
+                                && glob
+                                    .may_match_prefix(&format!("{}/", path.trim_end_matches('/')))
                     }
                     Matcher::Text(_) => unreachable!("file rules use path globs"),
                 })
@@ -308,27 +321,34 @@ impl Policy {
         commands.chain(opaque).max().unwrap_or(Effect::Deny)
     }
 
-    /// A whole mount or network namespace needs a grant that covers every
-    /// subject. A narrow allow can never grant this broader authority.
-    pub(crate) fn blanket_allows(&self, action: Action, zone: Zone) -> bool {
+    /// A whole mount needs a grant that covers every file under it.
+    pub(crate) fn blanket_allows_mount(&self, action: Action, root: &Path, zone: Zone) -> bool {
         if action == Action::Write
-            && self
-                .directories
-                .iter()
-                .any(|(_, kind)| *kind == Zone::ReadDirectory)
+            && self.directories.iter().any(|(path, mode)| {
+                *mode == Zone::ReadDirectory && (path.starts_with(root) || root.starts_with(path))
+            })
         {
             return false;
         }
-        let mut allowed = self.default_effect(action, zone) == Effect::Allow;
-        for (kind, matcher, effect) in &self.rules {
-            if *kind == action {
-                if *effect != Effect::Allow {
-                    return false;
-                }
-                allowed |= matcher.is_none();
-            }
-        }
-        allowed
+        let zone = self.path_zone(root, zone);
+        slash_path(root)
+            .is_some_and(|path| self.restricted_file_rule(action, &path, true).is_none())
+            && self.blanket_allow(action, zone)
+    }
+
+    pub(crate) fn blanket_allows(&self, action: Action, zone: Zone) -> bool {
+        !self
+            .rules
+            .iter()
+            .any(|(kind, _, effect)| *kind == action && *effect != Effect::Allow)
+            && self.blanket_allow(action, zone)
+    }
+
+    fn blanket_allow(&self, action: Action, zone: Zone) -> bool {
+        self.default_effect(action, zone) == Effect::Allow
+            || self.rules.iter().any(|(kind, matcher, effect)| {
+                *kind == action && matcher.is_none() && *effect == Effect::Allow
+            })
     }
 
     fn default_effect(&self, action: Action, zone: Zone) -> Effect {

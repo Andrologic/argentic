@@ -1,11 +1,11 @@
 //! Recipient-scoped native content. Nothing here grants authority to resources.
 use crate::{
-    host::HostContext,
+    host::{HostContext, HostPolicyLease},
     persistence::{failure, Result as HostResult},
 };
 use argentic_harness::tools::private_project_path;
 use serde_json::{json, Value};
-use std::{path::Path, sync::Arc};
+use std::{future::Future, path::Path, sync::Arc};
 use tokio_util::sync::CancellationToken;
 
 pub(crate) fn content_error(
@@ -131,6 +131,11 @@ pub(crate) struct Sources030 {
 
 impl Sources030 {
     pub async fn check_ceiling(&self) -> HostResult<()> {
+        self.lock_ceiling("skills").await?;
+        Ok(())
+    }
+
+    async fn lock_ceiling(&self, pointer: &str) -> HostResult<Option<HostPolicyLease>> {
         if let Some(config) = &self.config {
             let ceiling = config
                 .lock_agsdl_host_permissions()
@@ -139,12 +144,13 @@ impl Sources030 {
             if ceiling.fingerprint() != self.ceiling_digest {
                 return Err(failure(
                     "CAPTURE_CHANGED",
-                    "skills",
+                    pointer,
                     "Content permission ceiling changed",
                 ));
             }
+            return Ok(Some(ceiling));
         }
-        Ok(())
+        Ok(None)
     }
     pub async fn new(
         config: &HostContext,
@@ -264,23 +270,7 @@ impl Sources030 {
         usage: ContentUsage,
         pointer: &str,
     ) -> HostResult<()> {
-        let config = self.config.clone();
-        let _ceiling = if let Some(config) = &config {
-            let ceiling = config
-                .lock_agsdl_host_permissions()
-                .await
-                .map_err(|_| missing("contentPolicy"))?;
-            if ceiling.fingerprint() != self.ceiling_digest {
-                return Err(failure(
-                    "CAPTURE_CHANGED",
-                    pointer,
-                    "Content permission ceiling changed",
-                ));
-            }
-            Some(ceiling)
-        } else {
-            None
-        };
+        let _ceiling = self.lock_ceiling(pointer).await?;
         let expanded = source
             .get("ref")
             .and_then(Value::as_str)
@@ -335,7 +325,7 @@ impl Sources030 {
                 return Err(failure(
                     "CONTENT_SOURCE_UNSUPPORTED",
                     pointer,
-                    "This Codex adapter cannot represent this media type as native context",
+                    "This adapter cannot represent this media type as native context",
                 ))
             }
         }
@@ -387,34 +377,14 @@ impl Sources030 {
     }
 
     pub async fn skills(&mut self) -> HostResult<Vec<SkillDescriptor>> {
-        let config = self.config.clone();
-        let _ceiling = if let Some(config) = &config {
-            let ceiling = config
-                .lock_agsdl_host_permissions()
-                .await
-                .map_err(|_| missing("contentPolicy"))?;
-            if ceiling.fingerprint() != self.ceiling_digest {
-                return Err(failure(
-                    "CAPTURE_CHANGED",
-                    "skills",
-                    "Skill permission ceiling changed",
-                ));
-            }
-            Some(ceiling)
-        } else {
-            None
-        };
+        let _ceiling = self.lock_ceiling("skills").await?;
         qualify_skill_folders(
             &self.document,
             self.context.project_root().unwrap_or(&self.root),
             self.context.document_location(),
         )?;
-        for key in self.document["agents"][self.context.binding().map_err(content_error)?.agent]
-            ["skills"]
-            .as_array()
-            .into_iter()
-            .flatten()
-        {
+        let agent = &self.document["agents"][self.context.binding().map_err(content_error)?.agent];
+        for key in agent["skills"].as_array().into_iter().flatten() {
             let name = key.as_str().ok_or_else(|| missing("skills"))?;
             self.allowed_file(&self.document["skills"][name], &format!("/skills/{name}"))?;
         }
@@ -437,7 +407,7 @@ impl Sources030 {
                 "Selected skills exceed the work's content bound",
             ));
         }
-        for skill in &selected {
+        for skill in selected.iter().filter(|_| agent["harness"] != "argentic") {
             let root = Path::new(&skill.path)
                 .parent()
                 .ok_or_else(|| missing("skillRoot"))?;
@@ -456,6 +426,55 @@ impl Sources030 {
         self.receipts
             .extend(selected.iter().map(|skill| skill.source.clone()));
         Ok(selected)
+    }
+
+    pub async fn load_skill(
+        &self,
+        skill: &SkillDescriptor,
+    ) -> HostResult<crate::content::LoadedSkill> {
+        self.with_skill_ceiling("skills", async {
+            self.allowed_file(&self.document["skills"][&skill.key], "/skills")?;
+            crate::content::load_skill(&self.context, &skill.handle)
+                .await
+                .map_err(content_error)
+        })
+        .await
+    }
+
+    pub async fn skill_resource(
+        &self,
+        skill: &SkillDescriptor,
+        loaded: &crate::content::LoadedSkill,
+        path: &str,
+    ) -> HostResult<String> {
+        let pointer = "/skills/resources";
+        self.with_skill_ceiling(pointer, async {
+            let origin = url::Url::from_file_path(&skill.path).map_err(|_| missing("skillRoot"))?;
+            let target = origin.join(path).map_err(|_| missing("skillResource"))?;
+            self.allowed_file(&json!({"uri": target.as_str()}), pointer)?;
+            let receipt = crate::content::read_skill_resource(&self.context, loaded, path, None)
+                .await
+                .map_err(content_error)?;
+            match receipt.payload {
+                ContentPayload::Text { text } => Ok(text),
+                ContentPayload::Json { json } => Ok(json),
+                ContentPayload::Media { .. } => Err(failure(
+                    "CONTENT_SOURCE_UNSUPPORTED",
+                    pointer,
+                    "Skill resources must be text or JSON",
+                )),
+            }
+        })
+        .await
+    }
+
+    async fn with_skill_ceiling<T>(
+        &self,
+        pointer: &str,
+        read: impl Future<Output = HostResult<T>>,
+    ) -> HostResult<T> {
+        let _ceiling = self.lock_ceiling(pointer).await?;
+        read.await
     }
 
     fn allowed_file(&self, source: &Value, pointer: &str) -> HostResult<()> {
@@ -527,6 +546,9 @@ pub(crate) fn qualify_skill_folders(
                     "Selected skill is outside the approved project data scope",
                 ));
             }
+            if agent["harness"] == "argentic" {
+                continue;
+            }
             let directory = path.parent().ok_or_else(|| missing("skills"))?;
             for entry in std::fs::read_dir(directory).map_err(|_| missing("skills"))? {
                 let entry = entry.map_err(|_| missing("skills"))?;
@@ -546,6 +568,82 @@ mod tests {
     use super::*;
     use crate::permissions::{EffectivePolicy, PathContext, RequestedPermissions};
     use sha2::{Digest, Sha256};
+
+    #[tokio::test]
+    async fn skill_activation_and_companion_resolution_hold_the_live_ceiling() {
+        use crate::host::{PolicyFuture, PolicySource, ProjectPolicyLease};
+        use crate::permissions::Preset;
+        use tokio::sync::RwLock;
+
+        struct Policy(Arc<RwLock<bool>>);
+        impl PolicySource for Policy {
+            fn lock_project<'a>(&'a self, _: &'a str) -> PolicyFuture<'a, ProjectPolicyLease> {
+                unreachable!()
+            }
+            fn lock_ceiling(&self) -> PolicyFuture<'_, HostPolicyLease> {
+                Box::pin(async {
+                    let guard = self.0.clone().read_owned().await;
+                    let fingerprint = if *guard { "approved" } else { "revoked" };
+                    Ok(HostPolicyLease::new(
+                        RequestedPermissions::Preset(Preset::ReadOnly),
+                        fingerprint.into(),
+                        guard,
+                    ))
+                })
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let document = json!({"agents":{"worker":{}}});
+        let authored = document.to_string();
+        let origin = url::Url::from_file_path(root.join("agsdl.json")).unwrap();
+        let policy = normalize_requested(
+            RequestedPermissions::Preset(Preset::ReadOnly),
+            PathContext {
+                workspace: root.clone(),
+                home: root.clone(),
+            },
+        )
+        .unwrap();
+        let live = Arc::new(RwLock::new(true));
+        let context = ContentContext::capture(
+            "capture".into(),
+            format!("{:x}", Sha256::digest(authored.as_bytes())),
+            authored,
+            Some(origin.as_str()),
+            "worker".into(),
+            EffectivePolicy::new(policy.clone(), policy.clone(), policy),
+            ExecutionPurpose::Agent,
+            CancellationToken::new(),
+            Arc::new(|_| Box::pin(async { panic!("unexpected content approval") })),
+        )
+        .unwrap();
+        let private = root.join("private");
+        let mut sources =
+            Sources030::from_context(context, document, root.clone(), private).unwrap();
+        sources.config = Some(HostContext::new(root, Arc::new(Policy(live.clone()))));
+        sources.ceiling_digest = "approved".into();
+        for pointer in ["skills", "/skills/resources"] {
+            sources
+                .with_skill_ceiling(pointer, async {
+                    tokio::task::yield_now().await;
+                    assert!(
+                        live.try_write().is_err(),
+                        "skill read lost its policy lease"
+                    );
+                    Ok(())
+                })
+                .await
+                .unwrap();
+        }
+        *live.try_write().unwrap() = false;
+        let error = sources
+            .with_skill_ceiling::<()>("/skills/resources", async { panic!("revoked read ran") })
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "CAPTURE_CHANGED");
+    }
 
     /// A run from a project keeps the message rules of an equivalent JSON
     /// document. Only paths inside the retained copy use its inventory.
