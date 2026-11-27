@@ -291,8 +291,8 @@ mod tests {
     #[tokio::test]
     async fn interrupt_exits_with_stdin_still_open() {
         const CHILD: &str = "ARGENTIC_TEST_BLOCKED_HOST_STDIN";
-        if std::env::var_os(CHILD).is_some() {
-            std::thread::spawn(|| {
+        if let Some(ready) = std::env::var_os(CHILD) {
+            std::thread::spawn(move || {
                 run_on_runtime(async {
                     let mut input = tokio::io::stdin();
                     let mut byte = [0];
@@ -300,54 +300,46 @@ mod tests {
                     let mut interrupt = Box::pin(tokio::signal::ctrl_c());
                     assert!(futures::poll!(&mut interrupt).is_pending());
                     assert!(futures::poll!(&mut read).is_pending());
-                    println!("stdin pending");
+                    std::fs::write(ready, []).unwrap();
                     interrupt.await.unwrap();
-                    println!("drained");
                 });
             })
             .join()
             .unwrap();
             return;
         }
+        let temp = tempfile::tempdir().unwrap();
+        let ready = temp.path().join("stdin-ready");
         let mut child = tokio::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
                 "tests::interrupt_exits_with_stdin_still_open",
                 "--nocapture",
+                "--test-threads=1",
             ])
-            .env(CHILD, "1")
+            .env(CHILD, &ready)
             .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
+            .stdout(Stdio::null())
             .kill_on_drop(true)
             .spawn()
             .unwrap();
         let _input = child.stdin.take().unwrap();
-        let mut output = tokio::io::BufReader::new(child.stdout.take().unwrap()).lines();
-        let next = async |lines: &mut tokio::io::Lines<_>, expected| {
-            while let Some(line) = lines.next_line().await.unwrap() {
-                if line == expected {
-                    return;
-                }
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !ready.exists() {
+                assert!(
+                    child.try_wait().unwrap().is_none(),
+                    "Child exited before readiness"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
-            panic!("Child exited before writing {expected}");
-        };
-        tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            next(&mut output, "stdin pending"),
-        )
+        })
         .await
-        .unwrap();
+        .expect("Child did not install the signal handler");
         // The child has installed its signal handler and submitted the stdin read.
         assert_eq!(
             unsafe { libc::kill(child.id().unwrap() as libc::pid_t, libc::SIGINT) },
             0
         );
-        tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            next(&mut output, "drained"),
-        )
-        .await
-        .unwrap();
         assert!(
             tokio::time::timeout(std::time::Duration::from_secs(3), child.wait())
                 .await
