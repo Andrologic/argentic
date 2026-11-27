@@ -5,7 +5,7 @@ mod tls;
 
 use clock::Clock;
 
-use super::super::{Approval, Registry};
+use super::super::{Approval, ApprovalSource, DispatchAction, DispatchPolicy, Registry};
 use super::ShellNetwork;
 use crate::{
     policy::{normalize_network_host, Action, Effect, Policy, Zone},
@@ -25,7 +25,8 @@ use hyper::{
 };
 use hyper_util::rt::{TokioIo, TokioTimer};
 use std::{
-    collections::HashMap,
+    borrow::Cow,
+    collections::{HashMap, HashSet},
     io::{self, Read},
     net::{IpAddr, SocketAddr},
     os::fd::AsFd,
@@ -52,6 +53,7 @@ const MAX_CONCURRENT: usize = 16;
 const MAX_BYTES: usize = 64 * 1024 * 1024;
 const MAX_CONNECTION_TIME: Duration = Duration::from_secs(120);
 const MAX_DIAL_TIME: Duration = Duration::from_secs(10);
+const TUNNEL_POLICY_INTERVAL: Duration = Duration::from_millis(250);
 const MAX_HEADER_BYTES: usize = 32 * 1024;
 const PROXY_ENV: &[&str] = &[
     "http_proxy",
@@ -83,7 +85,8 @@ pub(super) struct Proxy {
 impl Proxy {
     pub(super) fn start(
         registry: Arc<Registry>,
-        live_policy: Option<Policy>,
+        command: String,
+        approved_by: Option<ApprovalSource>,
         call: ToolCall,
         cancel: &CancellationToken,
     ) -> io::Result<Self> {
@@ -126,7 +129,8 @@ impl Proxy {
         let clock = Arc::new(Clock::new());
         let context = Arc::new(Egress {
             registry,
-            live_policy,
+            command,
+            approved_by,
             call,
             cancel: cancel.clone(),
             auth,
@@ -189,7 +193,8 @@ impl Drop for Proxy {
 
 struct Egress {
     registry: Arc<Registry>,
-    live_policy: Option<Policy>,
+    command: String,
+    approved_by: Option<ApprovalSource>,
     call: ToolCall,
     cancel: CancellationToken,
     auth: String,
@@ -249,7 +254,7 @@ async fn disconnected(fd: AsyncFd<std::os::fd::OwnedFd>) {
 
 type ProxyBody = UnsyncBoxBody<Bytes, hyper::Error>;
 enum Tunnel {
-    Opaque(TcpStream),
+    Opaque(Target, Dialed),
     Intercept(Target),
 }
 
@@ -282,8 +287,28 @@ async fn serve(client: impl AsyncRead + AsyncWrite + Unpin + Send + 'static, con
         let Ok(client) = upgrade.await else { return };
         let mut client = TokioIo::new(client);
         match tunnel {
-            Tunnel::Opaque(mut upstream) => {
-                let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+            Tunnel::Opaque(target, mut dialed) => {
+                let copy = tokio::io::copy_bidirectional(&mut client, &mut dialed.stream);
+                tokio::pin!(copy);
+                let mut checks = tokio::time::interval(TUNNEL_POLICY_INTERVAL);
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = lifetime.cancelled() => break,
+                        _ = checks.tick() => {
+                            let Ok(lease) = context.network_policy(&lifetime).await else { break };
+                            if !matches!(
+                                context.required_approval(
+                                    &lease, &target.host, Some(dialed.address), &dialed.approved,
+                                ),
+                                Ok(None)
+                            ) {
+                                break;
+                            }
+                        }
+                        _ = &mut copy => break,
+                    }
+                }
             }
             Tunnel::Intercept(target) => {
                 let Some(tls) = &context.tls else { return };
@@ -341,6 +366,12 @@ const UPSTREAM: Failure = (
 struct Target {
     host: String,
     port: u16,
+}
+
+struct Dialed {
+    stream: TcpStream,
+    address: SocketAddr,
+    approved: HashSet<String>,
 }
 
 impl Target {
@@ -402,12 +433,14 @@ impl Egress {
             }
             let target = Target::new(authority, None)?;
             let destination = if self.tls.is_some() {
-                if self.effect(&target.host) == Effect::Deny {
+                let lease = self.network_policy(&lifetime).await?;
+                if self.effect(lease.policy.as_ref(), &target.host) == Effect::Deny {
                     return Err(DENIED);
                 }
                 Tunnel::Intercept(target)
             } else {
-                Tunnel::Opaque(self.dial(&target.host, target.port, &lifetime).await?)
+                let upstream = self.dial(&target.host, target.port, &lifetime).await?;
+                Tunnel::Opaque(target, upstream)
             };
             tunnel
                 .try_send((hyper::upgrade::on(&mut request), destination))
@@ -419,7 +452,10 @@ impl Egress {
             return Err(BAD_TARGET);
         }
         let target = Target::new(authority, Some(80))?;
-        let upstream = self.dial(&target.host, target.port, &lifetime).await?;
+        let upstream = self
+            .dial(&target.host, target.port, &lifetime)
+            .await?
+            .stream;
         self.send(request, &target, upstream, &lifetime).await
     }
 
@@ -445,7 +481,7 @@ impl Egress {
         if hosts.next().is_some() || Target::new(&authority, Some(443))? != *target {
             return Err(DENIED);
         }
-        let tcp = self.dial(&target.host, target.port, lifetime).await?;
+        let tcp = self.dial(&target.host, target.port, lifetime).await?.stream;
         let tls = self.tls.as_ref().ok_or(UPSTREAM)?;
         let upstream = tokio::time::timeout(MAX_DIAL_TIME, tls.connect(tcp, &target.host))
             .await
@@ -500,14 +536,106 @@ impl Egress {
         Ok(response.map(BodyExt::boxed_unsync))
     }
 
-    fn effect(&self, host: &str) -> Effect {
+    async fn network_policy(&self, cancel: &CancellationToken) -> Result<DispatchPolicy, Failure> {
+        // The shell worker holds the root gates. Reuse its dispatch policy
+        // accessor without acquiring any workspace or path locks here.
+        let lease = self
+            .registry
+            .lock_dispatch(
+                &self.call,
+                &[DispatchAction {
+                    action: Approval::Shell(&self.command),
+                    approved_by: self.approved_by,
+                }],
+                cancel,
+            )
+            .await
+            .map_err(|_| DENIED)?;
+        super::recheck_shell(&lease, &self.command, self.approved_by).map_err(|_| DENIED)?;
+        if self.registry.shell_network == ShellNetwork::Blanket
+            && lease
+                .policy
+                .as_ref()
+                .is_some_and(|policy| !policy.blanket_network())
+        {
+            return Err(DENIED);
+        }
+        Ok(lease)
+    }
+
+    fn effect(&self, live: Option<&Policy>, host: &str) -> Effect {
         self.registry
             .policy
             .iter()
-            .chain(self.live_policy.iter())
+            .chain(live)
             .map(|policy| policy.decide(Action::Network, host, Zone::Workspace))
             .max()
             .unwrap_or(Effect::Deny)
+    }
+
+    fn required_approval<'a>(
+        &self,
+        lease: &DispatchPolicy,
+        host: &'a str,
+        address: Option<SocketAddr>,
+        approved: &HashSet<String>,
+    ) -> Result<Option<Cow<'a, str>>, Failure> {
+        let live = lease.policy.as_ref();
+        let effect = self.effect(live, host);
+        if effect == Effect::Deny {
+            return Err(DENIED);
+        }
+        let mut address_ask = None;
+        if let Some(address) = address {
+            let ip = address.ip().to_canonical();
+            let (restriction, exact_grant) = self
+                .registry
+                .policy
+                .iter()
+                .chain(live)
+                .map(|policy| policy.network_address_rules(ip))
+                .fold((None, false), |(effect, grant), (next, exact)| {
+                    (effect.max(next), grant || exact)
+                });
+            if excluded_address(ip, address.port(), self.host_tcp_port)
+                || (restricted_ip(ip) && !exact_grant)
+                || restriction == Some(Effect::Deny)
+            {
+                return Err(DENIED);
+            }
+            if restriction == Some(Effect::Ask) && host.parse::<IpAddr>().is_err() {
+                let ip = ip.to_string();
+                if !approved.contains(&ip) {
+                    address_ask = Some(Cow::Owned(ip));
+                }
+            }
+        }
+        if effect == Effect::Ask && !approved.contains(host) {
+            return Ok(Some(Cow::Borrowed(host)));
+        }
+        Ok(address_ask)
+    }
+
+    async fn authorize_destination(
+        &self,
+        host: &str,
+        address: Option<SocketAddr>,
+        approved: &mut HashSet<String>,
+        cancel: &CancellationToken,
+    ) -> Result<Option<DispatchPolicy>, Failure> {
+        loop {
+            let lease = self.network_policy(cancel).await?;
+            let Ok(prompt) = self.required_approval(&lease, host, address, approved) else {
+                return Ok(None);
+            };
+            let Some(prompt) = prompt else {
+                return Ok(Some(lease));
+            };
+            // The broker may itself need the policy lock before accepting a vote.
+            drop(lease);
+            self.approve_once(&prompt, cancel).await?;
+            approved.insert(prompt.into_owned());
+        }
     }
 
     async fn dial(
@@ -515,8 +643,11 @@ impl Egress {
         host: &str,
         port: u16,
         cancel: &CancellationToken,
-    ) -> Result<TcpStream, Failure> {
-        self.authorize(self.effect(host), host, cancel).await?;
+    ) -> Result<Dialed, Failure> {
+        let mut approved = HashSet::new();
+        self.authorize_destination(host, None, &mut approved, cancel)
+            .await?
+            .ok_or(DENIED)?;
 
         let addresses = match host.parse::<IpAddr>() {
             Ok(ip) => vec![SocketAddr::new(ip, port)],
@@ -530,55 +661,52 @@ impl Egress {
                     .collect()
             }
         };
-        let mut permitted = Vec::new();
+        let base = self.clock.base_after(MAX_DIAL_TIME);
+        let mut error = DENIED;
         for address in addresses {
-            let ip = address.ip().to_canonical();
-            if excluded_address(ip, port, self.host_tcp_port) {
+            let Some(lease) = self
+                .authorize_destination(host, Some(address), &mut approved, cancel)
+                .await?
+            else {
                 continue;
-            }
-            let (restriction, exact_grant) = self
-                .registry
-                .policy
-                .iter()
-                .chain(self.live_policy.iter())
-                .map(|policy| policy.network_address_rules(ip))
-                .fold((None, false), |(effect, grant), (next, exact)| {
-                    (effect.max(next), grant || exact)
+            };
+            // Polling a single literal address starts the dial under the lease.
+            // Wait for the handshake with the lease released.
+            let connect = TcpStream::connect(address);
+            tokio::pin!(connect);
+            let started = futures::poll!(&mut connect);
+            drop(lease);
+            let result = match started {
+                Poll::Ready(result) => result,
+                Poll::Pending => tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => return Err(DENIED),
+                    _ = self.clock.expire(base) => return Err(UPSTREAM),
+                    result = &mut connect => result,
+                },
+            };
+            if let Ok(stream) = result {
+                let lease = self.network_policy(cancel).await?;
+                if self
+                    .required_approval(&lease, host, Some(address), &approved)?
+                    .is_some()
+                {
+                    return Err(DENIED);
+                }
+                return Ok(Dialed {
+                    stream,
+                    address,
+                    approved,
                 });
-            if (restricted_ip(ip) && !exact_grant) || restriction == Some(Effect::Deny) {
-                continue;
             }
-            if restriction == Some(Effect::Ask) && host.parse::<IpAddr>().is_err() {
-                self.authorize(Effect::Ask, &ip.to_string(), cancel).await?;
-            }
-            permitted.push(address);
+            error = UPSTREAM;
         }
-        if permitted.is_empty() {
-            return Err(DENIED);
-        }
-        // Connect directly to the checked addresses so DNS cannot change
-        // between policy evaluation and connection establishment.
-        tokio::select! {
-            biased;
-            _ = cancel.cancelled() => Err(DENIED),
-            result = tokio::time::timeout(MAX_DIAL_TIME, TcpStream::connect(permitted.as_slice())) => {
-                result.map_err(|_| UPSTREAM)?.map_err(|_| UPSTREAM)
-            }
-        }
+        Err(error)
     }
 
-    async fn authorize(
-        &self,
-        effect: Effect,
-        host: &str,
-        cancel: &CancellationToken,
-    ) -> Result<(), Failure> {
-        if effect != Effect::Ask || !self.registry.has_authorizer() {
-            return self
-                .registry
-                .authorize(effect, &self.call, Approval::Network(host), cancel)
-                .await
-                .map_err(|_| DENIED);
+    async fn approve_once(&self, host: &str, cancel: &CancellationToken) -> Result<(), Failure> {
+        if !self.registry.has_authorizer() {
+            return Err(DENIED);
         }
         // One prompt per canonical host and a hard cap per invocation. Mark
         // it refused before opening the ticket, including on disconnect.
@@ -751,6 +879,159 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for Metered<T> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    use crate::{
+        policy::{Preset, Rule},
+        tools::Authorizer,
+    };
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+        sync::RwLock,
+    };
+
+    struct LiveNetwork {
+        policy: Arc<RwLock<Policy>>,
+        asks: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl Authorizer for LiveNetwork {
+        async fn approve(
+            &self,
+            _: &ToolCall,
+            action: Approval<'_>,
+            _: &CancellationToken,
+        ) -> Result<bool, String> {
+            assert!(matches!(action, Approval::Network("127.0.0.1")));
+            self.asks.fetch_add(1, Ordering::Relaxed);
+            Ok(true)
+        }
+
+        async fn revalidate_dispatch(
+            &self,
+            _: &ToolCall,
+            actions: &[DispatchAction<'_>],
+        ) -> Result<DispatchPolicy, String> {
+            assert!(matches!(
+                actions,
+                [DispatchAction {
+                    action: Approval::Shell("curl"),
+                    ..
+                }]
+            ));
+            let guard = self.policy.clone().read_owned().await;
+            let current = guard.clone();
+            Ok(DispatchPolicy::new(guard).with_policy(current, false))
+        }
+    }
+
+    fn network_policy(root: &std::path::Path, effect: Effect) -> Policy {
+        Policy::compile_rules(
+            root,
+            None,
+            Some(Preset::Workspace),
+            None,
+            &[Rule {
+                action: Action::Network,
+                pattern: Some("127.0.0.1".into()),
+                effect,
+            }],
+        )
+        .unwrap()
+    }
+
+    fn fixture(root: &std::path::Path, effect: Effect) -> (Arc<Egress>, Arc<LiveNetwork>) {
+        let policy = network_policy(root, effect);
+        let live = Arc::new(LiveNetwork {
+            policy: Arc::new(RwLock::new(policy.clone())),
+            asks: AtomicUsize::new(0),
+        });
+        let registry = Registry::new(&[root.to_owned()], policy, serde_json::json!(true))
+            .unwrap()
+            .with_shell_network(ShellNetwork::Intercept)
+            .with_authorizer(live.clone());
+        // Use an in-memory proxy transport and loopback upstream to exercise
+        // the opaque copy path without a public server or system sandbox.
+        let context = Arc::new(Egress {
+            registry: Arc::new(registry),
+            command: "curl".into(),
+            approved_by: None,
+            call: ToolCall {
+                id: "test".into(),
+                name: "shell".into(),
+                arguments: "{}".into(),
+            },
+            cancel: CancellationToken::new(),
+            auth: "Basic fixture".into(),
+            host_tcp_port: None,
+            bytes: Arc::new(AtomicUsize::new(MAX_BYTES)),
+            approvals: Arc::new(Mutex::new(HashMap::new())),
+            clock: Arc::new(Clock::new()),
+            tls: None,
+            tasks: TaskTracker::new(),
+        });
+        (context, live)
+    }
+
+    async fn connect(context: Arc<Egress>, addr: SocketAddr) -> (tokio::io::DuplexStream, String) {
+        let (mut client, proxy) = tokio::io::duplex(4096);
+        tokio::spawn(serve(proxy, context));
+        client
+            .write_all(
+                format!("CONNECT {addr} HTTP/1.1\r\nProxy-Authorization: Basic fixture\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut header = Vec::new();
+        while !header.ends_with(b"\r\n\r\n") {
+            header.push(client.read_u8().await.unwrap());
+        }
+        (client, String::from_utf8(header).unwrap())
+    }
+
+    #[tokio::test]
+    async fn new_proxy_connections_recheck_live_policy_even_after_approval() {
+        let root = tempfile::tempdir().unwrap();
+        let (context, live) = fixture(root.path(), Effect::Ask);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        for _ in 0..2 {
+            let (client, header) = connect(context.clone(), addr).await;
+            assert!(header.starts_with("HTTP/1.1 200"), "{header}");
+            drop(client);
+            listener.accept().await.unwrap();
+        }
+        *live.policy.write().await = network_policy(root.path(), Effect::Deny);
+        let (_, header) = connect(context, addr).await;
+        assert_eq!(live.asks.load(Ordering::Relaxed), 1);
+        assert!(header.starts_with("HTTP/1.1 403"), "{header}");
+    }
+
+    #[tokio::test]
+    async fn live_revocation_closes_an_open_opaque_tunnel() {
+        let root = tempfile::tempdir().unwrap();
+        let (context, live) = fixture(root.path(), Effect::Allow);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (mut client, header) = connect(context, listener.local_addr().unwrap()).await;
+        assert!(header.starts_with("HTTP/1.1 200"), "{header}");
+        let (mut upstream, _) = listener.accept().await.unwrap();
+        client.write_u8(42).await.unwrap();
+        assert_eq!(upstream.read_u8().await.unwrap(), 42);
+
+        tokio::time::pause();
+        *live.policy.write().await = network_policy(root.path(), Effect::Deny);
+        let mut byte = [0];
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), client.read(&mut byte))
+                .await
+                .unwrap()
+                .unwrap(),
+            0,
+        );
+        assert_eq!(upstream.read(&mut byte).await.unwrap(), 0);
+    }
 
     #[test]
     fn unspecified_addresses_cannot_be_granted() {
