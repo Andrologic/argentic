@@ -127,7 +127,7 @@ pub(crate) async fn control(
         }
         if let Some(marker) = runtime.pending_event_commit(id, &event_id)? {
             return operator_receipt(
-                resolve_native_event_commit_tx(runtime, &lease, tx, &marker)
+                resolve_native_event_commit_tx(runtime, &lease, tx, &marker.event)
                     .await?
                     .ok_or_else(uncertain)?,
             );
