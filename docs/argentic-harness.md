@@ -394,9 +394,12 @@ octets de la conversation et ceux que sa représentation conserve en mémoire.
 
 La CI Linux affiche les mesures avec `shell_staging`,
 `scripted_turn_overhead` et `idle_history_round_trips_provider_replay`.
-Elle signale les fortes régressions au-delà de 8 s pour préparer un arbre,
-5 ms par tour scripté ou un quart des octets de la conversation pour
-l’historique au repos sur la fixture compressible.
+Elle échoue au-delà d’un quart des octets de la conversation pour
+l’historique au repos sur la fixture compressible. Les seuils de 8 s pour
+préparer un arbre et de 5 ms par tour scripté ne s’appliquent que sur une
+machine contrôlée : sur les runners hébergés, `ARGENTIC_PERF_REPORT_ONLY`
+les rend informatifs, mais un échec fonctionnel de ces mesures fait toujours
+échouer la CI.
 
 La recette de lecture de quatre fichiers suivie d’une soumission a réussi
 6 fois sur 6 avec LM Studio et `qwen/qwen3-4b-2507`.
