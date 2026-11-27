@@ -8,8 +8,8 @@ use tokio_util::sync::CancellationToken;
 use super::{
     emit_items,
     http::{bearer, rejects_effort, DecodeError, Events, HttpStream},
-    invalid, wire_index, wire_str, Chunk, Finish, Message, ModelName, Provider, ProviderError,
-    ProviderStream, Replay, Request, ToolCall, ToolChoice, Usage, WireFormat,
+    invalid, wire_index, wire_str, Chunk, Finish, HttpClient, Message, ModelName, Provider,
+    ProviderError, ProviderStream, Replay, Request, ToolCall, ToolChoice, Usage, WireFormat,
 };
 
 pub struct OpenAiResponses {
@@ -26,8 +26,18 @@ impl OpenAiResponses {
         endpoint: Url,
         api_key: Option<&str>,
     ) -> Result<Self, ProviderError> {
+        Self::with_http_client(provider, endpoint, api_key, HttpClient::new()?)
+    }
+
+    /// Share connections with other providers driven by this runtime.
+    pub fn with_http_client(
+        provider: impl Into<String>,
+        endpoint: Url,
+        api_key: Option<&str>,
+        client: HttpClient,
+    ) -> Result<Self, ProviderError> {
         Ok(Self {
-            http: HttpStream::new(endpoint, bearer(api_key)?, AUTHORIZATION)?,
+            http: HttpStream::new(endpoint, bearer(api_key)?, AUTHORIZATION, client)?,
             provider: provider.into(),
         })
     }

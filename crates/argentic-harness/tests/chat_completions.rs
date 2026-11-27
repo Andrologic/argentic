@@ -5,8 +5,8 @@ use std::{
 };
 
 use argentic_harness::providers::{
-    ChatCompletions, Chunk, DeliveryProgress, DeliveryStatus, Finish, Message, ModelName, Provider,
-    ProviderError, Request, TurnLimits,
+    ChatCompletions, Chunk, DeliveryProgress, DeliveryStatus, Finish, HttpClient, Message,
+    ModelName, Provider, ProviderError, Request, TurnLimits,
 };
 use axum::{
     body::{Body, Bytes},
@@ -412,8 +412,8 @@ async fn distinguishes_explicit_refusal_from_missing_headers_after_send() {
     assert_eq!(delivery.status(), DeliveryStatus::Uncertain);
 }
 
-#[tokio::test]
-async fn work_providers_reuse_the_connection_without_reusing_credentials() {
+#[test]
+fn work_providers_share_connections_only_within_one_runtime() {
     use axum::{extract::ConnectInfo, http::HeaderMap};
     use std::net::SocketAddr;
 
@@ -438,19 +438,29 @@ async fn work_providers_reuse_the_connection_without_reusing_credentials() {
             }
         }),
     );
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let endpoint = format!("http://{}/chat", listener.local_addr().unwrap());
-    let server = tokio::spawn(async move {
-        axum::serve(
-            listener,
-            service.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .await
+    let server = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
         .unwrap();
+    let endpoint = server.block_on(async {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/chat", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                service.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+        endpoint
     });
     let model = "test/model".parse().unwrap();
-    for key in ["first", "second"] {
-        let work = ChatCompletions::new("test", endpoint.parse().unwrap(), Some(key)).unwrap();
+    let request = async |pool: HttpClient, key: &str| {
+        let work =
+            ChatCompletions::with_http_client("test", endpoint.parse().unwrap(), Some(key), pool)
+                .unwrap();
         let chunks: Vec<_> = work
             .stream(
                 Request {
@@ -461,7 +471,10 @@ async fn work_providers_reuse_the_connection_without_reusing_credentials() {
                     tool_choice: Default::default(),
                     tool_choice_rejected: None,
                     max_output_tokens: 128,
-                    limits: TurnLimits::default(),
+                    limits: TurnLimits {
+                        timeout: Duration::from_secs(3),
+                        ..TurnLimits::default()
+                    },
                     delivery: DeliveryProgress::default(),
                 },
                 CancellationToken::new(),
@@ -478,11 +491,28 @@ async fn work_providers_reuse_the_connection_without_reusing_credentials() {
                 ..
             })
         ));
-    }
-    server.abort();
+    };
+    let runtime = || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    };
+    let first = runtime();
+    let first_pool = HttpClient::new().unwrap();
+    first.block_on(request(first_pool.clone(), "first"));
+    first.block_on(request(first_pool.clone(), "second"));
+
+    // The first runtime and its pooled connection stay alive while paused.
+    let second = runtime();
+    let second_pool = HttpClient::new().unwrap();
+    second.block_on(request(second_pool, "third"));
+
     let observed = requests.lock().unwrap();
-    assert_eq!(observed.len(), 2);
+    assert_eq!(observed.len(), 3);
     assert_eq!(observed[0].0, observed[1].0);
+    assert_ne!(observed[1].0, observed[2].0);
     assert_eq!(observed[0].1, "Bearer first");
     assert_eq!(observed[1].1, "Bearer second");
+    assert_eq!(observed[2].1, "Bearer third");
 }

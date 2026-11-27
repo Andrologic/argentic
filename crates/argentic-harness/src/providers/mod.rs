@@ -7,6 +7,7 @@ mod openai_responses;
 mod reasoning;
 pub use anthropic_messages::AnthropicMessages;
 pub use chat_completions::ChatCompletions;
+pub use http::HttpClient;
 pub use openai_responses::OpenAiResponses;
 pub use reasoning::{reasoning_capability, ReasoningCapability};
 

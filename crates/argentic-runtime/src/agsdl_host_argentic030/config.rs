@@ -3,8 +3,8 @@ use crate::persistence::{failure, Result};
 use argentic_harness::{
     config::Settings,
     providers::{
-        reasoning_capability, AnthropicMessages, ChatCompletions, ModelName, OpenAiResponses,
-        Provider, ReasoningCapability,
+        reasoning_capability, AnthropicMessages, ChatCompletions, HttpClient, ModelName,
+        OpenAiResponses, Provider, ReasoningCapability,
     },
     tools::ShellNetwork,
 };
@@ -271,6 +271,7 @@ impl ArgenticConfig030 {
     pub(super) fn provider(
         &self,
         model: &ModelName,
+        http: HttpClient,
     ) -> Result<(Arc<dyn Provider>, Option<String>)> {
         let provider = self
             .providers
@@ -294,19 +295,19 @@ impl ArgenticConfig030 {
         let map_error = |_| config_error("Cannot initialize the configured provider or credential");
         let client: Arc<dyn Provider> = match provider.protocol {
             Protocol::ChatCompletions => Arc::new(
-                ChatCompletions::new(id, endpoint, credential)
+                ChatCompletions::with_http_client(id, endpoint, credential, http)
                     .map_err(map_error)?
                     .with_attempt_effort_fallback(),
             ),
             Protocol::AnthropicMessages => Arc::new(
-                AnthropicMessages::new(id, endpoint, credential)
+                AnthropicMessages::with_http_client(id, endpoint, credential, http)
                     .map_err(map_error)?
                     .with_reasoning_catalog(provider.catalog(id))
                     .with_prompt_caching(provider.prompt_caching)
                     .with_attempt_effort_fallback(),
             ),
             Protocol::OpenAiResponses => Arc::new(
-                OpenAiResponses::new(id, endpoint, credential)
+                OpenAiResponses::with_http_client(id, endpoint, credential, http)
                     .map_err(map_error)?
                     .with_attempt_effort_fallback(),
             ),

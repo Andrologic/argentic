@@ -8,8 +8,8 @@ use tokio_util::sync::CancellationToken;
 
 use super::{
     http::{bearer, rejects_effort, DecodeError, Events, HttpStream, MAX_EVENT_BYTES},
-    Chunk, Finish, Message, ModelName, Provider, ProviderError, ProviderStream, Request, ToolCall,
-    ToolChoice, Usage,
+    Chunk, Finish, HttpClient, Message, ModelName, Provider, ProviderError, ProviderStream,
+    Request, ToolCall, ToolChoice, Usage,
 };
 
 pub struct ChatCompletions {
@@ -24,8 +24,18 @@ impl ChatCompletions {
         endpoint: Url,
         api_key: Option<&str>,
     ) -> Result<Self, ProviderError> {
+        Self::with_http_client(provider, endpoint, api_key, HttpClient::new()?)
+    }
+
+    /// Share connections with other providers driven by this runtime.
+    pub fn with_http_client(
+        provider: impl Into<String>,
+        endpoint: Url,
+        api_key: Option<&str>,
+        client: HttpClient,
+    ) -> Result<Self, ProviderError> {
         Ok(Self {
-            http: HttpStream::new(endpoint, bearer(api_key)?, AUTHORIZATION)?,
+            http: HttpStream::new(endpoint, bearer(api_key)?, AUTHORIZATION, client)?,
             provider: provider.into(),
         })
     }

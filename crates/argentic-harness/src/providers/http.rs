@@ -2,7 +2,7 @@ use std::{
     collections::VecDeque,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
-        Arc, LazyLock,
+        Arc,
     },
     time::{Duration, SystemTime},
 };
@@ -33,17 +33,24 @@ pub(super) fn bearer(api_key: Option<&str>) -> Result<Option<HeaderValue>, Provi
         .transpose()
 }
 
-// Reqwest keeps separate connection pools per origin. Credentials and
-// fallback flags stay with the provider instance for each work attempt.
-static CLIENT: LazyLock<Result<Client, ProviderError>> = LazyLock::new(|| {
-    Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(Duration::from_secs(10))
-        .read_timeout(Duration::from_secs(120))
-        .pool_max_idle_per_host(8)
-        .build()
-        .map_err(transport)
-});
+/// Connection pool for providers driven by the same Tokio runtime.
+///
+/// Create a separate pool for each runtime driving provider requests.
+#[derive(Clone)]
+pub struct HttpClient(Client);
+
+impl HttpClient {
+    pub fn new() -> Result<Self, ProviderError> {
+        Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(10))
+            .read_timeout(Duration::from_secs(120))
+            .pool_max_idle_per_host(8)
+            .build()
+            .map(Self)
+            .map_err(transport)
+    }
+}
 
 pub(super) struct HttpStream {
     client: Client,
@@ -57,6 +64,7 @@ impl HttpStream {
         endpoint: Url,
         credential: Option<HeaderValue>,
         header: HeaderName,
+        client: HttpClient,
     ) -> Result<Self, ProviderError> {
         if !matches!(endpoint.scheme(), "http" | "https")
             || endpoint.host().is_none()
@@ -66,13 +74,12 @@ impl HttpStream {
         {
             return Err(ProviderError::Invalid("Invalid provider endpoint".into()));
         }
-        let client = CLIENT.as_ref().map_err(Clone::clone)?.clone();
         let mut headers = HeaderMap::new();
         if let Some(value) = credential {
             headers.insert(header, value);
         }
         Ok(Self {
-            client,
+            client: client.0,
             endpoint,
             headers,
             effort_rejected: None,

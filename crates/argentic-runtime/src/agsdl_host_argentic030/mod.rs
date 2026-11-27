@@ -25,7 +25,7 @@ use crate::{
     },
 };
 use argentic_harness::{
-    providers::{Message, ModelName},
+    providers::{HttpClient, Message, ModelName},
     r#loop::{Failure, Harness, PlanMode, Work},
     tools::Registry,
 };
@@ -237,6 +237,7 @@ impl HarnessAdapter030 for ArgenticAdapter030 {
         Ok(Arc::new(Executor {
             host: context.host.clone(),
             config: self.0.clone(),
+            http: HttpClient::new().map_err(provider_failure)?,
             sessions: Arc::default(),
             policies: Arc::default(),
             toolboxes: Arc::default(),
@@ -268,6 +269,7 @@ impl HarnessAdapter030 for ArgenticAdapter030 {
 struct Executor {
     host: HostContext,
     config: Arc<ArgenticConfig030>,
+    http: HttpClient,
     // The Host creates one executor per run. The reducer serializes works
     // with the same instance ID and waits for the previous owner to join.
     sessions: Arc<Mutex<BTreeMap<String, session::IdleHistory>>>,
@@ -418,7 +420,7 @@ impl Executor {
         let model: ModelName = required(frozen, "modelName")?
             .parse()
             .map_err(|_| config::invalid_model("model"))?;
-        let (provider, credential) = self.config.provider(&model)?;
+        let (provider, credential) = self.config.provider(&model, self.http.clone())?;
         let mut definition = document["agents"][agent].clone();
         let settings =
             self.config
@@ -550,10 +552,11 @@ impl Executor {
             let model = name
                 .parse()
                 .map_err(|_| config::invalid_model("/reviewerModel"))?;
-            let (provider, reviewer_credential) = match self.config.provider(&model) {
-                Ok((provider, credential)) => (Some(provider), credential),
-                Err(_) => (None, None),
-            };
+            let (provider, reviewer_credential) =
+                match self.config.provider(&model, self.http.clone()) {
+                    Ok((provider, credential)) => (Some(provider), credential),
+                    Err(_) => (None, None),
+                };
             Some(Arc::new(review::ModelReviewer {
                 model,
                 model_name: name.into(),
