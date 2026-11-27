@@ -2,7 +2,6 @@ use crate::{
     agsdl_host_work_admission030::pointer_token030,
     permissions::{
         Action, DirectoryAccess, Effect, EffectivePolicy, Outside, Preset, RequestedPermissions,
-        Reviewer,
     },
     persistence::{failure, Result},
 };
@@ -25,14 +24,11 @@ pub(super) fn unsupported(pointer: &str, feature: &str) -> crate::persistence::d
 }
 
 pub(super) fn qualify(agent: &Value, pointer: &str, mode: ShellNetwork) -> Result<()> {
-    for property in ["plan", "planFirst", "completionCheck"] {
-        if agent.get(property).is_some_and(|value| {
-            value != false
-                && !value.as_array().is_some_and(Vec::is_empty)
-                && !value.as_object().is_some_and(serde_json::Map::is_empty)
-        }) {
-            return Err(unsupported(&format!("{pointer}/{property}"), property));
-        }
+    if !agent["completionCheck"].is_null() {
+        return Err(unsupported(
+            &format!("{pointer}/completionCheck"),
+            "completionCheck",
+        ));
     }
     let at = format!("{pointer}/permissions");
     let permissions: RequestedPermissions = serde_json::from_value(agent["permissions"].clone())
@@ -46,12 +42,6 @@ pub(super) fn qualify(agent: &Value, pointer: &str, mode: ShellNetwork) -> Resul
                 "Argentic supports at most eight additional roots per agent",
             ));
         }
-        if permissions.reviewer == Some(Reviewer::Model) {
-            return Err(unsupported(
-                &format!("{at}/reviewer"),
-                "model permission reviewers",
-            ));
-        }
         for (index, rule) in permissions.rules.iter().enumerate() {
             if let (Action::Network, Some(pattern)) = (rule.action, &rule.pattern) {
                 let at = format!("{at}/rules/{index}/match");
@@ -60,12 +50,6 @@ pub(super) fn qualify(agent: &Value, pointer: &str, mode: ShellNetwork) -> Resul
                 if shell && mode == ShellNetwork::Blanket {
                     return Err(failure("HARNESS_UNSUPPORTED", &at, SHELL_NETWORK_PATTERN));
                 }
-            }
-            if rule.action == Action::Delegate && rule.effect != Effect::Deny {
-                return Err(unsupported(
-                    &format!("{at}/rules/{index}/effect"),
-                    "delegation permissions",
-                ));
             }
         }
     }

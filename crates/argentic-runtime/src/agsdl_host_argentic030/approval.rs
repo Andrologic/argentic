@@ -1,4 +1,5 @@
 use crate::{
+    agsdl_host_action_approval030::permits_model_review,
     harness::{CommandApprovals030, FlowWorkAttempt030},
     permissions::{native_request_path, ActionRequest},
 };
@@ -15,11 +16,13 @@ use std::sync::{
 };
 use tokio_util::sync::CancellationToken;
 
-pub(super) struct Human {
+pub(super) struct ToolApprovals {
     pub approvals: Arc<dyn CommandApprovals030>,
+    pub person: Option<Arc<dyn CommandApprovals030>>,
     pub attempt: FlowWorkAttempt030,
     pub sequence: AtomicU64,
     pub credential: Option<String>,
+    pub model: bool,
 }
 
 fn file_request(path: &Path, write: bool) -> Result<(String, Vec<ActionRequest>), String> {
@@ -33,16 +36,35 @@ fn file_request(path: &Path, write: bool) -> Result<(String, Vec<ActionRequest>)
 }
 
 #[async_trait::async_trait]
-impl Authorizer for Human {
+impl Authorizer for ToolApprovals {
     async fn approve(
         &self,
         call: &ToolCall,
         action: Approval<'_>,
         cancel: &CancellationToken,
     ) -> Result<bool, String> {
+        // Proxy connections run outside the agent task that owns reviewer
+        // journal events. The human broker owns the connection's approval.
+        let approvals = if matches!(action, Approval::Network(_)) {
+            let Some(person) = &self.person else {
+                return Ok(false);
+            };
+            person
+        } else {
+            &self.approvals
+        };
         let (title, actions) = match action {
             Approval::Read(path) => file_request(path, false)?,
             Approval::Write(path) => file_request(path, true)?,
+            Approval::Delegate => {
+                let args: serde_json::Value = serde_json::from_str(&call.arguments)
+                    .map_err(|_| "Invalid delegation arguments")?;
+                let task = args["task"].as_str().ok_or("Missing delegation task")?;
+                (
+                    format!("Delegate read-only task: {task}"),
+                    vec![ActionRequest::Delegate {}],
+                )
+            }
             Approval::Network(host) => (
                 format!("Connect to {host}"),
                 vec![ActionRequest::Network { host: host.into() }],
@@ -65,7 +87,7 @@ impl Authorizer for Human {
             return Ok(false);
         }
         let sequence = self.sequence.fetch_add(1, Ordering::Relaxed);
-        let payload = json!({
+        let mut payload = json!({
             "title": title,
             "nativeRequest": {
                 "id": format!("argentic-{sequence}"),
@@ -77,8 +99,11 @@ impl Authorizer for Human {
                 }
             }
         });
+        if self.model && permits_model_review(&payload["nativeRequest"]) {
+            payload["nativeRequest"]["params"]["reviewArguments"] = json!(call.arguments);
+        }
         let permit = AtomicBool::new(false);
-        self.approvals
+        approvals
             .answer(
                 &self.attempt,
                 payload,

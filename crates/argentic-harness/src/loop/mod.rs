@@ -1,13 +1,16 @@
 //! Runs one AgSDL work in a fresh or continuing conversation.
 
 mod compaction;
+mod delegate;
+mod plan;
+pub use plan::{PlanDecision, PlanMode, PlanStatus, PlanStep};
 
 use std::{
     borrow::Cow,
     collections::{HashSet, VecDeque},
     sync::{
         atomic::{AtomicU8, Ordering},
-        Arc,
+        Arc, Mutex, MutexGuard,
     },
     time::Duration,
 };
@@ -24,7 +27,7 @@ use crate::{
     config::{Layer, Settings},
     providers::{
         Chunk, DeliveryProgress, DeliveryStatus, Finish, Message, ModelName, Provider,
-        ProviderError, Request, ToolCall, ToolChoice, ToolDefinition,
+        ProviderError, Request, ToolCall, ToolChoice, ToolDefinition, Usage,
     },
     tools::{Registry, SUBMIT_RESULT},
 };
@@ -48,6 +51,8 @@ pub struct Outcome {
 pub enum Failure {
     #[error(transparent)]
     Provider(#[from] ProviderError),
+    #[error("Plan rejected")]
+    PlanRejected,
     #[error("Work cancelled")]
     Cancelled,
     #[error("Turn limit reached")]
@@ -161,6 +166,19 @@ pub trait WorkPort: Send + Sync {
         Ok(())
     }
 
+    async fn plan(
+        &self,
+        _steps: &[PlanStep],
+        needs_approval: bool,
+        _cancel: &CancellationToken,
+    ) -> Result<PlanDecision, Failure> {
+        Ok(if needs_approval {
+            PlanDecision::Reject
+        } else {
+            PlanDecision::Accept
+        })
+    }
+
     /// Receive the complete visible assistant message before its tools run.
     async fn assistant_message(
         &self,
@@ -229,6 +247,12 @@ pub trait Hook: Send + Sync {
         Ok(())
     }
 
+    /// Called after charging the agent response and before running its tools.
+    fn begin_tool_batch(&self, _budget: &ReviewBudget) {}
+
+    /// Called only when the provider accepted the request carrying the steer.
+    fn steer_delivered(&self, _id: &str, _message: &str) {}
+
     async fn before_tool_call(
         &self,
         _turn: u32,
@@ -260,6 +284,8 @@ pub struct Harness {
     registry: Arc<Registry>,
     settings: Settings,
     context_window: Option<u32>,
+    plan: PlanMode,
+    delegation: bool,
     hooks: Vec<Arc<dyn Hook>>,
 }
 
@@ -270,12 +296,24 @@ impl Harness {
             registry,
             settings,
             context_window: None,
+            plan: PlanMode::Off,
+            delegation: false,
             hooks: Vec::new(),
         }
     }
 
     pub fn with_context_window(mut self, context_window: Option<u32>) -> Self {
         self.context_window = context_window;
+        self
+    }
+
+    pub fn with_plan(mut self, mode: PlanMode) -> Self {
+        self.plan = mode;
+        self
+    }
+
+    pub fn with_delegation(mut self) -> Self {
+        self.delegation = true;
         self
     }
 
@@ -286,75 +324,199 @@ impl Harness {
 
     pub async fn run(
         &self,
-        mut work: Work,
+        work: Work,
         port: &dyn WorkPort,
         steer: mpsc::Receiver<Steer>,
         parent: CancellationToken,
     ) -> RunReport {
-        let cancel = parent.child_token();
-        let _cancel_on_drop = cancel.clone().drop_guard();
-        let tracker = TaskTracker::new();
-        let tool_choice_rejected = AtomicU8::new(0);
-        let mut instance = Instance {
-            harness: self,
-            port,
-            steer,
-            cancel: &cancel,
-            tracker: &tracker,
-            text: String::new(),
-            artifacts: Vec::new(),
-            corrections: 0,
-            force_submission: false,
-            tool_choice_rejected: &tool_choice_rejected,
-            history_end: work.messages.len(),
-            protected_prefix: compaction::prefix_len(&work.messages),
-            mission_index: matches!(work.messages.last(), Some(Message::User(_)))
-                .then(|| work.messages.len() - 1),
-            correction_start: None,
-            response_text_start: None,
-            pending_steer: VecDeque::new(),
-            host_steer_pending: false,
-            accepted_steer: Vec::new(),
-            delivery: DeliveryProgress::default(),
-        };
-        let (outcome, forced) = {
-            let future = instance.execute(&mut work);
-            tokio::pin!(future);
-            tokio::select! {
-                biased;
-                _ = cancel.cancelled() => {
-                    let grace = Duration::from_millis(u64::from(self.settings.limit("cancelGraceMs")));
-                    let forced = tokio::time::timeout(grace, &mut future).await.is_err();
-                    (Err(Failure::Cancelled), forced)
+        let settings = &self.settings;
+        let turns = settings.limit("maxTurns");
+        let tokens = settings
+            .get("maxTotalTokens")
+            .filter(|(_, layer)| *layer != Layer::Default)
+            .map(|(limit, _)| u64::from(limit));
+        let budget = Arc::new(Mutex::new(Budget {
+            turns,
+            tokens,
+            ..Budget::default()
+        }));
+        self.run_with_budget(work, port, steer, parent, budget, turns)
+            .await
+    }
+
+    fn run_with_budget<'a>(
+        &'a self,
+        mut work: Work,
+        port: &'a dyn WorkPort,
+        steer: mpsc::Receiver<Steer>,
+        parent: CancellationToken,
+        budget: Arc<Mutex<Budget>>,
+        turn_limit: u32,
+    ) -> futures::future::BoxFuture<'a, RunReport> {
+        Box::pin(async move {
+            let cancel = parent.child_token();
+            let _cancel_on_drop = cancel.clone().drop_guard();
+            let tracker = TaskTracker::new();
+            let tool_choice_rejected = AtomicU8::new(0);
+            let mut instance = Instance {
+                harness: self,
+                port,
+                steer,
+                cancel: &cancel,
+                tracker: &tracker,
+                text: String::new(),
+                artifacts: Vec::new(),
+                corrections: 0,
+                force_submission: false,
+                tool_choice_rejected: &tool_choice_rejected,
+                history_end: work.messages.len(),
+                protected_prefix: compaction::prefix_len(&work.messages),
+                mission_index: matches!(work.messages.last(), Some(Message::User(_)))
+                    .then(|| work.messages.len() - 1),
+                correction_start: None,
+                response_text_start: None,
+                pending_steer: VecDeque::new(),
+                host_steer_pending: false,
+                accepted_steer: Vec::new(),
+                delivery: DeliveryProgress::default(),
+                plan_locked: self.plan.locked(),
+                plan_context: None,
+                budget,
+                turn_limit,
+            };
+            let (outcome, forced) = {
+                let future = instance.execute(&mut work);
+                tokio::pin!(future);
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => {
+                        let grace = Duration::from_millis(u64::from(self.settings.limit("cancelGraceMs")));
+                        let forced = tokio::time::timeout(grace, &mut future).await.is_err();
+                        (Err(Failure::Cancelled), forced)
+                    }
+                    outcome = &mut future => (outcome, false),
                 }
-                outcome = &mut future => (outcome, false),
+            };
+            let steer_result = instance.settle_steer().await;
+            instance.persist_steer(&mut work.messages);
+            let outcome = if cancel.is_cancelled() {
+                Err(Failure::Cancelled)
+            } else {
+                outcome.and_then(|outcome| steer_result.map(|()| outcome))
+            };
+            cancel.cancel();
+            // Closing drops any undelivered steer receipt before joining workers.
+            instance.steer.close();
+            while instance.steer.try_recv().is_ok() {}
+            tracker.close();
+            tracker.wait().await;
+            if matches!(outcome, Err(Failure::Cancelled)) {
+                instance.finish_interrupted_history(&mut work.messages);
+            } else {
+                work.messages.truncate(instance.history_end);
             }
-        };
-        let steer_result = instance.settle_steer().await;
-        instance.persist_steer(&mut work.messages);
-        let outcome = if cancel.is_cancelled() {
-            Err(Failure::Cancelled)
-        } else {
-            outcome.and_then(|outcome| steer_result.map(|()| outcome))
-        };
-        cancel.cancel();
-        // Closing drops any undelivered steer receipt before joining workers.
-        instance.steer.close();
-        while instance.steer.try_recv().is_ok() {}
-        tracker.close();
-        tracker.wait().await;
-        if matches!(outcome, Err(Failure::Cancelled)) {
-            instance.finish_interrupted_history(&mut work.messages);
-        } else {
-            work.messages.truncate(instance.history_end);
+            compaction::bound_history(&mut work.messages, instance.protected_prefix);
+            RunReport {
+                outcome,
+                physical_end: PhysicalEnd { forced },
+                artifacts: instance.artifacts,
+                messages: work.messages,
+            }
+        })
+    }
+}
+
+const PLAN_REQUIRED: &str = r#"{"error":"Present a plan using the plan tool before proceeding."}"#;
+
+#[derive(Default)]
+struct Budget {
+    turns: u32,
+    tokens: Option<u64>,
+    reviews: u32,
+    review_turn: u32,
+    reviews_this_turn: u32,
+}
+
+impl Budget {
+    fn has_turn(&self) -> bool {
+        self.turns > 0 && self.tokens != Some(0)
+    }
+
+    fn charge(&mut self, tokens: u64) {
+        self.tokens = self
+            .tokens
+            .map(|remaining| remaining.saturating_sub(tokens));
+    }
+
+    fn exhaust(&mut self) {
+        self.charge(u64::MAX);
+    }
+}
+
+const MAX_REVIEWS_PER_TURN: u32 = 4;
+const MAX_REVIEWS_PER_WORK: u32 = 32;
+
+/// Reserves a model review against the same token pool as the agent.
+#[derive(Clone)]
+pub struct ReviewBudget {
+    shared: Arc<Mutex<Budget>>,
+    turn: u32,
+}
+
+impl ReviewBudget {
+    pub fn reserve(&self, prompt_tokens: u64, max_output: u32) -> Option<ReviewReservation> {
+        let mut budget = self.shared.lock().ok()?;
+        let tokens = prompt_tokens.saturating_add(u64::from(max_output));
+        if self.turn < budget.review_turn
+            || budget.reviews >= MAX_REVIEWS_PER_WORK
+            || budget.tokens.is_some_and(|remaining| remaining < tokens)
+        {
+            return None;
         }
-        compaction::bound_history(&mut work.messages, instance.protected_prefix);
-        RunReport {
-            outcome,
-            physical_end: PhysicalEnd { forced },
-            artifacts: instance.artifacts,
-            messages: work.messages,
+        if self.turn > budget.review_turn {
+            budget.review_turn = self.turn;
+            budget.reviews_this_turn = 0;
         }
+        if budget.reviews_this_turn >= MAX_REVIEWS_PER_TURN {
+            return None;
+        }
+        budget.reviews_this_turn += 1;
+        budget.reviews += 1;
+        budget.charge(tokens);
+        Some(ReviewReservation {
+            shared: self.shared.clone(),
+            tokens,
+            max_output,
+        })
+    }
+}
+
+#[must_use]
+pub struct ReviewReservation {
+    shared: Arc<Mutex<Budget>>,
+    tokens: u64,
+    max_output: u32,
+}
+
+impl ReviewReservation {
+    /// Keep the reservation charged if the stream fails or omits usage.
+    pub fn settle(self, usage: Option<Usage>) -> bool {
+        let Ok(mut budget) = self.shared.lock() else {
+            return false;
+        };
+        let Some(remaining) = budget.tokens else {
+            return true;
+        };
+        let Some(usage) = usage else {
+            return false;
+        };
+        let actual = usage.prompt_tokens.saturating_add(usage.completion_tokens);
+        budget.tokens = Some(if actual <= self.tokens {
+            remaining.saturating_add(self.tokens - actual)
+        } else {
+            remaining.saturating_sub(actual - self.tokens)
+        });
+        actual <= self.tokens && usage.completion_tokens <= u64::from(self.max_output)
     }
 }
 
@@ -378,28 +540,37 @@ struct Instance<'a> {
     host_steer_pending: bool,
     accepted_steer: Vec<Message>,
     delivery: DeliveryProgress,
+    plan_locked: bool,
+    plan_context: Option<String>,
+    budget: Arc<Mutex<Budget>>,
+    turn_limit: u32,
 }
 
 impl Instance<'_> {
     async fn execute(&mut self, work: &mut Work) -> Result<Outcome, Failure> {
         let settings = &self.harness.settings;
-        let turn_limit = settings.limit("maxTurns");
+        let turn_limit = self.turn_limit;
         let min_output = self.harness.provider.min_output_tokens();
-        let total = settings
-            .get("maxTotalTokens")
-            .filter(|(_, layer)| *layer != Layer::Default)
-            .map(|(limit, _)| u64::from(limit));
-        let mut spent = 0u64;
-        let definitions: Vec<_> = self
+        let mut definitions: Vec<_> = self
             .harness
             .registry
             .definitions()
             .map(|(_, def)| def.clone())
             .collect();
-        let tool_bytes = compaction::tool_bytes(&definitions);
+        if self.harness.plan != PlanMode::Off {
+            definitions.push(plan::definition());
+        }
+        if self.harness.delegation && self.harness.registry.may_delegate() {
+            definitions.push(delegate::definition());
+        }
+        let mut extensions_ready = false;
         for turn in 1..=turn_limit {
             self.active()?;
-            let remaining = total.map(|limit| limit.saturating_sub(spent));
+            let remaining = {
+                let mut budget = self.budget()?;
+                budget.turns = budget.turns.checked_sub(1).ok_or(Failure::TurnLimit)?;
+                budget.tokens
+            };
             let max_output = u64::from(settings.limit("maxOutputTokens"))
                 .min(remaining.unwrap_or(u64::MAX)) as u32;
             if max_output < min_output {
@@ -408,12 +579,23 @@ impl Instance<'_> {
             if turn == 1 {
                 self.prune_start_history(work).await?;
             }
+            if !self.plan_locked && !extensions_ready {
+                self.harness
+                    .registry
+                    .prepare_extensions(self.tracker)
+                    .await
+                    .map_err(Failure::Port)?;
+                definitions.extend(self.harness.registry.extension_definitions());
+                extensions_ready = true;
+            }
+            let tool_bytes = compaction::tool_bytes(&definitions)
+                .saturating_add(self.plan_context.as_ref().map_or(0, String::len));
             let charged = self
                 .compact(turn, work, tool_bytes, remaining, max_output)
-                .await?;
-            spent = spent.saturating_add(charged);
-            let remaining = total.map_or(u64::MAX, |limit| limit.saturating_sub(spent));
-            let max_output = u64::from(settings.limit("maxOutputTokens")).min(remaining) as u32;
+                .await;
+            let remaining = self.account(charged)?;
+            let max_output = u64::from(settings.limit("maxOutputTokens"))
+                .min(remaining.unwrap_or(u64::MAX)) as u32;
             if max_output < min_output {
                 return Err(Failure::TokenLimit);
             }
@@ -424,14 +606,29 @@ impl Instance<'_> {
             self.response_text_start = Some(self.text.len());
             let response = self.request(turn, work, &definitions, max_output).await;
             self.persist_steer(&mut work.messages);
-            let response = response?;
-            spent = spent.saturating_add(compaction::token_charge(
+            let response = match response {
+                Ok(response) => response,
+                Err(error) => {
+                    self.budget()?.exhaust();
+                    return Err(error);
+                }
+            };
+            self.account(compaction::token_charge(
                 response.usage,
-                total.map(|_| remaining),
+                remaining,
                 max_output,
-            )?);
+            ))?;
             let finish = response.finish;
             let calls = response.calls;
+            if !calls.is_empty() {
+                let budget = ReviewBudget {
+                    shared: self.budget.clone(),
+                    turn,
+                };
+                for hook in &self.harness.hooks {
+                    hook.begin_tool_batch(&budget);
+                }
+            }
             self.response_text_start = None;
             self.correction_start = None;
             self.force_submission = false;
@@ -451,11 +648,28 @@ impl Instance<'_> {
                     .take_while(|call| call.name != SUBMIT_RESULT)
                     .count();
                 let (reads, tail) = pending.split_at(read_count);
-                self.tool_batch(turn, reads, &mut work.messages).await?;
+                if let Some(skipped) = self.tool_batch(turn, reads, work).await? {
+                    for call in skipped.iter().chain(tail) {
+                        self.publish_tool(
+                            turn,
+                            call,
+                            "Call not executed because the plan must be revised.",
+                            &mut work.messages,
+                        )
+                        .await?;
+                    }
+                    break;
+                }
                 let Some((call, tail)) = tail.split_first() else {
                     break;
                 };
                 self.before(turn, call).await?;
+                if self.plan_locked {
+                    self.publish_tool(turn, call, PLAN_REQUIRED, &mut work.messages)
+                        .await?;
+                    pending = tail;
+                    continue;
+                }
                 let validation = if self.port.validates_submission() {
                     serde_json::from_str(&call.arguments).map_err(|e| e.to_string())
                 } else {
@@ -508,11 +722,16 @@ impl Instance<'_> {
                     submission: Some(submission),
                 });
             }
-            let can_continue = turn < turn_limit && total.is_none_or(|limit| spent < limit);
+            let can_continue = turn < turn_limit && self.budget()?.has_turn();
             if can_continue && self.collect_steer().await? {
                 continue;
             }
             if calls.is_empty() && finish == Finish::Stop {
+                if self.plan_locked {
+                    work.messages.push(Message::User(PLAN_REQUIRED.into()));
+                    self.history_end = work.messages.len();
+                    continue;
+                }
                 // An ending work leaves any later arrivals unacknowledged.
                 let validation = work
                     .submission_required
@@ -550,6 +769,26 @@ impl Instance<'_> {
         Err(Failure::TurnLimit)
     }
 
+    fn budget(&self) -> Result<MutexGuard<'_, Budget>, Failure> {
+        self.budget
+            .lock()
+            .map_err(|_| Failure::Port("Work budget unavailable".into()))
+    }
+
+    fn account(&self, charge: Result<u64, Failure>) -> Result<Option<u64>, Failure> {
+        let mut budget = self.budget()?;
+        match charge {
+            Ok(charge) => {
+                budget.charge(charge);
+                Ok(budget.tokens)
+            }
+            Err(error) => {
+                budget.exhaust();
+                Err(error)
+            }
+        }
+    }
+
     async fn request(
         &mut self,
         turn: u32,
@@ -561,6 +800,9 @@ impl Instance<'_> {
         for hook in &self.harness.hooks {
             hook.prepare_request(turn, &mut messages, self.cancel)
                 .await?;
+        }
+        if let Some(plan) = &self.plan_context {
+            messages.to_mut().push(Message::User(plan.clone()));
         }
         self.active()?;
         let mut guard = None;
@@ -706,12 +948,12 @@ impl Instance<'_> {
         Err(ProviderError::Invalid("Provider ended without a terminal chunk".into()).into())
     }
 
-    async fn tool_batch(
+    async fn tool_batch<'a>(
         &mut self,
         turn: u32,
-        calls: &[ToolCall],
-        messages: &mut Vec<Message>,
-    ) -> Result<(), Failure> {
+        calls: &'a [ToolCall],
+        work: &mut Work,
+    ) -> Result<Option<&'a [ToolCall]>, Failure> {
         let parallelism = self.harness.settings.limit("maxParallelReads") as usize;
         let mut pending = calls;
         while !pending.is_empty() {
@@ -726,18 +968,43 @@ impl Instance<'_> {
                 .count();
             let (batch, remaining) = pending.split_at(parallel_reads.max(1));
             pending = remaining;
+            let call = &batch[0];
+            if call.name == plan::TOOL && self.harness.plan != PlanMode::Off {
+                self.before(turn, call).await?;
+                let (result, revise) = self.update_plan(call).await?;
+                self.publish_tool(turn, call, &result, &mut work.messages)
+                    .await?;
+                if revise {
+                    return Ok(Some(pending));
+                }
+                continue;
+            }
+            if self.plan_locked
+                && !matches!(
+                    call.name.as_str(),
+                    "read" | "list" | "glob" | "grep" | crate::tools::SKILL
+                )
+            {
+                self.publish_tool(turn, call, PLAN_REQUIRED, &mut work.messages)
+                    .await?;
+                continue;
+            }
             for call in batch {
                 self.before(turn, call).await?;
             }
-            let outputs = stream::iter(batch.iter().cloned())
-                .map(|call| {
-                    self.harness
-                        .registry
-                        .execute(call, self.cancel.child_token(), self.tracker)
-                })
-                .buffered(batch.len())
-                .collect::<Vec<_>>()
-                .await;
+            let outputs = if call.name == delegate::TOOL {
+                vec![self.delegate(work, call).await]
+            } else {
+                stream::iter(batch.iter().cloned())
+                    .map(|call| {
+                        self.harness
+                            .registry
+                            .execute(call, self.cancel.child_token(), self.tracker)
+                    })
+                    .buffered(batch.len())
+                    .collect::<Vec<_>>()
+                    .await
+            };
             self.active()?;
             for (call, output) in batch.iter().zip(outputs) {
                 let content = match output {
@@ -755,10 +1022,37 @@ impl Instance<'_> {
                     }
                     Err(error) => json!({"error":error}).to_string(),
                 };
-                self.publish_tool(turn, call, &content, messages).await?;
+                self.publish_tool(turn, call, &content, &mut work.messages)
+                    .await?;
             }
         }
-        Ok(())
+        Ok(None)
+    }
+
+    async fn update_plan(&mut self, call: &ToolCall) -> Result<(String, bool), Failure> {
+        let steps = match plan::parse(&call.arguments) {
+            Ok(steps) => steps,
+            Err(error) => return Ok((json!({"error":error}).to_string(), false)),
+        };
+        let ask = self.plan_locked && self.harness.plan == PlanMode::Ask;
+        match self.port.plan(&steps, ask, self.cancel).await? {
+            PlanDecision::Accept => {
+                self.plan_context = Some(plan::context(&steps)?);
+                self.plan_locked = false;
+                Ok((json!({"status":"accepted"}).to_string(), false))
+            }
+            PlanDecision::Revise(comment) => {
+                self.plan_context = Some(format!(
+                    "{}\nPlan review comment: {comment:?}",
+                    plan::context(&steps)?
+                ));
+                Ok((
+                    json!({"status":"revise","comment":comment}).to_string(),
+                    true,
+                ))
+            }
+            PlanDecision::Reject => Err(Failure::PlanRejected),
+        }
     }
 
     async fn before(&self, turn: u32, call: &ToolCall) -> Result<(), Failure> {
@@ -852,6 +1146,9 @@ impl Instance<'_> {
             self.port.settle_steer(&steer.id, status).await?;
             if let Some(steer) = self.pending_steer.pop_front() {
                 if status == DeliveryStatus::Accepted {
+                    for hook in &self.harness.hooks {
+                        hook.steer_delivered(&steer.id, &steer.message);
+                    }
                     if let Some(reference) = steer.reference {
                         self.accepted_steer.push(Message::User(reference));
                     }

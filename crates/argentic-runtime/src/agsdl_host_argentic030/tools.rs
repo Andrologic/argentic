@@ -7,7 +7,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, sync::Arc};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OnceCell};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -21,8 +21,15 @@ pub(super) struct Tools {
     sources: Arc<Mutex<Sources030>>,
     skills: Vec<SkillDescriptor>,
     loaded: Mutex<BTreeMap<String, LoadedSkill>>,
-    equipment: Arc<Equipment>,
-    mcp: BTreeMap<String, McpTool>,
+    setup: Mutex<Option<futures::future::BoxFuture<'static, HostResult<Equipment>>>>,
+    mcp: OnceCell<McpTools>,
+    failure: std::sync::Mutex<Option<crate::persistence::dto::EngineFailure>>,
+    cancel: CancellationToken,
+}
+
+struct McpTools {
+    equipment: Equipment,
+    catalogue: BTreeMap<String, McpTool>,
 }
 
 struct McpTool {
@@ -87,8 +94,28 @@ impl Tools {
     pub fn new(
         sources: Arc<Mutex<Sources030>>,
         skills: Vec<SkillDescriptor>,
-        equipment: Arc<Equipment>,
-    ) -> HostResult<Self> {
+        setup: futures::future::BoxFuture<'static, HostResult<Equipment>>,
+        cancel: CancellationToken,
+    ) -> Self {
+        Self {
+            sources,
+            skills,
+            loaded: Mutex::new(BTreeMap::new()),
+            setup: Mutex::new(Some(setup)),
+            mcp: OnceCell::new(),
+            failure: std::sync::Mutex::new(None),
+            cancel,
+        }
+    }
+
+    pub async fn close(self) -> HostResult<()> {
+        match self.mcp.into_inner() {
+            Some(mcp) => mcp.equipment.close().await,
+            None => self.failure.into_inner().unwrap().map_or(Ok(()), Err),
+        }
+    }
+
+    fn catalogue_mcp(equipment: &Equipment) -> HostResult<BTreeMap<String, McpTool>> {
         let mut mcp = BTreeMap::new();
         for (server, name, tool) in equipment.tools() {
             let alias = mcp_alias(server, name);
@@ -113,13 +140,7 @@ impl Tools {
                 },
             );
         }
-        Ok(Self {
-            sources,
-            skills,
-            loaded: Mutex::new(BTreeMap::new()),
-            equipment,
-            mcp,
-        })
+        Ok(mcp)
     }
 
     fn catalogue(&self) -> Vec<Value> {
@@ -129,16 +150,11 @@ impl Tools {
             .collect()
     }
 
-    pub fn definitions(&self) -> Vec<ToolDefinition> {
-        let mut definitions = self
-            .mcp
-            .values()
-            .map(|tool| tool.definition.clone())
-            .collect::<Vec<_>>();
+    pub fn skills_definition(&self) -> Vec<ToolDefinition> {
         if self.skills.is_empty() {
-            return definitions;
+            return Vec::new();
         }
-        definitions.push(ToolDefinition {
+        vec![ToolDefinition {
             name: SKILL.into(),
             description: format!(
                 "List the selected AgSDL skills, activate one by its key, or read a relative file from an activated skill by providing its key and path. Skills grant no permissions. Selected skills: {}",
@@ -148,26 +164,69 @@ impl Tools {
                 "type":"object","properties":{"name":{"type":"string"},"path":{"type":"string"}},
                 "additionalProperties":false
             }),
-        });
-        definitions
+        }]
     }
 }
 
 #[async_trait::async_trait]
 impl Extensions for Tools {
+    async fn prepare(&self) -> Result<(), String> {
+        let Some(setup) = self.setup.lock().await.take() else {
+            return Ok(());
+        };
+        let result = async {
+            let equipment = setup.await?;
+            match Self::catalogue_mcp(&equipment) {
+                Ok(catalogue) => Ok(McpTools {
+                    equipment,
+                    catalogue,
+                }),
+                Err(error) => {
+                    equipment.close().await?;
+                    Err(error)
+                }
+            }
+        }
+        .await;
+        match result {
+            Ok(tools) => self
+                .mcp
+                .set(tools)
+                .map_err(|_| "MCP equipment already initialized".into()),
+            Err(error) => {
+                let code = error.code.clone();
+                *self.failure.lock().unwrap() = Some(error);
+                Err(code)
+            }
+        }
+    }
+
+    fn definitions(&self) -> Vec<ToolDefinition> {
+        self.mcp
+            .get()
+            .into_iter()
+            .flat_map(|mcp| mcp.catalogue.values())
+            .map(|tool| tool.definition.clone())
+            .collect()
+    }
+
     async fn execute(&self, call: &ToolCall, cancel: &CancellationToken) -> Result<Page, String> {
         if call.name != SKILL {
-            let tool = self
-                .mcp
+            let mcp = self.mcp.get().ok_or("MCP equipment is unavailable")?;
+            let tool = mcp
+                .catalogue
                 .get(&call.name)
                 .ok_or("Unknown or denied MCP tool")?;
             let arguments =
                 serde_json::from_str(&call.arguments).map_err(|_| "Invalid MCP arguments")?;
-            let reply = self
+            let reply = mcp
                 .equipment
                 .call(&tool.server, &tool.name, arguments)
-                .await
-                .ok_or("MCP call denied, cancelled or unavailable")?;
+                .await;
+            if mcp.equipment.turn_cancel().is_cancelled() {
+                self.cancel.cancel();
+            }
+            let reply = reply.ok_or("MCP call denied, cancelled or unavailable")?;
             return Page::one_shot(&reply.to_string(), &call.id).map_err(|error| error.to_string());
         }
         if self.skills.is_empty() {

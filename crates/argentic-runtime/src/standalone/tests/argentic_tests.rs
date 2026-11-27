@@ -453,8 +453,8 @@ async fn stop_joins_the_stream_and_records_replayable_physical_end() {
 async fn steers_active_shared_work_and_preserves_the_conversation() {
     for memory in [false, true] {
         let mut server = Server::start().await;
-        let mut doc = document();
-        doc["agents"]["watcher"] = doc["agents"]["worker"].clone();
+        let (mut doc, cfg) = reviewer_fixture(&server);
+        doc["agents"]["watcher"] = document()["agents"]["worker"].clone();
         doc["flow"] = json!({"entry":"lead","steps":{
             "lead":{"type":"agent","agent":"watcher","instance":"new","prompt":"Lead mission","next":["work","watch"]},
             "work":{"type":"agent","agent":"worker","delivery":"queue","prompt":"Worker mission","next":"gather"},
@@ -467,7 +467,7 @@ async fn steers_active_shared_work_and_preserves_the_conversation() {
         let f = Fixture::new(&doc.to_string());
         let host = open(&f, memory)
             .await
-            .with_argentic(server.config(None))
+            .with_argentic(serde_json::from_value(cfg).unwrap())
             .unwrap();
         let run = start(&host).await;
         let submission = json!({"results":{"report":{"body":"done"}}});
@@ -543,7 +543,8 @@ async fn steers_active_shared_work_and_preserves_the_conversation() {
             "steer was consumed before response headers"
         );
         let (release, wait) = oneshot::channel::<()>();
-        let accepted = Request::tool_response("agsdl_submit_result", submission.clone());
+        let accepted =
+            Request::tool_response("write", json!({"path":"memo.txt","content":"approved"}));
         let body = futures::stream::iter([Ok::<_, std::io::Error>(": accepted\n\n".to_owned())])
             .chain(futures::stream::once(async move {
                 wait.await.unwrap();
@@ -552,6 +553,22 @@ async fn steers_active_shared_work_and_preserves_the_conversation() {
         request.send(StatusCode::OK, Body::from_stream(body), "text/event-stream");
         until(async || consumed(&host).await).await;
         release.send(()).unwrap();
+        let review = server.next().await;
+        assert_eq!(review.body["model"], "reviewer");
+        let context: Value =
+            serde_json::from_str(review.body["messages"][1]["content"].as_str().unwrap()).unwrap();
+        assert!(context["activeMission"]
+            .as_str()
+            .is_some_and(|mission| mission.ends_with("\nWorker mission")));
+        let steer = context["deliveredSteer"].as_array().unwrap();
+        assert_eq!(steer.len(), 1);
+        let message = steer[0]["message"].as_str().unwrap();
+        assert!(
+            message.contains("Message from watch") && message.contains("Steer mission fixture"),
+            "{message}"
+        );
+        send_text(review, r#"{"verdict":"DENY"}"#);
+        submit_done(server.next().await);
         let followup = server.next().await;
         let messages = followup.body["messages"].to_string();
         assert!(
@@ -748,6 +765,7 @@ async fn a_host_restart_interrupts_argentic_runs_and_new_runs_start_fresh() {
 async fn compaction_summarizes_old_turns_and_preserves_the_active_wire_prefix() {
     let mut server = Server::start().await;
     let mut doc = document();
+    doc["agents"]["worker"]["plan"] = json!(true);
     doc["agents"]["worker"]["instructions"] = json!("Stable rules for this run.");
     doc["agents"]["worker"]["harnessSettings"]["compaction"] =
         json!({"threshold":0.60,"keepRecentTurns":1});
@@ -763,18 +781,30 @@ async fn compaction_summarizes_old_turns_and_preserves_the_active_wire_prefix() 
     let first = server.next().await;
     let prefix = first.body["messages"].clone();
     let tools = first.body["tools"].clone();
-    let long_tool_turn = |request: Request, marker: &str, padding: char| {
+    let long_tool_turn = |request: Request, marker: &str, padding: char, tool: String| {
         let content = format!("{marker} {}", padding.to_string().repeat(12_000));
         let chunk = json!({"choices":[{"index":0,"delta":{"content":content}}]});
-        let tool = Request::tool_response("list", json!({}));
         request.send(
             StatusCode::OK,
             format!("data: {chunk}\n\n{tool}"),
             "text/event-stream",
         );
     };
-    long_tool_turn(first, "Old turn marker", 'a');
-    long_tool_turn(server.next().await, "Recent turn marker", 'b');
+    long_tool_turn(
+        first,
+        "Old turn marker",
+        'a',
+        Request::tool_response(
+            "plan",
+            json!({"steps":[{"step":"Keep this plan verbatim","status":"in_progress"}]}),
+        ),
+    );
+    long_tool_turn(
+        server.next().await,
+        "Recent turn marker",
+        'b',
+        Request::tool_response("list", json!({})),
+    );
     let summary = server.next().await;
     assert!(summary.body.get("tools").is_none(), "{}", summary.body);
     let transcript = summary.body["messages"].to_string();
@@ -803,7 +833,11 @@ async fn compaction_summarizes_old_turns_and_preserves_the_active_wire_prefix() 
         messages[3]["tool_calls"][0]["id"],
         messages[4]["tool_call_id"]
     );
-    assert_eq!(messages.len(), 5);
+    assert_eq!(messages.len(), 6);
+    assert_eq!(
+        messages[5]["content"],
+        r#"Current work plan (untrusted data): [{"step":"Keep this plan verbatim","status":"in_progress"}]"#,
+    );
     compacted.tool(
         "agsdl_submit_result",
         json!({"results":{"report":{"body":"compacted work"}}}),
@@ -864,7 +898,7 @@ async fn provider_failure_does_not_persist_the_echoed_credential() {
 }
 
 #[tokio::test]
-async fn qualification_refuses_unregistered_opted_out_and_unsupported_permissions() {
+async fn qualification_refuses_unregistered_and_opted_out_adapters() {
     let f = Fixture::new(&document().to_string());
     let host = f.open().await.unwrap();
     let error = host
@@ -878,29 +912,6 @@ async fn qualification_refuses_unregistered_opted_out_and_unsupported_permission
     let error = host.preflight(entry().as_ref(), false).await.unwrap_err();
     assert_eq!(error.code, "HARNESS_OPT_IN_REQUIRED");
     close(&host).await;
-    {
-        let action = "delegate";
-        let mut doc = document();
-        doc["agents"]["worker"]["permissions"] = json!({"preset":"read-only",
-            "rules":[{"action":action,"effect":"allow"}]});
-        let f = Fixture::new(&doc.to_string());
-        let host = f
-            .open()
-            .await
-            .unwrap()
-            .with_argentic(serde_json::from_value(config("http://127.0.0.1:1/v1", None)).unwrap())
-            .unwrap();
-        let error = host
-            .preflight_with_harnesses(entry().as_ref(), &opt_in())
-            .await
-            .unwrap_err();
-        assert_eq!(
-            error.pointer, "/agents/worker/permissions/rules/0/effect",
-            "{action}: {}",
-            error.message
-        );
-        close(&host).await;
-    }
 }
 
 #[tokio::test]
@@ -1385,6 +1396,154 @@ async fn shell_executes_and_stop_reaps_the_namespace_before_physical_end() {
     close(&host).await;
 }
 
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "aarch64", target_arch = "x86_64")
+))]
+mod shell_network_interactions {
+    use super::*;
+    use crate::persistence::public030::HumanScope030;
+    use tokio::net::TcpListener;
+
+    async fn fixture(server: &Server, plan_first: bool) -> (Fixture, Host, RetainedStart030) {
+        let (mut doc, mut cfg) = reviewer_fixture(server);
+        doc["agents"]["worker"]["permissions"] = json!({
+            "preset":"full","reviewer":"model","rules":[
+                {"action":"network","effect":"ask","match":"127.0.0.1"},
+                {"action":"delegate","effect":"allow"}
+            ]
+        });
+        if plan_first {
+            doc["agents"]["worker"]["planFirst"] = json!("auto");
+        }
+        let mut f = Fixture::new(&doc.to_string());
+        let mut policy: Value = serde_json::from_slice(&std::fs::read(&f.policy).unwrap()).unwrap();
+        policy["permissions"] = json!("full");
+        let bytes = serde_json::to_vec(&policy).unwrap();
+        std::fs::write(&f.policy, &bytes).unwrap();
+        f.digest = digest(bytes);
+        cfg["shellNetwork"] = json!("intercept");
+        let host = f
+            .open()
+            .await
+            .unwrap()
+            .with_argentic(serde_json::from_value(cfg).unwrap())
+            .unwrap();
+        let run = start(&host).await;
+        (f, host, run)
+    }
+
+    fn scope(run: &RetainedStart030) -> HumanScope030 {
+        HumanScope030 {
+            system_start_id: run.receipt.identity.system_start_id.clone(),
+            source: run.capture.source.clone(),
+        }
+    }
+
+    fn curl(request: Request, listener: &TcpListener) {
+        let address = listener.local_addr().unwrap();
+        request.tool(
+            "shell",
+            json!({"command":format!("curl -fsS --max-time 10 http://{address}/")}),
+        );
+    }
+
+    #[tokio::test]
+    async fn proxy_network_ask_bypasses_the_model_reviewer() {
+        let mut server = Server::start().await;
+        let (_f, host, run) = fixture(&server, false).await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let scope = scope(&run);
+        let request = server.next().await;
+        assert!(has_tool(&request, "shell"));
+        curl(request, &listener);
+        let ask = tokio::select! {
+            ask = pending_ask(&host, &scope) => ask,
+            request = server.next() => panic!("Unexpected provider request: {}", request.body),
+            _ = listener.accept() => panic!("Proxy connected before person approval"),
+        };
+        let facts: Value = serde_json::from_str(ask.flow_json.as_deref().unwrap()).unwrap();
+        assert_eq!(facts["content"]["kind"], "actionApproval");
+        assert_eq!(facts["content"]["title"], "Connect to 127.0.0.1");
+        host.submit_person(HumanSubmission {
+            scope,
+            request_id: ask.id,
+            expected_revision: ask.revision,
+            answer: api::HumanAnswer030::Decision {
+                decision: "no".into(),
+                comment: String::new(),
+            },
+        })
+        .await
+        .unwrap();
+        let next = tokio::select! {
+            request = server.next() => request,
+            _ = listener.accept() => panic!("Proxy connected after person denial"),
+        };
+        assert_eq!(next.body["model"], "gpt-5.5");
+        assert!(next.body["messages"].to_string().contains("403"));
+        let decisions: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM engine_flow030_work_events
+             WHERE decision_json IS NOT NULL
+               AND (ticket_json -> 'input' ->> 'eventJson') ->> '$.event.kind' = 'reviewerDecision'",
+        )
+        .fetch_one(&host.pool)
+        .await
+        .unwrap();
+        assert_eq!(decisions, 0);
+        submit_done(next);
+        completed(&finish(&host, &run).await);
+        close(&host).await;
+    }
+
+    #[tokio::test]
+    async fn plan_first_blocks_shell_before_any_proxy_approval() {
+        let mut server = Server::start().await;
+        let (_f, host, run) = fixture(&server, true).await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        curl(server.next().await, &listener);
+        let blocked = server.next().await;
+        assert!(blocked.body["messages"]
+            .to_string()
+            .contains("Present a plan"));
+        let scope = scope(&run);
+        assert!(host.humans(scope, None).await.unwrap().requests.is_empty());
+        send_plan(blocked, "Inspect the workspace");
+        let planned = server.next().await;
+        assert!(has_tool(&planned, "shell"));
+        submit_done(planned);
+        completed(&finish(&host, &run).await);
+        close(&host).await;
+    }
+
+    #[tokio::test]
+    async fn delegated_child_cannot_run_its_parents_network_enabled_shell() {
+        let mut server = Server::start().await;
+        let (_f, host, run) = fixture(&server, false).await;
+        let parent = server.next().await;
+        assert!(has_tool(&parent, "shell"));
+        delegate_task(parent);
+        let child = server.next().await;
+        assert!(!has_tool(&child, "shell"));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        curl(child, &listener);
+        let refused = server.next().await;
+        assert!(refused.body["messages"]
+            .to_string()
+            .contains("Shell tool is disabled"));
+        assert!(host
+            .humans(scope(&run), None)
+            .await
+            .unwrap()
+            .requests
+            .is_empty());
+        send_text(refused, "Child finished.");
+        submit_done(server.next().await);
+        completed(&finish(&host, &run).await);
+        close(&host).await;
+    }
+}
+
 #[tokio::test]
 async fn additional_directory_is_indexed_and_enforces_read_rules() {
     let mut server = Server::start().await;
@@ -1454,13 +1613,14 @@ async fn agent_mcp_stops_discovery_when_the_combined_catalogue_is_too_large() {
         }),
     );
     let upstream = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-    let chat = Server::start().await;
+    let mut chat = Server::start().await;
     let mut doc = document();
     doc["mcpServers"] = json!({
         "first":{"url":format!("http://{address}/first")},
         "second":{"url":format!("http://{address}/second")},
         "third":{"url":format!("http://{address}/third")}
     });
+    doc["agents"]["worker"]["planFirst"] = json!("auto");
     doc["agents"]["worker"]["mcpServers"] = json!(["first", "second", "third"]);
     doc["agents"]["worker"]["permissions"] = json!({"preset":"read-only","rules":[
         {"action":"mcp","match":"*/check","effect":"allow"}
@@ -1479,6 +1639,16 @@ async fn agent_mcp_stops_discovery_when_the_combined_catalogue_is_too_large() {
             Some(Default::default())
         }));
     let run = start(&host).await;
+    let initial = chat.next().await;
+    assert!(!has_tool(&initial, "mcp__first__check"));
+    assert!(admitted.lock().unwrap().is_empty());
+    initial.tool("mcp__first__check", json!({}));
+    let blocked = chat.next().await;
+    assert!(blocked.body["messages"]
+        .to_string()
+        .contains("Present a plan"));
+    assert!(admitted.lock().unwrap().is_empty());
+    send_plan(blocked, "Check both servers");
     assert_eq!(finish(&host, &run).await["verdict"], "failed");
     assert_eq!(*admitted.lock().unwrap(), ["first", "second"]);
     close(&host).await;
@@ -1672,5 +1842,704 @@ async fn confined_stdio_mcp_lists_and_calls_a_tool_then_joins_on_stop() {
     .await
     .unwrap();
     assert_eq!(finish(&host, &run).await["verdict"], "cancelled");
+    close(&host).await;
+}
+
+#[tokio::test]
+async fn plan_tool_reports_structured_progress() {
+    let mut server = Server::start().await;
+    let mut doc = document();
+    doc["agents"]["worker"]["plan"] = json!(true);
+    let f = Fixture::new(&doc.to_string());
+    let host = open(&f, true)
+        .await
+        .with_argentic(server.config(None))
+        .unwrap();
+    let run = start(&host).await;
+    let first = server.next().await;
+    assert!(first.body["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|tool| tool["function"]["name"] == "plan"));
+    let step = json!({"step":"Inspect the memo","status":"in_progress"});
+    first.tool("plan", json!({"steps":[step]}));
+    let next = server.next().await;
+    assert!(next.body["messages"]
+        .to_string()
+        .contains("Current work plan"));
+    let bodies: Vec<String> =
+        sqlx::query_scalar("SELECT ticket_json FROM engine_flow030_work_events WHERE decision_json IS NOT NULL ORDER BY rowid")
+            .fetch_all(&host.pool)
+            .await
+            .unwrap();
+    assert!(
+        bodies
+            .iter()
+            .any(|body| body.contains("planPresented") && body.contains("in_progress")),
+        "{bodies:?}"
+    );
+    submit_done(next);
+    completed(&finish(&host, &run).await);
+    close(&host).await;
+}
+
+fn submit_done(request: Request) {
+    request.tool(
+        "agsdl_submit_result",
+        json!({"results":{"report":{"body":"done"}}}),
+    );
+}
+
+fn plan_write_document(mode: &str) -> Value {
+    let mut doc = document();
+    doc["agents"]["worker"]["planFirst"] = json!(mode);
+    doc["agents"]["worker"]["permissions"] = json!({"preset":"workspace","rules":[forbid_shell()]});
+    doc
+}
+
+fn write_memo(request: Request) {
+    request.tool("write", json!({"path":"memo.txt","content":"approved"}));
+}
+
+fn send_plan(request: Request, step: &str) {
+    request.tool("plan", json!({"steps":[{"step":step,"status":"pending"}]}));
+}
+
+#[tokio::test]
+async fn plan_first_auto_blocks_writes_until_a_plan() {
+    let mut server = Server::start().await;
+    let f = Fixture::new(&plan_write_document("auto").to_string());
+    let host = open(&f, true)
+        .await
+        .with_argentic(server.config(None))
+        .unwrap();
+    let run = start(&host).await;
+    write_memo(server.next().await);
+    let blocked = server.next().await;
+    assert!(blocked.body["messages"]
+        .to_string()
+        .contains("Present a plan"));
+    assert!(!f.workspace.join("memo.txt").exists());
+    send_plan(blocked, "Write the memo");
+    write_memo(server.next().await);
+    submit_done(server.next().await);
+    completed(&finish(&host, &run).await);
+    assert_eq!(
+        std::fs::read_to_string(f.workspace.join("memo.txt")).unwrap(),
+        "approved"
+    );
+    close(&host).await;
+}
+
+#[tokio::test]
+async fn plan_first_ask_stays_locked_until_human_accepts_a_revision() {
+    for answer in ["accept revision", "reject", "timeout", "no person"] {
+        let mut server = Server::start().await;
+        let mut doc = plan_write_document("ask");
+        if answer == "timeout" {
+            doc["agents"]["worker"]["answerTimeoutMs"] = json!(250);
+        }
+        let f = Fixture::new(&doc.to_string());
+        let mut cfg = config(&server.base_url, None);
+        if answer == "no person" {
+            cfg["personReviewAvailable"] = json!(false);
+        }
+        let host = open(&f, true)
+            .await
+            .with_argentic(serde_json::from_value(cfg).unwrap())
+            .unwrap();
+        let run = start(&host).await;
+        let scope = persistence::public030::HumanScope030 {
+            system_start_id: run.receipt.identity.system_start_id.clone(),
+            source: run.capture.source.clone(),
+        };
+        let first = server.next().await;
+        if answer == "accept revision" {
+            let tools = [
+                (
+                    "plan",
+                    json!({"steps":[{"step":"Write the memo","status":"pending"}]}),
+                ),
+                (
+                    "plan",
+                    json!({"steps":[{"step":"Bypass the comment","status":"pending"}]}),
+                ),
+                (
+                    "agsdl_submit_result",
+                    json!({"results":{"report":{"body":"done"}}}),
+                ),
+            ];
+            let calls: Vec<_> = tools
+                .into_iter()
+                .enumerate()
+                .map(|(index, (name, args))| {
+                    json!({"index":index,"id":format!("plan-batch-{index}"),
+                    "function":{"name":name,"arguments":args.to_string()}})
+                })
+                .collect();
+            let chunk = json!({"choices":[{"index":0,"delta":{"tool_calls":calls},"finish_reason":"tool_calls"}]});
+            first.send(
+                StatusCode::OK,
+                format!("data: {chunk}\n\ndata: [DONE]\n\n"),
+                "text/event-stream",
+            );
+        } else {
+            send_plan(first, "Write the memo");
+        }
+        if answer == "no person" {
+            let state = finish(&host, &run).await;
+            assert!(state.to_string().contains("PLAN_REJECTED"), "{state}");
+            assert!(host.humans(scope, None).await.unwrap().requests.is_empty());
+            close(&host).await;
+            continue;
+        }
+        let ask = pending_ask(&host, &scope).await;
+        assert!(matches!(
+            ask.content,
+            persistence::public030::HumanContent030::Plan { .. }
+        ));
+        assert!(!f.workspace.join("memo.txt").exists());
+        if answer != "timeout" {
+            answer_person(
+                &host,
+                &scope,
+                ask,
+                "no",
+                if answer == "reject" {
+                    ""
+                } else {
+                    "Describe the output first"
+                },
+            )
+            .await;
+        }
+        if answer != "accept revision" {
+            let state = finish(&host, &run).await;
+            assert!(state.to_string().contains("PLAN_REJECTED"), "{state}");
+            assert!(!f.workspace.join("memo.txt").exists());
+        } else {
+            let revision = server.next().await;
+            assert!(revision.body["messages"]
+                .to_string()
+                .contains("Describe the output first"));
+            for index in 1..=2 {
+                let id = format!("plan-batch-{index}");
+                assert!(revision.body["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|msg| {
+                        msg["tool_call_id"] == id
+                            && msg["content"].as_str().is_some_and(|text| {
+                                text.contains("not executed because the plan must be revised")
+                            })
+                    }));
+            }
+            write_memo(revision);
+            let blocked = server.next().await;
+            assert!(blocked.body["messages"]
+                .to_string()
+                .contains("Present a plan"));
+            assert!(!f.workspace.join("memo.txt").exists());
+            send_plan(blocked, "Write a short memo about the result");
+            let ask = pending_ask(&host, &scope).await;
+            answer_person(&host, &scope, ask, "yes", "").await;
+            write_memo(server.next().await);
+            submit_done(server.next().await);
+            completed(&finish(&host, &run).await);
+            assert_eq!(
+                std::fs::read_to_string(f.workspace.join("memo.txt")).unwrap(),
+                "approved"
+            );
+        }
+        close(&host).await;
+    }
+}
+
+async fn answer_person(
+    host: &Host,
+    scope: &persistence::public030::HumanScope030,
+    request: persistence::public030::PublicHumanRequest030,
+    decision: &str,
+    comment: &str,
+) {
+    host.submit_person(HumanSubmission {
+        scope: scope.clone(),
+        request_id: request.id,
+        expected_revision: request.revision,
+        answer: api::HumanAnswer030::Decision {
+            decision: decision.into(),
+            comment: comment.into(),
+        },
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn model_reviewer_decides_exact_actions_and_fails_closed() {
+    for (reply, person, approved, verdict, source) in [
+        ("APPROVE", false, true, "APPROVE", "model"),
+        ("DENY", true, false, "DENY", "model"),
+        ("ESCALATE", true, true, "ESCALATE", "model"),
+        ("ESCALATE", false, false, "ESCALATE", "model"),
+        ("malformed", true, false, "DENY", "reviewUnavailable"),
+        ("network", true, false, "DENY", "reviewUnavailable"),
+    ] {
+        let mut server = Server::start().await;
+        let mut doc = document();
+        doc["agents"]["worker"]["permissions"] = json!({"preset":"workspace","reviewer":"model","rules":[
+            forbid_shell(), {"action":"write","match":"memo.txt","effect":"ask"}
+        ]});
+        let f = Fixture::new(&doc.to_string());
+        let mut cfg = config(&server.base_url, None);
+        cfg["providers"]["local"]["models"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!("reviewer"));
+        cfg["reviewerModel"] = json!("local/reviewer");
+        cfg["personReviewAvailable"] = json!(person);
+        let host = open(&f, true)
+            .await
+            .with_argentic(serde_json::from_value(cfg).unwrap())
+            .unwrap();
+        let run = start(&host).await;
+        let scope = persistence::public030::HumanScope030 {
+            system_start_id: run.receipt.identity.system_start_id.clone(),
+            source: run.capture.source.clone(),
+        };
+        write_memo(server.next().await);
+        let review = server.next().await;
+        assert_eq!(review.body["model"], "reviewer");
+        assert!(review.body["tools"].as_array().is_none_or(Vec::is_empty));
+        let context: Value =
+            serde_json::from_str(review.body["messages"][1]["content"].as_str().unwrap()).unwrap();
+        let args: Value = serde_json::from_str(
+            context["action"]["nativeRequest"]["params"]["reviewArguments"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(args, json!({"path":"memo.txt","content":"approved"}));
+        assert_eq!(context["permissionEffect"], "ask");
+        assert!(context["recentConversation"]
+            .to_string()
+            .contains("Read memo.txt"));
+        if reply == "network" {
+            review.send(StatusCode::UNAUTHORIZED, "unavailable", "text/plain");
+        } else {
+            let text = if reply == "malformed" {
+                "APPROVE!".into()
+            } else {
+                json!({"verdict":reply}).to_string()
+            };
+            send_text(review, &text);
+        }
+        if reply == "ESCALATE" && person {
+            let ask = pending_ask(&host, &scope).await;
+            assert!(!f.workspace.join("memo.txt").exists());
+            answer_person(&host, &scope, ask, "yes", "").await;
+        }
+        submit_done(server.next().await);
+        completed(&finish(&host, &run).await);
+        assert_eq!(f.workspace.join("memo.txt").exists(), approved, "{reply}");
+        let events: Vec<String> = sqlx::query_scalar(
+            "SELECT ticket_json -> 'input' ->> 'eventJson' FROM engine_flow030_work_events WHERE decision_json IS NOT NULL ORDER BY rowid",
+        ).fetch_all(&host.pool).await.unwrap();
+        assert!(
+            events.iter().any(|event| {
+                let event: Value = serde_json::from_str(event).unwrap();
+                event["event"]["kind"] == "reviewerDecision"
+                    && event["event"]["verdict"] == verdict
+                    && event["event"]["source"] == source
+                    && !event.to_string().contains("reviewArguments")
+            }),
+            "{events:?}"
+        );
+        if reply != "ESCALATE" || !person {
+            assert!(host.humans(scope, None).await.unwrap().requests.is_empty());
+        }
+        close(&host).await;
+    }
+}
+
+fn send_text(request: Request, text: &str) {
+    let chunk = json!({"choices":[{"index":0,"delta":{"content":text},"finish_reason":"stop"}]});
+    request.send(
+        StatusCode::OK,
+        format!("data: {chunk}\n\ndata: [DONE]\n\n"),
+        "text/event-stream",
+    );
+}
+
+fn reviewer_fixture(server: &Server) -> (Value, Value) {
+    let mut doc = document();
+    doc["agents"]["worker"]["permissions"] = json!({"preset":"workspace","reviewer":"model","rules":[
+        forbid_shell(), {"action":"write","match":"memo.txt","effect":"ask"}
+    ]});
+    let mut cfg = config(&server.base_url, None);
+    cfg["providers"]["local"]["models"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!("reviewer"));
+    cfg["reviewerModel"] = json!("local/reviewer");
+    (doc, cfg)
+}
+
+fn send_with_usage(request: Request, response: String, tokens: u32) {
+    let usage = json!({"choices":[],"usage":{"prompt_tokens":tokens - 5,"completion_tokens":5}});
+    request.send(
+        StatusCode::OK,
+        response.replace("data: [DONE]", &format!("data: {usage}\n\ndata: [DONE]")),
+        "text/event-stream",
+    );
+}
+
+#[tokio::test]
+async fn argentic_review_reserves_and_charges_shared_tokens() {
+    for first_charge in [8192, 7942, 20] {
+        let mut server = Server::start().await;
+        let (mut doc, cfg) = reviewer_fixture(&server);
+        doc["agents"]["worker"]["harnessSettings"]["maxTotalTokens"] = json!(8192);
+        let f = Fixture::new(&doc.to_string());
+        let host = open(&f, true)
+            .await
+            .with_argentic(serde_json::from_value(cfg).unwrap())
+            .unwrap();
+        let run = start(&host).await;
+        send_with_usage(
+            server.next().await,
+            Request::tool_response(
+                "write",
+                json!({
+                    "path":"memo.txt","content":"approved"
+                }),
+            ),
+            first_charge,
+        );
+
+        if first_charge == 8192 {
+            let state = tokio::select! {
+                req = server.next() => panic!("Unexpected model request with zero tokens left: {}", req.body["model"]),
+                state = finish(&host, &run) => state,
+            };
+            assert_eq!(state["verdict"], "failed");
+        } else {
+            let mut next = server.next().await;
+            let remaining = if first_charge == 20 {
+                assert_eq!(next.body["model"], "reviewer");
+                let reply = json!({"choices":[{"index":0,"delta":{"content":"{\"verdict\":\"DENY\"}"},"finish_reason":"stop"}]});
+                send_with_usage(next, format!("data: {reply}\n\ndata: [DONE]\n\n"), 200);
+                let read = Request::tool_response("list", json!({}));
+                send_with_usage(server.next().await, read, 8192 - 20 - 250);
+                next = server.next().await;
+                50
+            } else {
+                250
+            };
+            assert_eq!(next.body["model"], "gpt-5.5");
+            assert_eq!(next.body["max_completion_tokens"], remaining);
+            send_with_usage(
+                next,
+                Request::tool_response(
+                    "agsdl_submit_result",
+                    json!({
+                        "results":{"report":{"body":"done"}}
+                    }),
+                ),
+                25,
+            );
+            completed(&finish(&host, &run).await);
+        }
+        assert!(!f.workspace.join("memo.txt").exists());
+        close(&host).await;
+    }
+}
+
+#[tokio::test]
+async fn argentic_review_caps_requests_per_turn_and_work() {
+    let mut server = Server::start().await;
+    let (doc, cfg) = reviewer_fixture(&server);
+    let f = Fixture::new(&doc.to_string());
+    let host = open(&f, true)
+        .await
+        .with_argentic(serde_json::from_value(cfg).unwrap())
+        .unwrap();
+    let run = start(&host).await;
+    let mut next = server.next().await;
+    for turn in 0..9 {
+        assert_eq!(next.body["model"], "gpt-5.5");
+        let calls: Vec<_> = (0..5).map(|index| json!({"index":index,"id":format!("write-{turn}-{index}"),
+            "function":{"name":"write","arguments":"{\"path\":\"memo.txt\",\"content\":\"review me\"}"}})).collect();
+        let chunk = json!({"choices":[{"index":0,"delta":{"tool_calls":calls},"finish_reason":"tool_calls"}]});
+        next.send(
+            StatusCode::OK,
+            format!("data: {chunk}\n\ndata: [DONE]\n\n"),
+            "text/event-stream",
+        );
+        if turn < 8 {
+            for _ in 0..4 {
+                let review = server.next().await;
+                assert_eq!(review.body["model"], "reviewer");
+                send_text(review, r#"{"verdict":"DENY"}"#);
+            }
+        }
+        next = server.next().await;
+    }
+    assert_eq!(next.body["model"], "gpt-5.5");
+    submit_done(next);
+    completed(&finish(&host, &run).await);
+    assert!(!f.workspace.join("memo.txt").exists());
+    close(&host).await;
+}
+
+#[tokio::test]
+async fn argentic_review_records_a_refusal_at_final_policy_check() {
+    let mut server = Server::start().await;
+    let (doc, cfg) = reviewer_fixture(&server);
+    let f = Fixture::new(&doc.to_string());
+    let host = open(&f, true)
+        .await
+        .with_argentic(serde_json::from_value(cfg).unwrap())
+        .unwrap();
+    let run = start(&host).await;
+    write_memo(server.next().await);
+    let review = server.next().await;
+    assert_eq!(review.body["model"], "reviewer");
+    host.policies.0.write().await.policy.read_only = true;
+    send_text(review, r#"{"verdict":"APPROVE"}"#);
+    let next = server.next().await;
+    assert!(!f.workspace.join("memo.txt").exists());
+    submit_done(next);
+    completed(&finish(&host, &run).await);
+    let bodies: Vec<String> = sqlx::query_scalar(
+        "SELECT ticket_json -> 'input' ->> 'eventJson' FROM engine_flow030_work_events WHERE decision_json IS NOT NULL ORDER BY rowid",
+    ).fetch_all(&host.pool).await.unwrap();
+    let events: Vec<Value> = bodies
+        .iter()
+        .map(|body| serde_json::from_str(body).unwrap())
+        .collect();
+    let verdict = events
+        .iter()
+        .find(|entry| entry["event"]["kind"] == "reviewerDecision")
+        .unwrap();
+    assert_eq!(verdict["event"]["verdict"], "APPROVE");
+    assert!(
+        events.iter().any(|entry| {
+            let event = &entry["event"];
+            event["kind"] == "reviewerAuthorization"
+                && event["requestId"] == verdict["event"]["requestId"]
+                && event["allowed"] == false
+        }),
+        "{events:?}"
+    );
+    close(&host).await;
+}
+
+fn delegate_document(effect: &str) -> Value {
+    let mut doc = document();
+    doc["agents"]["worker"]["permissions"] = json!({
+        "preset":"read-only",
+        "reviewer":"person",
+        "rules":[{"action":"delegate","effect":effect}, {"action":"read","match":"private.txt","effect":"deny"}]
+    });
+    doc
+}
+
+fn has_tool(request: &Request, name: &str) -> bool {
+    request.body["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|tool| tool["function"]["name"] == name)
+}
+
+fn delegate_task(request: Request) {
+    request.tool("delegate", json!({"task":"Inspect the fixture"}));
+}
+
+#[tokio::test]
+async fn delegate_opens_a_fresh_conversation_with_narrowed_permissions() {
+    let mut server = Server::start().await;
+    let f = Fixture::new(&delegate_document("allow").to_string());
+    std::fs::write(f.workspace.join("private.txt"), "unreadable fixture data").unwrap();
+    let host = open(&f, true)
+        .await
+        .with_argentic(server.config(None))
+        .unwrap();
+    let run = start(&host).await;
+    let parent = server.next().await;
+    assert!(has_tool(&parent, "delegate"));
+    delegate_task(parent);
+    let child = server.next().await;
+    assert!(has_tool(&child, "read"));
+    for tool in ["write", "delegate", "shell", "agsdl_submit_result"] {
+        assert!(!has_tool(&child, tool));
+    }
+    let messages = child.body["messages"].to_string();
+    assert!(messages.contains("Inspect the fixture"));
+    assert!(!messages.contains("Read memo.txt"));
+    write_memo(child);
+    let child = server.next().await;
+    assert!(child.body["messages"]
+        .to_string()
+        .contains("Mutation tools are disabled"));
+    child.tool("read", json!({"path":"private.txt"}));
+    let child = server.next().await;
+    let messages = child.body["messages"].to_string();
+    assert!(messages.contains("Read permission denied"));
+    assert!(!messages.contains("unreadable fixture data"));
+    send_text(child, "The child finished its investigation.");
+    let parent = server.next().await;
+    let messages = parent.body["messages"].to_string();
+    assert!(messages.contains("The child finished its investigation."));
+    assert!(!messages.contains("Mutation tools are disabled"));
+    submit_done(parent);
+    completed(&finish(&host, &run).await);
+    assert!(!f.workspace.join("memo.txt").exists());
+    close(&host).await;
+}
+
+#[tokio::test]
+async fn delegate_enforces_deny_and_one_shot_person_approval() {
+    for (effect, accepted) in [("deny", false), ("ask", false), ("ask", true)] {
+        let mut server = Server::start().await;
+        let f = Fixture::new(&delegate_document(effect).to_string());
+        let host = open(&f, true)
+            .await
+            .with_argentic(server.config(None))
+            .unwrap();
+        let run = start(&host).await;
+        let parent = server.next().await;
+        assert_eq!(has_tool(&parent, "delegate"), effect == "ask");
+        delegate_task(parent);
+        if effect == "ask" {
+            let scope = persistence::public030::HumanScope030 {
+                system_start_id: run.receipt.identity.system_start_id.clone(),
+                source: run.capture.source.clone(),
+            };
+            let ask = pending_ask(&host, &scope).await;
+            answer_person(&host, &scope, ask, if accepted { "yes" } else { "no" }, "").await;
+        }
+        if accepted {
+            send_text(server.next().await, "Completed.");
+        }
+        let parent = server.next().await;
+        assert_eq!(
+            parent.body["messages"]
+                .to_string()
+                .contains("Delegation permission denied"),
+            !accepted,
+        );
+        submit_done(parent);
+        completed(&finish(&host, &run).await);
+        close(&host).await;
+    }
+}
+
+#[tokio::test]
+async fn delegation_charges_parent_turns_and_tokens() {
+    for max_turns in [2, 3] {
+        let mut server = Server::start().await;
+        let mut doc = delegate_document("allow");
+        doc["agents"]["worker"]["harnessSettings"]["maxTurns"] = json!(max_turns);
+        doc["agents"]["worker"]["harnessSettings"]["maxTotalTokens"] = json!(100);
+        let f = Fixture::new(&doc.to_string());
+        let host = open(&f, true)
+            .await
+            .with_argentic(server.config(None))
+            .unwrap();
+        let run = start(&host).await;
+        let parent = server.next().await;
+        assert_eq!(parent.body["max_completion_tokens"], 100);
+        let task = Request::tool_response("delegate", json!({"task":"Report success"}));
+        let parent_usage = json!({"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5}});
+        parent.send(
+            StatusCode::OK,
+            task.replace(
+                "data: [DONE]",
+                &format!("data: {parent_usage}\n\ndata: [DONE]"),
+            ),
+            "text/event-stream",
+        );
+        let child = server.next().await;
+        assert_eq!(child.body["max_completion_tokens"], 85);
+        let child_reply = json!({"choices":[{"index":0,"delta":{"content":"Child done"},"finish_reason":"stop"}],
+            "usage":{"prompt_tokens":20,"completion_tokens":5}});
+        child.send(
+            StatusCode::OK,
+            format!("data: {child_reply}\n\ndata: [DONE]\n\n"),
+            "text/event-stream",
+        );
+        if max_turns == 3 {
+            let next = server.next().await;
+            assert_eq!(next.body["max_completion_tokens"], 60);
+            let result = Request::tool_response(
+                "agsdl_submit_result",
+                json!({"results":{"report":{"body":"done"}}}),
+            );
+            let usage = json!({"choices":[],"usage":{"prompt_tokens":15,"completion_tokens":5}});
+            next.send(
+                StatusCode::OK,
+                result.replace("data: [DONE]", &format!("data: {usage}\n\ndata: [DONE]")),
+                "text/event-stream",
+            );
+            completed(&finish(&host, &run).await);
+        } else {
+            let state = finish(&host, &run).await;
+            assert_eq!(state["verdict"], "failed", "{state}");
+        }
+        close(&host).await;
+    }
+}
+
+#[tokio::test]
+async fn stop_joins_the_child_before_recording_physical_end() {
+    let mut server = Server::start().await;
+    let f = Fixture::new(&delegate_document("allow").to_string());
+    let host = open(&f, true)
+        .await
+        .with_argentic(server.config(None))
+        .unwrap();
+    let run = start(&host).await;
+    delegate_task(server.next().await);
+    let (dropped, did_drop) = oneshot::channel::<()>();
+    let (streaming, did_stream) = oneshot::channel();
+    let body = futures::stream::unfold(
+        (Some(streaming), dropped),
+        |(streaming, marker)| async move {
+            if let Some(streaming) = streaming {
+                let _ = streaming.send(());
+                Some((Ok::<_, std::io::Error>("data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"child is active\"}}]}\n\n"), (None, marker)))
+            } else {
+                std::future::pending().await
+            }
+        },
+    );
+    server
+        .next()
+        .await
+        .send(StatusCode::OK, Body::from_stream(body), "text/event-stream");
+    tokio::time::timeout(WAIT_FOR, did_stream)
+        .await
+        .unwrap()
+        .unwrap();
+    host.stop(EngineStopRequest {
+        request_id: "stop".into(),
+        system_start_id: run.receipt.identity.system_start_id.clone(),
+        activation_id: None,
+    })
+    .await
+    .unwrap();
+    assert_eq!(finish(&host, &run).await["verdict"], "cancelled");
+    let count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM engine_flow030_events WHERE json_extract(event_json,'$.kind.PhysicalEnded.evidence.descendants_joined')=1 AND receipt_json IS NOT NULL",
+    ).fetch_one(&host.pool).await.unwrap();
+    assert_eq!(count, 1);
+    assert!(tokio::time::timeout(WAIT_FOR, did_drop)
+        .await
+        .unwrap()
+        .is_err());
     close(&host).await;
 }

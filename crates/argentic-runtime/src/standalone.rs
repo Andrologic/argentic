@@ -244,10 +244,16 @@ impl ActionPolicySource for Policies {
                 let requests: Vec<ActionRequest> =
                     serde_json::from_value(native["params"]["actions"].clone())?;
                 let allowed = !requests.is_empty()
+                    && !(payload["reviewer"] == "model"
+                        && policy.reviewer() == Some(Reviewer::Person))
                     && requests.iter().all(|request| {
                         matches!(
                             request.action(),
-                            Action::Read | Action::Write | Action::Shell | Action::Network
+                            Action::Read
+                                | Action::Write
+                                | Action::Shell
+                                | Action::Network
+                                | Action::Delegate
                         ) && (!guard.policy.read_only || request.action() != Action::Write)
                             && evaluate_requested(&policy, request)
                                 .is_ok_and(|effect| effect != Effect::Deny)

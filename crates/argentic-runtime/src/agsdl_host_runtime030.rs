@@ -56,6 +56,7 @@ pub struct AgentWork030 {
     pub capture: StartCapture030,
     pub effect: FlowEffect030,
     pub policy: crate::permissions::EffectivePolicy,
+    pub plan_lock: Option<Arc<crate::harness::NativePlanLock030>>,
     pub tasks: StreamTasks,
     pub steer: crate::agsdl_host_steer030::SteerInbox030,
     pub operator: flow::operator030::AgentOperator030,
@@ -280,6 +281,7 @@ pub(crate) async fn start_agent_work030(
     let executor = executor_for(&prepared)?;
     let effective = prepared.policy().clone();
     let policy = executor.prepare(prepared)?;
+    let plan_lock = policy.plan_lock();
     let claim = flow::claim_expected(host.flow030(), host, pool, &effect.identity, &effect.id)
         .await?
         .ok_or_else(|| failure("STALE_REFERENCE", "work", "Expected agent start changed"))?;
@@ -322,6 +324,7 @@ pub(crate) async fn start_agent_work030(
                 capture: inspection.capture,
                 effect,
                 policy: effective,
+                plan_lock,
                 tasks: tasks_owned,
                 steer: inbox,
             };
