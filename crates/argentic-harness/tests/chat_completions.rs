@@ -411,3 +411,78 @@ async fn distinguishes_explicit_refusal_from_missing_headers_after_send() {
     assert_eq!(error, ProviderError::TurnTimeout);
     assert_eq!(delivery.status(), DeliveryStatus::Uncertain);
 }
+
+#[tokio::test]
+async fn work_providers_reuse_the_connection_without_reusing_credentials() {
+    use axum::{extract::ConnectInfo, http::HeaderMap};
+    use std::net::SocketAddr;
+
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let observed = requests.clone();
+    let service = Router::new().route(
+        "/chat",
+        post(move |ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap| {
+            let observed = observed.clone();
+            async move {
+                observed.lock().unwrap().push((
+                    peer,
+                    headers["authorization"].to_str().unwrap().to_owned(),
+                ));
+                (
+                    [("content-type", "text/event-stream")],
+                    concat!(
+                        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n",
+                        "data: [DONE]\n\n"
+                    ),
+                )
+            }
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/chat", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            service.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    let model = "test/model".parse().unwrap();
+    for key in ["first", "second"] {
+        let work = ChatCompletions::new("test", endpoint.parse().unwrap(), Some(key)).unwrap();
+        let chunks: Vec<_> = work
+            .stream(
+                Request {
+                    model: &model,
+                    reasoning_effort: None,
+                    messages: &[],
+                    tools: &[],
+                    tool_choice: Default::default(),
+                    tool_choice_rejected: None,
+                    max_output_tokens: 128,
+                    limits: TurnLimits::default(),
+                    delivery: DeliveryProgress::default(),
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        assert!(matches!(
+            chunks.last(),
+            Some(Chunk::End {
+                finish: Finish::Stop,
+                ..
+            })
+        ));
+    }
+    server.abort();
+    let observed = requests.lock().unwrap();
+    assert_eq!(observed.len(), 2);
+    assert_eq!(observed[0].0, observed[1].0);
+    assert_eq!(observed[0].1, "Bearer first");
+    assert_eq!(observed[1].1, "Bearer second");
+}

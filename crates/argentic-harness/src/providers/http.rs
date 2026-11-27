@@ -2,7 +2,7 @@ use std::{
     collections::VecDeque,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
-        Arc,
+        Arc, LazyLock,
     },
     time::{Duration, SystemTime},
 };
@@ -33,6 +33,18 @@ pub(super) fn bearer(api_key: Option<&str>) -> Result<Option<HeaderValue>, Provi
         .transpose()
 }
 
+// Reqwest keeps separate connection pools per origin. Credentials and
+// fallback flags stay with the provider instance for each work attempt.
+static CLIENT: LazyLock<Result<Client, ProviderError>> = LazyLock::new(|| {
+    Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(10))
+        .read_timeout(Duration::from_secs(120))
+        .pool_max_idle_per_host(8)
+        .build()
+        .map_err(transport)
+});
+
 pub(super) struct HttpStream {
     client: Client,
     endpoint: Url,
@@ -54,12 +66,7 @@ impl HttpStream {
         {
             return Err(ProviderError::Invalid("Invalid provider endpoint".into()));
         }
-        let client = Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(Duration::from_secs(10))
-            .read_timeout(Duration::from_secs(120))
-            .build()
-            .map_err(transport)?;
+        let client = CLIENT.as_ref().map_err(Clone::clone)?.clone();
         let mut headers = HeaderMap::new();
         if let Some(value) = credential {
             headers.insert(header, value);
