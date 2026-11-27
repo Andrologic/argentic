@@ -35,12 +35,17 @@ pub struct RuntimeProjectionQuery030 {
     pub snapshot_id: Option<String>,
 }
 
+/// Cursor returned by the previous projection page.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RuntimeProjectionContinuation030 {
     pub scope: RuntimeProjectionScope030,
     pub revision: String,
     pub offset: u32,
+    /// Binds an AgSDL 0.4 cursor to the external projection facts. Rust
+    /// struct literals must now provide this field. A 0.4 cursor issued
+    /// without it returns `CONFLICT`; request page one to get a new cursor.
+    /// AgSDL 0.3 cursor JSON remains compatible and omits this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot_version: Option<String>,
 }
@@ -363,6 +368,29 @@ mod tests {
             .items
             .len(),
             1
+        );
+        let old_page = page(scope.clone(), None, view.clone(), None).unwrap();
+        let old_cursor = serde_json::to_value(old_page.next_page.unwrap()).unwrap();
+        assert!(old_cursor.get("snapshotVersion").is_none());
+        let old_cursor: RuntimeProjectionContinuation030 =
+            serde_json::from_value(old_cursor).unwrap();
+        assert_eq!(
+            page(scope.clone(), Some(old_cursor.clone()), view.clone(), None)
+                .unwrap()
+                .items
+                .len(),
+            1
+        );
+        assert_eq!(
+            page(
+                scope.clone(),
+                Some(old_cursor),
+                view.clone(),
+                version.clone()
+            )
+            .unwrap_err()
+            .code,
+            "CONFLICT"
         );
         let admitted = BTreeSet::from(["effect".into()]);
         for changed_version in [
