@@ -252,7 +252,10 @@ impl crate::agsdl_host_calls::HostPort for CallHumans030 {
             .wake(&self.identity.system_start_id);
         Ok(id)
     }
-    async fn human_answer(&self, ticket: &str) -> crate::agsdl_host_calls::Result<String> {
+    async fn human_answer(
+        &self,
+        ticket: &str,
+    ) -> crate::agsdl_host_calls::Result<crate::agsdl_host_calls::HumanReply> {
         let host = self.app.clone();
         let broker = host
             .flow030()
@@ -276,15 +279,22 @@ impl crate::agsdl_host_calls::HostPort for CallHumans030 {
                     .await
                     .map_err(transport_error)?
                     .unwrap_or_else(|| "{\"action\":\"decline\"}".into());
-                broker
-                    .acknowledge(&host, &decision)
-                    .await
-                    .map_err(transport_error)?;
-                broker
-                    .pump(&host, &CancellationToken::new())
-                    .await
-                    .map_err(transport_error)?;
-                return Ok(answer);
+                drop(_operation);
+                return Ok(crate::agsdl_host_calls::HumanReply {
+                    body: answer,
+                    acknowledge: Box::pin(async move {
+                        let _operation = broker.operation.lock().await;
+                        broker
+                            .acknowledge(&host, &decision)
+                            .await
+                            .map_err(transport_error)?;
+                        broker
+                            .pump(&host, &CancellationToken::new())
+                            .await
+                            .map_err(transport_error)?;
+                        Ok(())
+                    }),
+                });
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }

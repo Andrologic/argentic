@@ -25,7 +25,7 @@ use tokio::{
 };
 
 use crate::agsdl_host_calls::{
-    CallError, CallIdentity, CommandGrant, Control, HostPort, PhysicalEvidence, Result,
+    CallError, CallIdentity, CommandGrant, Control, HostPort, HumanReply, PhysicalEvidence, Result,
 };
 use crate::process::ContainedBackgroundProcess;
 
@@ -872,7 +872,8 @@ impl Session {
                     if let Some(value) = fields.get("requestState") {
                         extra.push_str(&format!(",\"requestState\":{}", value.get()));
                     }
-                    if let Some(requests) = requests.filter(|r| !r.is_empty()) {
+                    let requests = requests.filter(|r| !r.is_empty());
+                    let human = if let Some(requests) = &requests {
                         for request in requests.values() {
                             let fields = object(request.get())?;
                             if fields.get("method").map(|v| string(v)).transpose()?.as_deref() != Some("elicitation/create") {
@@ -886,14 +887,25 @@ impl Session {
                         if !self.secret_values.is_empty() {
                             reject_secret_echo(&raw, &self.secret_values)?;
                         }
-                        let answers = wait_human(host, identity, &self.server, &raw, control).await?;
-                        let answers_map = object(&answers)?;
-                        if answers_map.len() != requests.len() || requests.keys().any(|id| !answers_map.contains_key(id)) {
-                            return Err(CallError::new("CORRELATION", "MCP form answers do not match requests"));
+                        Some(wait_human(host, identity, &self.server, &raw, control).await?)
+                    } else {
+                        None
+                    };
+                    let params = (|| {
+                        if let (Some((_, answer)), Some(requests)) = (&human, requests) {
+                            let answers_map = object(&answer.body)?;
+                            if answers_map.len() != requests.len() || requests.keys().any(|id| !answers_map.contains_key(id)) {
+                                return Err(CallError::new("CORRELATION", "MCP form answers do not match requests"));
+                            }
+                            extra.push_str(&format!(",\"inputResponses\":{}", answer.body));
                         }
-                        extra.push_str(&format!(",\"inputResponses\":{answers}"));
-                    }
-                    let (id, response) = self.handoff_tool(&format!("{{{base}{extra}}}"), control, None).await?;
+                        Ok(format!("{{{base}{extra}}}"))
+                    })();
+                    let handoff = match params {
+                        Ok(params) => self.handoff_tool(&params, control, None).await,
+                        Err(error) => Err(error),
+                    };
+                    let (id, response) = complete_human(host, human, handoff).await?;
                     raw = self.receive_tool(id, response, host, identity, control).await?;
                 }
                 Some("task") => return Err(CallError::new("UNCERTAIN", "MCP task requires a captured task completion adapter; remote effect may remain active")),
@@ -1015,29 +1027,33 @@ impl Session {
                             "Modern MCP forbids server-initiated requests",
                         ));
                     }
-                    let response = if method == "elicitation/create"
-                        && host.supports_human_requests()
+                    let human = if method == "elicitation/create" && host.supports_human_requests()
                     {
                         if !self.secret_values.is_empty() {
                             reject_secret_echo(&raw, &self.secret_values)?;
                         }
-                        let answer =
-                            wait_human(host, identity, &self.server, &raw, control).await?;
-                        object(&answer)?;
-                        format!("\"result\":{answer}")
-                    } else if method == "ping" {
-                        "\"result\":{}".into()
+                        Some(wait_human(host, identity, &self.server, &raw, control).await?)
                     } else {
-                        "\"error\":{\"code\":-32601,\"message\":\"Method not supported by this captured call\"}".into()
+                        None
                     };
-                    self.send(
-                        &format!(
-                            "{{\"jsonrpc\":\"2.0\",\"id\":{},{response}}}",
-                            request_id.get()
-                        ),
-                        control,
-                    )
-                    .await?;
+                    let delivery = match legacy_reply(
+                        &method,
+                        &human,
+                        "Method not supported by this captured call",
+                    ) {
+                        Ok(response) => {
+                            self.send(
+                                &format!(
+                                    "{{\"jsonrpc\":\"2.0\",\"id\":{},{response}}}",
+                                    request_id.get()
+                                ),
+                                control,
+                            )
+                            .await
+                        }
+                        Err(error) => Err(error),
+                    };
+                    complete_human(host, human, delivery).await?;
                 }
                 continue;
             }
@@ -1177,13 +1193,29 @@ fn secret_echo() -> CallError {
     CallError::transport("MCP message echoed a server secret")
 }
 
+type PendingHuman = (String, HumanReply);
+
+fn legacy_reply(method: &str, human: &Option<PendingHuman>, unsupported: &str) -> Result<String> {
+    if let Some((_, reply)) = human {
+        object(&reply.body)?;
+        Ok(format!("\"result\":{}", reply.body))
+    } else if method == "ping" {
+        Ok("\"result\":{}".into())
+    } else {
+        Ok(format!(
+            "\"error\":{{\"code\":-32601,\"message\":{}}}",
+            encode(&unsupported)?
+        ))
+    }
+}
+
 async fn wait_human(
     host: &dyn HostPort,
     identity: &CallIdentity,
     server: &str,
     raw: &str,
     control: &Control,
-) -> Result<String> {
+) -> Result<PendingHuman> {
     control.check()?;
     let ticket = host.human_open(identity, server, raw).await?;
     let answer = tokio::select! {
@@ -1191,8 +1223,31 @@ async fn wait_human(
         error = control.cancelled() => Err(error),
         answer = host.human_answer(&ticket) => answer,
     };
-    host.human_close(&ticket, &answer).await?;
-    answer
+    match answer {
+        Ok(reply) => Ok((ticket, reply)),
+        Err(error) => {
+            host.human_close(&ticket, &Err(error.clone())).await?;
+            Err(error)
+        }
+    }
+}
+
+async fn complete_human<T>(
+    host: &dyn HostPort,
+    human: Option<PendingHuman>,
+    delivery: Result<T>,
+) -> Result<T> {
+    if let Some((ticket, reply)) = human {
+        let outcome = match &delivery {
+            Ok(_) => {
+                reply.acknowledge.await?;
+                Ok(reply.body)
+            }
+            Err(error) => Err(error.clone()),
+        };
+        host.human_close(&ticket, &outcome).await?;
+    }
+    delivery
 }
 
 impl Drop for HttpWire {
@@ -1476,33 +1531,34 @@ async fn process_listener_message(
     let Some(id) = fields.get("id") else {
         return Ok(());
     };
-    let response = if method == "elicitation/create" {
-        let answer = wait_human(host, identity, server, raw, control).await?;
-        object(&answer)?;
-        format!("\"result\":{answer}")
-    } else if method == "ping" {
-        "\"result\":{}".into()
+    let human = if method == "elicitation/create" {
+        Some(wait_human(host, identity, server, raw, control).await?)
     } else {
-        "\"error\":{\"code\":-32601,\"message\":\"Method not supported\"}".into()
+        None
     };
-    let body = format!("{{\"jsonrpc\":\"2.0\",\"id\":{},{response}}}", id.get());
-    let mut request = client
-        .post(url.clone())
-        .headers(headers.clone())
-        .header("accept", "application/json, text/event-stream")
-        .header("content-type", "application/json")
-        .header("mcp-protocol-version", version)
-        .body(body);
-    if let Some(session) = session {
-        request = request.header("mcp-session-id", session);
-    }
-    let response = tokio::select! { biased; error = control.cancelled() => return Err(error), response = request.send() => response.map_err(|e| CallError::transport(e.to_string()))? };
-    if response.status() != reqwest::StatusCode::ACCEPTED {
-        return Err(CallError::transport(
-            "MCP GET request response was not accepted",
-        ));
-    }
-    Ok(())
+    let response = legacy_reply(&method, &human, "Method not supported");
+    let delivery = async {
+        let response = response?;
+        let body = format!("{{\"jsonrpc\":\"2.0\",\"id\":{},{response}}}", id.get());
+        let mut request = client
+            .post(url.clone())
+            .headers(headers.clone())
+            .header("accept", "application/json, text/event-stream")
+            .header("content-type", "application/json")
+            .header("mcp-protocol-version", version)
+            .body(body);
+        if let Some(session) = session {
+            request = request.header("mcp-session-id", session);
+        }
+        let response = tokio::select! { biased; error = control.cancelled() => return Err(error), response = request.send() => response.map_err(|e| CallError::transport(e.to_string()))? };
+        if response.status() != reqwest::StatusCode::ACCEPTED {
+            return Err(CallError::transport(
+                "MCP GET request response was not accepted",
+            ));
+        }
+        Ok(())
+    }.await;
+    complete_human(host, human, delivery).await
 }
 
 fn tool_budget_expired() -> CallError {

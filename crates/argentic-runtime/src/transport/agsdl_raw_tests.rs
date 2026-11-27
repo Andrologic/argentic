@@ -67,6 +67,9 @@ async fn http_handler(
     }
     if method.is_empty() || method == "notifications/initialized" {
         if method.is_empty() {
+            if state.mode == "rejected-human-response" {
+                return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
             state.answer_seen.notify_one();
         }
         return axum::http::StatusCode::ACCEPTED.into_response();
@@ -129,7 +132,7 @@ async fn http_handler(
                     assert!(value["params"].get("inputResponses").is_some());
                     r#"{"resultType":"complete","content":[],"structuredContent":{"large":9007199254740993},"isError":true}"#.into()
                 }
-            } else if state.mode == "sse" {
+            } else if matches!(state.mode, "sse" | "rejected-human-response") {
                 let raw = format!("data: {{\"jsonrpc\":\"2.0\",\"id\":\"human\",\"method\":\"elicitation/create\",\"params\":{{\"message\":\"Continue?\",\"requestedSchema\":{{\"type\":\"object\"}}}}}}\r\n\r\ndata: {{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"content\":[{{\"type\":\"text\",\"text\":\"done\"}}],\"isError\":false}}}}\r\n\r\n");
                 return ([("content-type", "text/event-stream"), ("mcp-session-id", "captured")], raw).into_response();
             } else { r#"{"content":[{"type":"text","text":"complete"}],"structuredContent":{"n":9007199254740993,"exp":1e999999},"isError":false}"#.into() }
@@ -328,6 +331,7 @@ async fn http_exact_receipts_human_waits_modern_continuation_and_no_replay() {
                 if mode == "sse" || mode == "modern" {
                     assert_eq!(host.human_open.load(Ordering::SeqCst), 1);
                     assert_eq!(host.human_closed.load(Ordering::SeqCst), 1);
+                    assert_eq!(host.human_delivered.load(Ordering::SeqCst), 1);
                 }
             }
         }
@@ -656,6 +660,17 @@ async fn legacy_get_request_is_answered_before_post_response_headers() {
     ));
     task.abort();
     let _ = task.await;
+}
+
+#[tokio::test]
+async fn rejected_human_response_does_not_acknowledge_delivery() {
+    let (server, _, task) = http_fixture("rejected-human-response").await;
+    let host = dummy_host();
+    let (result, _) = isolated(&host, server).await;
+    assert!(result.is_err());
+    assert_eq!(host.human_closed.load(Ordering::SeqCst), 1);
+    assert_eq!(host.human_delivered.load(Ordering::SeqCst), 0);
+    task.abort();
 }
 
 #[tokio::test]
