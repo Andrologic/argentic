@@ -101,7 +101,7 @@ impl Proxy {
             call,
             cancel: cancel.clone(),
             auth,
-            port,
+            host_tcp_port: cfg!(target_os = "macos").then_some(port),
             bytes: Arc::new(AtomicUsize::new(MAX_BYTES)),
             approvals: Mutex::new(()),
             upstreams: TaskTracker::new(),
@@ -142,7 +142,7 @@ struct Egress {
     call: ToolCall,
     cancel: CancellationToken,
     auth: String,
-    port: u16,
+    host_tcp_port: Option<u16>,
     bytes: Arc<AtomicUsize>,
     approvals: Mutex<()>,
     upstreams: TaskTracker,
@@ -359,7 +359,7 @@ impl Egress {
         let mut permitted = Vec::new();
         for address in addresses {
             let ip = address.ip().to_canonical();
-            if ip.is_loopback() && port == self.port {
+            if excluded_address(ip, port, self.host_tcp_port) {
                 continue;
             }
             let (restriction, exact_grant) = self
@@ -422,6 +422,11 @@ fn destination(host: &str) -> Option<String> {
         .and_then(|host| host.strip_suffix(']'))
         .unwrap_or(host);
     normalize_network_host(host)
+}
+
+fn excluded_address(ip: IpAddr, port: u16, host_tcp_port: Option<u16>) -> bool {
+    let ip = ip.to_canonical();
+    ip.is_unspecified() || (ip.is_loopback() && host_tcp_port == Some(port))
 }
 
 fn restricted_ip(ip: IpAddr) -> bool {
@@ -537,5 +542,25 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for Metered<T> {
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.io).poll_shutdown(cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unspecified_addresses_cannot_be_granted() {
+        for address in ["0.0.0.0", "::", "::0.0.0.0", "::ffff:0.0.0.0"] {
+            assert!(excluded_address(address.parse().unwrap(), 443, None));
+        }
+    }
+
+    #[test]
+    fn only_a_host_tcp_listener_excludes_its_port() {
+        let loopback = std::net::Ipv4Addr::LOCALHOST.into();
+        assert!(!excluded_address(loopback, 18999, None));
+        assert!(excluded_address(loopback, 18999, Some(18999)));
+        assert!(!excluded_address(loopback, 18998, Some(18999)));
     }
 }
