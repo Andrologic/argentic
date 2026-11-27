@@ -37,14 +37,16 @@ Ses défauts expliquent pourquoi on le refait plutôt que de le restaurer :
 | Sandbox OS | Linux d’abord (bwrap + seccomp, Landlock en complément), x86_64 et ARM64, pour le parcours serveur de Brigade. Extension ensuite du Seatbelt macOS existant. |
 | Base de travail | Relire et fusionner `feature/macro-host-integration` dans `main` avant le lot 0, car elle modifie les mêmes fichiers. |
 
-## Profil AgSDL visé
+## Profil AgSDL du module
 
 | Domaine | Cible du module `argentic` |
 | --- | --- |
-| `read`, `write`, `network`, `outside` | `sandbox` pour allow, ask et deny. L’OS interdit l’accès direct. Le proxy réseau peut demander une approbation au moment où le shell vise un hôte soumis à `ask`. |
+| `read`, `write` | `harness` pour `allow`, `sandbox` pour `ask` et `deny`. Le module déclare aussi `read.outside` en mode `sandbox`. |
+| `network` | `sandbox` pour `allow`, `ask` et `deny`. Le proxy réseau peut demander une approbation lorsque le shell vise un hôte soumis à `ask`. |
 | `shell` | `harness`, comparaison du texte complet de chaque sous-commande. |
 | `mcp`, `delegate` | `harness`. |
-| Toutes les propriétés | `native`, y compris `resources` (canal d’information distinct des instructions), `planFirst.ask` (verrou appliqué comme une permission), `reviewer.model` et `delivery.steer` (preuve de réception liée au work). |
+| `model.effort` | `approximate`. Si le fournisseur refuse le réglage d’effort, la tentative de travail se poursuit sans ce paramètre. |
+| Autres propriétés déclarées | `native`, y compris `resources` (canal d’information distinct des instructions), `planFirst.ask` (verrou appliqué comme une permission), `reviewer.model` et `delivery.steer` (preuve de réception liée au work). |
 
 Les exigences hors module s’appliquent aussi (`spec/agents.md`, `spec/flow.md`) :
 

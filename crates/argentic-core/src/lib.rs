@@ -1,16 +1,8 @@
-//! Argentic core: pure engine logic for AgSDL 0.3.
+//! Pure Argentic engine logic for AgSDL 0.3.0 and 0.4.0.
 //!
-//! D15 2.c ports the TypeScript evaluators here one sub-lot at a time; 2.c.1
-//! brought exact JSON values, value schemas and work integers, 2.c.2 the
-//! reader, the schema checker, flow graphs and static validation. 2.c.5a adds
-//! descriptive routes and captured message resolution. 2.c.3 adds compilation,
-//! contracts and explicit native data; numeric conversion stays at the boundary.
-//! Nothing
-//! outside tests calls this module before the 2.c.7 switch. The module must
-//! not use the desktop shell, storage drivers, generated IPC types or IO; the
-//! architecture guard counts forbidden names here, comments included. Besides
-//! the standard library, the staged ports use the locked schema regex, serde
-//! JSON data types, SHA-256 and the approved pure URL syntax parser.
+//! This crate validates and compiles authored documents, and calculates route,
+//! work and human-clock transitions from captured data. The runtime owns I/O,
+//! storage and native number conversion. Authored JSON stays lossless.
 pub(crate) mod calls_data;
 pub(crate) mod clock;
 pub(crate) mod compile;
@@ -25,6 +17,12 @@ pub(crate) mod reader;
 mod resource;
 pub(crate) mod route;
 pub(crate) mod schema;
+
+/// Whether an AgSDL result media type carries JSON, exactly as the published
+/// AgSDL reference validator decides it.
+pub fn is_json_media(media: &str) -> bool {
+    media == "application/json" || media.ends_with("+json")
+}
 
 pub const AGSDL_040: &str = "agsdl-0.4.0";
 

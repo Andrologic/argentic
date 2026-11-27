@@ -44,7 +44,7 @@ it names exists. A host checks itself by replaying the scenarios.
 
 | Path | Content |
 | --- | --- |
-| `runs/*.json` | One scenario per file, following the [scenario schema](../schema/run-scenario.schema.json). |
+| `runs/*.json` | One scenario per file, following the [scenario schema](schema/run-scenario.schema.json). |
 
 A scenario has a `document`, a path relative to this directory or the
 document itself, an optional `entry` message, a `timeline` and an `expect`.
@@ -56,7 +56,7 @@ For replay, configure the host to use each fan-out's declared
 the replay has no fan-out limit. For example, `fanout-keep.json` checks
 that both items are running and then ends item 1 first. This setup is
 specific to replay. In ordinary runs, the
-[fan-out rules](../spec/flow.md#fan-out) allow the host to lower the limit.
+[fan-out rules](https://github.com/Andrologic/AgSDL/blob/65e6529b0af3d1adba1dd9a1419e03c0ec347f21/spec/flow.md#fan-out) allow the host to lower the limit.
 If a host cannot use the replay setup, report the affected scenario as
 not run.
 

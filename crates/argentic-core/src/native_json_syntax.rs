@@ -209,6 +209,16 @@ pub(super) fn validate(raw: &Text) -> Result<()> {
     while let Some(state) = states.pop() {
         match state {
             State::Value => {
+                // The pending root end and each enclosing container account
+                // for one state apiece. Opening this container adds a level.
+                if matches!(token, Token::OpenArray | Token::OpenObject)
+                    && states.len() > crate::MAX_SOURCE_JSON_DEPTH
+                {
+                    return Err(error(format!(
+                        "Maximum JSON nesting depth is {}",
+                        crate::MAX_SOURCE_JSON_DEPTH
+                    )));
+                }
                 match token {
                     Token::OpenArray => states.push(State::ArrayStart),
                     Token::OpenObject => states.push(State::ObjectStart),

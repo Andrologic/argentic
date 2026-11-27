@@ -40,6 +40,8 @@ fn main() {
             tokio::time::timeout(Duration::from_secs(15), async {
                 exercise_reader().await;
                 exercise_project_sources().await;
+                #[cfg(all(target_os = "macos", feature = "agsdl-content-qa", debug_assertions))]
+                rejects_substituted_content_helper_image();
                 #[cfg(target_os = "linux")]
                 argentic_content::run().await;
             })
@@ -47,6 +49,38 @@ fn main() {
             .expect("content-reader integration test timed out");
         });
     println!("Native content reads passed on {}", std::env::consts::OS);
+}
+
+#[cfg(all(target_os = "macos", feature = "agsdl-content-qa", debug_assertions))]
+fn rejects_substituted_content_helper_image() {
+    use argentic_runtime::content_io::macos_launcher::{arm_image_swap, Launch};
+    use std::os::fd::AsRawFd;
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let helper = root.join("helper");
+    let replacement = root.join("replacement");
+    fs::copy(std::env::current_exe().unwrap(), &helper).unwrap();
+    // This only proves the QA swap hook runs right before Process.run: the
+    // substitute cannot execute at all. A valid Mach-O substitute currently
+    // runs despite the launch requirement; that defect is fixed separately.
+    let substitute = b"not a Mach-O executable";
+    fs::write(&replacement, substitute).unwrap();
+    let directory = Dir::open_ambient_dir(&root, ambient_authority()).unwrap();
+
+    arm_image_swap(&helper, &replacement).unwrap();
+    let refused = Launch::start(&helper, Path::new("fixture.txt"), directory.as_raw_fd());
+
+    // 4 is the bridge's launch failure; 6 would mean the QA swap never ran.
+    let error = refused
+        .err()
+        .expect("substituted helper image was launched");
+    assert!(
+        error.to_string().ends_with("(4)"),
+        "unexpected refusal: {error}"
+    );
+    assert_eq!(fs::read(helper).unwrap(), substitute);
+    assert!(!replacement.exists(), "QA replacement was not consumed");
 }
 
 async fn exercise_reader() {

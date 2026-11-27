@@ -214,7 +214,11 @@ async fn accept(listener: Listener, context: Arc<Egress>) {
                 remaining -= 1;
                 let context = context.clone();
                 jobs.spawn(async move {
-                    let Ok(fd) = client.as_fd().try_clone_to_owned().and_then(AsyncFd::new) else {
+                    let Ok(fd) = client.as_fd().try_clone_to_owned() else {
+                        return;
+                    };
+                    // SAFETY: The duplicate stays open and unchanged while AsyncFd owns it.
+                    let Ok(fd) = (unsafe { AsyncFd::register(fd) }) else {
                         return;
                     };
                     let base = context.clock.base_after(MAX_CONNECTION_TIME);
