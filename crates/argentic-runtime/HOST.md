@@ -493,6 +493,20 @@ this process's admitted runs on EOF, Ctrl-C or output disconnection. Keep the
 process alive for all commands and human answers. A separate invocation never
 adopts a live run.
 
+On Unix, the standalone host requires the data directory to have mode `0700`
+and `engine.sqlite` and its SQLite sidecars to have mode `0600`. All must
+belong to the user running the host. To migrate data created under an older
+umask, stop all hosts using the directory. Replace the example data path and
+run these commands as the data owner before restarting.
+
+```sh
+data=/absolute/private-host-data
+chmod 700 "$data"
+for file in "$data"/engine.sqlite "$data"/engine.sqlite-wal "$data"/engine.sqlite-shm "$data"/engine.sqlite-journal; do
+    if [ -f "$file" ]; then chmod 600 "$file"; fi
+done
+```
+
 The official private Codex profile is rooted at the explicit `--data` directory:
 `native-engines/codex-v1`, with the isolated context in `native-contexts/codex-v1`.
 Use the official login procedure in [Native Codex](https://github.com/Andrologic/Macro/blob/develop/docs/agsdl-codex-native.md#private-login),

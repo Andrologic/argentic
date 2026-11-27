@@ -75,19 +75,29 @@ pub async fn memory() -> Result<SqlitePool, sqlx::Error> {
 
 /// Validate existing private storage before SQLite can read or create sidecars.
 #[cfg(unix)]
-pub(crate) fn require_private(metadata: &std::fs::Metadata, mode: u32) -> std::io::Result<()> {
+pub(crate) fn require_private(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+    mode: u32,
+) -> crate::persistence::Result<()> {
     use std::os::unix::fs::MetadataExt;
     // SAFETY: geteuid has no arguments or memory preconditions.
-    if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o7777 != mode {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "Standalone storage must belong to the effective user and be owner-only",
+    let expected_uid = unsafe { libc::geteuid() };
+    let uid = metadata.uid();
+    let actual_mode = metadata.mode() & 0o7777;
+    if uid != expected_uid || actual_mode != mode {
+        return Err(crate::persistence::failure(
+            "PERMISSION",
+            "data",
+            &format!(
+                "Standalone storage {path:?}: expected UID {expected_uid} and mode {mode:04o}, found UID {uid} and mode {actual_mode:04o}"
+            ),
         ));
     }
     Ok(())
 }
 
-pub(crate) async fn open_standalone(path: &Path) -> Result<SqlitePool, sqlx::Error> {
+pub(crate) async fn open_standalone(path: &Path) -> crate::persistence::Result<SqlitePool> {
     let mut exists = false;
     for candidate in [
         path.to_path_buf(),
@@ -98,20 +108,22 @@ pub(crate) async fn open_standalone(path: &Path) -> Result<SqlitePool, sqlx::Err
         match std::fs::symlink_metadata(&candidate) {
             Ok(metadata) => {
                 if !metadata.is_file() {
-                    return Err(sqlx::Error::Protocol(
-                        "Standalone database and sidecars must be regular files".into(),
+                    return Err(crate::persistence::failure(
+                        "PERMISSION",
+                        "data",
+                        &format!("Standalone database path {candidate:?} must be a regular file"),
                     ));
                 }
                 #[cfg(unix)]
-                require_private(&metadata, 0o600)?;
+                require_private(&candidate, &metadata, 0o600)?;
                 exists |= candidate == path;
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
-            Err(e) => return Err(e.into()),
+            Err(e) => return Err(sqlx::Error::Io(e).into()),
         }
     }
     if !exists {
-        return create_file(path).await;
+        return Ok(create_file(path).await?);
     }
     // Check read-only first so an incompatible populated database is untouched.
     let mut reader =
@@ -123,9 +135,9 @@ pub(crate) async fn open_standalone(path: &Path) -> Result<SqlitePool, sqlx::Err
     if empty {
         // The standalone lock is held. initialize rechecks emptiness inside
         // BEGIN IMMEDIATE before submitting any schema changes.
-        create_file(path).await
+        Ok(create_file(path).await?)
     } else {
-        open_file(path).await
+        Ok(open_file(path).await?)
     }
 }
 

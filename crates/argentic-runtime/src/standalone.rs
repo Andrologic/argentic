@@ -364,14 +364,7 @@ impl Host {
         directory.create(data).map_err(io_error)?;
         let data = data.canonicalize().map_err(io_error)?;
         #[cfg(unix)]
-        crate::sqlite::require_private(&std::fs::metadata(&data).map_err(io_error)?, 0o700)
-            .map_err(|_| {
-                failure(
-                    "PERMISSION",
-                    "data",
-                    "Host data directory must be owned by the effective user and have mode 0700",
-                )
-            })?;
+        crate::sqlite::require_private(&data, &std::fs::metadata(&data).map_err(io_error)?, 0o700)?;
         if data.starts_with(&workspace) || workspace.starts_with(&data) {
             return Err(failure(
                 "PERMISSION",
@@ -1282,17 +1275,40 @@ mod tests {
         }
         host.shutdown(&[]).await.unwrap();
         host.close().await.unwrap();
-        let db = f.data.join("engine.sqlite");
-        std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o644)).unwrap();
-        assert!(f.open().await.is_err());
-        std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o600)).unwrap();
-        let wal = f.data.join("engine.sqlite-wal");
-        std::fs::write(&wal, []).unwrap();
-        std::fs::set_permissions(&wal, std::fs::Permissions::from_mode(0o644)).unwrap();
-        assert!(f.open().await.is_err());
-        std::fs::remove_file(wal).unwrap();
-        std::fs::set_permissions(&f.data, std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(f.open().await.is_err());
+        let uid = unsafe { libc::geteuid() };
+        for (name, expected, actual) in [
+            ("engine.sqlite", "0600", 0o644),
+            ("engine.sqlite-wal", "0600", 0o644),
+            ("engine.sqlite-shm", "0600", 0o644),
+            ("engine.sqlite-journal", "0600", 0o644),
+            ("", "0700", 0o755),
+        ] {
+            let path = f.data.join(name);
+            if name != "engine.sqlite" && !name.is_empty() {
+                std::fs::write(&path, []).unwrap();
+            }
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(actual)).unwrap();
+            let error = f.open().await.err().expect("insecure storage was opened");
+            assert_eq!(error.code, "PERMISSION");
+            assert!(error
+                .message
+                .contains(path.to_str().unwrap().trim_end_matches('/')));
+            assert!(error
+                .message
+                .contains(&format!("expected UID {uid} and mode {expected}")));
+            assert!(error
+                .message
+                .contains(&format!("found UID {uid} and mode {actual:04o}")));
+            if name == "engine.sqlite" || name.is_empty() {
+                let mode = if name.is_empty() { 0o700 } else { 0o600 };
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            } else {
+                std::fs::remove_file(&path).unwrap();
+            }
+        }
+        let reopened = f.open().await.unwrap();
+        reopened.shutdown(&[]).await.unwrap();
+        reopened.close().await.unwrap();
     }
 
     #[test]
