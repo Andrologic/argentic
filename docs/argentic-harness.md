@@ -283,8 +283,10 @@ et des extraits bornés de la conversation. Sa réponse JSON est limitée à
 `APPROVE`, `DENY` ou `ESCALATE`. Une erreur, un délai dépassé ou une réponse
 invalide produit un refus. Le Host exige une personne pour les demandes
 `ask` du shell, du réseau via le proxy et de MCP. Il vérifie la politique
-courante avant d’appliquer une acceptation. Le journal conserve le verdict
-et sa provenance. Les arguments bruts transmis au relecteur ne figurent pas
+courante avant d’appliquer une acceptation. Pour une opération sur des
+fichiers, il revérifie tous les chemins demandés une fois les verrous de
+l’outil acquis et maintient le verrou de politique jusqu’à la fin des
+lectures ou de la publication. Le journal conserve le verdict et sa provenance. Les arguments bruts transmis au relecteur ne figurent pas
 dans `reviewerDecision`.
 [AgSDL 0.4.0, reviewer](https://github.com/Andrologic/AgSDL/blob/v0.4.0/spec/agents.md#reviewer)
 

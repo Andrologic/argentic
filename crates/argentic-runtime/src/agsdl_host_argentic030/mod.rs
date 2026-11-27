@@ -615,6 +615,7 @@ impl Executor {
             registry = registry.with_authorizer(Arc::new(approval::ToolApprovals {
                 approvals: approvals.clone(),
                 person: person.clone(),
+                live_policy: self.approvals.clone(),
                 attempt: work.attempt.clone(),
                 sequence: std::sync::atomic::AtomicU64::new(0),
                 credential: credential.clone(),

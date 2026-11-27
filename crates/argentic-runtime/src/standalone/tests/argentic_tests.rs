@@ -1219,6 +1219,98 @@ async fn a_write_approval_is_one_shot_and_stop_cancels_the_next_ask() {
     close(&host).await;
 }
 
+#[tokio::test]
+async fn revoking_the_first_patch_path_while_the_second_awaits_review_prevents_publication() {
+    let mut server = Server::start().await;
+    let mut doc = document();
+    doc["agents"]["worker"]["permissions"] = json!({
+        "preset":"workspace", "reviewer":"person", "rules":[forbid_shell(),
+            {"action":"write","match":"first","effect":"ask"},
+            {"action":"write","match":"second","effect":"ask"}
+        ]
+    });
+    let f = Fixture::new(&doc.to_string());
+    let host = open(&f, true)
+        .await
+        .with_argentic(server.config(None))
+        .unwrap();
+    let run = start(&host).await;
+    let scope = persistence::public030::HumanScope030 {
+        system_start_id: run.receipt.identity.system_start_id.clone(),
+        source: run.capture.source.clone(),
+    };
+    let patch =
+        "*** Begin Patch\n*** Add File: first\n+one\n*** Add File: second\n+two\n*** End Patch";
+    server
+        .next()
+        .await
+        .tool("apply_patch", json!({"patch_text":patch}));
+
+    for path in ["first", "second"] {
+        let ask = tokio::time::timeout(WAIT_FOR, async {
+            loop {
+                let page = host.humans(scope.clone(), None).await.unwrap();
+                if let Some(request) = page.requests.into_iter().find(|r| r.status == "open") {
+                    break request;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let payload: String = sqlx::query_scalar(
+            "SELECT payload_json FROM engine_flow030_human_requests WHERE request_id=?",
+        )
+        .bind(&ask.id)
+        .fetch_one(&host.pool)
+        .await
+        .unwrap();
+        let payload: Value = serde_json::from_str(&payload).unwrap();
+        assert!(
+            payload["title"].as_str().unwrap().ends_with(path),
+            "{payload}"
+        );
+        if path == "second" {
+            let mut policy = host.policies.0.write().await;
+            policy.policy.permissions = serde_json::from_value(json!({
+                "preset": "workspace",
+                "rules": [{"action":"write","match":"first","effect":"deny"}]
+            }))
+            .unwrap();
+        }
+        host.submit_person(HumanSubmission {
+            scope: scope.clone(),
+            request_id: ask.id,
+            expected_revision: ask.revision,
+            answer: api::HumanAnswer030::Decision {
+                decision: "yes".into(),
+                comment: String::new(),
+            },
+        })
+        .await
+        .unwrap();
+    }
+
+    let next = server.next().await;
+    assert!(
+        !f.workspace.join("first").exists(),
+        "revoked path was published"
+    );
+    assert!(
+        !f.workspace.join("second").exists(),
+        "the rejected patch was partially published"
+    );
+    assert!(next.body["messages"]
+        .to_string()
+        .contains("permission denied"));
+    next.tool(
+        "agsdl_submit_result",
+        json!({"results":{"report":{"body":"done"}}}),
+    );
+    completed(&finish(&host, &run).await);
+    close(&host).await;
+}
+
 #[cfg(all(
     target_os = "linux",
     any(target_arch = "aarch64", target_arch = "x86_64")

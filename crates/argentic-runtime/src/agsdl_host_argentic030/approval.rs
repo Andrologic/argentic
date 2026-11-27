@@ -4,7 +4,7 @@ use crate::{
     permissions::{native_request_path, ActionRequest},
 };
 use argentic_harness::{
-    providers::ToolCall,
+    providers::{contains_credential, ToolCall},
     tools::{Approval, Authorizer},
 };
 use serde_json::json;
@@ -18,6 +18,7 @@ use tokio_util::sync::CancellationToken;
 
 pub(super) struct ToolApprovals {
     pub approvals: Arc<dyn CommandApprovals030>,
+    pub live_policy: Arc<dyn CommandApprovals030>,
     pub person: Option<Arc<dyn CommandApprovals030>>,
     pub attempt: FlowWorkAttempt030,
     pub sequence: AtomicU64,
@@ -25,14 +26,37 @@ pub(super) struct ToolApprovals {
     pub model: bool,
 }
 
-fn file_request(path: &Path, write: bool) -> Result<(String, Vec<ActionRequest>), String> {
+fn file_request(path: &Path, write: bool) -> Result<(String, ActionRequest), String> {
     let path = native_request_path(path).ok_or("Unsupported file approval path")?;
     let (verb, action) = if write {
         ("Write", ActionRequest::Write { path: path.clone() })
     } else {
         ("Read", ActionRequest::Read { path: path.clone() })
     };
-    Ok((format!("{verb} {path}"), vec![action]))
+    Ok((format!("{verb} {path}"), action))
+}
+
+impl ToolApprovals {
+    fn payload(
+        &self,
+        call: &ToolCall,
+        title: String,
+        actions: Vec<ActionRequest>,
+    ) -> serde_json::Value {
+        let sequence = self.sequence.fetch_add(1, Ordering::Relaxed);
+        json!({
+            "title": title,
+            "nativeRequest": {
+                "id": format!("argentic-{sequence}"),
+                "method": "argentic/tool/requestApproval",
+                "params": {
+                    "actions": actions,
+                    "tool": call.name,
+                    "argumentsDigest": format!("{:x}", Sha256::digest(call.arguments.as_bytes())),
+                }
+            }
+        })
+    }
 }
 
 #[async_trait::async_trait]
@@ -54,8 +78,10 @@ impl Authorizer for ToolApprovals {
             &self.approvals
         };
         let (title, actions) = match action {
-            Approval::Read(path) => file_request(path, false)?,
-            Approval::Write(path) => file_request(path, true)?,
+            Approval::Read(path) | Approval::Write(path) => {
+                let (title, action) = file_request(path, matches!(action, Approval::Write(_)))?;
+                (title, vec![action])
+            }
             Approval::Delegate => {
                 let args: serde_json::Value = serde_json::from_str(&call.arguments)
                     .map_err(|_| "Invalid delegation arguments")?;
@@ -79,26 +105,12 @@ impl Authorizer for ToolApprovals {
                 (format!("Run shell command: {command}"), actions)
             }
         };
-        if self
-            .credential
-            .as_ref()
-            .is_some_and(|key| title.contains(key))
-        {
+        if self.credential.as_deref().is_some_and(|key| {
+            contains_credential(&title, key) || contains_credential(&call.arguments, key)
+        }) {
             return Ok(false);
         }
-        let sequence = self.sequence.fetch_add(1, Ordering::Relaxed);
-        let mut payload = json!({
-            "title": title,
-            "nativeRequest": {
-                "id": format!("argentic-{sequence}"),
-                "method": "argentic/tool/requestApproval",
-                "params": {
-                    "actions": actions,
-                    "tool": call.name,
-                    "argumentsDigest": format!("{:x}", Sha256::digest(call.arguments.as_bytes())),
-                }
-            }
-        });
+        let mut payload = self.payload(call, title, actions);
         if self.model && permits_model_review(&payload["nativeRequest"]) {
             payload["nativeRequest"]["params"]["reviewArguments"] = json!(call.arguments);
         }
@@ -120,6 +132,34 @@ impl Authorizer for ToolApprovals {
             .map_err(|error| error.code)?;
         Ok(permit.load(Ordering::Relaxed) && !cancel.is_cancelled())
     }
+
+    async fn revalidate_files(
+        &self,
+        call: &ToolCall,
+        actions: &[Approval<'_>],
+    ) -> Result<Box<dyn Send + Sync>, String> {
+        let actions = actions
+            .iter()
+            .map(|action| match action {
+                Approval::Read(path) | Approval::Write(path) => {
+                    file_request(path, matches!(action, Approval::Write(_)))
+                        .map(|(_, action)| action)
+                }
+                _ => Err("Expected a file action".into()),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut payload = self.payload(call, "Revalidate file access".into(), actions);
+        if self.model {
+            payload["reviewer"] = json!("model");
+        }
+        let lease = self
+            .live_policy
+            .lock_argentic_files(&self.attempt, &payload)
+            .await
+            .map_err(|error| error.code)?
+            .ok_or("File permission denied by current policy")?;
+        Ok(Box::new(lease))
+    }
 }
 
 #[cfg(test)]
@@ -128,10 +168,9 @@ mod tests {
 
     fn assert_spelling(path: &Path, expected: &str) {
         for (write, action) in [(false, "read"), (true, "write")] {
-            let (_, requests) = file_request(path, write).unwrap();
-            assert_eq!(requests.len(), 1);
+            let (_, request) = file_request(path, write).unwrap();
             assert_eq!(
-                serde_json::to_value(&requests[0]).unwrap(),
+                serde_json::to_value(request).unwrap(),
                 json!({
                     "action": action,
                     "path": expected

@@ -219,7 +219,10 @@ and denies an `ask` without a reviewer.
 The engine can enable `write`, `edit` and `apply_patch` for paths relative to
 the selected root. Edits and patch updates require read and write permission.
 Patch moves also require permission on the destination. Writes use per-file queues
-and atomic replacement. A patch validates its whole plan before changing files.
+and atomic replacement. For an approved file operation, the Host rechecks every
+requested path against the live policy after the tool acquires its locks. It holds
+that policy lease through file I/O and publication. A patch validates its whole
+plan before changing files.
 An I/O failure during publication can leave some files changed, and the reply
 reports how many changes were applied. Parent directories must already exist.
 

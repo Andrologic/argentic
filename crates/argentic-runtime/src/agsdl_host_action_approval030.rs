@@ -3,7 +3,7 @@ use crate::{
     agsdl_host::HostState,
     agsdl_host_diagnostics030::{self as diagnostics, Stage},
     agsdl_host_flow030 as flow,
-    host::ActionPolicySource,
+    host::{ActionPolicyLease, ActionPolicySource},
     persistence::{failure, Result},
 };
 use futures::future::BoxFuture;
@@ -64,6 +64,15 @@ pub trait CommandApprovals030: Send + Sync {
         respond(false)
     }
 
+    /// Hold the live policy across an approved Argentic file operation.
+    fn lock_argentic_files<'a>(
+        &'a self,
+        _work: &'a flow::FlowWorkAttempt030,
+        _payload: &'a serde_json::Value,
+    ) -> BoxFuture<'a, Result<Option<ActionPolicyLease>>> {
+        Box::pin(async { Ok(None) })
+    }
+
     fn answer<'a>(
         &'a self,
         work: &'a flow::FlowWorkAttempt030,
@@ -74,6 +83,20 @@ pub trait CommandApprovals030: Send + Sync {
 }
 
 impl CommandApprovals030 for AgentActionHumans030 {
+    fn lock_argentic_files<'a>(
+        &'a self,
+        attempt: &'a flow::FlowWorkAttempt030,
+        payload: &'a serde_json::Value,
+    ) -> BoxFuture<'a, Result<Option<ActionPolicyLease>>> {
+        Box::pin(async move {
+            let view =
+                flow::inspect_run(self.host.flow030(), &self.host, &self.pool, attempt.owner())
+                    .await?;
+            let policy = self.policy.lock_current(&view.capture, payload).await?;
+            Ok(policy.allows().then_some(policy))
+        })
+    }
+
     fn answer_model<'a>(
         &'a self,
         attempt: &'a flow::FlowWorkAttempt030,

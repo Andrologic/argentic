@@ -193,6 +193,16 @@ pub trait Authorizer: Send + Sync {
         action: Approval<'_>,
         cancel: &CancellationToken,
     ) -> Result<bool, String>;
+
+    /// Recheck all file actions in an approved call after tool locks are held.
+    /// The returned guard stays with the worker until file IO finishes.
+    async fn revalidate_files(
+        &self,
+        _call: &ToolCall,
+        _actions: &[Approval<'_>],
+    ) -> Result<Box<dyn Send + Sync>, String> {
+        Ok(Box::new(()))
+    }
 }
 
 /// Per-work tools supplied by the embedding host.
@@ -371,6 +381,24 @@ impl Registry {
         check_cancel(cancel).map_err(|error| error.to_string())
     }
 
+    async fn lock_file_dispatch(
+        &self,
+        call: &ToolCall,
+        actions: &[(Effect, Approval<'_>)],
+        cancel: &CancellationToken,
+    ) -> Result<Option<Box<dyn Send + Sync>>, String> {
+        if !actions.iter().any(|(effect, _)| *effect == Effect::Ask) {
+            return Ok(None);
+        }
+        let authorizer = self.authorizer.as_ref().ok_or("File permission denied")?;
+        let actions: Vec<_> = actions.iter().map(|&(_, action)| action).collect();
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => Err("Tool cancelled".into()),
+            result = authorizer.revalidate_files(call, &actions) => result.map(Some),
+        }
+    }
+
     fn delegation_effect(&self) -> Effect {
         self.policy
             .iter()
@@ -502,16 +530,18 @@ impl Registry {
         } else {
             root.path.join(&path)
         };
-        self.authorize(
-            self.path_effect(root, Action::Read, &absolute),
-            &call,
-            Approval::Read(&absolute),
-            &cancel,
-        )
-        .await?;
+        let effect = self.path_effect(root, Action::Read, &absolute);
+        let action = Approval::Read(&absolute);
+        self.authorize(effect, &call, action, &cancel).await?;
+        let policy = self
+            .lock_file_dispatch(&call, &[(effect, action)], &cancel)
+            .await?;
         let registry = self.clone();
         tracker
-            .spawn_blocking(move || registry.read_sync(&call, args, &path, &cancel))
+            .spawn_blocking(move || {
+                let _policy = policy;
+                registry.read_sync(&call, args, &path, &cancel)
+            })
             .await
             .map_err(|e| e.to_string())?
     }
@@ -540,13 +570,19 @@ impl Registry {
             }
             requests.push((absolute, action, effect));
         }
-        for (path, action, effect) in &requests {
-            let request = match action {
-                Action::Read => Approval::Read(path),
-                Action::Write => Approval::Write(path),
-                _ => unreachable!("mutation requested a non-file action"),
-            };
-            self.authorize(*effect, &call, request, &cancel).await?;
+        let approvals: Vec<_> = requests
+            .iter()
+            .map(|(path, action, effect)| {
+                let request = match action {
+                    Action::Read => Approval::Read(path),
+                    Action::Write => Approval::Write(path),
+                    _ => unreachable!("mutation requested a non-file action"),
+                };
+                (*effect, request)
+            })
+            .collect();
+        for &(effect, request) in &approvals {
+            self.authorize(effect, &call, request, &cancel).await?;
         }
         let workspace = tokio::select! {
             biased;
@@ -554,10 +590,11 @@ impl Registry {
             guard = self.root_gates[index].clone().read_owned() => guard,
         };
         let guards = mutation::lock_paths(locks, &cancel).await?;
+        let policy = self.lock_file_dispatch(&call, &approvals, &cancel).await?;
         let registry = self.clone();
         tracker
             .spawn_blocking(move || {
-                let (_guards, _workspace) = (guards, workspace);
+                let (_guards, _workspace, _policy) = (guards, workspace, policy);
                 let text = mutation.run(&registry.roots[index], &cancel)?;
                 output::paginate(&text, &call.id, None, None).map_err(|error| error.to_string())
             })
