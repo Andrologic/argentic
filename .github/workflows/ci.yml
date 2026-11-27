@@ -137,10 +137,13 @@ jobs:
         working-directory: crates/argentic-runtime
         run: cargo test --locked --test content_reader
 
-      - name: Test macOS debug content reader
+      - name: Test macOS content reader QA in release with debug assertions
         if: runner.os == 'macOS'
         working-directory: crates/argentic-runtime
-        run: cargo test --locked --features agsdl-content-qa --test content_reader
+        env:
+          CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS: 'true'
+          CARGO_PROFILE_RELEASE_OPT_LEVEL: '0'
+        run: cargo test --locked --release --features agsdl-content-qa --test content_reader
 
       - name: Test argentic-runtime
         if: inputs.suite != 'reader'
