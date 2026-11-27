@@ -91,6 +91,17 @@ impl HostState {
         tasks: &StreamTasks,
         request: &EngineStopRequest,
     ) -> Result<persistence::public::PublicStopState> {
+        if !self
+            .flow030()
+            .supervisors
+            .is_registered(&request.system_start_id)?
+        {
+            if let Some(receipt) =
+                flow::read_retained_stop(pool, request, &self.native_generation()?).await?
+            {
+                return Ok(receipt);
+            }
+        }
         let result =
             crate::agsdl_host_stop030::request(self.flow030(), pool, tasks, request).await?;
         let asynchronous: bool = sqlx::query_scalar(
@@ -100,7 +111,12 @@ impl HostState {
         .bind(&request.system_start_id)
         .fetch_one(pool)
         .await?;
-        if !asynchronous {
+        if !asynchronous
+            && matches!(
+                result,
+                persistence::public::PublicStopState::Requested { .. }
+            )
+        {
             self.flow030()
                 .supervisors
                 .wait(&request.system_start_id)
@@ -114,9 +130,19 @@ impl HostState {
         tasks: &StreamTasks,
         system: &str,
     ) -> Result<persistence::public::PublicStopState> {
-        let result = crate::agsdl_host_stop030::ensure(self.flow030(), pool, tasks, system).await?;
-        self.flow030().supervisors.wake(system);
-        self.flow030().supervisors.wait(system).await?;
+        let generation = self.native_generation()?;
+        let result =
+            crate::agsdl_host_stop030::ensure(self.flow030(), pool, tasks, system, &generation)
+                .await?;
+        if self.flow030().supervisors.has_task(system)?
+            && matches!(
+                result,
+                persistence::public::PublicStopState::Requested { .. }
+            )
+        {
+            self.flow030().supervisors.wake(system);
+            self.flow030().supervisors.wait(system).await?;
+        }
         Ok(result)
     }
     pub async fn runtime_projection(

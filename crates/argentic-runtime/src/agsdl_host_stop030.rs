@@ -1,7 +1,7 @@
 //! Native stop supervision. A joined task is not, by itself, proof that its
 //! physical descendants ended; the reducer keeps such work pending until the
 //! owning executor supplies its physical receipt.
-use crate::agsdl_host_flow030::{FlowControl030, FlowHost030};
+use crate::agsdl_host_flow030::{self as flow, FlowControl030, FlowHost030};
 use crate::persistence::{
     dto::EngineStopRequest,
     failure,
@@ -21,8 +21,7 @@ pub(crate) async fn request(
     tasks: &StreamTasks,
     request: &EngineStopRequest,
 ) -> Result<PublicStopState> {
-    let admitted =
-        crate::agsdl_host_flow030::request_system_stop030(runtime, pool, request).await?;
+    let admitted = flow::request_system_stop030(runtime, pool, request).await?;
     runtime.supervisors.wake(&request.system_start_id);
     let _physical_pending = reconcile(runtime, pool, tasks, admitted.control()).await?;
     Ok(PublicStopState::Requested {
@@ -37,6 +36,7 @@ pub(crate) async fn ensure(
     pool: &SqlitePool,
     tasks: &StreamTasks,
     system_start_id: &str,
+    current_generation: &str,
 ) -> Result<PublicStopState> {
     let raw: Option<String> = sqlx::query_scalar(
         "SELECT request_json FROM engine_flow030_system_stop_requests WHERE system_id=? ORDER BY rowid DESC LIMIT 1",
@@ -55,10 +55,15 @@ pub(crate) async fn ensure(
     if request.system_start_id != system_start_id || request.activation_id.is_some() {
         return Err(failure("CORRELATION", "stop", "Stored Stop scope differs"));
     }
-    let admitted =
-        crate::agsdl_host_flow030::inspect_system_stop_request030(runtime, pool, &request)
-            .await?
-            .ok_or_else(|| failure("UNCERTAIN", "stop", "Stop receipt is unavailable"))?;
+    let unavailable = || failure("UNCERTAIN", "stop", "Stop receipt is unavailable");
+    if !runtime.supervisors.has_task(system_start_id)? {
+        if let Some(receipt) = flow::read_retained_stop(pool, &request, current_generation).await? {
+            return Ok(receipt);
+        }
+    }
+    let admitted = flow::inspect_system_stop_request030(runtime, pool, &request)
+        .await?
+        .ok_or_else(unavailable)?;
     let _physical_pending = reconcile(runtime, pool, tasks, admitted.control()).await?;
     Ok(PublicStopState::Requested {
         request_id: admitted.receipt().request_id.clone(),

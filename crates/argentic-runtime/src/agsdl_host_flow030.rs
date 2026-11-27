@@ -3016,10 +3016,7 @@ fn stop_marker(receipt: &NativeSystemStopReceipt030) -> FlowEvent030 {
     }
 }
 
-fn system_stop_control(
-    runtime: &FlowHost030,
-    request: &EngineStopRequest,
-) -> Result<Arc<FlowControl030>> {
+fn validate_system_stop_request(request: &EngineStopRequest) -> Result<()> {
     // A legacy activation-specific request must never acquire a broader scope.
     if request.activation_id.is_some() {
         return Err(failure(
@@ -3034,6 +3031,14 @@ fn system_stop_control(
     {
         return Err(refused());
     }
+    Ok(())
+}
+
+fn system_stop_control(
+    runtime: &FlowHost030,
+    request: &EngineStopRequest,
+) -> Result<Arc<FlowControl030>> {
+    validate_system_stop_request(request)?;
     runtime
         .controls
         .lock()
@@ -3058,34 +3063,88 @@ async fn stored_system_stop(
         .owner(db, &control.identity)
         .await
         .map_err(store_error)?;
-    let row = sqlx::query("SELECT system_id,invocation_id,owner_epoch,generation,request_json,receipt_json,event_id FROM engine_flow030_system_stop_requests WHERE request_id=?")
-        .bind(&request.request_id).fetch_optional(&mut *db).await?;
-    let Some(row) = row else {
+    let Some((receipt, _)) = read_system_stop_tx(db, request, None).await? else {
         return Ok(None);
     };
-    let receipt: NativeSystemStopReceipt030 = serde_json::from_str(row.get("receipt_json"))?;
-    if row.get::<&str, _>("system_id") != request.system_start_id
-        || row.get::<&str, _>("invocation_id") != control.identity.flow_invocation_id
-        || row.get::<&str, _>("owner_epoch") != control.owner.owner_epoch
-        || row.get::<&str, _>("generation") != control.generation
-        || row.get::<String, _>("request_json") != serde_json::to_string(request)?
-        || receipt.request_id != request.request_id
-        || receipt.identity != control.identity
+    if receipt.identity != control.identity
         || receipt.owner_epoch != control.owner.owner_epoch
         || receipt.generation != control.generation
-        || receipt.flow_event_id != row.get::<Option<String>, _>("event_id")
+    {
+        return Err(refused());
+    }
+    Ok(Some(receipt))
+}
+
+async fn read_system_stop_tx(
+    db: &mut SqliteConnection,
+    request: &EngineStopRequest,
+    current_generation: Option<&str>,
+) -> Result<Option<(NativeSystemStopReceipt030, FlowState030)>> {
+    let row = sqlx::query(
+        "SELECT s.system_id,s.invocation_id,s.owner_epoch,s.generation,s.request_json,s.receipt_json,s.event_id,
+                o.snapshot_id,o.capture_epoch,o.owner_epoch AS retained_owner_epoch,
+                o.generation AS retained_generation,r.state_json,e.event_json
+         FROM engine_flow030_system_stop_requests s
+         JOIN engine_flow030_owners o USING(system_id,invocation_id)
+         JOIN engine_flow030_runs r USING(system_id,invocation_id)
+         LEFT JOIN engine_flow030_events e
+           ON e.system_id=s.system_id AND e.invocation_id=s.invocation_id AND e.event_id=s.event_id
+         WHERE s.request_id=?1 AND (?2 IS NULL OR (o.status='revoked' AND o.generation<>?2))",
+    )
+    .bind(&request.request_id)
+    .bind(current_generation)
+    .fetch_optional(&mut *db)
+    .await?;
+    let Some(row) = row else { return Ok(None) };
+    let receipt: NativeSystemStopReceipt030 = serde_json::from_str(row.try_get("receipt_json")?)?;
+    let state: FlowState030 = serde_json::from_str(row.try_get("state_json")?)?;
+    let identity = &receipt.identity;
+    if row.try_get::<&str, _>("system_id")? != request.system_start_id
+        || row.try_get::<String, _>("request_json")? != serde_json::to_string(request)?
+        || receipt.request_id != request.request_id
+        || identity.system_start_id != request.system_start_id
+        || identity.flow_invocation_id != row.try_get::<&str, _>("invocation_id")?
+        || identity.snapshot_id != row.try_get::<&str, _>("snapshot_id")?
+        || identity.epoch != row.try_get::<&str, _>("capture_epoch")?
+        || *identity != state.identity
+        || receipt.owner_epoch != row.try_get::<&str, _>("owner_epoch")?
+        || receipt.owner_epoch != row.try_get::<&str, _>("retained_owner_epoch")?
+        || receipt.generation != row.try_get::<&str, _>("generation")?
+        || receipt.generation != row.try_get::<&str, _>("retained_generation")?
+        || receipt.flow_event_id != row.try_get::<Option<String>, _>("event_id")?
     {
         return Err(refused());
     }
     if let Some(event_id) = &receipt.flow_event_id {
         let marker = stop_marker(&receipt);
-        let raw: String = sqlx::query_scalar("SELECT event_json FROM engine_flow030_events WHERE system_id=? AND invocation_id=? AND event_id=?")
-            .bind(&control.identity.system_start_id).bind(&control.identity.flow_invocation_id).bind(event_id).fetch_one(&mut *db).await?;
-        if *event_id != marker.event_id || raw != serde_json::to_string(&marker)? {
+        if *event_id != marker.event_id
+            || row.try_get::<Option<String>, _>("event_json")?.as_deref()
+                != Some(serde_json::to_string(&marker)?.as_str())
+        {
             return Err(refused());
         }
     }
-    Ok(Some(receipt))
+    Ok(Some((receipt, state)))
+}
+
+/// Observe a committed Stop from a retired incarnation without cleanup authority.
+pub(crate) async fn read_retained_stop(
+    pool: &SqlitePool,
+    request: &EngineStopRequest,
+    current_generation: &str,
+) -> Result<Option<repository::public::PublicStopState>> {
+    use repository::public::PublicStopState;
+    validate_system_stop_request(request)?;
+    let mut db = pool.acquire().await?;
+    let retained = read_system_stop_tx(&mut db, request, Some(current_generation)).await?;
+    Ok(retained.map(|(receipt, state)| {
+        let request_id = receipt.request_id;
+        if state.verdict.is_some() && !state.activations.iter().any(|work| work.physical) {
+            PublicStopState::Confirmed { request_id }
+        } else {
+            PublicStopState::Uncertain { request_id }
+        }
+    }))
 }
 
 /// Product request identity is durable and idempotent. A second request on an

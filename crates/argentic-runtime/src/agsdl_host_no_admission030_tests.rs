@@ -552,7 +552,7 @@ async fn exercise(mode: u8) {
     if mode == 4 {
         let tasks = crate::tasks::StreamTasks::default();
         assert_eq!(
-            crate::agsdl_host_stop030::ensure(&runtime, &pool, &tasks, "system")
+            crate::agsdl_host_stop030::ensure(&runtime, &pool, &tasks, "system", "generation")
                 .await
                 .unwrap_err()
                 .code,
@@ -589,7 +589,7 @@ async fn exercise(mode: u8) {
             .unwrap();
         assert_eq!(replay.receipt().revision, first_revision);
         assert!(matches!(
-            crate::agsdl_host_stop030::ensure(&runtime, &pool, &tasks, "system")
+            crate::agsdl_host_stop030::ensure(&runtime, &pool, &tasks, "system", "generation")
                 .await
                 .unwrap(),
             crate::persistence::public::PublicStopState::Requested { .. }

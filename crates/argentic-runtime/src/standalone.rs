@@ -1828,6 +1828,25 @@ mod tests {
             .await
             .unwrap();
             assert_eq!(pending, 1);
+            let result = host
+                .stop(EngineStopRequest {
+                    request_id: "stop".into(),
+                    system_start_id: query.system_start_id.clone(),
+                    activation_id: None,
+                })
+                .await
+                .unwrap();
+            assert!(
+                matches!(result, persistence::public::PublicStopState::Confirmed { request_id } if request_id == "stop")
+            );
+            let ensured = host
+                .engine
+                .ensure_stop(&host.pool, &host.tasks, &query.system_start_id)
+                .await
+                .unwrap();
+            assert!(
+                matches!(ensured, persistence::public::PublicStopState::Confirmed { request_id } if request_id == "stop")
+            );
             host.shutdown(&[]).await.unwrap();
             host.close().await.unwrap();
             let replay = persistence::replay_verify030::verify_path030(

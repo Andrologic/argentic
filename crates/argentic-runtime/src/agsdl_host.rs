@@ -454,6 +454,10 @@ impl HostState {
             .ok_or_else(|| failure("RUNTIME_UNAVAILABLE", "", "Host not installed"))
     }
 
+    pub(crate) fn native_generation(&self) -> Result<String> {
+        Ok(self.native_incarnation()?.generation.clone())
+    }
+
     /// All process-owned runs, including call-only flows and unselected plans.
     /// Database/decoding failures are errors, never an empty activity snapshot.
     pub async fn shutdown_active_runs(&self, pool: &SqlitePool) -> Result<Vec<String>> {
