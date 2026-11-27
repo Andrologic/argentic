@@ -70,9 +70,11 @@ const BASE_RUNTIME_FILES: &[(&str, bool)] =
 pub(super) const NETWORK_MOUNTS: &[(&str, bool)] = &[("/etc/ssl/certs", true)];
 #[cfg(target_os = "macos")]
 pub(super) const RUNTIME_DIRS: &[&str] = &["/bin", "/usr/bin", "/usr/lib", "/System/Library"];
+// dyld reads the root directory entry during startup. Keep this a literal
+// so opening any directory below it still needs its own grant.
 #[cfg(target_os = "macos")]
 pub(super) const BASE_RUNTIME_FILES: &[(&str, bool)] =
-    &[("/dev/null", false), ("/dev/urandom", false)];
+    &[("/", false), ("/dev/null", false), ("/dev/urandom", false)];
 #[cfg(target_os = "macos")]
 pub(super) const NETWORK_MOUNTS: &[(&str, bool)] = &[("/private/etc/ssl", true)];
 
