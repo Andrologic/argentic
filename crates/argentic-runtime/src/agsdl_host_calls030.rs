@@ -620,8 +620,19 @@ pub(crate) async fn finish_joined_call030<A: CallAuthority030>(
     broker: &CallDataBroker030,
     joined: &JoinedCall030,
     cancel: &CancellationToken,
+    clock: Option<(
+        &crate::agsdl_host::HostState,
+        &crate::agsdl_host_human030::HumanBroker030,
+    )>,
 ) -> Result<CallSettlement030> {
+    let lock_clock = || async {
+        match clock {
+            Some((host, clock)) => Ok(Some(clock.lock_call_settlement(host, cancel).await?)),
+            None => Ok::<_, crate::persistence::dto::EngineFailure>(None),
+        }
+    };
     let prepared = {
+        let _clock = lock_clock().await?;
         let _gate = authority.admission_lock().lock_owned().await;
         authority
             .call_commits()
@@ -664,7 +675,14 @@ pub(crate) async fn finish_joined_call030<A: CallAuthority030>(
         let prepared = protocol::receive_tx(&mut tx, authority, joined).await?;
         // Stop is a native decision. Its already joined physical end needs
         // no resident worker, including when that worker has been closed.
-        if let Some(receipt) = protocol::finish_controlled_tx(&mut tx, authority, joined).await? {
+        if let Some(receipt) = protocol::finish_controlled_tx(
+            &mut tx,
+            authority,
+            joined,
+            clock.map(|(_, broker)| broker),
+        )
+        .await?
+        {
             commit_call_tx(tx, authority, joined.attempt()).await?;
             return Ok(receipt);
         }
@@ -683,6 +701,7 @@ pub(crate) async fn finish_joined_call030<A: CallAuthority030>(
             return Err(protocol::denied("Preparation failure is not a joined call"))
         }
     };
+    let _clock = lock_clock().await?;
     let _gate = authority.admission_lock().lock_owned().await;
     authority
         .call_commits()
@@ -692,12 +711,21 @@ pub(crate) async fn finish_joined_call030<A: CallAuthority030>(
         .execute(&mut *db)
         .await?;
     let mut tx = db.begin_with("BEGIN IMMEDIATE").await?;
-    let receipt =
-        if let Some(receipt) = protocol::finish_controlled_tx(&mut tx, authority, joined).await? {
-            receipt
-        } else {
-            protocol::finish_tx(&mut tx, authority, joined, result?).await?
-        };
+    let receipt = if let Some(receipt) =
+        protocol::finish_controlled_tx(&mut tx, authority, joined, clock.map(|(_, broker)| broker))
+            .await?
+    {
+        receipt
+    } else {
+        protocol::finish_tx(
+            &mut tx,
+            authority,
+            joined,
+            result?,
+            clock.map(|(_, broker)| broker),
+        )
+        .await?
+    };
     commit_call_tx(tx, authority, joined.attempt()).await?;
     Ok(receipt)
 }

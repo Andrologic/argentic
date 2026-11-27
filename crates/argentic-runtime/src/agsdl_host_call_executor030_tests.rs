@@ -1847,16 +1847,20 @@ impl crate::agsdl_host_call_executor030::CallTransport030 for ScheduledCommand {
 }
 
 #[cfg(unix)]
-async fn scheduled_command() -> Fixture {
+async fn scheduled_command(with_recovery: bool) -> Fixture {
     let mut doc = document(json!({"type":"call","command":"printf done","timeoutMs":60000}));
     doc["contract"] = json!(argentic_core::AGSDL_040);
+    if with_recovery {
+        doc["flow"]["steps"]["check"]["onError"] = json!("recover");
+        doc["flow"]["steps"]["recover"] = json!({"type":"call","command":"printf recovered"});
+    }
     Fixture::new(&json!({"document":doc,"entry":{},"timeline":[]}).to_string()).await
 }
 
 #[cfg(unix)]
 #[tokio::test]
 async fn stop_between_call_handoff_and_clock_admission_settles_not_started() {
-    let f = scheduled_command().await;
+    let f = scheduled_command(false).await;
     let runtime = f.host.flow030();
     let gap = runtime.install_operator_test_hook("call.clock_admission");
     let transport = Arc::new(ScheduledCommand(0.into()));
@@ -1895,4 +1899,42 @@ async fn stop_between_call_handoff_and_clock_admission_settles_not_started() {
     )
     .await;
     assert!(replay.ok, "{:?}", replay.divergence);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn replay_after_crash_immediately_following_call_terminal_commit() {
+    for with_recovery in [false, true] {
+        let f = scheduled_command(with_recovery).await;
+        let runtime = f.host.flow030();
+        let gap = runtime.install_operator_test_hook("call.terminal");
+        let _tasks = start_calls(&f, f.config.clone(), Arc::new(ScheduledCommand(0.into())));
+        tokio::time::timeout(std::time::Duration::from_secs(10), gap.reached())
+            .await
+            .unwrap();
+        let view = flow::inspect_run(runtime, &f.host, &f.pool, &f.owner)
+            .await
+            .unwrap()
+            .flow;
+        assert_eq!(
+            view.state.verdict.as_deref(),
+            if with_recovery { None } else { Some("failed") }
+        );
+        runtime
+            .supervisors
+            .crash_operator_fixture(&f.identity.system_start_id)
+            .await;
+        let path = f._temp.path().join("run.db");
+        let reopened = crate::sqlite::open_file(&path).await.unwrap();
+        crate::api::interrupt_previous_runs(&reopened)
+            .await
+            .unwrap();
+        let replay = crate::persistence::replay_verify030::verify_path030(
+            &path,
+            &f.identity.system_start_id,
+            &f.identity.flow_invocation_id,
+        )
+        .await;
+        assert!(replay.ok, "{:?}", replay.divergence);
+    }
 }

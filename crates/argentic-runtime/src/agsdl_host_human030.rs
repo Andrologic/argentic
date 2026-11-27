@@ -1453,6 +1453,10 @@ impl HumanBroker030 {
             self.pump(host, &CancellationToken::new()).await?;
             Ok(())
         }.await;
+        self.ignore_if_stopping(result).await
+    }
+
+    async fn ignore_if_stopping(&self, result: Result<()>) -> Result<()> {
         if result.is_err() {
             let stopping: bool = sqlx::query_scalar(
                 "SELECT json_extract(state_json,'$.stopping') FROM engine_flow030_runs WHERE system_id=? AND invocation_id=?",
@@ -1464,6 +1468,31 @@ impl HumanBroker030 {
         }
         result
     }
+
+    pub(crate) async fn pump_call_retirement(&self, host: &HostState) -> Result<()> {
+        self.ignore_if_stopping(self.settle_pending_flow_clock(host).await)
+            .await
+    }
+
+    pub(crate) async fn lock_call_settlement(
+        &self,
+        host: &HostState,
+        cancel: &CancellationToken,
+    ) -> Result<tokio::sync::MutexGuard<'_, ()>> {
+        let operation = self.operation.lock().await;
+        self.ignore_if_stopping(self.pump(host, cancel).await.map(|_| ()))
+            .await?;
+        Ok(operation)
+    }
+
+    pub(crate) async fn reserve_call_retirement_tx(
+        &self,
+        db: &mut SqliteConnection,
+        id: &str,
+    ) -> Result<()> {
+        self.reserve_finished_retirement_tx(db, id, "call").await
+    }
+
     pub(crate) async fn reserve_agent_retirement_tx(
         &self,
         db: &mut SqliteConnection,
@@ -1485,14 +1514,24 @@ impl HumanBroker030 {
                 "The work deadline already committed",
             ));
         }
+        self.reserve_finished_retirement_tx(db, id, "agent").await
+    }
+
+    async fn reserve_finished_retirement_tx(
+        &self,
+        db: &mut SqliteConnection,
+        id: &str,
+        kind: &str,
+    ) -> Result<()> {
         let active: bool = sqlx::query_scalar(
             "SELECT EXISTS (SELECT 1 FROM engine_flow030_clock_works
               WHERE system_id=? AND invocation_id=? AND activation_id=?
-                AND kind='agent' AND retired=0)",
+                AND kind=? AND retired=0)",
         )
         .bind(&self.identity.system_start_id)
         .bind(&self.identity.flow_invocation_id)
         .bind(id)
+        .bind(kind)
         .fetch_one(&mut *db)
         .await?;
         if active {

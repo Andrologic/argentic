@@ -654,7 +654,7 @@ pub(crate) async fn finish_terminal(
     joined: &JoinedCall030,
     cancel: &CancellationToken,
 ) -> Result<CallReceipt030> {
-    match super::finish_joined_call030(pool, authority, broker, joined, cancel).await? {
+    match super::finish_joined_call030(pool, authority, broker, joined, cancel, None).await? {
         CallSettlement030::Terminal { receipt } => Ok(receipt),
         CallSettlement030::Diagnostic { diagnostic } => {
             panic!("Unexpected diagnostic: {:?}", diagnostic.value())
@@ -1475,7 +1475,7 @@ async fn shared_call_diagnostic_commits_once_without_normalizer_or_reducer_repla
         .unwrap();
     let cancel = CancellationToken::new();
     let (result, ()) = tokio::join!(
-        super::finish_joined_call030(&f.pool, &f.authority, &broker, &joined, &cancel),
+        super::finish_joined_call030(&f.pool, &f.authority, &broker, &joined, &cancel, None),
         worker_once(&broker)
     );
     let CallSettlement030::Diagnostic { diagnostic } = result.unwrap() else {
@@ -1546,7 +1546,7 @@ async fn shared_call_diagnostic_commits_once_without_normalizer_or_reducer_repla
     for _ in 0..2 {
         let CallSettlement030::Diagnostic {
             diagnostic: repeated,
-        } = super::finish_joined_call030(&f.pool, &f.authority, &broker, &joined, &cancel)
+        } = super::finish_joined_call030(&f.pool, &f.authority, &broker, &joined, &cancel, None)
             .await
             .unwrap()
         else {
