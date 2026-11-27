@@ -51,6 +51,6 @@ fn main() {
     if build("-") {
         println!("cargo:rustc-cfg=argentic_shell_relay");
     } else {
-        println!("cargo:warning=Could not build the Argentic shell network relay. Install a C linker and target libc development files, then rebuild.");
+        println!("cargo:warning=Could not build the Argentic shell network relay. Install a C linker and target libc development files, then run `cargo clean -p argentic-harness` and rebuild.");
     }
 }

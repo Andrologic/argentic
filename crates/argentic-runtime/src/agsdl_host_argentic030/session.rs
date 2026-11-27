@@ -1,4 +1,4 @@
-use std::collections::{btree_map::Entry, BTreeMap};
+use std::{collections::BTreeMap, sync::Mutex};
 
 use argentic_harness::{providers::Message, r#loop::history_bytes};
 use flate2::{read::DeflateDecoder, write::DeflateEncoder, Compression};
@@ -29,29 +29,39 @@ impl IdleHistory {
         Self::Messages(messages)
     }
 
-    fn decode(bytes: &[u8]) -> serde_json::Result<Vec<Message>> {
-        serde_json::from_reader(DeflateDecoder::new(bytes))
+    fn decode(bytes: &[u8]) -> std::io::Result<Vec<Message>> {
+        use std::io::Read;
+
+        // Inflate first: serde_json reads byte by byte from a reader.
+        let mut json = Vec::with_capacity(bytes.len() * 4);
+        DeflateDecoder::new(bytes).read_to_end(&mut json)?;
+        Ok(serde_json::from_slice(&json)?)
     }
 
+    /// Removes the instance history and decodes it outside the sessions lock.
+    /// A history that cannot be decoded is put back unchanged.
     pub(super) fn take(
-        sessions: &mut BTreeMap<String, Self>,
+        sessions: &Mutex<BTreeMap<String, Self>>,
         instance: &str,
     ) -> Result<Vec<Message>> {
-        let Entry::Occupied(mut entry) = sessions.entry(instance.to_owned()) else {
+        let Some(idle) = sessions.lock().unwrap().remove(instance) else {
             return Ok(Vec::new());
         };
-        let history = match entry.get_mut() {
-            Self::Messages(messages) => std::mem::take(messages),
-            Self::Compressed(bytes) => Self::decode(bytes).map_err(|_| {
-                failure(
-                    "ARGENTIC_SESSION_HISTORY",
-                    "work",
-                    "Could not restore the continuous session history. The stored history was retained.",
-                )
-            })?,
+        let bytes = match idle {
+            Self::Messages(messages) => return Ok(messages),
+            Self::Compressed(bytes) => bytes,
         };
-        entry.remove();
-        Ok(history)
+        Self::decode(&bytes).map_err(|_| {
+            sessions
+                .lock()
+                .unwrap()
+                .insert(instance.to_owned(), Self::Compressed(bytes));
+            failure(
+                "ARGENTIC_SESSION_HISTORY",
+                "work",
+                "Could not restore the continuous session history. The stored history was retained.",
+            )
+        })
     }
 }
 
@@ -89,9 +99,9 @@ mod tests {
         let retained = compressed.len() + std::mem::size_of::<IdleHistory>();
         println!("idle instance: {retained} B retained for {initial} B of conversation");
         assert!(retained < initial / 4);
-        let mut sessions = BTreeMap::from([("worker".into(), idle)]);
-        assert_eq!(IdleHistory::take(&mut sessions, "worker").unwrap(), history);
-        assert!(sessions.is_empty());
+        let sessions = Mutex::new(BTreeMap::from([("worker".into(), idle)]));
+        assert_eq!(IdleHistory::take(&sessions, "worker").unwrap(), history);
+        assert!(sessions.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -123,18 +133,18 @@ mod tests {
 
         let idle = IdleHistory::sleep(history.clone());
         assert!(matches!(idle, IdleHistory::Messages(_)));
-        let mut sessions = BTreeMap::from([("worker".into(), idle)]);
-        assert_eq!(IdleHistory::take(&mut sessions, "worker").unwrap(), history);
+        let sessions = Mutex::new(BTreeMap::from([("worker".into(), idle)]));
+        assert_eq!(IdleHistory::take(&sessions, "worker").unwrap(), history);
 
         // Verify waking a stored history from an older implementation is non-destructive.
-        sessions.insert(
+        sessions.lock().unwrap().insert(
             "worker".into(),
             IdleHistory::Compressed(compressed.clone().into_boxed_slice()),
         );
-        let error = IdleHistory::take(&mut sessions, "worker").unwrap_err();
+        let error = IdleHistory::take(&sessions, "worker").unwrap_err();
         assert_eq!(error.code, "ARGENTIC_SESSION_HISTORY");
         assert!(
-            matches!(&sessions["worker"], IdleHistory::Compressed(bytes) if **bytes == compressed)
+            matches!(&sessions.lock().unwrap()["worker"], IdleHistory::Compressed(bytes) if **bytes == compressed)
         );
     }
 }

@@ -320,7 +320,9 @@ Chaque commande reçoit des inodes privés. Linux utilise `FICLONE` quand le
 système de fichiers permet de partager les blocs avec la source. Le repli
 copie les données avec jusqu’à quatre travailleurs et une file bornée.
 Le contrôle de publication conserve les empreintes des fichiers au lieu
-de leur contenu initial. Chaque racine de shell accepte 50 000 entrées et
+de leur contenu initial. Avant chaque écriture, il compare aussi le `ctime`
+et le SHA-256 du fichier hôte. Une écriture d’un autre processus entre ce
+contrôle et le renommage final reste possible, faute de verrou commun. Chaque racine de shell accepte 50 000 entrées et
 256 Mio, avec 8 Mio par fichier source ou publié. Le contrôle périodique
 du shell écrivable applique les mêmes plafonds d’entrées et de taille totale.
 

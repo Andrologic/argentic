@@ -191,7 +191,7 @@ fn run_inner(
         .map(|_| {
             RELAY.ok_or_else(|| {
                 io::Error::other(
-                    "The shell network relay was unavailable at build time. Install a C linker and target libc development files, then rebuild Argentic.",
+                    "The shell network relay was unavailable at build time. Install a C linker and target libc development files, then run `cargo clean -p argentic-harness` and rebuild Argentic.",
                 )
             })
         })

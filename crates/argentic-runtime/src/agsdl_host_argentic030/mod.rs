@@ -681,7 +681,7 @@ impl Executor {
         // Only carry conversation messages forward. Each work rebuilds its
         // instructions, submission schema and tools from its admitted policy.
         let history = if continuous {
-            session::IdleHistory::take(&mut self.sessions.lock().unwrap(), &instance)?
+            session::IdleHistory::take(&self.sessions, &instance)?
         } else {
             Vec::new()
         };
@@ -717,16 +717,17 @@ impl Executor {
             )
             .await;
         drop(harness);
-        Arc::try_unwrap(tools)
-            .map_err(|_| missing("toolRegistry"))?
-            .close()
-            .await?;
         // RunReport is available only after the provider stream and all tool
         // workers have ended. The engine joins this owner before routing.
+        // Store the history before cleanup so a cleanup failure keeps it.
         if continuous {
             let idle = session::IdleHistory::sleep(report.messages.into_iter().skip(1).collect());
             self.sessions.lock().unwrap().insert(instance, idle);
         }
+        Arc::try_unwrap(tools)
+            .map_err(|_| missing("toolRegistry"))?
+            .close()
+            .await?;
         match report.outcome {
             Ok(_) | Err(Failure::Cancelled | Failure::PlanRejected) => Ok(()),
             Err(Failure::Provider(error)) => Err(provider_failure(error)),
