@@ -195,7 +195,7 @@ action et effet, inutilisé. Il servira à prouver le profil du module.
 | 3 | Steer et livraison, instances partagées et nommées, compaction, effort, Anthropic Messages et Responses. | Scénarios steer et arrêt de la 0.4.0 verts. |
 | 4 | MCP, skills, `resources`, `directories`, proxy réseau, Seatbelt macOS. | Profil complet sur Linux et macOS. |
 | 5 | `plan`, `planFirst` auto et ask, `reviewer.model`, délégation. | Propriétés du lot `native`, délégation appliquée par le harnais. |
-| 6 | Performance : pools partagés, données immuables partagées, hibernation. | Mesures mémoire et latence par session, suivies en CI. |
+| 6 | Performance, relais natif, préparation du shell, pools partagés et hibernation. | Implémenté. La CI Linux relève la latence et la taille de l’historique au repos. |
 
 
 ### Lot 4a
@@ -308,3 +308,58 @@ appliqués par le harnais. Le lot reprend le principe des trois verdicts de
 Hermes Agent et l’objectif d’isolation d’oh-my-pi en Rust, sans reprendre
 leur code.
 [AgSDL 0.4.0, modules de harnais](https://github.com/Andrologic/AgSDL/blob/v0.4.0/spec/harnesses.md)
+
+
+### Lot 6
+
+Bubblewrap installe le relais Rust embarqué sur sa racine en lecture seule.
+Le relais écoute sur le loopback privé et relaie les connexions au socket
+Unix du proxy hôte. La fin du namespace ferme les connexions restantes.
+
+Chaque commande reçoit des inodes privés. Linux utilise `FICLONE` quand le
+système de fichiers permet de partager les blocs avec la source. Le repli
+copie les données avec jusqu’à quatre travailleurs et une file bornée.
+Le contrôle de publication conserve les empreintes des fichiers au lieu
+de leur contenu initial. Avant chaque écriture, il compare aussi le `ctime`
+et le SHA-256 du fichier hôte. Une écriture d’un autre processus entre ce
+contrôle et le renommage final reste possible, faute de verrou commun. Chaque racine de shell accepte 50 000 entrées et
+256 Mio, avec 8 Mio par fichier source ou publié. Le contrôle périodique
+du shell écrivable applique les mêmes plafonds d’entrées et de taille totale.
+
+Les fournisseurs partagent un client HTTP dont les connexions sont séparées
+par origine. Le client négocie HTTP/2 avec les serveurs compatibles. Chaque
+travail garde ses propres identifiants et ses décisions de repli en cas de
+refus d’un réglage par le fournisseur. Un run partage
+ses politiques compilées et ses définitions d’outils par contrat. Le
+catalogue de raisonnement est chargé une fois par processus. Dans les
+requêtes, le plan et le steer peuvent être ajoutés temporairement sans
+dupliquer l’historique.
+
+Entre deux travaux, le Host compresse l’historique d’une instance continue
+à partir de 64 Kio si cela économise au moins un quart de sa taille estimée.
+Il restaure le contenu et les données de reprise propres au fournisseur au
+travail suivant.
+
+Mesures locales en profil debug sur Linux ARM64, avec la copie de repli sur
+ext4. Les temps de préparation sont les médianes de trois passages et
+excluent la génération
+des fichiers, le lancement de Bash et la publication. Le tour scripté
+est la médiane de 256 tours sans appel réseau. La mesure mémoire suit les
+octets de la conversation et ceux que sa représentation conserve en mémoire.
+
+| Mesure | Avant | Après |
+| --- | ---: | ---: |
+| Préparation, 20 000 fichiers et 200 Mo | Refus à 64 Mio | 263 ms |
+| Préparation, 20 000 fichiers et 60 Mo | 543 ms | 250 ms |
+| Préparation du dépôt Argentic | 22 ms | 26 ms |
+| Tour scripté | 96 µs | 80 µs |
+| Historique au repos, fixture compressible | 123 108 octets d’historique | 1 083 octets retenus |
+
+La CI Linux affiche les mesures avec `shell_staging`,
+`scripted_turn_overhead` et `idle_history_round_trips_provider_replay`.
+Elle signale les fortes régressions au-delà de 8 s pour préparer un arbre,
+5 ms par tour scripté ou un quart des octets de la conversation pour
+l’historique au repos sur la fixture compressible.
+
+La recette de lecture de quatre fichiers suivie d’une soumission a réussi
+6 fois sur 6 avec LM Studio et `qwen/qwen3-4b-2507`.

@@ -19,6 +19,14 @@ Le chantier Macro a rapporté 42 tests du cœur, 346 du runtime, les contrôles 
 
 Le profil autonome est plus étroit que le langage. La recette Codex utilise le binaire officiel 0.167.0. La documentation borne Codex aux profils qualifiés macOS ARM64 et Linux ARM64 et le flux humain autonome à macOS ARM64. Les appels locaux de l’hôte, les autres harnais, le contenu réseau et MCP distant sont indisponibles dans cet hôte. Garder leurs refus explicites. [Contrat et limites de l’hôte](https://github.com/Andrologic/Macro/blob/82762f8d9e6a775198c90a1736a5d69edadf34d6/crates/argentic-runtime/HOST.md)
 
+## Harnais Argentic
+
+Sous Linux, le shell filtré utilise un relais Rust embarqué dans le binaire.
+La préparation d’un arbre de 20 000 fichiers et 60 Mo passe de 543 à 250 ms
+sur ext4. Le plafond par racine est désormais de 50 000 entrées et 256 Mio.
+La CI Linux relève aussi la latence d’un tour scripté et les octets retenus
+par l’historique d’une instance au repos. [Mesures et méthode](docs/argentic-harness.md#lot-6)
+
 ## Contribution avec GitHub Flow
 
 `main` est la branche de référence. Pour chaque changement, créer une branche

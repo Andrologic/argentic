@@ -3,12 +3,12 @@
 use super::super::{
     check_cancel, confined, denied,
     mutation::{Change, Target},
-    relative_path, Root, MAX_DEPTH, MAX_ENTRIES, MAX_FILE_BYTES, MAX_SCAN_BYTES,
+    relative_path, Root, MAX_DEPTH, MAX_FILE_BYTES,
 };
-use cap_fs_ext::{DirExt, FollowSymlinks, MetadataExt, OpenOptionsFollowExt};
+use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt, OsMetadataExt};
 use cap_std::{
     ambient_authority,
-    fs::{Dir, Metadata, OpenOptions, OpenOptionsExt, PermissionsExt as _},
+    fs::{Dir, File, Metadata, OpenOptions, OpenOptionsExt, PermissionsExt as _},
 };
 use std::{
     collections::BTreeMap,
@@ -20,7 +20,15 @@ use std::{
 };
 use tokio_util::sync::CancellationToken;
 
-type Original = BTreeMap<PathBuf, (Target, Vec<u8>, u32)>;
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
+
+use ring::digest::{digest, Digest, SHA256};
+
+const MAX_ENTRIES: usize = 50_000;
+const MAX_SCAN_BYTES: u64 = 256 * 1024 * 1024;
+type CopyJob = (PathBuf, File, Metadata, Metadata);
+type Original = BTreeMap<PathBuf, (Target, Digest, u32)>;
 
 pub(super) struct Snapshot {
     staging: tempfile::TempDir,
@@ -32,6 +40,7 @@ impl Snapshot {
         root: &Root,
         staging_parent: Option<&Path>,
         cancel: &CancellationToken,
+        writable: bool,
         readable: impl FnMut(&Path) -> bool,
     ) -> io::Result<Self> {
         let staging_parent = match staging_parent {
@@ -45,54 +54,68 @@ impl Snapshot {
             ));
         }
         let staging = tempfile::tempdir_in(staging_parent)?;
-        let mut original = BTreeMap::new();
-        walk(root, cancel, readable, false, |path, entry| {
-            match entry {
-                Entry::Directory => fs::create_dir(staging.path().join(path))?,
-                Entry::File(bytes, opened, parent) => {
-                    let mode = opened.permissions().mode() & 0o777;
-                    let target =
-                        Target::from_snapshot(path.to_owned(), parent.clone(), opened.clone());
-                    let path = path.to_owned();
-                    original.insert(path, (target, bytes, mode));
-                }
-            }
-            Ok(())
-        })?;
-        Self::populate(staging.path(), &original, cancel)?;
-        Ok(Self { staging, original })
-    }
-
-    fn populate(staging: &Path, original: &Original, cancel: &CancellationToken) -> io::Result<()> {
-        let files: Vec<_> = original.iter().collect();
-        let workers = std::thread::available_parallelism()
-            .map_or(1, usize::from)
-            .min(4);
-        let batch = files.len().div_ceil(workers).max(1);
-        std::thread::scope(|scope| {
-            let tasks: Vec<_> = files
-                .chunks(batch)
-                .map(|files| {
-                    scope.spawn(move || -> io::Result<()> {
-                        for (path, (_, bytes, mode)) in files {
+        let original = std::thread::scope(|scope| {
+            let workers = std::thread::available_parallelism()
+                .map_or(1, usize::from)
+                .min(4);
+            let (send, jobs) = std::sync::mpsc::sync_channel::<CopyJob>(64);
+            let jobs = std::sync::Arc::new(std::sync::Mutex::new(jobs));
+            let tasks: Vec<_> = (0..workers)
+                .map(|_| {
+                    let jobs = jobs.clone();
+                    let staging = staging.path();
+                    scope.spawn(move || -> io::Result<Original> {
+                        let mut original = BTreeMap::new();
+                        let mut copy = FileCopy::default();
+                        loop {
+                            let job = jobs
+                                .lock()
+                                .map_err(|_| {
+                                    io::Error::other("Shell staging queue is unavailable")
+                                })?
+                                .recv();
+                            let Ok((path, mut file, opened, parent)) = job else {
+                                return Ok(original);
+                            };
                             check_cancel(cancel)?;
-                            let mut dest = fs::OpenOptions::new()
-                                .write(true)
-                                .create_new(true)
-                                .open(staging.join(path))?;
-                            dest.write_all(bytes)?;
-                            dest.set_permissions(fs::Permissions::from_mode(*mode))?;
+                            let mode = opened.permissions().mode() & 0o777;
+                            let hash = copy.stage(
+                                &mut file,
+                                &opened,
+                                &staging.join(&path),
+                                mode,
+                                writable,
+                            )?;
+                            verify_file(root, &path, &file, &opened)?;
+                            if let Some(hash) = hash {
+                                let target =
+                                    Target::from_snapshot(path.clone(), parent, opened, hash);
+                                original.insert(path, (target, hash, mode));
+                            }
                         }
-                        Ok(())
                     })
                 })
                 .collect();
+            drop(jobs);
+            let scanned = walk(root, cancel, readable, false, |path, entry| match entry {
+                None => fs::create_dir(staging.path().join(path)),
+                Some((file, opened, parent)) => send
+                    .send((path.to_owned(), file, opened, parent.clone()))
+                    .map_err(|_| io::Error::other("Shell workspace copy workers stopped")),
+            });
+            drop(send);
+            let mut original = BTreeMap::new();
             for task in tasks {
-                task.join()
-                    .map_err(|_| io::Error::other("Shell workspace copy failed"))??;
+                original.append(
+                    &mut task
+                        .join()
+                        .map_err(|_| io::Error::other("Shell workspace copy worker failed"))??,
+                );
             }
-            Ok(())
-        })
+            scanned?;
+            Ok::<_, io::Error>(original)
+        })?;
+        Ok(Self { staging, original })
     }
 
     pub(super) fn path(&self) -> &Path {
@@ -111,21 +134,23 @@ impl Snapshot {
             path,
         };
         let mut changes = Vec::new();
+        let mut content = Vec::new();
         walk(
             &staging,
             cancel,
             |_| true,
             true,
             |path, entry| {
-                let Entry::File(bytes, opened, _) = entry else {
+                let Some((mut file, opened, _)) = entry else {
                     return Ok(());
                 };
                 let mode = opened.permissions().mode() & 0o777;
+                read_content(&mut file, opened.len(), &mut content)?;
+                verify_file(&staging, path, &file, &opened)?;
                 let original = self.original.remove(path);
-                if original
-                    .as_ref()
-                    .is_some_and(|(_, old, old_mode)| old == &bytes && *old_mode == mode)
-                {
+                if original.as_ref().is_some_and(|(_, old, old_mode)| {
+                    *old_mode == mode && old.as_ref() == digest(&SHA256, &content).as_ref()
+                }) {
                     return Ok(());
                 }
                 if !allowed(path) {
@@ -140,7 +165,7 @@ impl Snapshot {
                     }
                 };
                 target.revalidate(root)?;
-                let mut change = target.bytes(Some(bytes));
+                let mut change = target.bytes(Some(std::mem::take(&mut content)));
                 change.mode = Some(cap_std::fs::Permissions::from_std(
                     fs::Permissions::from_mode(mode),
                 ));
@@ -157,6 +182,99 @@ impl Snapshot {
         }
         Ok(changes)
     }
+}
+
+#[derive(Default)]
+struct FileCopy {
+    content: Vec<u8>,
+    #[cfg(target_os = "linux")]
+    unsupported_devices: std::collections::HashSet<u64>,
+}
+
+impl FileCopy {
+    fn stage(
+        &mut self,
+        source: &mut File,
+        metadata: &Metadata,
+        destination: &Path,
+        mode: u32,
+        writable: bool,
+    ) -> io::Result<Option<Digest>> {
+        let mut dest = fs::OpenOptions::new()
+            .read(writable)
+            .write(true)
+            .create_new(true)
+            .open(destination)?;
+        #[cfg(target_os = "linux")]
+        if !self.unsupported_devices.contains(&metadata.dev()) {
+            // Clone only the data into a fresh inode. Source ACLs and xattrs
+            // remain on the original, and a write can never mutate its blocks.
+            if unsafe { libc::ioctl(dest.as_raw_fd(), libc::FICLONE, source.as_raw_fd()) } == 0 {
+                if dest.metadata()?.len() != metadata.len() {
+                    return Err(changed());
+                }
+                let hash = if writable {
+                    read_content(&mut dest, metadata.len(), &mut self.content)?;
+                    Some(digest(&SHA256, &self.content))
+                } else {
+                    None
+                };
+                dest.set_permissions(fs::Permissions::from_mode(mode))?;
+                return Ok(hash);
+            }
+            let error = io::Error::last_os_error();
+            if !matches!(
+                error.raw_os_error(),
+                Some(libc::EXDEV | libc::EOPNOTSUPP | libc::ENOTTY | libc::EINVAL | libc::ENOSYS)
+            ) {
+                return Err(error);
+            }
+            self.unsupported_devices.insert(metadata.dev());
+        }
+        let hash = if writable {
+            read_content(source, metadata.len(), &mut self.content)?;
+            dest.write_all(&self.content)?;
+            Some(digest(&SHA256, &self.content))
+        } else {
+            // std can use in-kernel file copies on Linux. Bound the copy even
+            // if another process grows the source after the initial stat.
+            let source = source.try_clone()?.into_std();
+            if io::copy(&mut source.take(metadata.len() + 1), &mut dest)? != metadata.len() {
+                return Err(changed());
+            }
+            None
+        };
+        dest.set_permissions(fs::Permissions::from_mode(mode))?;
+        Ok(hash)
+    }
+}
+
+fn read_content(file: &mut impl Read, len: u64, content: &mut Vec<u8>) -> io::Result<()> {
+    content.clear();
+    content.reserve(len as usize);
+    file.take(len + 1).read_to_end(content)?;
+    if content.len() as u64 != len {
+        return Err(changed());
+    }
+    Ok(())
+}
+
+fn changed() -> io::Error {
+    io::Error::other("Shell workspace changed during snapshot")
+}
+
+fn verify_file(root: &Root, path: &Path, file: &File, opened: &Metadata) -> io::Result<()> {
+    root.verify_location(path, confined::location(file)?)?;
+    let current = file.metadata()?;
+    if current.nlink() != 1
+        || current.len() != opened.len()
+        || current.modified()? != opened.modified()?
+        || current.ctime() != opened.ctime()
+        || current.ctime_nsec() != opened.ctime_nsec()
+    {
+        return Err(changed());
+    }
+    Ok(())
 }
 
 /// Sample linked entries through directory handles without following symlinks.
@@ -212,7 +330,7 @@ impl Budget {
             let allocated = cap_std::fs::MetadataExt::blocks(&meta).saturating_mul(512);
             let logical = if meta.is_file() { meta.len() } else { 0 };
             self.bytes = self.bytes.saturating_add(allocated.max(logical));
-            if self.bytes > MAX_SCAN_BYTES as u64 {
+            if self.bytes > MAX_SCAN_BYTES {
                 return Err(io::Error::other(
                     "Shell workspace byte budget exceeded during execution",
                 ));
@@ -229,17 +347,14 @@ impl Budget {
     }
 }
 
-enum Entry<'a> {
-    Directory,
-    File(Vec<u8>, &'a Metadata, &'a Metadata),
-}
+type OpenedFile<'a> = (File, Metadata, &'a Metadata);
 
 fn walk(
     root: &Root,
     cancel: &CancellationToken,
     mut include: impl FnMut(&Path) -> bool,
     strict: bool,
-    mut visit: impl FnMut(&Path, Entry<'_>) -> io::Result<()>,
+    mut visit: impl FnMut(&Path, Option<OpenedFile<'_>>) -> io::Result<()>,
 ) -> io::Result<()> {
     let mut entries = 0;
     let mut bytes = 0;
@@ -273,7 +388,7 @@ fn walk(
             if kind.is_dir() {
                 let child = confined::directory(&directory, Path::new(&name))?;
                 root.verify_location(&path, confined::location(&child)?)?;
-                visit(&path, Entry::Directory)?;
+                visit(&path, None)?;
                 pending.push((path, child, depth + 1));
             } else if kind.is_file() {
                 let meta = directory.symlink_metadata(&name)?;
@@ -288,7 +403,7 @@ fn walk(
                     .read(true)
                     .follow(FollowSymlinks::No)
                     .custom_flags(libc::O_NONBLOCK);
-                let mut file = directory.open_with(&name, &options)?;
+                let file = directory.open_with(&name, &options)?;
                 root.verify_location(&path, confined::location(&file)?)?;
                 let opened = file.metadata()?;
                 if !opened.is_file()
@@ -298,24 +413,11 @@ fn walk(
                 {
                     return Err(denied());
                 }
-                let mut content =
-                    Vec::with_capacity(opened.len().min(MAX_FILE_BYTES as u64) as usize);
-                (&mut file)
-                    .take((MAX_FILE_BYTES + 1) as u64)
-                    .read_to_end(&mut content)?;
-                root.verify_location(&path, confined::location(&file)?)?;
-                let current = file.metadata()?;
-                if current.nlink() != 1
-                    || current.len() != opened.len()
-                    || current.modified()? != opened.modified()?
-                {
-                    return Err(io::Error::other("Shell workspace changed during snapshot"));
-                }
-                bytes += content.len();
-                if content.len() > MAX_FILE_BYTES || bytes > MAX_SCAN_BYTES {
+                bytes = u64::saturating_add(bytes, opened.len());
+                if opened.len() > MAX_FILE_BYTES as u64 || bytes > MAX_SCAN_BYTES {
                     return Err(io::Error::other("Shell workspace byte budget exceeded"));
                 }
-                visit(&path, Entry::File(content, &opened, &parent_metadata))?;
+                visit(&path, Some((file, opened, &parent_metadata)))?;
             } else if strict {
                 return Err(io::Error::other(
                     "Cannot publish symlinks or special files from shell",
@@ -325,4 +427,85 @@ fn walk(
         root.verify_location(&parent, confined::location(&directory)?)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn publication_rejects_a_host_edit_with_restored_mtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().canonicalize().unwrap();
+        let file = path.join("file");
+        fs::write(&file, "old").unwrap();
+        let mtime = fs::metadata(&file).unwrap().modified().unwrap();
+        let root = Root {
+            directory: Dir::open_ambient_dir(&path, ambient_authority()).unwrap(),
+            path,
+        };
+        let cancel = CancellationToken::new();
+        let snapshot = Snapshot::new(&root, None, &cancel, true, |_| true).unwrap();
+        fs::write(snapshot.path().join("file"), "new").unwrap();
+        let changes = snapshot.changes(&root, &cancel, |_| true).unwrap();
+        assert_eq!(changes.len(), 1);
+
+        fs::write(&file, "ext").unwrap();
+        fs::File::open(&file).unwrap().set_modified(mtime).unwrap();
+        assert_eq!(fs::metadata(&file).unwrap().modified().unwrap(), mtime);
+        assert!(changes[0].apply(&root, &cancel).is_err());
+        assert_eq!(fs::read_to_string(&file).unwrap(), "ext");
+
+        // Exercise the digest check independently of filesystem timestamp granularity.
+        let target = Target::from_snapshot(
+            "file".into(),
+            root.directory.dir_metadata().unwrap(),
+            root.directory.symlink_metadata("file").unwrap(),
+            digest(&SHA256, b"old"),
+        );
+        assert!(target.bytes(None).apply(&root, &cancel).is_err());
+        assert_eq!(fs::read_to_string(&file).unwrap(), "ext");
+    }
+
+    #[test]
+    #[ignore = "explicit performance measurement"]
+    fn shell_staging() {
+        let fixture = tempfile::tempdir().unwrap();
+        let count = std::env::var("ARGENTIC_BENCH_FILES").map_or(20_000, |n| n.parse().unwrap());
+        let size = std::env::var("ARGENTIC_BENCH_FILE_SIZE").map_or(10_000, |n| n.parse().unwrap());
+        let content = vec![b'x'; size];
+        for i in 0..count {
+            fs::write(fixture.path().join(format!("file-{i}")), &content).unwrap();
+        }
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        for source in [fixture.path(), repository.as_path()] {
+            let path = source.canonicalize().unwrap();
+            let root = Root {
+                directory: Dir::open_ambient_dir(&path, ambient_authority()).unwrap(),
+                path,
+            };
+            let mut samples = Vec::new();
+            for _ in 0..3 {
+                let start = Instant::now();
+                let snapshot =
+                    Snapshot::new(&root, None, &CancellationToken::new(), true, |relative| {
+                        !relative
+                            .components()
+                            .any(|part| part.as_os_str() == "target")
+                            && !super::super::super::private_project_path(
+                                &root.path,
+                                &root.path.join(relative),
+                            )
+                    })
+                    .unwrap();
+                std::hint::black_box(&snapshot);
+                samples.push(start.elapsed());
+            }
+            samples.sort_unstable();
+            let median = samples[1];
+            println!("shell staging {}: {median:?} median", root.path.display());
+            assert!(median.as_secs() < 8, "shell staging exceeded 8 seconds");
+        }
+    }
 }

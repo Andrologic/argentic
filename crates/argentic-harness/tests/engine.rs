@@ -965,3 +965,27 @@ async fn steer_admitted_after_missing_submission_can_request_a_tool() {
     assert!(report.outcome.is_ok(), "{:?}", report.outcome);
     late_receipt.await.unwrap();
 }
+
+#[tokio::test]
+#[ignore = "explicit performance measurement"]
+async fn scripted_turn_overhead() {
+    const TURNS: usize = 256;
+    let (_dir, harness) = fixture(
+        vec![vec![Chunk::Text("done".into()), end(Finish::Stop)]; TURNS],
+        json!({}),
+    );
+    let mut samples = Vec::with_capacity(TURNS);
+    for _ in 0..TURNS {
+        let work = work(false);
+        let (_sender, steers) = mpsc::channel(1);
+        let cancel = CancellationToken::new();
+        let start = std::time::Instant::now();
+        let report = harness.run(work, &(), steers, cancel).await;
+        samples.push(start.elapsed());
+        assert!(report.outcome.is_ok());
+    }
+    samples.sort_unstable();
+    let median = samples[TURNS / 2];
+    println!("scripted harness turn: {median:?} median over {TURNS} turns");
+    assert!(median < Duration::from_millis(5));
+}

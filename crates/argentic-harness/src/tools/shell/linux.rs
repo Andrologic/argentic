@@ -1,6 +1,6 @@
 use std::{
     fs::{self, File},
-    io::{self, Read, Write},
+    io::{self, Read, Seek, Write},
     os::fd::{AsRawFd, FromRawFd, RawFd},
     os::unix::process::CommandExt,
     path::Path,
@@ -17,6 +17,13 @@ use super::{
 };
 
 pub(super) const RELAY_PORT: u16 = 18999;
+#[cfg(argentic_shell_relay)]
+const RELAY: Option<&[u8]> = Some(include_bytes!(concat!(
+    env!("OUT_DIR"),
+    "/argentic-shell-relay"
+)));
+#[cfg(not(argentic_shell_relay))]
+const RELAY: Option<&[u8]> = None;
 const SETUP_LIMIT: Duration = Duration::from_secs(5);
 const STAGING_CHECK_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -54,7 +61,7 @@ pub(super) fn preflight(network: bool) -> Result<(), String> {
     })
     .map_err(|error| {
         if network {
-            format!("Argentic Linux shell network relay is unavailable (requires system Python 3.11 or later): {error}")
+            format!("Argentic Linux shell network relay is unavailable: {error}")
         } else {
             format!("Argentic shell sandbox is unavailable: {error}")
         }
@@ -180,6 +187,15 @@ fn run_inner(
     cancel: &CancellationToken,
 ) -> io::Result<String> {
     super::super::check_cancel(cancel)?;
+    let relay_binary = socket
+        .map(|_| {
+            RELAY.ok_or_else(|| {
+                io::Error::other(
+                    "The shell network relay was unavailable at build time. Install a C linker and target libc development files, then run `cargo clean -p argentic-harness` and rebuild Argentic.",
+                )
+            })
+        })
+        .transpose()?;
     let mut budgets = mounts
         .iter()
         .filter(|(_, write)| *write)
@@ -190,6 +206,15 @@ fn run_inner(
     let (mut info, info_writer) = io::pipe()?;
     let (gate_reader, mut gate) = io::pipe()?;
     nonblocking(info.as_raw_fd())?;
+    let relay = relay_binary
+        .map(|bytes| -> io::Result<File> {
+            let mut file = tempfile::tempfile()?;
+            file.write_all(bytes)?;
+            file.rewind()?;
+            Ok(file)
+        })
+        .transpose()?;
+    let relay_fd = relay.as_ref().map(AsRawFd::as_raw_fd);
     let fds = [
         filter.as_raw_fd(),
         info_writer.as_raw_fd(),
@@ -221,7 +246,11 @@ fn run_inner(
     for &system in super::RUNTIME_DIRS.iter().chain(&[super::LOADER_CACHE]) {
         child.args(["--ro-bind-try", system, system]);
     }
-    if let Some(socket) = socket {
+    if let (Some(socket), Some(relay_fd)) = (socket, relay_fd) {
+        child
+            .args(["--perms", "0555", "--file"])
+            .arg(relay_fd.to_string())
+            .arg("/run/argentic-shell-relay");
         child
             .args(["--ro-bind"])
             .arg(socket)
@@ -278,21 +307,14 @@ fn run_inner(
     }
     child.arg("--");
     if socket.is_some() {
-        child.args([
-            "/usr/bin/python3",
-            "-I",
-            "-S",
-            "-c",
-            include_str!("linux/bridge.py"),
-            &RELAY_PORT.to_string(),
-        ]);
+        child.args(["/run/argentic-shell-relay", &RELAY_PORT.to_string()]);
     }
     child.args(super::BASH_ARGS).arg(command);
     // Only the execution child gets these descriptors. Ambient host fds stay
-    // close-on-exec, and bwrap consumes the three sandbox setup descriptors.
+    // close-on-exec, and bwrap consumes the sandbox setup descriptors.
     unsafe {
         child.pre_exec(move || {
-            for fd in fds {
+            for fd in fds.into_iter().chain(relay_fd) {
                 inheritable(fd)?;
             }
             for (resource, ceiling) in [
@@ -320,6 +342,7 @@ fn run_inner(
         supervisor: child.spawn()?,
         namespace: None,
     };
+    drop(relay);
     drop(filter);
     drop(info_writer);
     drop(gate_reader);
@@ -425,4 +448,74 @@ fn run_inner(
         out.into_text(),
         err.into_text()
     ))
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[cfg(not(argentic_shell_relay))]
+    #[test]
+    fn missing_relay_refuses_networking_but_allows_isolated_shell() {
+        if binary().is_err() {
+            return;
+        }
+        preflight(false).unwrap();
+        let error = preflight(true).unwrap_err();
+        assert!(
+            error.contains("Install a C linker and target libc development files"),
+            "{error}"
+        );
+    }
+
+    #[cfg(argentic_shell_relay)]
+    #[test]
+    fn relay_reaps_orphans_and_preserves_shell_status() {
+        let program = match binary() {
+            Ok(program) => program,
+            Err(error) => {
+                assert_ne!(
+                    std::env::var("ARGENTIC_REQUIRE_BWRAP").as_deref(),
+                    Ok("1"),
+                    "{error}"
+                );
+                return;
+            }
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("probe.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let run = |command| {
+            run_inner(
+                program,
+                command,
+                &[(dir.path(), false)],
+                Some(&socket),
+                None,
+                5_000,
+                &CancellationToken::new(),
+            )
+            .unwrap()
+        };
+        // The subshell exits while its child still sleeps, making the relay
+        // the child's new parent. Keep the main shell alive while it exits.
+        let output = run(r#"
+            pid=$(bash -c 'sleep 0.2 >/dev/null 2>&1 & echo $!')
+            for ((attempt=0; attempt<100; attempt++)); do
+                if [[ ! -e /proc/$pid ]]; then
+                    echo reaped
+                    exit 23
+                fi
+                sleep 0.02
+            done
+            exit 1
+        "#);
+        assert!(
+            output.starts_with("Exit status: 23\nstdout:\nreaped\n"),
+            "{output}"
+        );
+        let output = run("kill -TERM $$");
+        assert!(output.starts_with("Exit status: 143\n"), "{output}");
+    }
 }

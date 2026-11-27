@@ -4,6 +4,7 @@ mod approval;
 mod config;
 mod port;
 mod review;
+mod session;
 mod tools;
 
 pub use config::ArgenticConfig030;
@@ -24,7 +25,7 @@ use crate::{
     },
 };
 use argentic_harness::{
-    providers::{Message, ModelName},
+    providers::{HttpClient, Message, ModelName},
     r#loop::{Failure, Harness, PlanMode, Work},
     tools::Registry,
 };
@@ -236,7 +237,10 @@ impl HarnessAdapter030 for ArgenticAdapter030 {
         Ok(Arc::new(Executor {
             host: context.host.clone(),
             config: self.0.clone(),
+            http: HttpClient::new().map_err(provider_failure)?,
             sessions: Arc::default(),
+            policies: Arc::default(),
+            toolboxes: Arc::default(),
             approvals: context.approvals,
             has_mcp_equipment: context.document["agents"]
                 .as_object()
@@ -265,14 +269,67 @@ impl HarnessAdapter030 for ArgenticAdapter030 {
 struct Executor {
     host: HostContext,
     config: Arc<ArgenticConfig030>,
+    http: HttpClient,
     // The Host creates one executor per run. The reducer serializes works
     // with the same instance ID and waits for the previous owner to join.
-    sessions: Arc<Mutex<BTreeMap<String, Vec<Message>>>>,
+    sessions: Arc<Mutex<BTreeMap<String, session::IdleHistory>>>,
+    policies: Arc<Mutex<BTreeMap<String, Arc<[argentic_harness::policy::Policy]>>>>,
+    toolboxes: Arc<Mutex<BTreeMap<([u8; 32], bool, bool), argentic_harness::tools::Toolbox>>>,
     approvals: Arc<dyn crate::harness::CommandApprovals030>,
     has_mcp_equipment: bool,
 }
 
 impl Executor {
+    fn policies(
+        &self,
+        policy: &crate::permissions::EffectivePolicy,
+    ) -> Result<Arc<[argentic_harness::policy::Policy]>> {
+        let key = policy.fingerprint();
+        let mut cache = self.policies.lock().unwrap();
+        if let Some(compiled) = cache.get(&key) {
+            return Ok(compiled.clone());
+        }
+        let compiled: Arc<[_]> = admission::compile_policy(policy)?.into();
+        // Live policy can be edited during a long run. Bound the cache and
+        // keep active registries valid through their own Arc.
+        if cache.len() == 64 {
+            cache.clear();
+        }
+        cache.insert(key, compiled.clone());
+        Ok(compiled)
+    }
+
+    fn toolbox(
+        &self,
+        schema: Value,
+        writes: bool,
+        shell: bool,
+    ) -> Result<argentic_harness::tools::Toolbox> {
+        use sha2::{Digest, Sha256};
+        let key = (
+            Sha256::digest(serde_json::to_vec(&schema)?).into(),
+            writes,
+            shell,
+        );
+        let mut cache = self.toolboxes.lock().unwrap();
+        if let Some(toolbox) = cache.get(&key) {
+            return Ok(toolbox.clone());
+        }
+        let mut toolbox =
+            argentic_harness::tools::Toolbox::new(schema).map_err(|_| missing("toolRegistry"))?;
+        if writes {
+            toolbox = toolbox.with_writes();
+        }
+        if shell {
+            toolbox = toolbox.with_shell();
+        }
+        if cache.len() == 64 {
+            cache.clear();
+        }
+        cache.insert(key, toolbox.clone());
+        Ok(toolbox)
+    }
+
     fn verify_evidence(&self, entry: &Value) -> Result<()> {
         let evidence: Value = serde_json::from_str(required(entry, "evidenceJson")?)?;
         if evidence["configDigest"] != self.config.fingerprint()? || evidence["version"] != VERSION
@@ -308,7 +365,7 @@ impl AgentExecutor030 for Executor {
             )));
         }
         let shell = admission::admit_shell(
-            &admission::compile_policy(work.policy())?,
+            &self.policies(work.policy())?,
             reviewer.is_some() && self.config.person_review_available,
             &pointer,
             self.config.shell_network,
@@ -363,7 +420,7 @@ impl Executor {
         let model: ModelName = required(frozen, "modelName")?
             .parse()
             .map_err(|_| config::invalid_model("model"))?;
-        let (provider, credential) = self.config.provider(&model)?;
+        let (provider, credential) = self.config.provider(&model, self.http.clone())?;
         let mut definition = document["agents"][agent].clone();
         let settings =
             self.config
@@ -474,7 +531,7 @@ impl Executor {
         let writable = !crate::tool_policy::agsdl_native_read_only(&captured_tools)
             && project.tools["readOnly"] != true;
         drop(project);
-        let policies = admission::compile_policy(&work.policy)?;
+        let policies = self.policies(&work.policy)?;
         let reviewer = work.policy.reviewer();
         let person = self
             .config
@@ -495,10 +552,11 @@ impl Executor {
             let model = name
                 .parse()
                 .map_err(|_| config::invalid_model("/reviewerModel"))?;
-            let (provider, reviewer_credential) = match self.config.provider(&model) {
-                Ok((provider, credential)) => (Some(provider), credential),
-                Err(_) => (None, None),
-            };
+            let (provider, reviewer_credential) =
+                match self.config.provider(&model, self.http.clone()) {
+                    Ok((provider, credential)) => (Some(provider), credential),
+                    Err(_) => (None, None),
+                };
             Some(Arc::new(review::ModelReviewer {
                 model,
                 model_name: name.into(),
@@ -541,15 +599,11 @@ impl Executor {
         for path in &extra {
             roots.push((path.clone(), open_extra_root(path)?));
         }
-        let mut registry = Registry::with_open_roots(roots, policies, schema)
+        let toolbox = self.toolbox(schema, writable, shell)?;
+        let mut registry = Registry::with_toolbox(roots, policies, toolbox)
             .map_err(|_| missing("toolRegistry"))?;
-        if writable {
-            registry = registry.with_writes();
-        }
         if shell {
-            registry = registry
-                .with_shell()
-                .with_shell_network(self.config.shell_network);
+            registry = registry.with_shell_network(self.config.shell_network);
             if let Some(directory) = &self.config.shell_staging_directory {
                 registry = registry.with_shell_staging_directory(directory.clone());
             }
@@ -627,11 +681,7 @@ impl Executor {
         // Only carry conversation messages forward. Each work rebuilds its
         // instructions, submission schema and tools from its admitted policy.
         let history = if continuous {
-            self.sessions
-                .lock()
-                .unwrap()
-                .remove(&instance)
-                .unwrap_or_default()
+            session::IdleHistory::take(&self.sessions, &instance)?
         } else {
             Vec::new()
         };
@@ -667,18 +717,17 @@ impl Executor {
             )
             .await;
         drop(harness);
+        // RunReport is available only after the provider stream and all tool
+        // workers have ended. The engine joins this owner before routing.
+        // Store the history before cleanup so a cleanup failure keeps it.
+        if continuous {
+            let idle = session::IdleHistory::sleep(report.messages.into_iter().skip(1).collect());
+            self.sessions.lock().unwrap().insert(instance, idle);
+        }
         Arc::try_unwrap(tools)
             .map_err(|_| missing("toolRegistry"))?
             .close()
             .await?;
-        // RunReport is available only after the provider stream and all tool
-        // workers have ended. The engine joins this owner before routing.
-        if continuous {
-            self.sessions
-                .lock()
-                .unwrap()
-                .insert(instance, report.messages.into_iter().skip(1).collect());
-        }
         match report.outcome {
             Ok(_) | Err(Failure::Cancelled | Failure::PlanRejected) => Ok(()),
             Err(Failure::Provider(error)) => Err(provider_failure(error)),
