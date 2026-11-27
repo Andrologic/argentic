@@ -900,6 +900,33 @@ async fn provider_failure_does_not_persist_the_echoed_credential() {
 }
 
 #[tokio::test]
+async fn credential_in_submission_arguments_allows_a_native_correction() {
+    const KEY_ENV: &str = "CARGO_PKG_DESCRIPTION";
+    let credential = std::env::var(KEY_ENV).unwrap();
+    let mut server = Server::start().await;
+    let f = Fixture::new(&document().to_string());
+    let host = f
+        .open()
+        .await
+        .unwrap()
+        .with_argentic(server.config(Some(KEY_ENV)))
+        .unwrap();
+    let run = start(&host).await;
+    server.next().await.tool(
+        "agsdl_submit_result",
+        json!({"results":{"report":{"body":credential}}}),
+    );
+    let next = server.next().await;
+    let messages = next.body["messages"].to_string();
+    assert!(messages.contains("Correct the result arguments"));
+    assert!(!messages.contains(&credential));
+    submit_done(next);
+    completed(&finish(&host, &run).await);
+    assert!(!decisions(&host).await.join("").contains(&credential));
+    close(&host).await;
+}
+
+#[tokio::test]
 async fn qualification_refuses_unregistered_and_opted_out_adapters() {
     let f = Fixture::new(&document().to_string());
     let host = f.open().await.unwrap();
@@ -1806,21 +1833,18 @@ async fn provider_credential_in_mcp_arguments_never_reaches_approval_or_upstream
             "text/event-stream",
         );
 
-        // A safe rejection terminates the response. The unfixed allow path
-        // instead calls upstream and asks the provider for another turn.
-        let state = tokio::select! {
-            biased;
-            next = server.next() => panic!("unexpected follow-up request with {} upstream calls and {} messages",
-                peer.calls().len(), next.body["messages"].as_array().unwrap().len()),
-            state = finish(&host, &run) => state,
-        };
+        let next = server.next().await;
+        let messages = next.body["messages"].to_string();
+        assert!(messages.contains("Tool arguments contain a configured provider credential"));
+        assert!(!messages.contains(&credential));
         assert!(peer.calls().is_empty());
         let asks: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM engine_flow030_human_requests")
             .fetch_one(&host.pool)
             .await
             .unwrap();
         assert_eq!(asks, 0);
-        assert_eq!(state["verdict"], "failed");
+        submit_done(next);
+        completed(&finish(&host, &run).await);
         close(&host).await;
         let bytes = std::fs::read(f.data.join("engine.sqlite")).unwrap();
         assert!(!bytes
