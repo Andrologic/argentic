@@ -651,6 +651,46 @@ impl HumanBroker030 {
         }
         validate_json(&answer_json)?;
         let received_ms = self.clock.now_ms().to_string();
+        // Inspect and validate the answer before taking the admission lock.
+        // The transaction below rechecks the revision and visit before reserving it.
+        if let HumanAnswer030::Question { answer_json } = &input.answer {
+            validate_json(answer_json)?;
+            if origin.name() != "synthetic-person" {
+                let row = {
+                    let mut db = self.pool.acquire().await?;
+                    self.request_row(&mut db, &input.request_id).await?
+                };
+                require(
+                    row.try_get::<&str, _>("kind")? == "question",
+                    "Not a protocol question",
+                )?;
+                require(
+                    row.try_get::<&str, _>("revision")? == input.expected_revision,
+                    "Stale human revision",
+                )?;
+                let payload: Value = serde_json::from_str(row.try_get("payload_json")?)?;
+                let validator = self
+                    .question_validators
+                    .lock()
+                    .map_err(|_| {
+                        failure(
+                            "RUNTIME_UNAVAILABLE",
+                            "question",
+                            "Protocol validators unavailable",
+                        )
+                    })?
+                    .get(&input.request_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        failure(
+                            "CORRELATION",
+                            "question",
+                            "Product question requires protocol schema attestation",
+                        )
+                    })?;
+                validator.validate(&payload, answer_json)?;
+            }
+        }
         self.settle_pending_flow_clock(host).await?;
         let lease = host.start_lease().await?;
         let _gate = host.admission_lock().lock_owned().await;
@@ -711,31 +751,8 @@ impl HumanBroker030 {
                 )?;
                 json!({"kind":"answer","requestId":input.request_id,"nativeReceiptId":receipt_id,"answer":{"decision":decision,"comment":comment}})
             }
-            HumanAnswer030::Question { answer_json } => {
+            HumanAnswer030::Question { .. } => {
                 require(kind == "question", "Not a protocol question")?;
-                validate_json(answer_json)?;
-                if origin.name() != "synthetic-person" {
-                    let validator = self
-                        .question_validators
-                        .lock()
-                        .map_err(|_| {
-                            failure(
-                                "RUNTIME_UNAVAILABLE",
-                                "question",
-                                "Protocol validators unavailable",
-                            )
-                        })?
-                        .get(&input.request_id)
-                        .cloned()
-                        .ok_or_else(|| {
-                            failure(
-                                "CORRELATION",
-                                "question",
-                                "Product question requires protocol schema attestation",
-                            )
-                        })?;
-                    validator.validate(&payload, answer_json)?;
-                }
                 json!({"kind":"answer","requestId":input.request_id,"nativeReceiptId":receipt_id,"answer":null})
             }
         };

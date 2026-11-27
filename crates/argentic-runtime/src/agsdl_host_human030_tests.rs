@@ -690,10 +690,59 @@ async fn native_large_elapse_stabilizes_at_intermediate_deadlines() {
 }
 
 #[tokio::test]
+async fn mcp_question_rejects_unsupported_schema_before_opening() {
+    use crate::{
+        agsdl_host_calls::{CallIdentity, HostPort},
+        agsdl_host_human_executor030::CallHumans030,
+    };
+    let f = fixture("call", Some(60000), Some(600000)).await;
+    let identity = f.attempt.identity().clone();
+    let port = CallHumans030 {
+        app: f.host.clone(),
+        pool: f.broker.pool.clone(),
+        identity: identity.clone(),
+    };
+    let call = CallIdentity {
+        system_id: identity.system_start_id,
+        run_id: identity.flow_invocation_id,
+        group_id: String::new(),
+        work_id: f.attempt.work().activation_id.clone(),
+        epoch: String::new(),
+        effect_id: f.attempt.start_effect_id().into(),
+        provider_attempt_id: None,
+        native_call_id: "native-call".into(),
+    };
+    for schema in [
+        json!({"type":"object","properties":{"nested":{"type":"object"}}}),
+        json!({"type":"object","properties":{"field":{"type":"string","$ref":"other"}}}),
+        json!({"type":"object","properties":{"field":{"type":"array","items":{"type":"object"}}}}),
+        json!({"type":"object","properties":{"field":{"type":"string","oneOf":[{"type":"string"}]}}}),
+        json!({"type":"object","properties":{},"additionalProperties":false}),
+    ] {
+        let raw = json!({"method":"elicitation/create","params":{"message":"Continue?","requestedSchema":schema}});
+        let error = port
+            .human_open(&call, "test", &raw.to_string())
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "INPUT_CONSTRAINT");
+        assert!(error.detail.contains("MCP elicitation schema"));
+    }
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM engine_flow030_human_requests")
+        .fetch_one(&f.broker.pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+}
+
+#[tokio::test]
 async fn native_protocol_answer_requires_attested_validator_and_preserves_exact_bytes() {
-    struct Validator;
+    struct Validator(Arc<tokio::sync::Mutex<()>>);
     impl QuestionValidator030 for Validator {
         fn validate(&self, payload: &Value, answer: &str) -> Result<()> {
+            assert!(
+                self.0.try_lock().is_ok(),
+                "Validation holds the admission lock"
+            );
             require(
                 payload["protocolReceiptId"] == "native-protocol-receipt"
                     && answer == "{\"count\":9007199254740993}",
@@ -708,7 +757,7 @@ async fn native_protocol_answer_requires_attested_validator_and_preserves_exact_
         .await
         .unwrap();
     pump(&f).await;
-    let request = f.broker.open_question(&f.host,&work,json!({"nativeCallId":"native-call","protocolReceiptId":"native-protocol-receipt","schema":"count"}),Arc::new(Validator)).await.unwrap();
+    let request = f.broker.open_question(&f.host,&work,json!({"nativeCallId":"native-call","protocolReceiptId":"native-protocol-receipt","schema":"count"}),Arc::new(Validator(f.host.admission_lock()))).await.unwrap();
     pump(&f).await;
     assert!(f
         .broker

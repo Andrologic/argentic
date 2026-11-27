@@ -261,7 +261,7 @@ printf '{"jsonrpc":"2.0","id":"%s","result":{"content":[]}}\n' "$id"
                     };
                     let form = json!({"jsonrpc":"2.0","id":id,
                         "method":"elicitation/create",
-                        "params":{"message":"Continue?","requestedSchema":{"type":"object"}}
+                        "params":{"message":"Continue?","requestedSchema":{"type":"object","properties":{}}}
                     });
                     let frame = Ok::<_, std::io::Error>(format!("data: {form}\n\n"));
                     let stream = futures::stream::once(async move { frame })

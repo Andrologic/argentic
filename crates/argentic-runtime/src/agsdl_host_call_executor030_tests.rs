@@ -878,7 +878,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":"1","result":{"protocolVersion":"2025-11-25
 IFS= read -r initialized
 IFS= read -r call
 exec 0<&-
-printf '%s\n' '{"jsonrpc":"2.0","id":"person","method":"elicitation/create","params":{"message":"Continue?","requestedSchema":{"type":"object"}}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":"person","method":"elicitation/create","params":{"message":"Continue?","requestedSchema":{"type":"object","properties":{}}}}'
 "#;
     let mut doc = document(json!({"type":"call","mcp":{"server":"local","tool":"check"}}));
     doc["contract"] = json!(argentic_core::AGSDL_040);
