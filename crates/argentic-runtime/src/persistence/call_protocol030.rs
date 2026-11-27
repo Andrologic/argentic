@@ -1770,6 +1770,45 @@ pub(crate) async fn read_diagnostic_tx<A: CallAuthority030>(
     }))
 }
 
+/// A handed-off worker can be joined before it launches, and before a
+/// separate StopWork handoff. Correlate its durable NotStarted proof.
+pub(crate) async fn verify_not_started_stop_tx(
+    db: &mut SqliteConnection,
+    event: &FlowEvent030,
+    work: &WorkRef030,
+    evidence: &PhysicalEvidence030,
+) -> Result<bool> {
+    let row: Option<(String, String, String, String, String, String, String)> = sqlx::query_as(
+        "SELECT c.call_id,c.start_effect_id,c.attempt_json,c.received_json,c.receipt_json,o.owner_epoch,o.generation
+         FROM engine_flow030_calls c JOIN engine_flow030_owners o USING(system_id,invocation_id)
+         WHERE c.system_id=? AND c.invocation_id=? AND c.activation_id=? AND c.status='terminal'",
+    )
+    .bind(&event.identity.system_start_id)
+    .bind(&event.identity.flow_invocation_id)
+    .bind(&work.activation_id)
+    .fetch_optional(db)
+    .await?;
+    let Some((call_id, start, attempt, received, receipt, owner, generation)) = row else {
+        return Ok(false);
+    };
+    let receipt = decode_receipt(&receipt)?;
+    let attempt = decode_attempt(&attempt)?;
+    Ok(receipt.attempt == attempt
+        && receipt.received == decode_received(&received)?
+        && attempt.identity() == &event.identity
+        && attempt.work() == work
+        && start == work.start_effect_id
+        && attempt.owner_epoch == owner
+        && attempt.generation == generation
+        && attempt.call_id == call_id
+        && event.event_id == format!("call:{call_id}:terminal")
+        && receipt.event_id == event.event_id
+        && receipt.not_started()
+        && receipt.received.end == CallEnd030::Stopped
+        && receipt.result == CallResult030::Stopped
+        && receipt.physical() == *evidence)
+}
+
 /// A resolved MCP question can remain reserved when the call fails while
 /// returning the answer. Replay authenticates the joined failure even after
 /// startup fencing revoked the live owner.

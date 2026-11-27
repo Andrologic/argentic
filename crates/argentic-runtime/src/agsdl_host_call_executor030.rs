@@ -94,6 +94,7 @@ impl HostExecutor030 for CallExecutor030 {
             let remote_mcp_budget_ms = config.remote_mcp_tool_budget_ms();
             let worker_app = app.clone();
             let clock_pool = pool.clone();
+            let clock_owner = owner.clone();
             claim
                 .handoff_host(&tasks, async move {
                     let host = worker_app.clone();
@@ -202,17 +203,53 @@ impl HostExecutor030 for CallExecutor030 {
                     let _ = send.send(result);
                 })
                 .await?;
-            let human = host
-                .flow030()
-                .humans
-                .broker(&host, &clock_pool, &effect.identity)
-                .await?;
-            {
+            #[cfg(test)]
+            host.flow030()
+                .operator_test_yield("call.clock_admission")
+                .await;
+            let admitted = async {
+                let human = host
+                    .flow030()
+                    .humans
+                    .broker(&host, &clock_pool, &effect.identity)
+                    .await?;
                 let _operation = human.operation.lock().await;
                 human
                     .admit_call(&host, &effect.id, remote_mcp_budget_ms)
                     .await?;
                 human.pump(&host, &CancellationToken::new()).await?;
+                Ok::<_, crate::persistence::dto::EngineFailure>(())
+            }
+            .await;
+            if let Err(error) = admitted {
+                // The handoff is durable but the worker never had permission to launch.
+                drop(clock_ready);
+                if !matches!(tasks.cancel_owned(&request_id).await, Ok(true)) {
+                    return Err(failure(
+                        "UNCERTAIN",
+                        "call",
+                        "Call ownership cleanup did not complete",
+                    ));
+                }
+                if flow::inspect_run(host.flow030(), &host, &clock_pool, &clock_owner)
+                    .await?
+                    .flow
+                    .state
+                    .stopping
+                {
+                    let authority = NativeCallAuthority030::capture(&host, &clock_owner).await?;
+                    match calls::stop_before_launch030(&clock_pool, &authority, &attempt).await? {
+                        calls::CallSettlement030::Terminal { .. } => return Ok(None),
+                        _ => {
+                            return Err(failure(
+                                "UNCERTAIN",
+                                "call",
+                                "Call completion has a diagnostic",
+                            ))
+                        }
+                    }
+                }
+                return Err(error);
             }
             let _ = clock_ready.send(());
             Ok(Some(StartedCall030 {

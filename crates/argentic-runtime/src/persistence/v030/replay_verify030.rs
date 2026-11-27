@@ -20,7 +20,7 @@ pub const OUTSIDE_REPLAY: &[&str] = &[
     "036: engine_flow030_work_admissions, engine_flow030_work_authorizations, engine_flow030_work_state, engine_flow030_work_events, engine_flow030_work_checks (only Start settlement and provider-attempt correlation are checked)",
     "037: engine_flow030_route_source_attestations, engine_flow030_route_content_contexts, engine_flow030_route_content_receipts",
     "038: engine_flow030_system_stop_requests",
-    "039: engine_flow030_calls, engine_flow030_call_causes, engine_flow030_call_diagnostics (only the joined failure of a call with a reserved human answer is checked)",
+    "039: engine_flow030_calls, engine_flow030_call_causes, engine_flow030_call_diagnostics (only NotStarted proof and the joined failure of a call with a reserved human answer are checked)",
 ];
 
 #[derive(Debug, Serialize)]
@@ -804,6 +804,24 @@ async fn verify_physical_end(
             // verify_settlement already rejects any handoff or settlement for
             // pending/uncertain effects. The validated native proof above is
             // mandatory; admitted work never enters this exception.
+            return Ok(());
+        }
+        if handoff == 1
+            && status == "pending"
+            && event.event_id.starts_with("call:")
+            && crate::persistence::call_protocol030::verify_not_started_stop_tx(
+                db, event, work, evidence,
+            )
+            .await
+            .map_err(|error| {
+                mismatch(
+                    "physicalEnded.call",
+                    "valid NotStarted proof",
+                    error.message,
+                )
+            })?
+        {
+            // The Start worker was joined before StopWork could be handed off.
             return Ok(());
         }
         equal("physicalEnded.stop.status", &"settled", &status.as_str())?;
