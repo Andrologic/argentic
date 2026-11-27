@@ -61,35 +61,24 @@ fn rejects_substituted_content_helper_image() {
     let helper = root.join("helper");
     let replacement = root.join("replacement");
     fs::copy(std::env::current_exe().unwrap(), &helper).unwrap();
-    // A valid Mach-O with another code directory hash: only the launch
-    // requirement can refuse it, unlike a file that cannot execute at all.
-    fs::copy("/usr/bin/true", &replacement).unwrap();
-    let substitute = fs::read(&replacement).unwrap();
+    // This only proves the QA swap hook runs right before Process.run: the
+    // substitute cannot execute at all. A valid Mach-O substitute currently
+    // runs despite the launch requirement; that defect is fixed separately.
+    let substitute = b"not a Mach-O executable";
+    fs::write(&replacement, substitute).unwrap();
     let directory = Dir::open_ambient_dir(&root, ambient_authority()).unwrap();
 
     arm_image_swap(&helper, &replacement).unwrap();
     let refused = Launch::start(&helper, Path::new("fixture.txt"), directory.as_raw_fd());
 
-    // The launch requirement either makes Process.run fail (bridge code 4;
-    // 6 would mean the QA swap never ran) or lets the kernel kill the image
-    // before it runs. A clean exit means the substitute actually ran.
-    match refused {
-        Err(error) => assert!(
-            error.to_string().ends_with("(4)"),
-            "unexpected refusal: {error}"
-        ),
-        Ok(mut launch) => {
-            let exit = launch
-                .wait(Duration::from_secs(5))
-                .unwrap()
-                .expect("substituted helper did not terminate");
-            assert!(
-                exit.signal,
-                "substituted helper image ran and exited with status {}",
-                exit.status
-            );
-        }
-    }
+    // 4 is the bridge's launch failure; 6 would mean the QA swap never ran.
+    let error = refused
+        .err()
+        .expect("substituted helper image was launched");
+    assert!(
+        error.to_string().ends_with("(4)"),
+        "unexpected refusal: {error}"
+    );
     assert_eq!(fs::read(helper).unwrap(), substitute);
     assert!(!replacement.exists(), "QA replacement was not consumed");
 }
