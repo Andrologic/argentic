@@ -80,6 +80,10 @@ pub trait StartAuthority030: Authority030 {
     fn commit_acknowledged(&self, request: &EngineStartRequest, identity: &FlowIdentity030);
     #[cfg(test)]
     async fn before_commit(&self) {}
+    #[cfg(test)]
+    async fn lose_commit_reply(&self) -> bool {
+        false
+    }
     async fn capture(&self, request: &EngineStartRequest) -> Result<StartCapture030>;
     async fn lock_source(&self, request: &EngineStartRequest) -> Result<Self::SourceGuard>;
     async fn bind_capture_tx(
@@ -386,7 +390,14 @@ async fn start_linked_with_outcome<A: StartAuthority030, H: StartIntentHook + ?S
     authority.begin_commit(request, &capture.identity)?;
     #[cfg(test)]
     authority.before_commit().await;
-    if tx.commit().await.is_err() {
+    let committed = tx.commit().await;
+    #[cfg(test)]
+    let committed = if committed.is_ok() && authority.lose_commit_reply().await {
+        Err(sqlx::Error::Protocol("Test lost Start commit reply".into()))
+    } else {
+        committed
+    };
+    if committed.is_err() {
         return Err(failure(
             "UNCERTAIN",
             "requestId",

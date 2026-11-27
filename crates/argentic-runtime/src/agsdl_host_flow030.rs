@@ -41,7 +41,7 @@ pub(crate) struct FlowHost030 {
     pub(crate) start_admission: tokio::sync::RwLock<()>,
     pub(crate) supervisors: crate::agsdl_host_runtime030::RuntimeRegistry030,
     pub(crate) humans: crate::agsdl_host_human030::HumanRuntime030,
-    committing: Mutex<BTreeMap<String, FlowIdentity030>>,
+    committing: Mutex<BTreeMap<String, StartCommit030>>,
     pub(crate) call_commits: crate::agsdl_host_calls030::CallCommitFence030,
     event_committing: Mutex<BTreeMap<(String, String), FlowEvent030>>,
     work_committing: Mutex<BTreeMap<(String, String), FlowWorkCommitMarker030>>,
@@ -59,6 +59,12 @@ pub(crate) struct FlowHost030 {
     work_commit_hooks: Mutex<BTreeMap<(String, String), Arc<CommitTestHook030>>>,
     #[cfg(test)]
     handoff_commit_hooks: Mutex<BTreeMap<(String, String), Arc<CommitTestHook030>>>,
+}
+
+struct StartCommit030 {
+    request: EngineStartRequest,
+    identity: FlowIdentity030,
+    retryable: bool,
 }
 
 /// Correlates an authenticated work decision's COMMIT, without authorizing any
@@ -134,22 +140,22 @@ impl FlowHost030 {
         hook
     }
 
-    pub(crate) async fn operator_test_yield(&self, point: &'static str) {
+    pub(crate) async fn operator_test_yield(&self, point: &'static str) -> bool {
         let hook = {
             let mut hooks = self.operator_test_hooks.lock().unwrap();
             let Some((remaining, _)) = hooks.get_mut(point) else {
-                return;
+                return false;
             };
             *remaining -= 1;
             if *remaining != 0 {
-                return;
+                return false;
             }
             hooks.remove(point).map(|(_, hook)| hook)
         };
-        if let Some(hook) = hook {
-            hook.reached.add_permits(1);
-            hook.proceed.acquire().await.unwrap().forget();
-        }
+        let hook = hook.expect("reached hook");
+        hook.reached.add_permits(1);
+        hook.proceed.acquire().await.unwrap().forget();
+        true
     }
 
     pub(crate) fn install_runtime_fixture_control(
@@ -448,7 +454,7 @@ impl FlowHost030 {
         let pending = self.committing.lock().map_err(|_| unavailable())?;
         if pending
             .values()
-            .any(|id| id.system_start_id == identity.system_start_id)
+            .any(|start| start.identity.system_start_id == identity.system_start_id)
         {
             return Err(uncertain());
         }
@@ -655,13 +661,23 @@ impl FlowHost030 {
         if pending.contains_key(&request.request_id) {
             return Err(uncertain());
         }
-        pending.insert(request.request_id.clone(), identity.clone());
+        pending.insert(
+            request.request_id.clone(),
+            StartCommit030 {
+                request: request.clone(),
+                identity: identity.clone(),
+                retryable: false,
+            },
+        );
         Ok(())
     }
     pub(crate) fn acknowledge(&self, request: &EngineStartRequest, identity: &FlowIdentity030) {
         // Poison is fail-closed: retaining the barrier is safer than admitting work.
         if let Ok(mut pending) = self.committing.lock() {
-            if pending.get(&request.request_id) == Some(identity) {
+            if pending
+                .get(&request.request_id)
+                .is_some_and(|start| start.request == *request && start.identity == *identity)
+            {
                 pending.remove(&request.request_id);
             }
         }
@@ -1102,6 +1118,36 @@ impl FlowHost030 {
         }
         Ok(())
     }
+    // The standalone admission gate serializes marking an unresolved Start
+    // and reading it back on a later retry.
+    pub(crate) fn mark_start_retryable(
+        &self,
+        request: &EngineStartRequest,
+        identity: &FlowIdentity030,
+    ) -> Result<()> {
+        let mut pending = self.committing.lock().map_err(|_| unavailable())?;
+        let start = pending.get_mut(&request.request_id).ok_or_else(uncertain)?;
+        if start.request != *request || start.identity != *identity {
+            return Err(uncertain());
+        }
+        start.retryable = true;
+        Ok(())
+    }
+
+    pub(crate) fn pending_start_retry(
+        &self,
+        request: &EngineStartRequest,
+    ) -> Result<Option<FlowIdentity030>> {
+        let pending = self.committing.lock().map_err(|_| unavailable())?;
+        match pending.get(&request.request_id) {
+            None => Ok(None),
+            Some(start) if start.retryable && start.request == *request => {
+                Ok(Some(start.identity.clone()))
+            }
+            Some(_) => Err(uncertain()),
+        }
+    }
+
     pub(crate) fn retain_start_before_commit(
         &self,
         host: &HostState,

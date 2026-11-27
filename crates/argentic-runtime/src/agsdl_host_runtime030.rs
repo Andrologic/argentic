@@ -680,6 +680,23 @@ impl RuntimeRegistry030 {
         );
         Ok(())
     }
+    pub(crate) fn resume_start_reservation(&self, system: &str) -> Result<()> {
+        let unavailable = || {
+            failure(
+                "RUNTIME_UNAVAILABLE",
+                "runtime",
+                "Start reservation is unavailable",
+            )
+        };
+        let mut handles = self.0.lock().map_err(|_| unavailable())?;
+        let handle = handles.get_mut(system).ok_or_else(unavailable)?;
+        if handle.task.is_some() || !matches!(handle.outcome, Some(Err(_))) {
+            return Err(unavailable());
+        }
+        handle.outcome = None;
+        Ok(())
+    }
+
     pub(crate) fn fail_reservation(
         &self,
         system: &str,

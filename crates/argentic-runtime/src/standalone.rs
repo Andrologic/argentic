@@ -700,46 +700,77 @@ impl Host {
             committing: Mutex::new(None),
             allowed_harnesses,
         };
-        let start = start030::start_with_outcome(&self.pool, &request, &adapter);
-        tokio::pin!(start);
-        let outcome = tokio::select! {
-            biased;
-            _ = reply.closed() => {
-                if adapter.committing.lock().expect("Start commit marker").is_none() {
-                    return Err(failure("CANCELLED", "start", "Start caller disconnected before commit"));
-                }
-                start.await
+        let reconciled = if self
+            .engine
+            .flow030()
+            .pending_start_retry(&request)?
+            .is_some()
+        {
+            let _gate = session.lock_admission().await;
+            if let Some(identity) = self.engine.flow030().pending_start_retry(&request)? {
+                let retained = adapter.read_settled(&request).await?;
+                let outcome = match retained {
+                    Some(retained) if retained.receipt.identity == identity => {
+                        self.engine
+                            .flow030()
+                            .supervisors
+                            .resume_start_reservation(&identity.system_start_id)?;
+                        Some(StartOutcome030::Created(retained))
+                    }
+                    Some(retained) => Some(StartOutcome030::Replayed(retained)),
+                    None => None,
+                };
+                session.commit_acknowledged(&request, &identity);
+                outcome
+            } else {
+                None
             }
-            outcome = &mut start => outcome,
+        } else {
+            None
         };
-        let outcome = match outcome {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                let identity = adapter
-                    .committing
-                    .lock()
-                    .expect("Start commit marker")
-                    .clone();
-                let Some(identity) = identity else {
-                    return Err(error);
-                };
-                let settled = {
+        let outcome = if let Some(outcome) = reconciled {
+            outcome
+        } else {
+            let start = start030::start_with_outcome(&self.pool, &request, &adapter);
+            tokio::pin!(start);
+            let outcome = tokio::select! {
+                biased;
+                _ = reply.closed() => {
+                    if adapter.committing.lock().expect("Start commit marker").is_none() {
+                        return Err(failure("CANCELLED", "start", "Start caller disconnected before commit"));
+                    }
+                    start.await
+                }
+                outcome = &mut start => outcome,
+            };
+            match outcome {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    let identity = adapter
+                        .committing
+                        .lock()
+                        .expect("Start commit marker")
+                        .clone();
+                    let Some(identity) = identity else {
+                        return Err(error);
+                    };
                     let _gate = session.lock_admission().await;
-                    start030::read_settled_start(&self.pool, &request, &adapter).await
-                };
-                match settled {
-                    Ok(Some(retained)) if retained.receipt.identity == identity => {
-                        session.commit_acknowledged(&request, &identity);
-                        StartOutcome030::Created(retained)
-                    }
-                    Ok(None) => {
-                        session.commit_acknowledged(&request, &identity);
-                        session.fail_reservation(&identity.system_start_id, error.clone());
-                        return Err(error);
-                    }
-                    _ => {
-                        session.fail_reservation(&identity.system_start_id, error.clone());
-                        return Err(error);
+                    match adapter.read_settled(&request).await {
+                        Ok(Some(retained)) if retained.receipt.identity == identity => {
+                            session.commit_acknowledged(&request, &identity);
+                            StartOutcome030::Created(retained)
+                        }
+                        settled => {
+                            session.fail_reservation(&identity.system_start_id, error.clone());
+                            match settled {
+                                Ok(None) => session.commit_acknowledged(&request, &identity),
+                                _ => self
+                                    .engine
+                                    .flow030()
+                                    .mark_start_retryable(&request, &identity)?,
+                            }
+                            return Err(error);
+                        }
                     }
                 }
             }
@@ -890,6 +921,21 @@ struct Start<'a> {
     committing: Mutex<Option<FlowIdentity030>>,
     allowed_harnesses: &'a BTreeSet<String>,
 }
+impl Start<'_> {
+    async fn read_settled(&self, request: &EngineStartRequest) -> Result<Option<RetainedStart030>> {
+        #[cfg(test)]
+        if self
+            .host
+            .engine
+            .flow030()
+            .operator_test_yield("start.readback.failed")
+            .await
+        {
+            return Err(failure("STORAGE", "start", "Test Start readback failure"));
+        }
+        start030::read_settled_start(&self.host.pool, request, self).await
+    }
+}
 impl Authority030 for Start<'_> {
     fn owner<'a>(
         &'a self,
@@ -940,6 +986,14 @@ impl StartAuthority030 for Start<'_> {
             .flow030()
             .operator_test_yield("start.commit")
             .await;
+    }
+    #[cfg(test)]
+    async fn lose_commit_reply(&self) -> bool {
+        self.host
+            .engine
+            .flow030()
+            .operator_test_yield("start.commit.unknown")
+            .await
     }
     fn commit_acknowledged(&self, r: &EngineStartRequest, id: &FlowIdentity030) {
         self.session.commit_acknowledged(r, id)
@@ -1165,6 +1219,60 @@ mod tests {
         let id = second.receipt.identity.system_start_id;
         assert_eq!(host.active_runs().await.unwrap(), std::slice::from_ref(&id));
         host.shutdown(&[id]).await.unwrap();
+        host.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn start_retry_reconciles_after_commit_and_readback_fail() {
+        let f = Fixture::new(WAIT);
+        let host = f.open().await.unwrap();
+        let commit = host
+            .engine
+            .flow030()
+            .install_operator_test_hook("start.commit.unknown");
+        let readback = host
+            .engine
+            .flow030()
+            .install_operator_test_hook("start.readback.failed");
+        let mut first = Box::pin(host.start("retry".into(), entry(), false));
+        tokio::select! {
+            _ = commit.reached() => (),
+            result = &mut first => panic!("Start returned before COMMIT: {result:?}"),
+        }
+        commit.release();
+        tokio::select! {
+            _ = readback.reached() => (),
+            result = &mut first => panic!("Start returned before readback: {result:?}"),
+        }
+        readback.release();
+        assert_eq!(first.await.unwrap_err().code, "UNCERTAIN");
+
+        let recorded = host.runs().await.unwrap();
+        assert_eq!(recorded.len(), 1);
+        let mut wrong = entry().unwrap();
+        wrong.message_json = "{} ".into();
+        assert!(host
+            .start("retry".into(), Some(wrong), false)
+            .await
+            .is_err());
+
+        let retry = host.start("retry".into(), entry(), false).await.unwrap();
+        assert_eq!(
+            serde_json::to_value(&retry.receipt).unwrap(),
+            recorded[0]["receipt"]
+        );
+        let system = retry.receipt.identity.system_start_id;
+        assert!(host.engine.flow030().supervisors.has_task(&system).unwrap());
+        assert_eq!(
+            host.start("retry".into(), entry(), false)
+                .await
+                .unwrap()
+                .receipt
+                .identity
+                .system_start_id,
+            system
+        );
+        host.shutdown(&[system]).await.unwrap();
         host.close().await.unwrap();
     }
 
