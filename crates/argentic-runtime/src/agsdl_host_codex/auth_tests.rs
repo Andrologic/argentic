@@ -26,6 +26,7 @@ for line in sys.stdin:
  elif method=='config/read':
   observed=json.loads(json.dumps(settings))
   if (authed and mode=='post-login-config') or (refreshed and mode=='post-refresh-config'): observed['features']['hooks']=True
+  if mode=='missing-source-denial': del observed['permissions']['macro-agsdl']['filesystem'][source]
   result={'layers':[{'name':{'type':'sessionFlags'},'config':observed}],'config':observed}
  elif method=='skills/list': result={'data':[{'cwd':bootstrap,'skills':[],'errors':[]}]}
  elif method=='command/exec': result={'exitCode':0}
@@ -75,11 +76,15 @@ impl Fixture {
     fn new(mode: &str) -> Self {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
-        let source = root.join("ordinary.json");
-        auth::fixture_file(&source, "synthetic-account", u64::MAX, "initial");
-        for name in ["workspace", "profile", "bootstrap", "profile/codex"] {
+        for name in ["workspace", "profile", "bootstrap", "profile/codex", "bin"] {
             std::fs::create_dir(root.join(name)).unwrap();
         }
+        let source = root.join(match mode {
+            "package-auth-path" => "bin/ordinary.json",
+            "bootstrap-auth-path" => "bootstrap/ordinary.json",
+            _ => "ordinary.json",
+        });
+        auth::fixture_file(&source, "synthetic-account", u64::MAX, "initial");
         let profile = Profile {
             mcp: None,
             runtime: None,
@@ -89,7 +94,10 @@ impl Fixture {
             bootstrap: root.join("bootstrap"),
             digest: "synthetic".into(),
         };
-        let settings = profile.settings(&root.join("workspace"), true).unwrap();
+        let auth_source = (!mode.ends_with("-auth-path")).then_some(source.as_path());
+        let settings = profile
+            .settings_with_auth(&root.join("workspace"), true, auth_source)
+            .unwrap();
         let mut command = background_contained_tokio_command("/usr/bin/python3");
         command
             .args(["-u", "-c", SERVER])
@@ -130,6 +138,28 @@ impl Fixture {
         drop(self.client);
         self.process.terminate_bounded().await.unwrap();
     }
+}
+
+#[tokio::test]
+async fn external_auth_refuses_sources_in_native_read_grants() {
+    for mode in ["package-auth-path", "bootstrap-auth-path"] {
+        let mut f = Fixture::new(mode);
+        let command =
+            f.profile
+                .app_server_command(&f.root.join("workspace"), true, Some(&f.source));
+        assert_eq!(command.unwrap_err().code, "CODEX_AUTH_SOURCE_UNSUPPORTED");
+        assert_eq!(
+            f.bootstrap().await.unwrap_err().code,
+            "CODEX_AUTH_SOURCE_UNSUPPORTED"
+        );
+        f.end().await;
+    }
+    let mut f = Fixture::new("missing-source-denial");
+    assert_eq!(
+        f.bootstrap().await.unwrap_err().code,
+        "CODEX_PROFILE_UNQUALIFIED"
+    );
+    f.end().await;
 }
 
 #[tokio::test]

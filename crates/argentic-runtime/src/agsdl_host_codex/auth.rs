@@ -27,7 +27,7 @@ pub(super) fn error(code: &str) -> EngineFailure {
         "CODEX_AUTH_REFRESH_REQUIRED" => "Codex rejected the access token and no renewed token for the same account is available",
         "CODEX_AUTH_TIMEOUT" => "Native authentication did not complete within its deadline",
         "CODEX_AUTH_PROFILE_CONFLICT" => "External authentication requires a private execution profile without stored auth",
-        "CODEX_AUTH_SOURCE_UNSUPPORTED" => "Expected an explicitly selected private ChatGPT file session outside the workspace and execution profile",
+        "CODEX_AUTH_SOURCE_UNSUPPORTED" => "Expected an explicitly selected private ChatGPT file session outside the execution profile and native read grants",
         "CODEX_AUTH_SOURCE_UNAVAILABLE" => "The explicitly selected ChatGPT file session is unavailable",
         _ => "Native external ChatGPT authentication was refused",
     })

@@ -416,7 +416,16 @@ impl Profile {
         }
         command
     }
+    #[cfg(test)]
     pub fn settings(&self, root: &Path, read_only: bool) -> Result<Value> {
+        self.settings_with_auth(root, read_only, None)
+    }
+    pub(crate) fn settings_with_auth(
+        &self,
+        root: &Path,
+        read_only: bool,
+        auth_source: Option<&Path>,
+    ) -> Result<Value> {
         if let Some(runtime) = &self.runtime {
             if !read_only || self.directory.starts_with("/tmp") {
                 return Err(failure(
@@ -473,6 +482,17 @@ impl Profile {
                 json!("read"),
             );
         }
+        if let Some(source) = auth_source {
+            super::auth::source_scope(source, &self.directory, root)?;
+            let unsupported = || super::auth::error("CODEX_AUTH_SOURCE_UNSUPPORTED");
+            if source.starts_with(binary) || source.starts_with(&self.bootstrap) {
+                return Err(unsupported());
+            }
+            tool_files.insert(
+                source.to_str().ok_or_else(unsupported)?.into(),
+                json!("deny"),
+            );
+        }
         // Context discovery stays at the private empty bootstrap. Existing
         // metadata can be read only as explicit workspace data by native tools.
         Ok(
@@ -489,8 +509,9 @@ impl Profile {
         &self,
         root: &Path,
         read_only: bool,
+        auth_source: Option<&Path>,
     ) -> Result<tokio::process::Command> {
-        let mut settings = self.settings(root, read_only)?;
+        let mut settings = self.settings_with_auth(root, read_only, auth_source)?;
         if let Some(mcp) = &self.mcp {
             settings["mcp_servers"] = mcp.servers.clone();
         }
@@ -646,6 +667,7 @@ pub(crate) fn verify_layers(
     profile: &Profile,
     root: &Path,
     read_only: bool,
+    auth_source: Option<&Path>,
 ) -> Result<()> {
     let layers = value
         .get("layers")
@@ -679,7 +701,7 @@ pub(crate) fn verify_layers(
         }
     }
     let config = &value["config"];
-    let expected = profile.settings(root, read_only)?;
+    let expected = profile.settings_with_auth(root, read_only, auth_source)?;
     fn contains(actual: &Value, expected: &Value) -> bool {
         if let Some(expected) = expected.as_object() {
             return expected.iter().all(|(key, value)| {
@@ -871,26 +893,26 @@ mod tests {
             "deny"
         );
         let config = json!({"layers":[{"name":{"type":"sessionFlags"},"config":settings}],"config":settings});
-        verify_layers(&config, &profile, &workspace, false).unwrap();
+        verify_layers(&config, &profile, &workspace, false, None).unwrap();
         let mut serialized = config.clone();
         serialized["config"]
             .as_object_mut()
             .unwrap()
             .remove("tools");
-        verify_layers(&serialized, &profile, &workspace, false).unwrap();
+        verify_layers(&serialized, &profile, &workspace, false, None).unwrap();
         serialized["layers"][0]["config"]["tools"]["update_plan"]["enabled"] = json!(false);
-        assert!(verify_layers(&serialized, &profile, &workspace, false).is_err());
+        assert!(verify_layers(&serialized, &profile, &workspace, false, None).is_err());
         for pointer in [
             "/config/permissions/macro-agsdl/filesystem/:tmpdir",
             "/config/permissions/macro-agsdl/filesystem/:slash_tmp",
         ] {
             let mut changed = config.clone();
             *changed.pointer_mut(pointer).unwrap() = json!("write");
-            assert!(verify_layers(&changed, &profile, &workspace, false).is_err());
+            assert!(verify_layers(&changed, &profile, &workspace, false, None).is_err());
         }
         let mut network = config;
         network["config"]["permissions"]["macro-agsdl"]["network"]["enabled"] = json!(true);
-        assert!(verify_layers(&network, &profile, &workspace, false).is_err());
+        assert!(verify_layers(&network, &profile, &workspace, false, None).is_err());
     }
     #[test]
     fn bootstrap_is_stable_and_changes_are_refused_without_deleting_data() {

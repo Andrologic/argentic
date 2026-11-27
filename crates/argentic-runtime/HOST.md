@@ -509,6 +509,13 @@ supplies `codex-code-mode-host` as a sibling. Argentic checks the expected
 helpers and binds their digests to the capture. An incomplete package
 reports `CODEX_PACKAGE_INCOMPLETE` before a model thread.
 
+Before launching the app-server for a work, Argentic compares the current
+package and profile digest with the Start capture. It verifies the active
+ChatGPT account and routing before it starts or resumes a thread.
+
+Argentic holds non-final agent text until the turn ends. A turn that queues
+more than 1,000 items or 4,000,000 encoded bytes fails with `NATIVE_UNCERTAIN`.
+
 On Linux, Argentic waits for the process supervisor to reap its adopted
 children before confirming that the contained process tree has stopped.
 
@@ -525,8 +532,10 @@ starts no provider and reads no credentials. This experimental opt-in uses the
 internal app-server external-auth API, limited to the exact official 0.167.0
 execution binary. It reads only a private, owned, regular ChatGPT file session,
 never its configuration or refresh mechanism. The default private login remains
-unchanged. Keep the file outside the workspace and execution profile, and use a
-private execution profile without stored auth. See [authentication limits and
+unchanged. Keep the file outside the workspace, execution profile, bootstrap
+directory and Codex package directory. Argentic includes an explicit denial
+for the auth file in the attested native sandbox policy. Use a private execution
+profile without stored auth. See [authentication limits and
 diagnostics](https://github.com/Andrologic/Macro/blob/develop/docs/agsdl-codex-native.md#explicit-existing-file-authentication).
 Do not expose credentials in operator input/output, logs or evidence. A status
 login or synthetic peer does not qualify this opt-in for product use.

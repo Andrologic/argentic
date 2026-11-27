@@ -261,7 +261,13 @@ impl Client {
                 json!({"includeLayers":true,"cwd":profile.bootstrap}),
             )
             .await?;
-        profile::verify_layers(&config, profile, std::path::Path::new(cwd), read_only)?;
+        profile::verify_layers(
+            &config,
+            profile,
+            Path::new(cwd),
+            read_only,
+            self.auth_source.as_deref(),
+        )?;
         let skills = self
             .request(
                 "skills/list",
@@ -305,6 +311,12 @@ impl Client {
         read_only: bool,
     ) -> Result<(Vec<Value>, String)> {
         self.preflight(profile, cwd, read_only).await?;
+        let account_digest = self.current_account_digest().await?;
+        let models = self.request("model/list", json!({"limit":100})).await?;
+        Ok((model_observations030(&models)?, account_digest))
+    }
+
+    pub(crate) async fn current_account_digest(&mut self) -> Result<String> {
         let account = self
             .request("account/read", json!({"refreshToken":false}))
             .await?;
@@ -322,8 +334,7 @@ impl Client {
                 return Err(auth::error("CODEX_AUTH_ACCOUNT_CHANGED"));
             }
         }
-        let models = self.request("model/list", json!({"limit":100})).await?;
-        Ok((model_observations030(&models)?, account_digest))
+        Ok(account_digest)
     }
 }
 
@@ -369,7 +380,6 @@ impl Client {
         if self.external_auth.is_some() {
             return self.check_auth_current().await;
         }
-        auth::source_scope(&source, &profile.directory, workspace)?;
         let credential = auth::read(&source).await?;
         let state = auth::Guard(std::sync::Arc::new(tokio::sync::Mutex::new(
             auth::Session {
@@ -468,7 +478,13 @@ impl Client {
                 json!({"includeLayers":true,"cwd":profile.bootstrap}),
             )
             .await?;
-        profile::verify_layers(&config, profile, &state.workspace, state.read_only)?;
+        profile::verify_layers(
+            &config,
+            profile,
+            &state.workspace,
+            state.read_only,
+            Some(&state.source),
+        )?;
         let skills = self
             .auth_response(
                 "skills/list",
