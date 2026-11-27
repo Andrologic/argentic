@@ -128,6 +128,7 @@ struct Choice {
 #[derive(Deserialize)]
 struct Delta {
     content: Option<String>,
+    refusal: Option<String>,
     #[serde(alias = "reasoning")]
     reasoning_content: Option<String>,
     tool_calls: Option<Vec<CallDelta>>,
@@ -153,6 +154,7 @@ struct Accumulator {
     calls: BTreeMap<u32, (String, String, String)>,
     usage: Option<Usage>,
     finish: Option<Finish>,
+    refused: bool,
     call_bytes: usize,
 }
 
@@ -175,6 +177,10 @@ impl Events for Accumulator {
         if let Some(choice) = frame.choices.into_iter().find(|choice| choice.index == 0) {
             if let Some(delta) = choice.delta {
                 if let Some(text) = delta.content.filter(|text| !text.is_empty()) {
+                    output.push_back(Chunk::Text(text));
+                }
+                if let Some(text) = delta.refusal.filter(|text| !text.is_empty()) {
+                    self.refused = true;
                     output.push_back(Chunk::Text(text));
                 }
                 if let Some(reasoning) = delta.reasoning_content.filter(|text| !text.is_empty()) {
@@ -233,6 +239,11 @@ impl Events for Accumulator {
         let finish = self
             .finish
             .ok_or_else(|| ProviderError::Invalid("Stream ended without a finish reason".into()))?;
+        let finish = if self.refused && matches!(finish, Finish::Stop | Finish::ToolCalls) {
+            Finish::Filtered
+        } else {
+            finish
+        };
         let mut ids = std::collections::HashSet::new();
         for (id, name, arguments) in std::mem::take(&mut self.calls).into_values() {
             if matches!(finish, Finish::Length | Finish::Filtered) {
