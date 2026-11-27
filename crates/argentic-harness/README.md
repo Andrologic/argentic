@@ -341,8 +341,10 @@ clears both forms of `NO_PROXY`. Clients that ignore the proxy cannot reach
 the network directly.
 
 The proxy checks the requested host and resolved addresses against the current
-policy before each upstream connection. It rechecks open opaque CONNECT
-tunnels every 250 ms and closes them if access is revoked. The proxy resolves
+policy before each upstream connection. It refreshes the policy for open
+opaque CONNECT tunnels once per invocation every 250 ms. Revoked tunnels
+close within roughly one refresh interval plus scheduling and policy lookup
+time. Bytes already handed to the socket may still arrive. The proxy resolves
 names on the host and connects to checked IP addresses.
 Private, loopback and link-local addresses need an exact IP grant. Unspecified
 addresses are always blocked. In intercept mode an `ask` requires a person's

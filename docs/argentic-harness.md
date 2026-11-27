@@ -244,8 +244,11 @@ et l’autorité des requêtes HTTP.
 
 Le proxy vérifie l’hôte demandé et les adresses résolues dans la politique
 en vigueur avant chaque connexion sortante. Un refus renvoie une erreur HTTP
-403. Le proxy revérifie les tunnels opaques ouverts toutes les 250 ms et les
-ferme si l’accès est révoqué. Une demande `ask` passe par le port partagé
+403. Le proxy actualise toutes les 250 ms la politique commune aux tunnels
+opaques de l’invocation. En cas de révocation, la fermeture prend environ
+un intervalle, auquel s’ajoutent le délai de planification et le temps de
+consultation de la politique. Les octets déjà transmis à la socket peuvent
+encore arriver. Une demande `ask` passe par le port partagé
 d’approbation humaine en mode `intercept` et est refusée en l’absence de
 relecteur. Le proxy mémorise la décision par hôte pour la durée de
 l’invocation. Un refus dans la politique en vigueur prime sur une approbation
