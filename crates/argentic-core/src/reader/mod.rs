@@ -40,7 +40,10 @@ pub(crate) const PINNED_MODULES: [(&str, &str); 5] = [
         include_str!("../../assets/harnesses/opencode/module.json"),
     ),
     ("pi", include_str!("../../assets/harnesses/pi/module.json")),
-    ("argentic", include_str!("../../assets/harnesses/argentic/module.json")),
+    (
+        "argentic",
+        include_str!("../../assets/harnesses/argentic/module.json"),
+    ),
 ];
 
 // Installation metadata lives outside the AgSDL module schema. Only bundled
