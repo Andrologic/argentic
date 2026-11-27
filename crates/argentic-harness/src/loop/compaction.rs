@@ -486,7 +486,8 @@ fn message_bytes(message: &Message) -> usize {
     }
 }
 
-pub(super) fn history_bytes(messages: &[Message]) -> usize {
+/// Approximate the bytes retained by an instance conversation.
+pub fn history_bytes(messages: &[Message]) -> usize {
     messages.iter().map(message_bytes).sum()
 }
 

@@ -1,6 +1,7 @@
 //! Runs one AgSDL work in a fresh or continuing conversation.
 
 mod compaction;
+pub use compaction::history_bytes;
 mod delegate;
 mod plan;
 pub use plan::{PlanDecision, PlanMode, PlanStatus, PlanStep};
@@ -520,6 +521,27 @@ impl ReviewReservation {
     }
 }
 
+// Plan context and steer are request-only until the provider accepts delivery.
+struct RequestMessages<'a> {
+    messages: &'a mut Vec<Message>,
+    original_len: usize,
+}
+
+impl<'a> RequestMessages<'a> {
+    fn new(messages: &'a mut Vec<Message>) -> Self {
+        Self {
+            original_len: messages.len(),
+            messages,
+        }
+    }
+}
+
+impl Drop for RequestMessages<'_> {
+    fn drop(&mut self) {
+        self.messages.truncate(self.original_len);
+    }
+}
+
 struct Instance<'a> {
     harness: &'a Harness,
     port: &'a dyn WorkPort,
@@ -551,17 +573,12 @@ impl Instance<'_> {
         let settings = &self.harness.settings;
         let turn_limit = self.turn_limit;
         let min_output = self.harness.provider.min_output_tokens();
-        let mut definitions: Vec<_> = self
-            .harness
-            .registry
-            .definitions()
-            .map(|(_, def)| def.clone())
-            .collect();
+        let mut definitions = Cow::Borrowed(self.harness.registry.tool_definitions());
         if self.harness.plan != PlanMode::Off {
-            definitions.push(plan::definition());
+            definitions.to_mut().push(plan::definition());
         }
         if self.harness.delegation && self.harness.registry.may_delegate() {
-            definitions.push(delegate::definition());
+            definitions.to_mut().push(delegate::definition());
         }
         let mut extensions_ready = false;
         for turn in 1..=turn_limit {
@@ -585,7 +602,10 @@ impl Instance<'_> {
                     .prepare_extensions(self.tracker)
                     .await
                     .map_err(Failure::Port)?;
-                definitions.extend(self.harness.registry.extension_definitions());
+                let extensions = self.harness.registry.extension_definitions();
+                if !extensions.is_empty() {
+                    definitions.to_mut().extend(extensions);
+                }
                 extensions_ready = true;
             }
             let tool_bytes = compaction::tool_bytes(&definitions)
@@ -792,7 +812,7 @@ impl Instance<'_> {
     async fn request(
         &mut self,
         turn: u32,
-        work: &Work,
+        work: &mut Work,
         definitions: &[ToolDefinition],
         max_output_tokens: u32,
     ) -> Result<Response, Failure> {
@@ -801,8 +821,13 @@ impl Instance<'_> {
             hook.prepare_request(turn, &mut messages, self.cancel)
                 .await?;
         }
+        let mut owned = match messages {
+            Cow::Borrowed(messages) if std::ptr::eq(messages, work.messages.as_slice()) => None,
+            replaced => Some(replaced.into_owned()),
+        };
+        let messages = RequestMessages::new(owned.as_mut().unwrap_or(&mut work.messages));
         if let Some(plan) = &self.plan_context {
-            messages.to_mut().push(Message::User(plan.clone()));
+            messages.messages.push(Message::User(plan.clone()));
         }
         self.active()?;
         let mut guard = None;
@@ -813,9 +838,9 @@ impl Instance<'_> {
                 SteerAdmission::Admit(admitted) => {
                     guard = admitted;
                     if let Some(reference) = &steer.reference {
-                        messages.to_mut().push(Message::User(reference.clone()));
+                        messages.messages.push(Message::User(reference.clone()));
                     }
-                    messages.to_mut().push(Message::User(steer.message.clone()));
+                    messages.messages.push(Message::User(steer.message.clone()));
                     index += 1;
                 }
                 SteerAdmission::Defer => {
@@ -841,7 +866,7 @@ impl Instance<'_> {
             Request {
                 model: &work.model,
                 reasoning_effort: work.reasoning_effort.as_deref(),
-                messages: &messages,
+                messages: messages.messages,
                 tools: definitions,
                 tool_choice,
                 tool_choice_rejected: Some(self.tool_choice_rejected),

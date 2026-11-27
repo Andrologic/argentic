@@ -66,16 +66,113 @@ impl Root {
 
 pub struct Registry {
     roots: Vec<Root>,
-    policy: Vec<Policy>,
-    submission: jsonschema::Validator,
-    definitions: Vec<ToolDefinition>,
+    policy: Arc<[Policy]>,
+    toolbox: Toolbox,
     authorizer: Option<Arc<dyn Authorizer>>,
     extensions: Option<Arc<dyn Extensions>>,
-    writes: bool,
-    shell: bool,
     shell_staging_directory: Option<PathBuf>,
     shell_network: ShellNetwork,
     root_gates: Vec<Arc<tokio::sync::RwLock<()>>>,
+}
+
+/// Tool schemas, compiled once for registries with the same submission contract.
+#[derive(Clone)]
+pub struct Toolbox {
+    submission: Arc<jsonschema::Validator>,
+    definitions: Arc<Vec<ToolDefinition>>,
+    writes: bool,
+    shell: bool,
+}
+
+impl Toolbox {
+    pub fn new(submission_schema: Value) -> Result<Self, String> {
+        let submission =
+            jsonschema::validator_for(&submission_schema).map_err(|e| e.to_string())?;
+        let mut definitions = Vec::new();
+        for (name, description, required) in [
+            (
+                "read",
+                "Read a UTF-8 file relative to the selected workspace root.",
+                vec!["path"],
+            ),
+            (
+                "list",
+                "List the readable entries of a workspace directory.",
+                vec![],
+            ),
+            (
+                "glob",
+                "Find readable paths matching a glob relative to the selected directory.",
+                vec!["pattern"],
+            ),
+            (
+                "grep",
+                "Search readable UTF-8 files for a regular expression.",
+                vec!["pattern"],
+            ),
+        ] {
+            definitions.push(ToolDefinition {
+                name: name.into(),
+                description: description.into(),
+                parameters: json!({
+                    "type": "object", "required": required, "additionalProperties": false,
+                    "properties": {
+                        "path": {"type":"string"},
+                        "root": {"type":"integer","minimum":0},
+                        "pattern": {"type":"string"},
+                        "cursor": {"type":"string"},
+                        "limit": {"type":"integer","minimum":1,"maximum":2000}
+                    }
+                }),
+            });
+        }
+        definitions.push(ToolDefinition {
+            name: SUBMIT_RESULT.into(),
+            description:
+                "Submit the work result. Correct any validation error in this conversation.".into(),
+            parameters: submission_schema,
+        });
+        Ok(Self {
+            submission: Arc::new(submission),
+            definitions: Arc::new(definitions),
+            writes: false,
+            shell: false,
+        })
+    }
+
+    pub fn with_writes(mut self) -> Self {
+        self.writes = true;
+        for (name, description, required, mut properties) in [
+            ("write", "Create or atomically replace a workspace file. Its parent directory must exist.",
+                json!(["path","content"]), json!({"path":{"type":"string"},"content":{"type":"string"}})),
+            ("edit", "Replace one exact match in a workspace file, or all matches when requested.",
+                json!(["path","old_text","new_text"]), json!({"path":{"type":"string"},"old_text":{"type":"string"},"new_text":{"type":"string"},"replace_all":{"type":"boolean"}})),
+            ("apply_patch", "Apply a patch with Begin Patch and End Patch markers and Add File, Update File, Move to, or Delete File sections.",
+                json!(["patch_text"]), json!({"patch_text":{"type":"string"}})),
+        ] {
+            properties["root"] = json!({"type":"integer","minimum":0});
+            Arc::make_mut(&mut self.definitions).push(ToolDefinition {
+                name: name.into(), description: description.into(),
+                parameters: json!({"type":"object","required":required,"properties":properties,"additionalProperties":false}),
+            });
+        }
+        self
+    }
+
+    pub fn with_shell(mut self) -> Self {
+        self.shell = true;
+        Arc::make_mut(&mut self.definitions).push(ToolDefinition {
+            name: "shell".into(),
+            description: if cfg!(target_os = "macos") {
+                "Run Bash with the staged workspace as the current directory. Additional roots are in ARGENTIC_DIRECTORY_<index>. Output is capped."
+            } else {
+                "Run Bash in a sandbox with the admitted workspace at /workspace and additional roots under /directories. Output is capped."
+            }.into(),
+            parameters: json!({"type":"object","required":["command"],"additionalProperties":false,
+                "properties":{"command":{"type":"string"},"timeout_ms":{"type":"integer","minimum":1,"maximum":300000}}}),
+        });
+        self
+    }
 }
 
 /// An approval belongs to this tool call and this action only.
@@ -143,6 +240,18 @@ impl Registry {
         if roots.is_empty() || policy.is_empty() {
             return Err("At least one workspace root and read ceiling are required".into());
         }
+        Self::with_toolbox(roots, policy.into(), Toolbox::new(submission_schema)?)
+    }
+
+    /// Combine reusable definitions with the handles and ceilings for this work.
+    pub fn with_toolbox(
+        roots: Vec<(PathBuf, Dir)>,
+        policy: Arc<[ReadPolicy]>,
+        toolbox: Toolbox,
+    ) -> Result<Self, String> {
+        if roots.is_empty() || policy.is_empty() {
+            return Err("At least one workspace root and read ceiling are required".into());
+        }
         let root_gates = roots
             .iter()
             .map(|(path, _)| workspace_gate(path))
@@ -151,61 +260,12 @@ impl Registry {
             .into_iter()
             .map(|(path, directory)| Root { path, directory })
             .collect();
-        let submission =
-            jsonschema::validator_for(&submission_schema).map_err(|e| e.to_string())?;
-        let mut definitions = Vec::new();
-        for (name, description, required) in [
-            (
-                "read",
-                "Read a UTF-8 file relative to the selected workspace root.",
-                vec!["path"],
-            ),
-            (
-                "list",
-                "List the readable entries of a workspace directory.",
-                vec![],
-            ),
-            (
-                "glob",
-                "Find readable paths matching a glob relative to the selected directory.",
-                vec!["pattern"],
-            ),
-            (
-                "grep",
-                "Search readable UTF-8 files for a regular expression.",
-                vec!["pattern"],
-            ),
-        ] {
-            definitions.push(ToolDefinition {
-                name: name.into(),
-                description: description.into(),
-                parameters: json!({
-                    "type": "object", "required": required, "additionalProperties": false,
-                    "properties": {
-                        "path": {"type":"string"},
-                        "root": {"type":"integer","minimum":0},
-                        "pattern": {"type":"string"},
-                        "cursor": {"type":"string"},
-                        "limit": {"type":"integer","minimum":1,"maximum":2000}
-                    }
-                }),
-            });
-        }
-        definitions.push(ToolDefinition {
-            name: SUBMIT_RESULT.into(),
-            description:
-                "Submit the work result. Correct any validation error in this conversation.".into(),
-            parameters: submission_schema,
-        });
         Ok(Self {
             roots,
             policy,
-            submission,
-            definitions,
+            toolbox,
             authorizer: None,
             extensions: None,
-            writes: false,
-            shell: false,
             shell_staging_directory: None,
             shell_network: ShellNetwork::default(),
             root_gates,
@@ -219,49 +279,26 @@ impl Registry {
     ) -> Result<Self, String> {
         for definition in definitions {
             if self
+                .toolbox
                 .definitions
                 .iter()
                 .any(|tool| tool.name == definition.name)
             {
                 return Err("Duplicate tool name".into());
             }
-            self.definitions.push(definition);
+            Arc::make_mut(&mut self.toolbox.definitions).push(definition);
         }
         self.extensions = Some(tools);
         Ok(self)
     }
 
     pub fn with_writes(mut self) -> Self {
-        self.writes = true;
-        for (name, description, required, mut properties) in [
-            ("write", "Create or atomically replace a workspace file. Its parent directory must exist.",
-                json!(["path","content"]), json!({"path":{"type":"string"},"content":{"type":"string"}})),
-            ("edit", "Replace one exact match in a workspace file, or all matches when requested.",
-                json!(["path","old_text","new_text"]), json!({"path":{"type":"string"},"old_text":{"type":"string"},"new_text":{"type":"string"},"replace_all":{"type":"boolean"}})),
-            ("apply_patch", "Apply a patch with Begin Patch and End Patch markers and Add File, Update File, Move to, or Delete File sections.",
-                json!(["patch_text"]), json!({"patch_text":{"type":"string"}})),
-        ] {
-            properties["root"] = json!({"type":"integer","minimum":0});
-            self.definitions.push(ToolDefinition {
-                name: name.into(), description: description.into(),
-                parameters: json!({"type":"object","required":required,"properties":properties,"additionalProperties":false}),
-            });
-        }
+        self.toolbox = self.toolbox.with_writes();
         self
     }
 
     pub fn with_shell(mut self) -> Self {
-        self.shell = true;
-        self.definitions.push(ToolDefinition {
-            name: "shell".into(),
-            description: if cfg!(target_os = "macos") {
-                "Run Bash with the staged workspace as the current directory. Additional roots are in ARGENTIC_DIRECTORY_<index>. Output is capped."
-            } else {
-                "Run Bash in a sandbox with the admitted workspace at /workspace and additional roots under /directories. Output is capped."
-            }.into(),
-            parameters: json!({"type":"object","required":["command"],"additionalProperties":false,
-                "properties":{"command":{"type":"string"},"timeout_ms":{"type":"integer","minimum":1,"maximum":300000}}}),
-        });
+        self.toolbox = self.toolbox.with_shell();
         self
     }
 
@@ -384,12 +421,10 @@ impl Registry {
                 .map(|(path, _)| (path.clone(), Zone::ReadDirectory))
                 .collect(),
         );
-        let mut policies = self.policy.clone();
+        let mut policies = self.policy.to_vec();
         policies.push(child_policy);
         let mut registry = Self::with_open_roots(roots, policies, json!(false))?;
-        registry
-            .definitions
-            .retain(|tool| tool.name != SUBMIT_RESULT);
+        Arc::make_mut(&mut registry.toolbox.definitions).retain(|tool| tool.name != SUBMIT_RESULT);
         Ok(registry)
     }
 
@@ -398,7 +433,13 @@ impl Registry {
     }
 
     pub fn definitions(&self) -> impl Iterator<Item = (Exposure, &ToolDefinition)> {
-        self.definitions.iter().map(|def| (Exposure::Direct, def))
+        self.tool_definitions()
+            .iter()
+            .map(|def| (Exposure::Direct, def))
+    }
+
+    pub(crate) fn tool_definitions(&self) -> &[ToolDefinition] {
+        &self.toolbox.definitions
     }
 
     pub(crate) async fn prepare_extensions(&self, tracker: &TaskTracker) -> Result<(), String> {
@@ -419,7 +460,7 @@ impl Registry {
     }
 
     pub fn validate_submission(&self, arguments: &str) -> Result<Value, String> {
-        submission::validate(&self.submission, arguments)
+        submission::validate(&self.toolbox.submission, arguments)
     }
 
     pub async fn read_tool(
@@ -481,7 +522,7 @@ impl Registry {
         cancel: CancellationToken,
         tracker: &TaskTracker,
     ) -> Result<Page, String> {
-        if !self.writes {
+        if !self.toolbox.writes {
             return Err("Mutation tools are disabled".into());
         }
         let (index, mutation) = mutation::Mutation::parse(&call.name, &call.arguments)?;

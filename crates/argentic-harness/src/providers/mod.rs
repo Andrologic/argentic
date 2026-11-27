@@ -19,7 +19,7 @@ use serde_json::Value;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct ModelName {
     provider: String,
     model: String,
@@ -79,7 +79,7 @@ pub struct ToolDefinition {
     pub parameters: Value,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub enum Message {
     System(String),
     User(String),
@@ -95,7 +95,7 @@ pub enum Message {
     },
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 enum WireFormat {
     Anthropic,
     Responses,
@@ -103,7 +103,7 @@ enum WireFormat {
 
 /// Provider-native assistant items reserved for replay with the same model.
 /// Kept out of visible events and redacted in diagnostic output.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct Replay {
     format: WireFormat,
     model: ModelName,

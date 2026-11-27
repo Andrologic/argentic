@@ -179,7 +179,7 @@ impl Registry {
         cancel: CancellationToken,
         tracker: &TaskTracker,
     ) -> Result<Page, String> {
-        if !self.shell {
+        if !self.toolbox.shell {
             return Err("Shell tool is disabled".into());
         }
         let args: Arguments = serde_json::from_str(&call.arguments).map_err(|e| e.to_string())?;
@@ -203,7 +203,7 @@ impl Registry {
             {
                 return Err(SHELL_NETWORK_PATTERN.into());
             }
-            for policy in &self.policy {
+            for policy in self.policy.iter() {
                 if let Some(conflict) = shell_read_conflict(policy, network) {
                     return Err(conflict.to_string());
                 }
@@ -263,7 +263,7 @@ fn run(
     {
         let mut snapshots = Vec::with_capacity(registry.roots.len());
         for root in &registry.roots {
-            let write = registry.writes
+            let write = registry.toolbox.writes
                 && registry.policy.iter().all(|policy| {
                     let zone = registry.base_zone(&root.path);
                     [Action::Read, Action::Write]
