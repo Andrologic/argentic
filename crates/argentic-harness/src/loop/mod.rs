@@ -385,20 +385,39 @@ impl Harness {
                 budget,
                 turn_limit,
             };
-            let (outcome, forced) = {
+            let grace = Duration::from_millis(u64::from(self.settings.limit("cancelGraceMs")));
+            let (outcome, deadline, mut forced) = {
                 let future = instance.execute(&mut work);
                 tokio::pin!(future);
                 tokio::select! {
                     biased;
                     _ = cancel.cancelled() => {
-                        let grace = Duration::from_millis(u64::from(self.settings.limit("cancelGraceMs")));
-                        let forced = tokio::time::timeout(grace, &mut future).await.is_err();
-                        (Err(Failure::Cancelled), forced)
+                        let deadline = tokio::time::Instant::now() + grace;
+                        let forced = tokio::time::timeout_at(deadline, &mut future).await.is_err();
+                        (Err(Failure::Cancelled), Some(deadline), forced)
                     }
-                    outcome = &mut future => (outcome, false),
+                    outcome = &mut future => (outcome, None, false),
                 }
             };
-            let steer_result = instance.settle_steer().await;
+            let steer_result = {
+                let settlement = instance.settle_steer();
+                tokio::pin!(settlement);
+                let result = match deadline {
+                    Some(deadline) => tokio::time::timeout_at(deadline, &mut settlement).await,
+                    None => tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => tokio::time::timeout(grace, &mut settlement).await,
+                        result = &mut settlement => Ok(result),
+                    },
+                };
+                match result {
+                    Ok(result) => result,
+                    Err(_) => {
+                        forced = true;
+                        Err(Failure::Cancelled)
+                    }
+                }
+            };
             instance.persist_steer(&mut work.messages);
             let outcome = if cancel.is_cancelled() {
                 Err(Failure::Cancelled)
@@ -407,6 +426,7 @@ impl Harness {
             };
             cancel.cancel();
             // Closing drops any undelivered steer receipt before joining workers.
+            instance.pending_steer.clear();
             instance.steer.close();
             while instance.steer.try_recv().is_ok() {}
             tracker.close();

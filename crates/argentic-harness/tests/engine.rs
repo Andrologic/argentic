@@ -853,6 +853,53 @@ async fn text_only_submission_gets_a_tool_call_correction() {
     }
 }
 
+#[tokio::test(start_paused = true)]
+async fn stop_bounds_pending_steer_settlement() {
+    struct PendingSettlement(CancellationToken);
+
+    #[async_trait]
+    impl WorkPort for PendingSettlement {
+        async fn settle_steer(
+            &self,
+            id: &str,
+            status: argentic_harness::providers::DeliveryStatus,
+        ) -> Result<(), Failure> {
+            assert_eq!(id, "offer");
+            assert_eq!(
+                status,
+                argentic_harness::providers::DeliveryStatus::Accepted
+            );
+            self.0.cancel();
+            std::future::pending().await
+        }
+    }
+
+    let (_dir, harness) = fixture(
+        vec![vec![end(Finish::Stop)], vec![end(Finish::Stop)]],
+        json!({"cancelGraceMs": 10}),
+    );
+    let (send, steer) = mpsc::channel(1);
+    let (consumed, receipt) = oneshot::channel();
+    send.try_send(Steer {
+        id: "offer".into(),
+        reference: None,
+        message: "accepted steer".into(),
+        consumed,
+    })
+    .unwrap();
+    let cancel = CancellationToken::new();
+    let port = PendingSettlement(cancel.clone());
+    let report = tokio::time::timeout(
+        Duration::from_millis(100),
+        harness.run(work(false), &port, steer, cancel),
+    )
+    .await
+    .expect("Stop must return within the cancellation grace period");
+    assert!(matches!(report.outcome, Err(Failure::Cancelled)));
+    assert!(report.physical_end.forced());
+    assert!(receipt.await.is_err());
+}
+
 #[tokio::test]
 async fn steer_is_not_acknowledged_or_retained_when_the_next_request_fails() {
     let (_dir, harness) = fixture(vec![vec![end(Finish::Stop)]], json!({}));
