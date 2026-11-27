@@ -646,7 +646,6 @@ fn install_linux_process_supervisor(status_descriptor: i32) -> io::Result<()> {
     match start_linux_workload(supervisor_group, status_descriptor) {
         Ok(None) => Ok(()),
         Ok(Some(command_process_id)) => {
-            close_linux_file_descriptors_except(status_descriptor);
             supervise_linux_command(command_process_id, status_descriptor)
         }
         Err(error) => {
@@ -661,8 +660,10 @@ fn start_linux_workload(
     supervisor_group: libc::pid_t,
     status_descriptor: i32,
 ) -> io::Result<Option<libc::pid_t>> {
-    use std::io::{Read, Write};
-    use std::os::unix::net::UnixStream;
+    use std::{
+        io::{Read, Write},
+        os::{fd::AsRawFd, unix::net::UnixStream},
+    };
 
     // Linux retains the group of an exited child until it is reaped.
     if unsafe { libc::setpgid(supervisor_group, supervisor_group) } == -1 {
@@ -676,7 +677,8 @@ fn start_linux_workload(
     if pid == 0 {
         drop(ready_writer);
         unsafe { libc::close(status_descriptor) };
-        // Do not exec while the supervisor is still in the workload group.
+        // Do not exec until the supervisor is in its own group and has
+        // closed its unrelated descriptors.
         if ready_reader.read_exact(&mut [0]).is_err() {
             unsafe { libc::_exit(1) };
         }
@@ -684,11 +686,13 @@ fn start_linux_workload(
     }
 
     drop(ready_reader);
-    let ready = if unsafe { libc::setpgid(0, supervisor_group) } == -1 {
-        Err(io::Error::last_os_error())
-    } else {
+    let ready = (|| {
+        if unsafe { libc::setpgid(0, supervisor_group) } == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        close_linux_file_descriptors_except([status_descriptor, ready_writer.as_raw_fd()])?;
         ready_writer.write_all(&[1])
-    };
+    })();
     drop(ready_writer);
     if let Err(error) = ready {
         reap_linux_setup_child(pid);
@@ -757,22 +761,91 @@ fn write_linux_command_status(descriptor: i32, status: i32) {
 }
 
 #[cfg(target_os = "linux")]
-fn close_linux_file_descriptors_except(preserved_descriptor: i32) {
-    let close_range = |first: u32, last: u32| {
-        first > last || unsafe { libc::syscall(libc::SYS_close_range, first, last, 0_u32) } == 0
+fn close_linux_file_descriptors_except(preserved: [i32; 2]) -> io::Result<()> {
+    let mut first = 0_u32;
+    let mut sorted = preserved.map(|fd| fd as u32);
+    sorted.sort_unstable();
+    for next in [sorted[0], sorted[1], u32::MAX] {
+        if first < next
+            && unsafe { libc::syscall(libc::SYS_close_range, first, next - 1, 0_u32) } != 0
+        {
+            return close_linux_file_descriptors_fallback(preserved);
+        }
+        first = next.saturating_add(1);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn close_linux_file_descriptors_fallback(preserved: [i32; 2]) -> io::Result<()> {
+    use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
+
+    // This runs after fork, so avoid allocating or acquiring libc/Rust locks.
+    // A descriptor may exceed the current resource limit if the limit was lowered.
+    let dir = unsafe {
+        libc::open(
+            c"/proc/self/fd".as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
     };
-    let lower_closed =
-        preserved_descriptor <= 0 || close_range(0, (preserved_descriptor - 1) as u32);
-    let upper_closed = close_range((preserved_descriptor + 1) as u32, u32::MAX);
-    if lower_closed && upper_closed {
-        return;
+    if dir < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let directory = unsafe { OwnedFd::from_raw_fd(dir) };
+    let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    if unsafe { libc::fstatfs(dir, stat.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if unsafe { stat.assume_init() }.f_type as u64 != libc::PROC_SUPER_MAGIC as u64 {
+        return Err(io::Error::from_raw_os_error(libc::ENOTSUP));
     }
 
-    for descriptor in 0..65_536 {
-        if descriptor != preserved_descriptor {
-            let _ = unsafe { libc::close(descriptor) };
+    let invalid_record = || io::Error::from_raw_os_error(libc::EIO);
+    let mut buffer = [0_u8; 4096];
+    loop {
+        let len =
+            unsafe { libc::syscall(libc::SYS_getdents64, dir, buffer.as_mut_ptr(), buffer.len()) };
+        if len == 0 {
+            break;
+        }
+        if len < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        let mut entries = &buffer[..len as usize];
+        while !entries.is_empty() {
+            // linux_dirent64 has two u64s, a u16 record length, a type byte,
+            // then the zero-terminated filename in that record.
+            let size = entries.get(16..18).ok_or_else(invalid_record)?;
+            let size = u16::from_ne_bytes([size[0], size[1]]) as usize;
+            let name = entries.get(19..size).ok_or_else(invalid_record)?;
+            let end = name
+                .iter()
+                .position(|&byte| byte == 0)
+                .ok_or_else(invalid_record)?;
+            let name = &name[..end];
+            if !matches!(name, b"." | b"..") {
+                let descriptor = std::str::from_utf8(name)
+                    .ok()
+                    .and_then(|name| name.parse::<i32>().ok())
+                    .ok_or_else(invalid_record)?;
+                if descriptor != dir
+                    && !preserved.contains(&descriptor)
+                    && unsafe { libc::close(descriptor) } == -1
+                {
+                    return Err(io::Error::last_os_error());
+                }
+            }
+            entries = &entries[size..];
         }
     }
+    if unsafe { libc::close(directory.into_raw_fd()) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -1892,6 +1965,62 @@ mod tests {
     };
     #[cfg(unix)]
     use std::fs;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_descriptor_fallback_closes_high_descriptors() {
+        // Isolate the descriptor table so the fallback can close everything
+        // except the nominated status descriptor.
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork descriptor fixture");
+        if child == 0 {
+            let preserved = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY) };
+            let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+            if preserved < 0
+                || unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) } != 0
+            {
+                unsafe { libc::_exit(2) }
+            }
+            let mut limit = unsafe { limit.assume_init() };
+            let minimum = if limit.rlim_max > 65_536 {
+                // Raise only the fixture's soft limit if the host permits it.
+                limit.rlim_cur = limit.rlim_cur.max(65_537);
+                if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) } != 0 {
+                    unsafe { libc::_exit(2) }
+                }
+                65_536
+            } else {
+                3
+            };
+            let duplicate = unsafe { libc::fcntl(preserved, libc::F_DUPFD_CLOEXEC, minimum) };
+            if duplicate < 0 {
+                unsafe { libc::_exit(2) }
+            }
+            let ready = unsafe { libc::fcntl(preserved, libc::F_DUPFD_CLOEXEC, 3) };
+            if ready < 0
+                || super::close_linux_file_descriptors_fallback([preserved, ready]).is_err()
+            {
+                unsafe { libc::_exit(2) }
+            }
+            let closed = unsafe { libc::fcntl(duplicate, libc::F_GETFD) } == -1;
+            let kept = [preserved, ready]
+                .into_iter()
+                .all(|fd| unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0);
+            unsafe { libc::_exit(i32::from(!(closed && kept))) }
+        }
+        let mut status = 0;
+        loop {
+            let waited = unsafe { libc::waitpid(child, &mut status, 0) };
+            if waited == child {
+                break;
+            }
+            assert_eq!(
+                std::io::Error::last_os_error().kind(),
+                std::io::ErrorKind::Interrupted
+            );
+        }
+        assert_eq!(status, 0, "descriptor fixture did not complete cleanly");
+    }
 
     #[cfg(target_os = "linux")]
     #[test]
