@@ -8,7 +8,7 @@ pub const HELPER_ARGUMENT: &str = "--macro-internal-agsdl-content-read";
 pub fn qualified_platform() -> bool {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
-        return super::macos_launcher::available();
+        super::macos_launcher::available()
     }
     #[cfg(any(target_os = "linux", windows))]
     {

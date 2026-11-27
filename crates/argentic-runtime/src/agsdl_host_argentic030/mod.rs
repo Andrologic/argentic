@@ -789,7 +789,7 @@ fn submission_schema(agent: &Value, contract: &Value) -> Value {
     let mut required = Vec::new();
     for (name, result) in agent["results"].as_object().into_iter().flatten() {
         let media = result["mediaType"].as_str().unwrap_or("application/json");
-        let mut schema = if media == "application/json" || media.ends_with("+json") {
+        let mut schema = if argentic_core::is_json_media(media) {
             result.get("schema").cloned().unwrap_or_else(|| json!({}))
         } else {
             json!({"type":"string"})

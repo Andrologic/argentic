@@ -15,15 +15,14 @@ module's descriptive capability is never permission to execute it.
 
 `validate_document_json` validates document bytes and returns the diagnostic
 report for the authored edition. The caller can use the bundled harness modules or supply its own
-module bytes. The Cargo suite checks the published 0.3.0 corpus and the new 0.4.0 selection cases through this API.
+module bytes. The Cargo suite checks both published validation corpora through this API.
 
 ```sh
-cargo test --offline --locked --manifest-path argentic-core/Cargo.toml
-cargo test --offline --locked --manifest-path argentic-core/Cargo.toml --doc
+cargo test --locked --manifest-path crates/argentic-core/Cargo.toml --all-targets -- --test-threads=1
+cargo test --locked --manifest-path crates/argentic-core/Cargo.toml --doc
 ```
 
-Prefix paths with `crates/` inside Macro. Keep this crate beside
-`argentic-runtime` when testing the two extracted source directories. The default
-Rust suites need no editor checkout or Bun. Editor oracle replay remains an
+Run these commands from the repository root. The default Rust suites need no
+editor checkout or Bun. Editor oracle replay remains an
 explicit development feature of the runtime. See the runtime's `README.md` and
 `HOST.md` for operational use, platform limitations and native ownership.
