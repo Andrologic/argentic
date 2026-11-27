@@ -478,6 +478,8 @@ for line in sys.stdin:
  elif method=='config/read': result={'layers':[{'name':{'type':'sessionFlags'},'config':settings}],'config':settings}
  elif method=='skills/list': result={'data':[{'cwd':bootstrap,'skills':[],'errors':[]}]}
  elif method=='command/exec': result={'exitCode':0}
+ elif method=='account/read': result={'account':{'type':'chatgpt','email':'synthetic@example.invalid'},'workspaceRouting':{'chatgptAccountId':'synthetic-account','backendOrigin':'https://chatgpt.com','accountRoutingOverride':'NO_CONSTRAINT'}}
+ elif method=='accountSession/list': result={'activeSessionId':None,'sessions':[]}
  elif method=='thread/start': result={'thread':{'id':thread},'model':p['model'],'approvalPolicy':'never','activePermissionProfile':{'id':'macro-agsdl'},'cwd':bootstrap,'runtimeWorkspaceRoots':p['runtimeWorkspaceRoots'],'instructionSources':[]}
  elif method=='turn/start':
   print(json.dumps({'id':i,'result':{'turn':{'id':'turn'}}}),flush=True)

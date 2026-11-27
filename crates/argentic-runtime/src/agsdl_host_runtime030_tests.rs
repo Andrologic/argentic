@@ -192,7 +192,7 @@ impl Fixture {
             models: vec![
                 json!({"name":"fixture","efforts":["medium","high"],"defaultEffort":"medium","isDefault":true}),
             ],
-            account_digest: "synthetic-account".into(),
+            account_digest: crate::agsdl_host_codex030::protocol_tests::fixture_account_digest(),
         };
         let digest = source["sourceSha256"].as_str().unwrap();
         let (harness, agents) = if opened.is_some() {

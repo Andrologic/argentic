@@ -246,9 +246,9 @@ impl OpenedSource {
     /// Write a deterministic `agsdl-archive-1` snapshot to an empty sink.
     /// Exports the opened project files without Git history.
     /// Returns a `PROJECT` error for a plain JSON document or an archive limit
-    /// violation before writing any bytes. On an I/O error the output may be
-    /// incomplete. The output is flushed before success is reported; the
-    /// caller still owns syncing and publishing it.
+    /// violation before writing any bytes. A write or flush failure returns
+    /// `STORAGE` and the output may be incomplete. The caller owns syncing
+    /// and publishing the completed output.
     pub fn write_archive<W: Write + ?Sized>(&self, output: &mut W) -> Result<()> {
         let project = self
             .project
@@ -256,9 +256,9 @@ impl OpenedSource {
             .ok_or_else(|| invalid(MANIFEST, "", "Source is not an AgSDL project"))?;
         archive::write(&project.files, &mut *output)?;
         output.flush().map_err(|error| {
-            invalid(
-                MANIFEST,
-                "",
+            failure(
+                "STORAGE",
+                "archive",
                 &format!("Could not flush archive output: {error}"),
             )
         })
@@ -666,12 +666,13 @@ fn read_regular(
     limit: u64,
     budget: &SourceBudget,
 ) -> std::io::Result<ProjectFile> {
-    let file = open_regular(dir, path)?;
+    let mut file = open_regular(dir, path)?;
     let meta = file.metadata()?;
-    let bytes = bounded_read(file, meta.len(), limit, budget)?;
+    let bytes = bounded_read(&mut file, meta.len(), limit, budget)?;
+    crate::content_io::single_link_metadata(&file)?;
     #[cfg(unix)]
     let executable = {
-        use cap_std::fs::PermissionsExt;
+        use std::os::unix::fs::PermissionsExt;
         meta.permissions().mode() & 0o111 != 0
     };
     #[cfg(not(unix))]
