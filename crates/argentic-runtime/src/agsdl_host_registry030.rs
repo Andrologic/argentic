@@ -43,12 +43,10 @@ pub trait HarnessAdapter030: Send + Sync {
     fn module_json(&self) -> &str;
 
     /// Local validation of an authored agent. Called before installation observation.
-    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     fn qualify_agent(&self, _agent: &Value, _pointer: &str) -> Result<()> {
         Ok(())
     }
 
-    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     fn validate_document(&self, _document: &Value, _location: Option<&url::Url>) -> Result<()> {
         Ok(())
     }
@@ -60,7 +58,6 @@ pub trait HarnessAdapter030: Send + Sync {
         read_only: bool,
     ) -> BoxFuture<'a, Result<HarnessObservation030>>;
 
-    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     fn validate_observation(
         &self,
         _document: &Value,
@@ -71,7 +68,6 @@ pub trait HarnessAdapter030: Send + Sync {
     }
 
     /// Create one executor for the run. Provider work begins in AgentExecutor030::run.
-    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     fn executor(&self, context: AgentExecutorContext030<'_>) -> Result<Arc<dyn AgentExecutor030>>;
 
     fn supports_host_approval(&self) -> bool {
@@ -105,7 +101,6 @@ impl HarnessRegistry030 {
         Self(BTreeMap::from([(adapter.id().to_owned(), adapter.clone())]))
     }
 
-    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub fn register(&mut self, adapter: Arc<dyn HarnessAdapter030>) -> Result<()> {
         use std::collections::btree_map::Entry;
         let module: Value = serde_json::from_str(adapter.module_json())?;

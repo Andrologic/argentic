@@ -83,7 +83,6 @@ impl ProviderConfig {
             })
     }
 
-    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     fn capability(&self, id: &str, model: &str) -> Result<Option<&'static ReasoningCapability>> {
         let catalog = self.catalog(id);
         match self.protocol {
@@ -100,7 +99,6 @@ impl ProviderConfig {
         }
     }
 
-    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     fn endpoint(&self) -> Result<Url> {
         let mut endpoint =
             Url::parse(&self.base_url).map_err(|_| config_error("Invalid provider base URL"))?;
@@ -130,7 +128,6 @@ impl ProviderConfig {
 }
 
 impl ArgenticConfig030 {
-    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub(super) fn validate(&self) -> Result<()> {
         if self.providers.is_empty() {
             return Err(config_error("Configure at least one Argentic provider"));
@@ -202,7 +199,6 @@ impl ArgenticConfig030 {
         Ok(())
     }
 
-    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub(super) fn catalogue(&self) -> Result<Vec<Value>> {
         let mut models = Vec::new();
         for (id, provider) in &self.providers {
@@ -219,7 +215,6 @@ impl ArgenticConfig030 {
         Ok(models)
     }
 
-    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub(super) fn fingerprint(&self) -> Result<String> {
         let legacy = (&self.providers, &self.settings);
         let bytes = match (
@@ -246,7 +241,6 @@ impl ArgenticConfig030 {
         Ok(format!("sha256:{:x}", Sha256::digest(bytes)))
     }
 
-    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     fn settings(&self, settings: &Value, pointer: &str) -> Result<Settings> {
         Settings::resolve(&self.settings, &empty_settings(), settings).map_err(|_| {
             failure(
@@ -257,7 +251,6 @@ impl ArgenticConfig030 {
         })
     }
 
-    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub(super) fn settings_for_model(
         &self,
         model: &ModelName,
@@ -275,7 +268,6 @@ impl ArgenticConfig030 {
         Ok(settings)
     }
 
-    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub(super) fn provider(
         &self,
         model: &ModelName,
@@ -328,7 +320,6 @@ impl ArgenticConfig030 {
     }
 }
 
-#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 fn validate_responses_limits(settings: &Settings, pointer: &str) -> Result<()> {
     for key in ["maxOutputTokens", "maxTotalTokens"] {
         if settings

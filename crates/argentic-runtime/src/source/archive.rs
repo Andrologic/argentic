@@ -97,7 +97,6 @@ fn export_index(files: &Files) -> ExportIndex<'_> {
     }
 }
 
-#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 pub(super) fn inventory_size(files: &Files, budget: &SourceBudget) -> Result<u64> {
     let mut size = 1;
     // The portable path rules exclude all characters escaped by serde_json.
@@ -121,7 +120,6 @@ pub(super) fn inventory_size(files: &Files, budget: &SourceBudget) -> Result<u64
     Ok(size)
 }
 
-#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 fn check_export_limits(files: usize, total: u64, index: u64, directory: u64) -> Result<()> {
     let message = if files + 1 > MAX_FILES {
         "Archive including its inventory exceeds the 8192 entry limit"
@@ -138,7 +136,6 @@ fn check_export_limits(files: usize, total: u64, index: u64, directory: u64) -> 
 }
 
 /// Package the already validated selection from an opened project.
-#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 pub(super) fn write(files: &Files, output: impl Write) -> Result<()> {
     if !files.contains_key(MANIFEST) {
         return Err(invalid(
@@ -233,7 +230,6 @@ pub(super) fn path_key(path: &str) -> String {
     unicase::UniCase::new(path).to_folded_case().nfc().collect()
 }
 
-#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 pub(super) fn portable(name: &str) -> Result<()> {
     if name.len() > 4096 || name.split('/').count() > 64 {
         return Err(invalid(
@@ -346,7 +342,6 @@ impl Member {
         u64::from(u32_at(&self.header, 24))
     }
 
-    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     fn read(
         &self,
         input: &mut (impl Read + Seek),
@@ -464,7 +459,6 @@ fn inflate(input: impl Read, compressed: u64, size: u64) -> std::io::Result<Vec<
     }
 }
 
-#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 fn members(
     input: &mut (impl Read + Seek),
     budget: &super::SourceBudget,
@@ -587,12 +581,10 @@ fn members(
 }
 
 #[cfg(test)]
-#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 pub(super) fn read(input: impl Read + Seek) -> Result<Files> {
     read_with_budget(input, &super::SourceBudget::default())
 }
 
-#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 pub(super) fn read_with_budget(
     mut input: impl Read + Seek,
     budget: &super::SourceBudget,

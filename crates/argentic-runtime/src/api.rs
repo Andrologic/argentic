@@ -191,11 +191,9 @@ impl StartSession<'_> {
     pub fn generation(&self) -> &str {
         self.lease.generation()
     }
-    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub fn ensure_live(&self) -> Result<()> {
         self.lease.ensure_live()
     }
-    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub fn require_clear(&self, request: &EngineStartRequest) -> Result<()> {
         self.lease.ensure_live()?;
         self.engine.flow030().require_start_clear(request)
@@ -203,7 +201,6 @@ impl StartSession<'_> {
     pub async fn lock_admission(&self) -> tokio::sync::OwnedMutexGuard<()> {
         self.engine.admission_lock().lock_owned().await
     }
-    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub fn begin_commit(
         &self,
         request: &EngineStartRequest,
@@ -305,19 +302,15 @@ pub fn qualified_codex_version(version: &str) -> bool {
 pub fn codex_module() -> String {
     crate::agsdl_host_codex030::approvals::module030()
 }
-#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 pub fn validate_codex_document(document: &Value) -> Result<()> {
     crate::agsdl_host_codex030::admission::validate_codex_document030(document)
 }
-#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 pub fn validate_codex_permissions(value: &Value, pointer: &str) -> Result<()> {
     crate::agsdl_host_codex030::admission::codex_permissions030(value, pointer)
 }
-#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 pub fn codex_read_only(policy: &crate::permissions::EffectivePolicy) -> Result<bool> {
     crate::agsdl_host_codex030::admission::codex_read_only030(policy)
 }
-#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 pub fn qualify_skill_folders(document: &Value, root: &std::path::Path) -> Result<()> {
     crate::agsdl_host_content030::qualify_skill_folders(document, root, None)
 }
@@ -331,7 +324,6 @@ pub use crate::agsdl_host_qualification030::{
 /// Checks native product capabilities for an assembled AgSDL document. Supply
 /// the approved host ceiling to match Codex equipment admission. With no ceiling
 /// the report uses the agents' requested permissions alone.
-#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 pub fn qualify_product(
     document: &Value,
     compiled: Option<&str>,
@@ -345,7 +337,6 @@ pub fn qualify_product(
     )
 }
 
-#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 pub fn qualify_product_with_harnesses(
     document: &Value,
     compiled: Option<&str>,

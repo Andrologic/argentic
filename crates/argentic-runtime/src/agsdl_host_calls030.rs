@@ -32,7 +32,6 @@ pub(crate) use protocol::{CallAttempt030, CallDiagnostic030, CallReceipt030, Cal
 /// debug-only and restricted to its authenticated fixture pin.
 pub(crate) trait CallAuthority030: Authority030 + Sync {
     fn generation(&self) -> &str;
-    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     fn ensure_live(&self) -> Result<()>;
     /// The integrator also checks this fence in flow admission/dispatch.
     fn call_commits(&self) -> &CallCommitFence030;
@@ -57,7 +56,6 @@ impl CallCommitFence030 {
     fn key(id: &FlowIdentity030) -> (String, String) {
         (id.system_start_id.clone(), id.flow_invocation_id.clone())
     }
-    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub(crate) fn require_clear(&self, id: &FlowIdentity030) -> Result<()> {
         if self
             .0
@@ -78,7 +76,6 @@ impl CallCommitFence030 {
             .get(&Self::key(id))
             .cloned()
     }
-    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub(crate) fn begin(&self, marker: &protocol::CallCommitMarker030) -> Result<()> {
         let mut pending = self.0.lock().expect("call commits");
         protocol::require(
@@ -88,7 +85,6 @@ impl CallCommitFence030 {
         pending.insert(Self::key(marker.identity()), marker.clone());
         Ok(())
     }
-    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     fn acknowledge(&self, marker: &protocol::CallCommitMarker030) -> Result<()> {
         let mut pending = self.0.lock().expect("call commits");
         protocol::require(
@@ -242,7 +238,6 @@ impl CallDataBroker030 {
         self.route.next().await
     }
     #[cfg(all(test, feature = "agsdl-engine-qa", debug_assertions))]
-    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub(crate) fn complete(&self, generation: &str, result: HostRouteCompletion030) -> Result<()> {
         self.route.complete(generation, result)
     }
@@ -554,7 +549,6 @@ pub(crate) struct SyntheticCallDriver030 {
 }
 #[cfg(test)]
 impl SyntheticCallDriver030 {
-    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub(crate) fn send(self, event: CallEvent030) -> Result<()> {
         self.sender
             .send(event)

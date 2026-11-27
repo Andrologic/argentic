@@ -16,7 +16,6 @@ impl From<VerificationError> for EngineFailure {
     }
 }
 
-#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 pub(super) fn ms(raw: &str) -> Result<u64> {
     verifier::ms(raw).map_err(Into::into)
 }
@@ -27,7 +26,6 @@ fn strip_reason(mut value: Value) -> Value {
     value
 }
 
-#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 async fn facts(
     broker: &HumanBroker030,
     db: &mut SqliteConnection,
@@ -121,7 +119,6 @@ pub(super) async fn validate(
 }
 
 /// Reuse the deadline verifier's bounded exact-integer conversion for display.
-#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 pub(crate) fn machine_remaining_ms030(raw: &str, elapsed: u64) -> Result<Option<String>> {
     Ok(verifier::bounded(raw, u64::MAX as u128)?
         .map(|limit| limit.saturating_sub(elapsed as u128).to_string()))

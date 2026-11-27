@@ -351,7 +351,6 @@ impl SteerDelivery030 {
 
     /// Let the recipient return after submitting its result. Its registry
     /// still joins the observer and the provider process before routing.
-    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub(crate) fn handoff_observation<F>(
         mut self,
         tasks: &StreamTasks,
@@ -402,11 +401,9 @@ impl SteerDelivery030 {
     }
 
     /// Only before any provider send, or after an explicit provider rejection.
-    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub fn not_sent(self, tasks: &StreamTasks, attempt: &FlowWorkAttempt030) -> Result<()> {
         self.resolve(tasks, attempt, false)
     }
-    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     fn resolve(
         self,
         tasks: &StreamTasks,
@@ -432,7 +429,6 @@ impl SteerDelivery030 {
     }
 
     #[cfg(test)]
-    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub(crate) fn simulation(
         self,
         tasks: &StreamTasks,
@@ -442,7 +438,6 @@ impl SteerDelivery030 {
         self.evidence(tasks, attempt, consumed)
     }
 
-    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     fn evidence(
         self,
         tasks: &StreamTasks,
@@ -461,7 +456,6 @@ impl SteerDelivery030 {
         })
     }
 
-    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     fn verify_consumer(&self, tasks: &StreamTasks, attempt: &FlowWorkAttempt030) -> Result<String> {
         if !matches_attempt(&self.effect, attempt)
             || self.attempt.provider_attempt_id() != attempt.provider_attempt_id()

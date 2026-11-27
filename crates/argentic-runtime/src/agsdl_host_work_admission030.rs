@@ -66,7 +66,6 @@ pub struct AttestedWorkPolicy030 {
 impl AttestedWorkPolicy030 {
     /// Freeze the adapter's completion-check bounds and derive plan-lock
     /// evidence from a gate that the adapter must retain and enforce.
-    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub fn new(
         prepared: PreparedEffectiveAgentWork030,
         adapter_id: &str,
@@ -100,7 +99,6 @@ impl AttestedWorkPolicy030 {
     }
 
     #[cfg(any(test, feature = "dev-support"))]
-    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub(crate) fn from_codex(prepared: PreparedEffectiveAgentWork030) -> Result<Self> {
         crate::agsdl_host_codex030::admission::prepare(prepared)
     }
@@ -110,7 +108,6 @@ pub(crate) fn pointer_token030(value: &str) -> String {
     value.replace('~', "~0").replace('/', "~1")
 }
 
-#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 pub(crate) fn qualified_observation030<'a>(
     registry: &'a serde_json::Value,
     agent: &str,
@@ -155,7 +152,6 @@ pub(crate) fn qualified_observation030<'a>(
 impl AttestedWorkPolicy030 {
     /// The QA executor must retain plan_lock() and guard every change, including
     /// shell, MCP, checks and delegation. Completion checks remain unsupported.
-    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub(crate) fn from_example(
         prepared: PreparedEffectiveAgentWork030,
         observation: &crate::agsdl_host_example030::ExampleObservation030,
@@ -400,7 +396,6 @@ impl PreparedEffectiveAgentWork030 {
 impl PreparedAgentWork030 {
     /// Compare the capability minted at handoff with the inspected pending
     /// effect. The caller must separately authenticate both against SQL.
-    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub(crate) fn verify_attempt(&self, attempt: &FlowWorkAttempt030) -> Result<()> {
         if attempt.identity() != &self.identity
             || attempt.owner() != &self.owner
@@ -493,7 +488,6 @@ impl PolicyLeases030 {
     /// Extract the named agent's authored request and the existing compiler's
     /// work contract. These checks do not authenticate `capture`: the native
     /// admission transaction must still compare it to the durable owner row.
-    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub(crate) fn captured_agent_inputs(
         &self,
         capture: &StartCapture030,
@@ -511,7 +505,6 @@ impl PolicyLeases030 {
 
     /// Bind the candidate to the native snapshot and its pending Start before
     /// `handoff_agent` mints the attempt. No model or IPC value grants access.
-    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub(crate) fn prepare_agent_work(
         self,
         inspection: &NativeFlowInspection030,
@@ -591,7 +584,6 @@ impl PolicyLeases030 {
     }
 }
 
-#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 fn agent_inputs(
     capture: &StartCapture030,
     work: &EngineWork,
@@ -837,7 +829,6 @@ impl NativePlanLock030 {
             state: std::sync::Arc::new(tokio::sync::RwLock::new(PlanGate030::AwaitingPlan)),
         }
     }
-    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     fn verify(&self, work: &FlowWorkAttempt030) -> Result<()> {
         if self.identity != *work.identity()
             || self.owner != *work.owner()

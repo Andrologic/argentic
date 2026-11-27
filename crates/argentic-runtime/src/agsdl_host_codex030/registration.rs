@@ -94,7 +94,6 @@ impl HarnessAdapter030 for CodexAdapter030 {
     }
 }
 
-#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 pub(crate) fn validate_observation(
     document: &Value,
     scope: &Value,
@@ -108,7 +107,6 @@ pub(crate) fn validate_observation(
     validate_captured_observation(document, scope, &observed.version, &observed.models)
 }
 
-#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 fn validate_captured_observation(
     document: &Value,
     scope: &Value,

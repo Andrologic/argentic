@@ -166,7 +166,6 @@ fn uncertain() -> super::dto::EngineFailure {
         "Commit or handoff is uncertain; do not replay effects",
     )
 }
-#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 fn require(ok: bool, message: &str) -> Result<()> {
     if ok {
         Ok(())
@@ -174,12 +173,10 @@ fn require(ok: bool, message: &str) -> Result<()> {
         Err(denied(message))
     }
 }
-#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 fn json<T: Serialize>(value: &T) -> Result<String> {
     Ok(serde_json::to_string(value)?)
 }
 
-#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 fn live_activation<'a>(
     flow: &'a FlowState030,
     id: &FlowIdentity030,
@@ -867,7 +864,6 @@ pub(crate) async fn finish_joined_agent030(
     .await
 }
 
-#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 fn accepted_terminal030(
     attempt: &crate::agsdl_host_flow030::FlowWorkAttempt030,
     joined: &crate::agsdl_host_dispatch030::JoinedOwnedAgent030,
@@ -1237,7 +1233,6 @@ pub(crate) async fn inspect_work_commit(
 
 /// Exercise the production 04 validator from a synthetic native test fixture.
 #[cfg(test)]
-#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 pub(crate) fn test_accepted_terminal030(
     attempt: &crate::agsdl_host_flow030::FlowWorkAttempt030,
     joined: &crate::agsdl_host_dispatch030::JoinedOwnedAgent030,

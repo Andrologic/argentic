@@ -52,7 +52,6 @@ fn io_error(_: std::io::Error) -> EngineFailure {
         "Standalone input or storage is unavailable",
     )
 }
-#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 fn read(path: &Path) -> Result<Vec<u8>> {
     // A source is a regular file, never a device, directory or unbounded stream.
     let meta = std::fs::symlink_metadata(path).map_err(io_error)?;
@@ -87,7 +86,6 @@ struct Inputs {
     policy_digest: String,
 }
 impl Inputs {
-    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     fn verify(&self) -> Result<()> {
         if (self.opened.is_document()
             && (read(&self.source_path)? != self.opened.authored_json().as_bytes()
@@ -111,7 +109,6 @@ impl Inputs {
             "allowedToolIds":[], "riskLevel":"strict", "agsdlHostPermissions":self.policy.permissions})
     }
 }
-#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 fn scope(root: &Path, owner: &EngineSourceOwner, source: &RetainedSource) -> Result<Value> {
     let root = root.canonicalize().map_err(io_error)?;
     let identity = crate::content_io::admitted::workspace_root_identity(&root)
@@ -131,7 +128,6 @@ fn scope(root: &Path, owner: &EngineSourceOwner, source: &RetainedSource) -> Res
 }
 /// Compare the project snapshot recorded by a Start with the current scope.
 /// Captures without a scope or snapshot belong to a JSON document.
-#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 fn snapshot_matches(private_capture_json: &str, scope: &Value) -> Result<()> {
     let private: Value = serde_json::from_str(private_capture_json)?;
     let captured = match private["callScopeJson"].as_str() {
@@ -328,7 +324,6 @@ impl Host {
     }
     /// Configure the Argentic adapter. Preflight and Start still
     /// require an explicit "argentic" entry in the allowed harness set.
-    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub fn with_argentic(mut self, config: crate::harness::ArgenticConfig030) -> Result<Self> {
         let mut registry = self.context.harnesses().clone();
         registry.register(Arc::new(crate::harness::ArgenticAdapter030::new(config)?))?;
@@ -729,7 +724,6 @@ impl Host {
         Ok(retained)
     }
     /// Captured source identities and receipts, including interrupted earlier runs.
-    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub async fn runs(&self) -> Result<Vec<Value>> {
         let rows: Vec<(String, String, bool)> = sqlx::query_as("SELECT s.receipt_json,s.capture_json,EXISTS(SELECT 1 FROM engine_flow030_interruptions i WHERE i.system_id=s.system_id) FROM engine_start030_requests s ORDER BY s.request_id")
             .fetch_all(&self.pool).await?;

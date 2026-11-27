@@ -26,7 +26,6 @@ use std::{
 };
 use tokio_util::sync::CancellationToken;
 
-#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 fn require(ok: bool, message: &str) -> Result<()> {
     if ok {
         Ok(())
@@ -129,7 +128,6 @@ impl ResolvedHumanDecision030 {
             && self.payload.get("planId").and_then(Value::as_str) == Some(plan_id)
     }
     /// Build a controller event, not a flow WorkResult. A rejected ask continues.
-    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub(crate) fn plan_event(&self) -> Result<Value> {
         require(self.kind == "plan", "Not a plan decision")?;
         let answer = &self.resolution["answer"];
@@ -140,7 +138,6 @@ impl ResolvedHumanDecision030 {
         )
     }
     /// Approval output is built from the message retained at native admission.
-    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub(crate) fn approval_output(&self) -> Result<Value> {
         require(
             self.kind == "approval" && self.resolution["expired"] == false,
@@ -162,7 +159,6 @@ impl TimeoutControl030 {
 /// A native Call port retains the attested protocol/schema validator. This
 /// capability is never part of IPC; a caller cannot attest its own answer JSON.
 pub(crate) trait QuestionValidator030: Send + Sync {
-    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     fn validate(&self, captured_payload: &Value, exact_answer_json: &str) -> Result<()>;
 }
 

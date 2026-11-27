@@ -26,7 +26,6 @@ pub(crate) fn is_remote_mcp_call(document: &Value, step: &Value) -> bool {
             .is_some_and(|server| document["mcpServers"][server]["url"].is_string())
 }
 
-#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 fn clock_failure(attempt: &CallAttempt030) -> Result<CallResult030> {
     let declaration: Object = serde_json::from_str(attempt.declaration_json())?;
     Ok(CallResult030::failure(
@@ -48,7 +47,6 @@ pub(crate) fn uncertain() -> EngineFailure {
         "Inspect the exact native call receipt; never replay its launch",
     )
 }
-#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 pub(crate) fn require(ok: bool, detail: &str) -> Result<()> {
     if ok {
         Ok(())
@@ -104,7 +102,6 @@ struct StoredAttempt030 {
 #[derive(Deserialize)]
 #[serde(transparent)]
 struct AttemptRecord030(#[serde(with = "StoredAttempt030")] CallAttempt030);
-#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 fn decode_attempt(raw: &str) -> Result<CallAttempt030> {
     let attempt = serde_json::from_str::<AttemptRecord030>(raw)?.0;
     require(
@@ -157,7 +154,6 @@ impl CallAttempt030 {
         }
     }
     #[cfg(all(test, feature = "agsdl-engine-qa", debug_assertions))]
-    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub(crate) fn answer_timeout_ms_json(&self) -> Result<Option<String>> {
         let step: Object = serde_json::from_str(&self.declaration_json)?;
         Ok(step.get("answerTimeoutMs").map(|v| v.get().to_owned()))
@@ -217,13 +213,11 @@ struct StoredReceived030 {
 #[derive(Deserialize)]
 #[serde(transparent)]
 struct ReceivedRecord030(#[serde(with = "StoredReceived030")] ReceivedCall030);
-#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 fn decode_received(raw: &str) -> Result<ReceivedCall030> {
     Ok(serde_json::from_str::<ReceivedRecord030>(raw)?.0)
 }
 // Data read from SQL never becomes a join capability. Only the opaque witness
 // returned after the executor joins can authorize receive/finish for launched IO.
-#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 fn received_from_join(joined: &JoinedCall030) -> Result<ReceivedCall030> {
     require(
         !joined.receipt_id().is_empty(),
@@ -252,7 +246,6 @@ impl CallResult030 {
     pub(crate) fn failure(code: &str) -> Self {
         Self::Failed { code: code.into() }
     }
-    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     fn work_result(&self) -> Result<Option<WorkResult030>> {
         Ok(match self {
             Self::Completed { output_json } => {
@@ -313,20 +306,17 @@ struct StoredReceipt030 {
 #[derive(Deserialize)]
 #[serde(transparent)]
 struct ReceiptRecord030(#[serde(with = "StoredReceipt030")] CallReceipt030);
-#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 fn decode_receipt(raw: &str) -> Result<CallReceipt030> {
     Ok(serde_json::from_str::<ReceiptRecord030>(raw)?.0)
 }
 
 impl CallReceipt030 {
-    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub(crate) fn matches_joined(&self, joined: &JoinedCall030) -> Result<bool> {
         Ok(self.attempt == *joined.attempt() && self.received == received_from_join(joined)?)
     }
     pub(crate) fn event_id(&self) -> &str {
         &self.event_id
     }
-    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub(crate) fn work_result(&self) -> Result<Option<WorkResult030>> {
         self.result.work_result()
     }
@@ -398,7 +388,6 @@ impl CallDiagnostic030 {
     pub(crate) fn value(&self) -> &Value {
         &self.diagnostic
     }
-    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub(crate) fn matches_joined(&self, joined: &JoinedCall030) -> Result<bool> {
         self.candidate.matches_joined(joined)
     }
@@ -729,7 +718,6 @@ async fn state_tx(db: &mut SqliteConnection, id: &FlowIdentity030) -> Result<Flo
     )?;
     Ok(state)
 }
-#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 fn declaration(
     capture: &StartCapture030,
     effect: &FlowEffect030,
@@ -937,7 +925,6 @@ pub(crate) async fn read_attempt_tx<A: CallAuthority030>(
     Ok(Some(attempt))
 }
 
-#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 pub(crate) fn validate_prepared(
     attempt: &CallAttempt030,
     prepared: &PreparedCall030,
@@ -994,7 +981,6 @@ pub(crate) fn validate_prepared(
         }
     }
 }
-#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 fn select_raw(input: &str, path: &str) -> Result<Box<RawValue>> {
     validate_json(input)?;
     let path: Vec<Box<RawValue>> = serde_json::from_str(path)?;
@@ -1028,7 +1014,6 @@ fn select_raw(input: &str, path: &str) -> Result<Box<RawValue>> {
 
 /// Independently verify a ticketed OPERAND against the captured MCP operands.
 /// A worker failure string alone cannot manufacture a failure or physical proof.
-#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 pub(crate) fn require_operand_failure(attempt: &CallAttempt030) -> Result<()> {
     let step: Object = serde_json::from_str(attempt.declaration_json())?;
     require(
@@ -1196,7 +1181,6 @@ pub(crate) async fn admit_remote_tool_tx<A: CallAuthority030>(
     Ok(())
 }
 
-#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 pub(crate) fn validate_event(prepared: &PreparedCall030, event: &CallEvent030) -> Result<()> {
     match (prepared, event) {
         (_, CallEvent030::StartFailed)
@@ -1223,7 +1207,6 @@ pub(crate) fn validate_event(prepared: &PreparedCall030, event: &CallEvent030) -
 }
 /// Check that a ticketed pure output cannot replace the raw receipt, outcome,
 /// stdout parser, or MCP structured result with model-authored strings.
-#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 pub(crate) fn validate_output(
     prepared: &PreparedCall030,
     event: &CallEvent030,
@@ -1497,7 +1480,6 @@ async fn apply_terminal_tx<A: CallAuthority030>(
     }
 }
 
-#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 fn call_stopped(state: &FlowState030, attempt: &CallAttempt030) -> Result<bool> {
     let activation = state
         .activations

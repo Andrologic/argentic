@@ -60,10 +60,8 @@ pub enum StartInspection030 {
 pub trait StartAuthority030: Authority030 {
     type SourceGuard;
     /// The native barrier is shared with capture, claims, dispatch and fencing.
-    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     fn require_clear(&self, request: &EngineStartRequest) -> Result<()>;
     /// Install the exclusion before submitting COMMIT; cancellation retains it.
-    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     fn begin_commit(&self, request: &EngineStartRequest, identity: &FlowIdentity030) -> Result<()>;
     /// Release only after an acknowledged successful commit.
     fn commit_acknowledged(&self, request: &EngineStartRequest, identity: &FlowIdentity030);
@@ -89,7 +87,6 @@ fn store_error(error: StoreError030) -> super::dto::EngineFailure {
     }
 }
 
-#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 pub fn validate_capture(
     request: &EngineStartRequest,
     capture: &StartCapture030,

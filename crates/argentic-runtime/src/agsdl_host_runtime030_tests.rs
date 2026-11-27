@@ -873,7 +873,6 @@ struct StopBeforeClaimExecutor {
     starts: Arc<AtomicUsize>,
 }
 impl AgentExecutor030 for StopBeforeClaimExecutor {
-    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     fn prepare(
         &self,
         prepared: PreparedEffectiveAgentWork030,

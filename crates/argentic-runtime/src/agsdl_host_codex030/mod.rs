@@ -16,7 +16,6 @@ pub(crate) fn output_schema030() -> Value {
 }
 
 /// Expose the result tool's public arguments, not the host's controller state.
-#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 fn result_instructions030(contract_json: &str) -> HostResult<String> {
     let contract: Value = serde_json::from_str(contract_json)?;
     let agent: Value = serde_json::from_str(required(&contract, "agentJson")?.as_str())?;
@@ -43,7 +42,6 @@ fn result_instructions030(contract_json: &str) -> HostResult<String> {
     ))
 }
 
-#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 pub(crate) fn parse_envelope030(text: &str) -> Result<FinalEnvelope030> {
     validate_json(text)?;
     let envelope: FinalEnvelope030 = serde_json::from_str(text)?;
@@ -225,7 +223,6 @@ fn skill_tool030() -> Value {
 
 /// Native tool replies use only the recipient's captured bytes. There is no
 /// path argument, filesystem read, or grant derived from the model's request.
-#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 fn skill_reply030(
     params: &Value,
     thread: &str,
@@ -272,7 +269,6 @@ fn missing(field: &str) -> crate::persistence::dto::EngineFailure {
     )
 }
 
-#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 fn inline_source(source: &Value, document: &Value) -> HostResult<String> {
     let resolved = if let Some(name) = source.get("ref").and_then(Value::as_str) {
         document["content"]
@@ -287,7 +283,6 @@ fn inline_source(source: &Value, document: &Value) -> HostResult<String> {
         .map(str::to_owned)
         .unwrap_or_else(|| value.to_string()))
 }
-#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 fn prompt_text(value: &Value, document: &Value) -> HostResult<String> {
     if let Some(text) = value.as_str() {
         return Ok(text.to_owned());
@@ -300,7 +295,6 @@ fn prompt_text(value: &Value, document: &Value) -> HostResult<String> {
         .collect::<HostResult<Vec<_>>>()
         .map(|p| p.join("\n\n"))
 }
-#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 fn mission_text030(
     message: &Value,
     declaration: &Value,
@@ -318,7 +312,6 @@ fn mission_text030(
         ),
     }
 }
-#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 fn append_resources(
     target: &mut BTreeMap<String, String>,
     resources: &Value,
@@ -387,7 +380,6 @@ impl PendingSteer030 {
         Ok(())
     }
 
-    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     fn handoff(
         &mut self,
         mut client: Client,
@@ -556,7 +548,6 @@ fn steer_recipient(event: &Value, thread: &str, turn: &str) -> Option<bool> {
     )
 }
 
-#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 fn defer_native030(
     queue: &mut std::collections::VecDeque<Value>,
     bytes: &mut usize,
@@ -586,7 +577,6 @@ async fn operator_request(
     }
 }
 
-#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 fn observe_plan030(
     observed: Option<&mut Option<Value>>,
     event: &Value,
@@ -721,7 +711,6 @@ async fn between_turn_event030(
 }
 
 impl CodexExecutor030 {
-    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     async fn execute(
         &self,
         work: AgentWork030,
@@ -1051,7 +1040,6 @@ impl CodexExecutor030 {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     async fn session(
         &self,
         client: &mut Client,
@@ -1623,7 +1611,6 @@ impl CodexExecutor030 {
     }
 }
 
-#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 fn external_account_capture(frozen: &Value, profile: &profile::Profile) -> HostResult<String> {
     let evidence: Value =
         serde_json::from_str(&required(frozen, "evidenceJson")?).map_err(|_| {

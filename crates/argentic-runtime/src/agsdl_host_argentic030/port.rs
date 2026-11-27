@@ -471,7 +471,6 @@ pub(super) fn contains_credential(raw: &str, key: &str) -> bool {
     raw.contains(key) || serde_json::from_str(raw).is_ok_and(|value| contains(&value, key))
 }
 
-#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 pub(super) fn prompt_text(value: &Value) -> Result<String> {
     if let Some(text) = value.as_str() {
         return Ok(text.to_owned());
@@ -491,7 +490,6 @@ pub(super) fn prompt_text(value: &Value) -> Result<String> {
         .map(|parts| parts.join("\n\n"))
 }
 
-#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 pub(super) fn mission_text(prompt: Option<&Value>, sender: Option<&Producer030>) -> Result<String> {
     let sender = sender
         .map(|sender| {

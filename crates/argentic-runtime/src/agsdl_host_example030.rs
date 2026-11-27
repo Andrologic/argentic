@@ -144,7 +144,6 @@ async fn start_scripted_call030(
     })
 }
 
-#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 fn scripted_work_key030(
     effect: &FlowEffect030,
 ) -> Result<crate::agsdl_host_scenario030::WorkKey030> {
@@ -249,7 +248,6 @@ impl crate::agsdl_host_runtime030::AgentExecutor030 for ScriptedExecutor030 {
     }
 }
 
-#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 async fn start_scripted_work030(
     app: &HostState,
     pool: &SqlitePool,
@@ -888,7 +886,6 @@ pub(crate) async fn drive_scenario030(
 
 /// Synthetic test admission has no external effects. Recheck the captured
 /// owner/scope and exact pinned declaration in SQL callers.
-#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 pub(crate) fn qualify_synthetic_call030(
     capture: &crate::persistence::start030::StartCapture030,
     effect: &FlowEffect030,
@@ -953,7 +950,6 @@ impl ExampleAdapter030 {
     }
 }
 
-#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 fn expect_kind(decision: &ProtocolDecision030, expected: &str) -> Result<()> {
     let receipt: serde_json::Value = serde_json::from_str(&decision.receipt_json)?;
     if receipt
@@ -981,7 +977,6 @@ impl ExampleObservation030 {
 
     /// Build transport observations from this adapter and the native source
     /// lock. The later 036 writer still obtains and checks actual 03 policy.
-    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub(crate) fn registry(
         &self,
         document: &serde_json::Value,

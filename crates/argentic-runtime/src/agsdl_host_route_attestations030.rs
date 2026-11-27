@@ -38,7 +38,6 @@ use {
 fn sha(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
-#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 fn require(ok: bool) -> Result<()> {
     if ok {
         Ok(())
@@ -203,7 +202,6 @@ impl AttestedRouteSource030 {
             SourceKind030::Join | SourceKind030::JoinError | SourceKind030::FailedGroupError
         )
     }
-    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub(crate) fn commit_marker(&self) -> Result<RouteSourceCommitMarker030> {
         require(!self.native_receipt_id.is_empty())?;
         let row = json!({
@@ -269,7 +267,6 @@ impl RouteAttestor030 {
             verifier,
         })
     }
-    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     fn live(&self, lease: &HostStartLease) -> Result<()> {
         lease.ensure_live()?;
         require(
@@ -851,7 +848,6 @@ impl RouteAttestor030 {
 }
 
 #[cfg(all(test, feature = "agsdl-content-qa"))]
-#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 fn canonical_index(index: &str) -> Result<()> {
     require(
         index == "0"
@@ -861,7 +857,6 @@ fn canonical_index(index: &str) -> Result<()> {
     )
 }
 #[cfg(all(test, feature = "agsdl-content-qa"))]
-#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 fn validate_recipient(
     capture: &StartCapture030,
     reference: &PrepareRef030,
@@ -904,7 +899,6 @@ fn validate_recipient(
     Ok((address.clone(), binding.agent.clone()))
 }
 #[cfg(all(test, feature = "agsdl-content-qa"))]
-#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 fn transport_receipt(
     binding: &ContentContextBinding,
     usage: &ContentUse,

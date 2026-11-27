@@ -481,7 +481,6 @@ fn generated(name: &str) -> String {
     }
 }
 
-#[allow(clippy::result_large_err, reason = "Measure the API’s by-value error")]
 fn measure_skill_tree() {
     let project = tempfile::tempdir().unwrap();
     let skill = project.path().join("skills/review");

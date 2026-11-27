@@ -40,7 +40,6 @@ pub trait AgentExecutor030: Send + Sync {
         false
     }
     /// Local preparation only. No provider IO while configuration leases live.
-    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     fn prepare(&self, work: PreparedEffectiveAgentWork030) -> Result<AttestedWorkPolicy030>;
     /// Return only after native resources have ended or have been attached to
     /// StreamTasks cleanups. turnEnded is logical, never physical evidence.
@@ -435,7 +434,6 @@ pub(crate) trait EffectDriver030: Send {
     ) -> SourceOwnership030<'a>;
 }
 
-#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 pub(crate) fn next_effect030(
     inspection: &NativeFlowInspection030,
     owns: impl Fn(&str) -> bool,
@@ -627,7 +625,6 @@ struct SupervisorHandle030 {
 #[derive(Default)]
 pub(crate) struct RuntimeRegistry030(Mutex<BTreeMap<String, SupervisorHandle030>>);
 impl RuntimeRegistry030 {
-    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub(crate) fn is_registered(&self, system: &str) -> Result<bool> {
         self.0
             .lock()
@@ -640,7 +637,6 @@ impl RuntimeRegistry030 {
                 )
             })
     }
-    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub(crate) fn reserve(&self, system: &str) -> Result<()> {
         let mut handles = self.0.lock().map_err(|_| {
             failure(
@@ -899,7 +895,6 @@ impl EffectDriver030 for NativeDriver030<'_> {
     fn owns_effect(&self, id: &str) -> bool {
         self.in_flight.contains(id)
     }
-    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     fn start_agent(&mut self, effect: FlowEffect030) -> BoxFuture<'_, Result<()>> {
         Box::pin(async move {
             let inspection =
@@ -987,7 +982,6 @@ impl EffectDriver030 for NativeDriver030<'_> {
             Ok(())
         })
     }
-    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     fn start_host(
         &mut self,
         inspection: NativeFlowInspection030,
@@ -1275,7 +1269,6 @@ impl EffectDriver030 for NativeDriver030<'_> {
 
 /// Called by the start integration in lot 1.5. Registration precedes both the
 /// first revision read and the spawn, so concurrent validated events persist.
-#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 pub(crate) fn spawn_supervisor030(
     app: HostState,
     pool: SqlitePool,
@@ -1405,7 +1398,6 @@ pub(crate) async fn supervise_with_emitter030(
 }
 
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 pub(crate) async fn supervise_with_steer_port030(
     app: Option<&HostState>,
     host: &HostState,

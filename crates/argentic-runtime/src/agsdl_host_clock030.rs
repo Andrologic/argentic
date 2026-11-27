@@ -58,7 +58,6 @@ impl Clock030 for VirtualClock030 {
 impl VirtualClock030 {
     // Only the pinned QA driver may advance; call at each broker boundary, then
     // stabilize the flow before continuing the remainder of a large elapse.
-    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub(crate) fn advance_to(&self, at: u64) -> Result<()> {
         self.0
             .fetch_update(
@@ -321,7 +320,6 @@ impl ClockBroker030 {
     }
 
     #[cfg(test)]
-    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub(crate) fn complete(
         &self,
         generation: &str,

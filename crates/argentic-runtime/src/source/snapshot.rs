@@ -43,7 +43,6 @@ impl RetainedSource {
 
     /// Bind the document base and snapshot identity to the host-created scope.
     /// Persist this scope as the Start capture's `callScopeJson`.
-    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub fn bind_scope(&self, scope: &mut Value) -> Result<()> {
         let object = scope
             .as_object_mut()
@@ -94,7 +93,6 @@ fn unavailable() -> crate::persistence::dto::EngineFailure {
     )
 }
 
-#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 pub(super) fn retain(
     host_data: &Path,
     authored_sha256: &str,
@@ -216,7 +214,6 @@ pub(super) fn retain(
 }
 
 #[cfg(unix)]
-#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 fn sync_directory(path: &Path) -> Result<()> {
     fs::File::open(path)
         .and_then(|dir| dir.sync_all())
@@ -230,7 +227,6 @@ pub(crate) struct Snapshot {
 }
 
 impl Snapshot {
-    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     fn open(data: &Path, id: &str, authored_sha256: &str) -> Result<Self> {
         if !hex(id, 64) {
             return Err(unavailable());
@@ -271,7 +267,6 @@ impl Snapshot {
         })
     }
 
-    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub fn from_capture(
         data: &Path,
         capture: &crate::persistence::start030::StartCapture030,
@@ -300,7 +295,6 @@ impl Snapshot {
 
     /// Verify a member before exposing its path to a confined process. The
     /// host protects the directory against renames and writes through spawn.
-    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub(crate) fn verify_member(&self, name: &str) -> Result<()> {
         use sha2::Digest;
         let entry = self.manifest.files.get(name).ok_or_else(unavailable)?;
@@ -326,7 +320,6 @@ impl Snapshot {
 
     /// Read the interpreter prefix of a verified member. The host keeps the
     /// retained directory unchanged between verification and launch.
-    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub(crate) fn allows_shebang(&self, path: &Path) -> Result<bool> {
         let name = path.strip_prefix(&self.root).map_err(|_| unavailable())?;
         let dir =

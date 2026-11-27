@@ -33,7 +33,6 @@ pub(super) fn error(code: &str) -> EngineFailure {
     })
 }
 
-#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 pub(super) fn no_private_auth(profile: &Path) -> Result<()> {
     match std::fs::symlink_metadata(profile.join("codex/auth.json")) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -66,7 +65,6 @@ impl Credentials {
     }
 }
 
-#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 pub(super) fn source_scope(source: &Path, profile: &Path, workspace: &Path) -> Result<()> {
     if !source.is_absolute() || source.starts_with(profile) || source.starts_with(workspace) {
         return Err(error("CODEX_AUTH_SOURCE_UNSUPPORTED"));

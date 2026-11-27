@@ -52,7 +52,6 @@ pub(crate) fn captured_permissions() -> Value {
 
 use crate::persistence::failure;
 use std::path::Path;
-#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 pub(crate) fn codex_registry030(
     document: &Value,
     source_sha256: &str,

@@ -591,7 +591,6 @@ fn folder_reads_from_the_opened_directory_after_a_rename() {
 }
 
 #[test]
-#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 fn folder_sidecar_round_trip_preserves_archive_modes() {
     let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/conformance-050");
     let input = std::fs::File::open(fixtures.join("review-project.agsdl")).unwrap();

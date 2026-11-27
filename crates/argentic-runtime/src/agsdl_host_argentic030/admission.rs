@@ -23,7 +23,6 @@ pub(super) fn unsupported(pointer: &str, feature: &str) -> crate::persistence::d
     )
 }
 
-#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 pub(super) fn qualify(agent: &Value, pointer: &str, mode: ShellNetwork) -> Result<()> {
     if !agent["completionCheck"].is_null() {
         return Err(unsupported(
@@ -120,7 +119,6 @@ pub(super) fn qualify(agent: &Value, pointer: &str, mode: ShellNetwork) -> Resul
     Ok(())
 }
 
-#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 pub(super) fn validate_document(document: &Value, location: Option<&url::Url>) -> Result<()> {
     if document["contract"] != argentic_core::AGSDL_040 {
         return Err(unsupported("/contract", "contracts other than AgSDL 0.4.0"));
@@ -158,7 +156,6 @@ fn read_conflict(
     failure("HARNESS_UNSUPPORTED", pointer, &conflict.to_string())
 }
 
-#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 pub(super) fn admit_shell(
     policies: &[Policy],
     person: bool,
@@ -192,7 +189,6 @@ pub(super) fn admit_shell(
     Ok(true)
 }
 
-#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 pub(super) fn extra_roots(
     policy: &EffectivePolicy,
     private: &Path,
@@ -240,7 +236,6 @@ pub(super) fn extra_roots(
     Ok(roots)
 }
 
-#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 pub(super) fn compile_policy(policy: &EffectivePolicy) -> Result<Vec<Policy>> {
     policy
         .policies()

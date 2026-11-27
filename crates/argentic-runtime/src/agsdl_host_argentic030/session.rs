@@ -40,7 +40,6 @@ impl IdleHistory {
 
     /// Removes the instance history and decodes it outside the sessions lock.
     /// A history that cannot be decoded is put back unchanged.
-    #[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
     pub(super) fn take(
         sessions: &Mutex<BTreeMap<String, Self>>,
         instance: &str,

@@ -85,7 +85,6 @@ pub struct RuntimeProjectionPage030 {
     pub next_page: Option<RuntimeProjectionContinuation030>,
 }
 
-#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 fn page(
     scope: RuntimeProjectionScope030,
     continuation: Option<RuntimeProjectionContinuation030>,

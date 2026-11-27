@@ -19,7 +19,6 @@ use std::{
 };
 use tokio_util::sync::CancellationToken;
 
-#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 pub(crate) fn workspace_sandbox_read_only030(
     policy: &EffectivePolicy,
     unsupported: &str,
@@ -49,12 +48,10 @@ pub(crate) fn workspace_sandbox_read_only030(
 
 /// The same effective ceiling as the agent, including write-ask regions which
 /// an unmediated shell must keep read-only. Runtime files grant no user data.
-#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 pub(crate) fn grant(policy: &EffectivePolicy, command: &str) -> Result<CommandGrant> {
     grant_scoped(policy, command, false)
 }
 
-#[allow(clippy::result_large_err, reason = "Preserve by-value errors")]
 fn grant_scoped(
     policy: &EffectivePolicy,
     command: &str,
