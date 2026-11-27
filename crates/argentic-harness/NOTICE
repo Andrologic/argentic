@@ -1,0 +1,6 @@
+The Linux proxy routing design was informed by OpenAI Codex (Apache-2.0),
+codex-rs/linux-sandbox and codex-rs/network-proxy, revision 8727186a0a.
+https://github.com/openai/codex/tree/8727186a0a/codex-rs
+
+Argentic's HTTP proxy and loopback relay are independent implementations.
+Bubblewrap is supplied by the host system.

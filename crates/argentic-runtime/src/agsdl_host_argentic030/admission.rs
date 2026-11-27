@@ -9,7 +9,10 @@ use crate::{
 use argentic_harness::policy::{
     Action as NativeAction, Effect as NativeEffect, Policy, Preset as NativePreset, Rule, Zone,
 };
-use argentic_harness::tools::{shell_network_allowed, shell_read_conflict, ShellReadConflict};
+use argentic_harness::tools::{
+    shell_network_allowed, shell_read_conflict, ShellNetwork, ShellReadConflict,
+    SHELL_NETWORK_PATTERN,
+};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
@@ -21,7 +24,7 @@ pub(super) fn unsupported(pointer: &str, feature: &str) -> crate::persistence::d
     )
 }
 
-pub(super) fn qualify(agent: &Value, pointer: &str) -> Result<()> {
+pub(super) fn qualify(agent: &Value, pointer: &str, mode: ShellNetwork) -> Result<()> {
     for property in ["plan", "planFirst", "completionCheck"] {
         if agent.get(property).is_some_and(|value| {
             value != false
@@ -34,6 +37,7 @@ pub(super) fn qualify(agent: &Value, pointer: &str) -> Result<()> {
     let at = format!("{pointer}/permissions");
     let permissions: RequestedPermissions = serde_json::from_value(agent["permissions"].clone())
         .map_err(|_| unsupported(&at, "these permissions"))?;
+    let shell = shell_requested(&permissions);
     if let RequestedPermissions::Object(permissions) = &permissions {
         if permissions.directories.len() > 8 {
             return Err(failure(
@@ -49,6 +53,14 @@ pub(super) fn qualify(agent: &Value, pointer: &str) -> Result<()> {
             ));
         }
         for (index, rule) in permissions.rules.iter().enumerate() {
+            if let (Action::Network, Some(pattern)) = (rule.action, &rule.pattern) {
+                let at = format!("{at}/rules/{index}/match");
+                argentic_harness::policy::normalize_network_pattern(pattern)
+                    .map_err(|error| failure("HARNESS_UNSUPPORTED", &at, error))?;
+                if shell && mode == ShellNetwork::Blanket {
+                    return Err(failure("HARNESS_UNSUPPORTED", &at, SHELL_NETWORK_PATTERN));
+                }
+            }
             if rule.action == Action::Delegate && rule.effect != Effect::Deny {
                 return Err(unsupported(
                     &format!("{at}/rules/{index}/effect"),
@@ -57,8 +69,8 @@ pub(super) fn qualify(agent: &Value, pointer: &str) -> Result<()> {
             }
         }
     }
-    if shell_requested(&permissions) {
-        #[cfg(target_os = "linux")]
+    if shell {
+        #[cfg(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64")))]
         if let RequestedPermissions::Object(object) = &permissions {
             if object.outside == Some(Outside::Deny) {
                 return Err(read_conflict(
@@ -101,7 +113,23 @@ pub(super) fn qualify(agent: &Value, pointer: &str) -> Result<()> {
                 }
             }
         }
-        argentic_harness::tools::shell_preflight()
+        let (preset, rules) = match &permissions {
+            RequestedPermissions::Preset(preset) => (Some(*preset), &[][..]),
+            RequestedPermissions::Object(object) => (object.preset, object.rules.as_slice()),
+        };
+        let effect = |rule: &crate::permissions::PermissionRule| {
+            rule.effect != Effect::Deny
+                && (mode == ShellNetwork::Intercept || rule.effect == Effect::Allow)
+        };
+        let network_rules = || rules.iter().filter(|rule| rule.action == Action::Network);
+        let global = |rule: &crate::permissions::PermissionRule| {
+            rule.pattern
+                .as_ref()
+                .is_none_or(|pattern| pattern.bytes().all(|byte| byte == b'*'))
+        };
+        let network = !network_rules().any(|rule| global(rule) && !effect(rule))
+            && (preset == Some(Preset::Full) || network_rules().any(effect));
+        argentic_harness::tools::shell_network_preflight(network)
             .map_err(|diagnostic| failure("HARNESS_CAPABILITY", &at, &diagnostic))?;
     }
     Ok(())
@@ -144,11 +172,27 @@ fn read_conflict(
     failure("HARNESS_UNSUPPORTED", pointer, &conflict.to_string())
 }
 
-pub(super) fn admit_shell(policies: &[Policy], person: bool, pointer: &str) -> Result<bool> {
+pub(super) fn admit_shell(
+    policies: &[Policy],
+    person: bool,
+    pointer: &str,
+    mode: ShellNetwork,
+) -> Result<bool> {
     if !policies.iter().all(|policy| policy.may_run_shell(person)) {
         return Ok(false);
     }
-    let network = shell_network_allowed(policies);
+    if mode == ShellNetwork::Blanket
+        && policies
+            .iter()
+            .any(|policy| policy.first_network_pattern().is_some())
+    {
+        return Err(failure(
+            "HARNESS_UNSUPPORTED",
+            &format!("{pointer}/permissions/rules"),
+            SHELL_NETWORK_PATTERN,
+        ));
+    }
+    let network = shell_network_allowed(policies, mode);
     for policy in policies {
         if let Some(conflict) = shell_read_conflict(policy, network) {
             let at = match conflict {
@@ -200,7 +244,7 @@ pub(super) fn extra_roots(
             return Err(failure(
                 "HARNESS_CAPABILITY",
                 &at,
-                "Overlapping roots cannot be staged independently for Linux shell access",
+                "Overlapping roots cannot be staged independently for shell access",
             ));
         }
         roots.push(path.clone());
@@ -292,4 +336,23 @@ pub(super) fn compile_policy(policy: &EffectivePolicy) -> Result<Vec<Policy>> {
 
 pub(super) fn agent_pointer(name: &str) -> String {
     format!("/agents/{}", pointer_token030(name))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn blanket_reports_each_host_rule_at_its_match_field() {
+        let pointer = "/agents/worker";
+        for effect in ["allow", "ask", "deny"] {
+            let agent = json!({"permissions":{"preset":"workspace","rules":[
+                {"action":"network","match":"*.example.test","effect":effect},
+            ]}});
+            let error = qualify(&agent, pointer, ShellNetwork::Blanket).unwrap_err();
+            assert_eq!(error.code, "HARNESS_UNSUPPORTED");
+            assert_eq!(error.pointer, "/agents/worker/permissions/rules/0/match");
+        }
+    }
 }

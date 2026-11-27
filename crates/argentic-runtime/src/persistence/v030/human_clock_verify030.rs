@@ -243,14 +243,14 @@ pub(super) fn resolution(
     }
     Ok(value)
 }
-fn cancelled_ask(request: &Request, at: u64) -> Result<Value> {
+fn cancelled_ask(request: &Request, at: u64, marker: &str) -> Result<Value> {
     require(
         request.kind == "ask",
-        "Operator hold did not target a native action request",
+        "Cancellation did not target a native action request",
     )?;
     let mut result = resolution(request, at, None)?;
     result["expired"] = json!(false);
-    result["operatorCancelled"] = json!(true);
+    result[marker] = json!(true);
     Ok(result)
 }
 fn keyed(values: &Value, key: &str) -> Result<BTreeMap<String, Value>> {
@@ -344,8 +344,26 @@ pub(super) fn validate_projection(
                 "Operator cancellation must belong to newly held agent work",
             )?;
             if request.resolution.is_none() {
-                request.resolution = Some(cancelled_ask(request, now)?);
+                request.resolution = Some(cancelled_ask(request, now, "operatorCancelled")?);
             }
+        }
+    }
+    if event["kind"] == "withdrawAsk" {
+        let request = requests
+            .iter_mut()
+            .find(|r| Some(r.id.as_str()) == event["requestId"].as_str())
+            .ok_or_else(|| failure("CORRELATION", "clock", "Unknown withdrawn action request"))?;
+        let work_id = text(event, "workId")?;
+        require(
+            request.kind == "ask"
+                && request.works == [work_id]
+                && works
+                    .iter()
+                    .any(|work| work.id == work_id && work.kind == "agent" && !work.retired),
+            "Withdrawal must belong to live agent work",
+        )?;
+        if request.resolution.is_none() {
+            request.resolution = Some(cancelled_ask(request, now, "withdrawn")?);
         }
     }
     let mut accepted_current = false;
@@ -427,12 +445,13 @@ pub(super) fn verify_existing(request: &Request, submissions: &[Submission]) -> 
         "Stored decision lacks a committed native validation proof",
     )?;
     let at = ms(text(stored, "resolvedAtMs")?)?;
-    if stored["operatorCancelled"] == true {
-        require(
-            *stored == cancelled_ask(request, at)?,
-            "Invalid operator cancellation",
-        )?;
-        return Ok(());
+    for marker in ["operatorCancelled", "withdrawn"] {
+        if stored[marker] == true {
+            return require(
+                *stored == cancelled_ask(request, at, marker)?,
+                "Invalid action cancellation",
+            );
+        }
     }
     let submission = if stored["expired"] == true {
         require(

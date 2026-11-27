@@ -8,3 +8,6 @@ pub mod providers;
 pub mod tools;
 
 pub const MODULE_JSON: &str = include_str!("../module.json");
+
+#[doc(hidden)]
+pub mod seatbelt;

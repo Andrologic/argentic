@@ -247,7 +247,7 @@ impl ActionPolicySource for Policies {
                     && requests.iter().all(|request| {
                         matches!(
                             request.action(),
-                            Action::Read | Action::Write | Action::Shell
+                            Action::Read | Action::Write | Action::Shell | Action::Network
                         ) && (!guard.policy.read_only || request.action() != Action::Write)
                             && evaluate_requested(&policy, request)
                                 .is_ok_and(|effect| effect != Effect::Deny)

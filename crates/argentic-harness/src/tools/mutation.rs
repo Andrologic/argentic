@@ -336,9 +336,12 @@ impl Target {
         Ok(text)
     }
 
-    #[cfg(all(
-        target_os = "linux",
-        any(target_arch = "aarch64", target_arch = "x86_64")
+    #[cfg(any(
+        all(
+            target_os = "linux",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ),
+        all(target_os = "macos", target_arch = "aarch64")
     ))]
     pub(super) fn from_snapshot(relative: PathBuf, parent: Metadata, before: Metadata) -> Self {
         Self {

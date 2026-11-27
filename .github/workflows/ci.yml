@@ -59,15 +59,17 @@ jobs:
           rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
           rustc -Vv
 
-      - name: Check Swift toolchain
+      - name: Check the macOS ARM64 runner
         if: runner.os == 'macOS'
-        run: swiftc --version
+        run: |
+          test "$(uname -m)" = arm64
+          swiftc --version
 
       - name: Install Bubblewrap and enable unprivileged user namespaces
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y bubblewrap
+          sudo apt-get install -y bubblewrap curl python3
           if [[ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi

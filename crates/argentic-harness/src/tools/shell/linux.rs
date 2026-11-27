@@ -11,8 +11,12 @@ use std::{
 use tokio_util::sync::CancellationToken;
 
 mod seccomp;
+use super::{
+    process::{nonblocking, Capture},
+    proxy::Proxy,
+};
 
-const OUTPUT_LIMIT: usize = 256 * 1024;
+pub(super) const RELAY_PORT: u16 = 18999;
 const SETUP_LIMIT: Duration = Duration::from_secs(5);
 const STAGING_CHECK_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -24,15 +28,23 @@ fn binary() -> Result<&'static Path, String> {
         .ok_or_else(|| "Argentic shell requires system Bubblewrap (bwrap)".into())
 }
 
-pub(super) fn preflight() -> Result<(), String> {
+pub(super) fn preflight(network: bool) -> Result<(), String> {
     let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
-    run(
+    let socket = dir.path().join("probe.sock");
+    let _listener = network
+        .then(|| std::os::unix::net::UnixListener::bind(&socket))
+        .transpose()
+        .map_err(|error| error.to_string())?;
+    run_inner(
+        binary()?,
         ":",
         &[(dir.path(), false)],
-        false,
+        network.then_some(socket.as_path()),
+        None,
         5_000,
         &CancellationToken::new(),
     )
+    .map_err(|error| error.to_string())
     .and_then(|output| {
         if output.starts_with("Exit status: 0\n") {
             Ok(())
@@ -40,19 +52,17 @@ pub(super) fn preflight() -> Result<(), String> {
             Err(output)
         }
     })
-    .map_err(|error| format!("Argentic shell sandbox is unavailable: {error}"))
+    .map_err(|error| {
+        if network {
+            format!("Argentic Linux shell network relay is unavailable (requires system Python 3.11 or later): {error}")
+        } else {
+            format!("Argentic shell sandbox is unavailable: {error}")
+        }
+    })
 }
 
 fn inheritable(fd: RawFd) -> io::Result<()> {
     if unsafe { libc::fcntl(fd, libc::F_SETFD, 0) } == -1 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-fn nonblocking(fd: RawFd) -> io::Result<()> {
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    if flags == -1 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
         return Err(io::Error::last_os_error());
     }
     Ok(())
@@ -140,57 +150,32 @@ impl Drop for Sandbox {
     }
 }
 
-#[derive(Default)]
-struct Capture {
-    bytes: Vec<u8>,
-    truncated: bool,
-}
-
-impl Capture {
-    fn pump(&mut self, stream: &mut impl Read) -> io::Result<()> {
-        let mut buf = [0; 8192];
-        // Yield to the cancellation and deadline checks even when a child
-        // continuously fills a pipe.
-        for _ in 0..8 {
-            let count = match stream.read(&mut buf) {
-                Ok(0) => break,
-                Ok(count) => count,
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                Err(error) => return Err(error),
-            };
-            let available = (OUTPUT_LIMIT - self.bytes.len()).min(count);
-            self.bytes.extend_from_slice(&buf[..available]);
-            self.truncated |= available < count;
-        }
-        Ok(())
-    }
-
-    fn into_text(self) -> String {
-        let mut text = String::from_utf8_lossy(&self.bytes).into_owned();
-        if self.truncated {
-            text.push_str("\n[Shell output capture limit reached]");
-        }
-        text
-    }
-}
-
 pub(super) fn run(
     command: &str,
     mounts: &[(&Path, bool)],
-    network: bool,
+    proxy: Option<&Proxy>,
     timeout_ms: u64,
     cancel: &CancellationToken,
 ) -> Result<String, String> {
     let program = binary()?;
-    run_inner(program, command, mounts, network, timeout_ms, cancel).map_err(|e| e.to_string())
+    run_inner(
+        program,
+        command,
+        mounts,
+        proxy.map(|proxy| proxy.socket.as_path()),
+        proxy,
+        timeout_ms,
+        cancel,
+    )
+    .map_err(|e| e.to_string())
 }
 
 fn run_inner(
     program: &Path,
     command: &str,
     mounts: &[(&Path, bool)],
-    network: bool,
+    socket: Option<&Path>,
+    proxy: Option<&Proxy>,
     timeout_ms: u64,
     cancel: &CancellationToken,
 ) -> io::Result<String> {
@@ -201,7 +186,7 @@ fn run_inner(
         .map(|(path, _)| super::workspace::Budget::open(path))
         .collect::<io::Result<Vec<_>>>()?;
     let mut filter = tempfile::tempfile()?;
-    seccomp::write_filter(&mut filter, network)?;
+    seccomp::write_filter(&mut filter, socket.is_some())?;
     let (mut info, info_writer) = io::pipe()?;
     let (gate_reader, mut gate) = io::pipe()?;
     nonblocking(info.as_raw_fd())?;
@@ -228,9 +213,6 @@ fn run_inner(
         "--cap-drop",
         "ALL",
     ]);
-    if network {
-        child.arg("--share-net");
-    }
     child.args([
         "--dev", "/dev", "--proc", "/proc", "--size", "67108864", "--tmpfs", "/tmp",
     ]);
@@ -239,9 +221,18 @@ fn run_inner(
     for &system in super::RUNTIME_DIRS.iter().chain(&[super::LOADER_CACHE]) {
         child.args(["--ro-bind-try", system, system]);
     }
-    if network {
+    if let Some(socket) = socket {
+        child
+            .args(["--ro-bind"])
+            .arg(socket)
+            .arg("/run/argentic-proxy.sock");
+        if let Some(bundle) = proxy.and_then(|proxy| proxy.ca_bundle.as_ref()) {
+            child
+                .arg("--ro-bind")
+                .arg(bundle)
+                .arg("/run/argentic-ca.pem");
+        }
         for &(system, _) in super::NETWORK_MOUNTS {
-            // Resolve distro-managed resolv.conf links without mounting /run.
             if let Ok(source) = fs::canonicalize(system) {
                 child.arg("--ro-bind").arg(source).arg(system);
             }
@@ -274,15 +265,29 @@ fn run_inner(
         "LANG",
         "C.UTF-8",
     ]);
+    if let Some(proxy) = proxy {
+        for (key, value) in proxy.env() {
+            child.args(["--setenv", key, value]);
+        }
+    }
     for (name, fd) in ["--seccomp", "--info-fd", "--block-fd"]
         .into_iter()
         .zip(fds)
     {
         child.arg(name).arg(fd.to_string());
     }
-    child.args(["--", "/bin/bash", "--noprofile", "--norc", "-c",
-        "if /bin/bash --noprofile --norc -n -c \"$1\"; then exec /bin/bash --noprofile --norc -c \"$1\"; else exit 2; fi",
-        "argentic-shell", command]);
+    child.arg("--");
+    if socket.is_some() {
+        child.args([
+            "/usr/bin/python3",
+            "-I",
+            "-S",
+            "-c",
+            include_str!("linux/bridge.py"),
+            &RELAY_PORT.to_string(),
+        ]);
+    }
+    child.args(super::BASH_ARGS).arg(command);
     // Only the execution child gets these descriptors. Ambient host fds stay
     // close-on-exec, and bwrap consumes the three sandbox setup descriptors.
     unsafe {
@@ -333,7 +338,9 @@ fn run_inner(
     let mut out = Capture::default();
     let mut err = Capture::default();
     let start = Instant::now();
-    let deadline = Duration::from_millis(timeout_ms);
+    let timeout = Duration::from_millis(timeout_ms);
+    let base = start + timeout;
+    let deadline = || proxy.map_or(base, |proxy| proxy.clock.deadline(base));
     let mut info_bytes = Vec::new();
     loop {
         out.pump(&mut stdout)?;
@@ -365,17 +372,17 @@ fn run_inner(
             break;
         }
         super::super::check_cancel(cancel)?;
-        if start.elapsed() >= deadline.min(SETUP_LIMIT) || info_bytes.len() >= 1024 {
+        if start.elapsed() >= timeout.min(SETUP_LIMIT) || info_bytes.len() >= 1024 {
             return Err(io::Error::other("Bubblewrap setup timed out"));
         }
         thread::sleep(Duration::from_millis(5));
     }
     super::super::check_cancel(cancel)?;
-    if start.elapsed() >= deadline {
+    if Instant::now() >= deadline() {
         return Err(io::Error::other("Shell command timed out"));
     }
     for budget in &mut budgets {
-        budget.check(cancel, start + deadline)?;
+        budget.check(cancel, &deadline)?;
     }
     gate.write_all(b"1")?;
     drop(gate);
@@ -393,20 +400,20 @@ fn run_inner(
             }
         }
         super::super::check_cancel(cancel)?;
-        if start.elapsed() >= deadline {
+        if Instant::now() >= deadline() {
             return Err(io::Error::other("Shell command timed out"));
         }
         if !budgets.is_empty() && Instant::now() >= next_budget_check {
             // Returning here drops Sandbox, which kills PID 1 and waits.
             for budget in &mut budgets {
-                budget.check(cancel, start + deadline)?;
+                budget.check(cancel, &deadline)?;
             }
             next_budget_check = Instant::now() + STAGING_CHECK_INTERVAL;
         }
         thread::sleep(Duration::from_millis(5));
     };
     for budget in &mut budgets {
-        budget.check(cancel, start + deadline)?;
+        budget.check(cancel, &deadline)?;
     }
     out.pump(&mut stdout)?;
     err.pump(&mut stderr)?;

@@ -6,6 +6,7 @@ use argentic_harness::{
         reasoning_capability, AnthropicMessages, ChatCompletions, ModelName, OpenAiResponses,
         Provider, ReasoningCapability,
     },
+    tools::ShellNetwork,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -19,6 +20,8 @@ pub struct ArgenticConfig030 {
     providers: BTreeMap<String, ProviderConfig>,
     pub(super) default_model: Option<String>,
     pub(super) shell_staging_directory: Option<PathBuf>,
+    #[serde(default)]
+    pub(super) shell_network: ShellNetwork,
     #[serde(default = "empty_settings")]
     settings: Value,
 }
@@ -202,10 +205,21 @@ impl ArgenticConfig030 {
 
     pub(super) fn fingerprint(&self) -> Result<String> {
         let legacy = (&self.providers, &self.settings);
-        let bytes = match (&self.default_model, &self.shell_staging_directory) {
-            (name, Some(path)) => serde_json::to_vec(&(legacy.0, legacy.1, name, path))?,
-            (Some(name), None) => serde_json::to_vec(&(legacy.0, legacy.1, name))?,
-            (None, None) => serde_json::to_vec(&legacy)?,
+        let bytes = match (
+            &self.default_model,
+            &self.shell_staging_directory,
+            self.shell_network,
+        ) {
+            (name, path, ShellNetwork::Intercept) => {
+                serde_json::to_vec(&(legacy.0, legacy.1, name, path, self.shell_network))?
+            }
+            (name, Some(path), ShellNetwork::Blanket) => {
+                serde_json::to_vec(&(legacy.0, legacy.1, name, path))?
+            }
+            (Some(name), None, ShellNetwork::Blanket) => {
+                serde_json::to_vec(&(legacy.0, legacy.1, name))?
+            }
+            (None, None, ShellNetwork::Blanket) => serde_json::to_vec(&legacy)?,
         };
         Ok(format!("sha256:{:x}", Sha256::digest(bytes)))
     }

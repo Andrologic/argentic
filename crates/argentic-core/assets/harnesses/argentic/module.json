@@ -42,7 +42,7 @@
     },
     "directories": {
       "support": "native",
-      "note": "Additional admitted roots are indexed for file tools. On Linux they are staged under /directories/<index> for shell calls. Overlapping shell roots are refused."
+      "note": "Additional admitted roots are indexed for file tools. Shell calls stage them under /directories/<index> on Linux and expose their staged paths in ARGENTIC_DIRECTORY_<index> on macOS. Overlapping shell roots are refused."
     },
     "instance.new": {
       "support": "native",
@@ -58,25 +58,25 @@
       "ask": "sandbox",
       "deny": "sandbox",
       "outside": "sandbox",
-      "note": "Direct file tools enforce the compiled policy. The Linux sandbox exposes a filtered workspace snapshot and the system files needed to run programs. Qualification refuses shell with an explicit outside denial or a deny or ask rule that overlaps a required runtime mount."
+      "note": "Direct file tools enforce the compiled policy. The shell sandbox exposes a filtered workspace snapshot and the system files needed to run programs. Qualification refuses shell with an explicit outside denial or a deny or ask rule that overlaps a required runtime mount."
     },
     "write": {
       "allow": "harness",
       "ask": "sandbox",
       "deny": "sandbox",
-      "note": "Direct file tools enforce the compiled policy. Linux shell changes to regular workspace files are published only with a blanket write grant."
+      "note": "Direct file tools enforce the compiled policy. Shell changes to regular workspace files are published only with a blanket write grant."
     },
     "shell": {
       "allow": "harness",
       "ask": "harness",
       "deny": "harness",
-      "note": "Shell rules match the command text, including each subcommand of a compound command, but not programs that a matched command starts. Dynamic command words and shell constructs that indirectly execute commands take the most restrictive explicit shell rule. Shell requires system Bubblewrap and working PID and user namespaces on Linux ARM64 or x86-64."
+      "note": "Shell rules match the command text, including each subcommand of a compound command, but not programs that a matched command starts. Dynamic command words and shell constructs that indirectly execute commands take the most restrictive explicit shell rule. Shell requires system Bubblewrap and working PID and user namespaces on Linux ARM64 or x86-64, or Seatbelt on macOS ARM64."
     },
     "network": {
       "allow": "sandbox",
       "ask": "sandbox",
       "deny": "sandbox",
-      "note": "Linux shell uses an isolated network namespace and seccomp unless every policy layer grants network access without restrictions. Per-host rules cannot enable shell networking."
+      "note": "The OS blocks direct shell egress. The default shellNetwork mode, blanket, requires an unconditional grant in every policy layer. Shell host patterns require shellNetwork: \"intercept\" and are refused at qualification otherwise. Intercept mode enforces host rules for HTTP/1.1 and decrypts HTTPS in the host process using a per-invocation CA."
     },
     "mcp": {
       "allow": "harness",

@@ -137,7 +137,7 @@ impl HarnessAdapter030 for ArgenticAdapter030 {
     }
 
     fn qualify_agent(&self, agent: &Value, pointer: &str) -> Result<()> {
-        admission::qualify(agent, pointer)?;
+        admission::qualify(agent, pointer, self.0.shell_network)?;
         let name = match agent.pointer("/model/name") {
             Some(name) => name.as_str(),
             None => self.0.default_model.as_deref(),
@@ -292,6 +292,7 @@ impl AgentExecutor030 for Executor {
             &admission::compile_policy(work.policy())?,
             work.policy().reviewer() == Some(Reviewer::Person),
             &pointer,
+            self.config.shell_network,
         )?;
         admission::extra_roots(
             work.policy(),
@@ -455,7 +456,12 @@ impl Executor {
         drop(project);
         let policies = admission::compile_policy(&work.policy)?;
         let person = work.policy.reviewer() == Some(Reviewer::Person);
-        let shell = admission::admit_shell(&policies, person, &admission::agent_pointer(agent))?;
+        let shell = admission::admit_shell(
+            &policies,
+            person,
+            &admission::agent_pointer(agent),
+            self.config.shell_network,
+        )?;
         let extra = admission::extra_roots(
             &work.policy,
             &self
@@ -476,7 +482,9 @@ impl Executor {
             registry = registry.with_writes();
         }
         if shell {
-            registry = registry.with_shell();
+            registry = registry
+                .with_shell()
+                .with_shell_network(self.config.shell_network);
             if let Some(directory) = &self.config.shell_staging_directory {
                 registry = registry.with_shell_staging_directory(directory.clone());
             }

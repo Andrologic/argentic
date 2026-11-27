@@ -43,6 +43,10 @@ impl Authorizer for Human {
         let (title, actions) = match action {
             Approval::Read(path) => file_request(path, false)?,
             Approval::Write(path) => file_request(path, true)?,
+            Approval::Network(host) => (
+                format!("Connect to {host}"),
+                vec![ActionRequest::Network { host: host.into() }],
+            ),
             Approval::Shell(command) => {
                 let actions = argentic_harness::policy::subcommands(command)?
                     .into_iter()

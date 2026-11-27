@@ -77,7 +77,7 @@ pub(crate) async fn read(
                 "person"
             };
             let resolved = json!({"receiptId":receipt,"resolvedAtMs":resolution["resolvedAtMs"],"accepted":true,"reason":reason,"answer":answer});
-            status = if resolution["operatorCancelled"] == true {
+            status = if resolution["operatorCancelled"] == true || resolution["withdrawn"] == true {
                 json!({"kind":"cancelled","resolution":{"receiptId":format!("human:{id}:closed"),"resolvedAtMs":resolution["resolvedAtMs"],"accepted":false,"reason":"workEnded","answer":null}})
             } else if expired {
                 json!({"kind":"expired","resolution":resolved})

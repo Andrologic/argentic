@@ -227,8 +227,19 @@ impl Projection {
                 }
             }
             for id in event.get("cancelAsks").array().unwrap() {
-                self.registry.cancel_ask(id, now_raw)?;
+                self.registry.cancel_ask(id, now_raw, "operatorCancelled")?;
             }
+        } else if kind.eq_str("withdrawAsk") {
+            let request_id = event.get("requestId");
+            let request = self.registry.request(request_id)?;
+            if !request
+                .get("workIds")
+                .array()
+                .is_some_and(|ids| ids.len() == 1 && contains(ids, event.get("workId")))
+            {
+                return plain("Withdrawal must belong to the action's work.");
+            }
+            self.registry.cancel_ask(request_id, now_raw, "withdrawn")?;
         } else if kind.eq_str("ack") {
             if let Some(i) = find(&self.approvals, event.get("requestId")) {
                 if self.approvals[i].1.resolution.is_none() {
@@ -376,8 +387,10 @@ impl Projection {
             raw.get("workActions").clone(),
             answer,
         );
-        if raw.get("operatorCancelled").truthy() {
-            projected.set("operatorCancelled", Value::Bool(true));
+        for marker in ["operatorCancelled", "withdrawn"] {
+            if raw.get(marker).truthy() {
+                projected.set(marker, Value::Bool(true));
+            }
         }
         Ok(projected)
     }

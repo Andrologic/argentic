@@ -223,40 +223,82 @@ An I/O failure during publication can leave some files changed, and the reply
 reports how many changes were applied. Parent directories must already exist.
 
 Use `reviewer: "person"` to have the engine ask about a direct read, write,
-shell or MCP call. The reply covers that specific action in that call. A refused or
+shell, network or MCP action. The reply covers that specific action in that call. A refused or
 expired answer returns a tool error. Engine Stop closes pending questions.
 `answerTimeoutMs` bounds the human wait, which the engine excludes from step
 machine time.
 
-## Linux shell
+## Shell sandbox
 
-Shell qualification runs a probe with system Bubblewrap. Install `bwrap`
-and Bash on Linux ARM64 or x86-64. The host kernel must allow unprivileged user
-and PID namespaces, seccomp filters and pidfds. The probe detects container
-or AppArmor restrictions. On Ubuntu 24.04, deploy with an AppArmor policy
-that permits user namespaces for Bubblewrap. CI disables the restriction
-on its disposable runners and requires the Linux sandbox tests to run.
-macOS and Windows refuse shell at qualification.
-To use file mutations without shell, declare a global `shell` denial.
+Linux ARM64 and x86-64 require system Bubblewrap and Bash. The qualification
+probe checks unprivileged user and PID namespaces, seccomp and pidfds. On
+Ubuntu 24.04, deploy with an AppArmor policy that permits user namespaces for
+Bubblewrap. CI disables the restriction on its disposable runners. Linux
+shells start with a cleared environment, private PID and network namespaces,
+private `/tmp`, `/dev` and `/proc`, and read-only system binaries and libraries.
+They drop capabilities, and seccomp blocks tracing and other privileged
+interfaces.
 
-The sandbox starts with a cleared environment, a private PID namespace and
-a private network namespace. It provides private `/tmp`, `/dev` and `/proc`.
-It mounts the available executable and library directories `/bin`, `/usr/bin`,
-`/lib`, `/lib64`, `/usr/lib` and `/usr/lib64` read-only, along with
-`/etc/ld.so.cache` when present. The process drops capabilities and seccomp
-blocks tracing, process introspection syscalls and other privileged kernel
-interfaces. Shell networking requires a blanket grant from every ceiling.
-The network-enabled profile allows IPv4 and IPv6 sockets and mounts
-`/etc/resolv.conf`, `/etc/hosts` and `/etc/ssl/certs` when present. Per-host
-grants cannot enable networking.
+macOS ARM64 qualification probes `sandbox-exec`. The generated Seatbelt profile
+exposes staged roots, private scratch space and required system files. Executable paths are limited to Bash and
+a list of system commands, including curl. Bash starts in the staged workspace and sees
+other staged roots as `ARGENTIC_DIRECTORY_<index>`. Windows refuses shell at
+qualification. To use file mutations without shell, declare a global `shell`
+denial.
+
+### Shell networking
+
+Set `shellNetwork` in the host's Argentic provider configuration. It defaults
+to `"blanket"`. In that mode a shell can use the proxy only if every policy
+layer grants network access unconditionally. Qualification rejects network
+rules with a host match when the agent can run shell commands. Blanket mode
+passes CONNECT bytes through without inspecting TLS or checking the
+authorities inside the tunnel.
+
+Set `shellNetwork: "intercept"` to use host patterns. Argentic terminates
+client TLS with a CA generated for the shell invocation. It keeps the CA
+private key in memory and exposes a read-only trust bundle containing the
+system roots and the invocation CA. This lets the host process read HTTPS
+request and response contents, including any credentials the command sends.
+Clients must trust the bundle and support HTTP/1.1. Certificate pinning or
+clients that require a different trust store can cause connections to fail.
+
+Intercept mode requires the TLS SNI and each HTTP request's authority to match
+the CONNECT host, with the usual absence of SNI on IP literal connections.
+It checks each request against the effective network policy and verifies the
+upstream certificate against the host's trust roots. It offers only HTTP/1.1
+over TLS. Redirects that clients follow go through the same checks as new
+requests. Rules and request hosts use the same IDNA normalization. Use a host
+pattern without a scheme, path, or port.
+
+The OS blocks direct egress in both modes. On Linux, a relay using system
+Python 3.11 or later starts inside the private network namespace and forwards
+to a read-only-mounted Unix socket. Seatbelt restricts outbound TCP to the
+invocation's local proxy port. Argentic sets proxy environment variables and
+clears both forms of `NO_PROXY`. Clients that ignore the proxy cannot reach
+the network directly.
+
+The proxy resolves names on the host and connects to checked IP addresses.
+Private, loopback and link-local addresses need an exact IP grant. Unspecified
+addresses are always blocked. In intercept mode an `ask` requires a person's
+decision. The proxy remembers each answer for that host for the lifetime of
+the invocation and withdraws pending requests when the client or shell exits.
+Human wait time pauses the shell and proxy machine deadlines.
+
+Each invocation can use up to 128 proxy connections, with 16 active at once
+and a shared 64 MiB wire budget. Each connection has a two-minute machine-time
+budget, subject to the shell deadline. DNS resolution, dialing, and TLS
+handshakes each have a ten-second timeout.
+
+### Staging and publication
 
 The default outside denial leaves the system runtime readable as AgSDL
 specifies. Qualification refuses shell with an explicit `outside: "deny"`
 or any read denial or approval rule that overlaps a required runtime mount.
 The executor checks all effective policy layers before enabling shell.
 
-Bash sees a private copy at `/workspace` built from verified directory and
-file handles. A scan checks at most 20,000 entries and copies at most 64 MiB.
+Bash starts in a private copy built from verified directory and file handles.
+On Linux the copy is mounted at `/workspace`. A scan checks at most 20,000 entries and copies at most 64 MiB.
 Up to four workers create fresh staging files from the verified bytes.
 The scan omits paths without a read grant, private metadata, symlinks, special
 files and files with multiple hard links. Any ceiling that restricts workspace
@@ -282,9 +324,11 @@ originals and checks read and write permission for every changed path before
 applying any change. Only regular files and deletions are published, and their
 parent directories must already exist in the workspace. Publication uses the
 same atomic file replacement as the mutation tools. On timeout, Stop, or a
-staging budget error the host kills PID 1 through a pidfd and waits for it and
-the Bubblewrap supervisor before returning. The kernel terminates all
-processes remaining in that PID namespace.
+staging budget error Linux kills PID 1 through a pidfd and joins it and the
+Bubblewrap supervisor. The kernel terminates the remaining namespace processes.
+On macOS the launcher kills the process group and checks the private session
+for remaining jobs, including processes in other job-control groups. It waits
+for the session to end before publishing.
 
 The staging mount contains separate inodes from the host workspace. Workspace
 roots are host capabilities and should be managed by the host. Mutations
@@ -334,8 +378,9 @@ Compaction runs when the provider entry sets `contextWindowTokens`.
   confirmed yields `MCP_TERMINATION_UNCERTAIN`. Operator Hold is unavailable
   for runs that select MCP servers.
 - File tools use `root: 0` for the workspace and positive indices for up to
-  eight additional roots. On Linux, shell commands see filtered snapshots
-  under `/directories/<index>`. A root is writable in the shell only when
+  eight additional roots. Shell commands see filtered snapshots under
+  `/directories/<index>` on Linux and through `ARGENTIC_DIRECTORY_<index>` on
+  macOS. A root is writable in the shell only when
   every effective policy grants unrestricted read and write on that root.
   Work admission refuses overlapping shell roots and roots covering private
   Host data.

@@ -2,6 +2,7 @@ use std::io::{self, Seek, Write};
 
 const LD_WORD_ABS: u16 = 0x20;
 const JEQ: u16 = 0x15;
+const AND: u16 = 0x54;
 const JSET: u16 = 0x45;
 const RET: u16 = 0x06;
 const ALLOW: u32 = 0x7fff0000;
@@ -52,21 +53,21 @@ pub(super) fn write_filter(file: &mut std::fs::File, network: bool) -> io::Resul
         emit(RET, 0, 0, ERRNO)?;
     }
     if network {
-        // Exclude VM sockets, netlink, and abstract Unix sockets in the
-        // shared network namespace. IPv4 and IPv6 require a blanket grant.
-        emit(JEQ, 0, 4, libc::SYS_socket as u32)?;
-        emit(
-            LD_WORD_ABS,
-            0,
-            0,
-            if cfg!(target_endian = "little") {
-                16
-            } else {
-                20
-            },
-        )?; // args[0]
-        emit(JEQ, 2, 0, libc::AF_INET as u32)?;
-        emit(JEQ, 1, 0, libc::AF_INET6 as u32)?;
+        // The private namespace has only loopback. Allow IPv4 stream
+        // sockets for the loopback bridge and Unix sockets for its one
+        // mounted endpoint. socketpair cannot connect to a host socket.
+        let argument_offset = if cfg!(target_endian = "little") {
+            16
+        } else {
+            20
+        };
+        emit(JEQ, 0, 7, libc::SYS_socket as u32)?;
+        emit(LD_WORD_ABS, 0, 0, argument_offset)?; // domain
+        emit(JEQ, 5, 0, libc::AF_UNIX as u32)?;
+        emit(JEQ, 0, 3, libc::AF_INET as u32)?;
+        emit(LD_WORD_ABS, 0, 0, argument_offset + 8)?; // type
+        emit(AND, 0, 0, 0xf)?; // Ignore CLOEXEC and NONBLOCK
+        emit(JEQ, 1, 0, libc::SOCK_STREAM as u32)?;
         emit(RET, 0, 0, ERRNO)?;
     } else {
         for call in [libc::SYS_socket, libc::SYS_socketpair] {

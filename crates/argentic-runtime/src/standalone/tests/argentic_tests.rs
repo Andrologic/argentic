@@ -1228,7 +1228,11 @@ async fn shell_executes_and_stop_reaps_the_namespace_before_physical_end() {
     let mut doc = document();
     doc["agents"]["worker"]["permissions"] = json!({"preset":"full",
         "directories":{"../cache":"write","../shared":"read"},
-        "rules":[{"action":"read","effect":"deny","match":"../shared/private"}]
+        "reviewer":"person",
+        "rules":[
+            {"action":"read","effect":"deny","match":"../shared/private"},
+            {"action":"network","effect":"ask","match":"127.0.0.1"}
+        ]
     });
     let mut f = Fixture::new(&doc.to_string());
     let cache = f.workspace.with_file_name("cache");
@@ -1241,6 +1245,7 @@ async fn shell_executes_and_stop_reaps_the_namespace_before_physical_end() {
     std::fs::create_dir(&staging).unwrap();
     let mut config = config(&server.base_url, None);
     config["shellStagingDirectory"] = json!(staging);
+    config["shellNetwork"] = json!("intercept");
     let mut policy: Value = serde_json::from_slice(&std::fs::read(&f.policy).unwrap()).unwrap();
     policy["permissions"] = json!("full");
     let bytes = serde_json::to_vec(&policy).unwrap();
@@ -1273,17 +1278,81 @@ async fn shell_executes_and_stop_reaps_the_namespace_before_physical_end() {
         "sandboxed"
     );
 
-    // Keep a stream open in a grandchild. EOF after Stop proves the kernel
-    // closed its descriptor, independent of the work's journal marker.
+    // Disconnect a native client while approval is open. The broker must
+    // close the ticket and let the work continue with no upstream connection.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let scope = persistence::public030::HumanScope030 {
+        system_start_id: run.receipt.identity.system_start_id.clone(),
+        source: run.capture.source.clone(),
+    };
+    request.tool(
+        "shell",
+        json!({"command":format!(
+            "curl -sS --max-time 2 http://127.0.0.1:{port}/; sleep 2"
+        )}),
+    );
+    let withdrawn = pending_ask(&host, &scope).await;
+    let stored: String = tokio::time::timeout(WAIT_FOR, async {
+        loop {
+            let stored = sqlx::query_scalar(
+                "SELECT resolution_json FROM engine_flow030_human_requests WHERE request_id=?",
+            )
+            .bind(&withdrawn.id)
+            .fetch_one(&host.pool)
+            .await
+            .unwrap();
+            if let Some(stored) = stored {
+                break stored;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("The disconnected shell client left an open approval");
+    let request = server.next().await;
+    assert_eq!(
+        serde_json::from_str::<Value>(&stored).unwrap()["withdrawn"],
+        true
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), listener.accept())
+            .await
+            .is_err()
+    );
+
+    // Hold an approved connection until Stop. The target must see no connection
+    // before the shared approval port authorizes this destination.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     request.tool(
         "shell",
         json!({"command":format!(
-            "( (sleep 30) ) > /dev/tcp/127.0.0.1/{port} & wait"
+            "curl -sS --max-time 30 http://127.0.0.1:{port}/ & wait"
         )}),
     );
-    let (stream, _) = tokio::time::timeout(WAIT_FOR, listener.accept())
+    let scope = persistence::public030::HumanScope030 {
+        system_start_id: run.receipt.identity.system_start_id.clone(),
+        source: run.capture.source.clone(),
+    };
+    let ask = pending_ask(&host, &scope).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), listener.accept())
+            .await
+            .is_err()
+    );
+    host.submit_person(HumanSubmission {
+        scope,
+        request_id: ask.id,
+        expected_revision: ask.revision,
+        answer: api::HumanAnswer030::Decision {
+            decision: "yes".into(),
+            comment: String::new(),
+        },
+    })
+    .await
+    .unwrap();
+    let (mut stream, _) = tokio::time::timeout(WAIT_FOR, listener.accept())
         .await
         .unwrap()
         .unwrap();
@@ -1297,11 +1366,12 @@ async fn shell_executes_and_stop_reaps_the_namespace_before_physical_end() {
     .unwrap();
     let state = finish(&host, &run).await;
     assert_eq!(state["verdict"], "cancelled", "{state}");
-    tokio::time::timeout(WAIT_FOR, stream.readable())
+    use tokio::io::AsyncReadExt;
+    let mut request = Vec::new();
+    tokio::time::timeout(WAIT_FOR, stream.read_to_end(&mut request))
         .await
-        .unwrap()
+        .expect("proxy connection did not close on Stop")
         .unwrap();
-    assert_eq!(stream.try_read(&mut [0]).unwrap(), 0);
     assert_eq!(std::fs::read_dir(&staging).unwrap().count(), 0);
     let physical: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM engine_flow030_events WHERE
