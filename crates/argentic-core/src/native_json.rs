@@ -229,6 +229,17 @@ mod tests {
         );
     }
     #[test]
+    fn native_json_respects_source_depth_limit() {
+        let depth = crate::MAX_SOURCE_JSON_DEPTH;
+        let decoder = Decoder(boundary);
+        let raw = format!("{}0{}", "[".repeat(depth), "]".repeat(depth));
+        assert!(decoder.parse(&Text::from(raw.as_str())).is_ok());
+        let raw = format!(r#"{{"value":{raw}}}"#);
+        let error = decoder.parse(&Text::from(raw.as_str())).unwrap_err();
+        assert!(error.message.lossy().contains("JSON nesting depth"));
+    }
+
+    #[test]
     fn syntax_refusal_precedes_scalar_conversion() {
         fn forbidden(_: &str) -> Result<String, String> {
             panic!("conversion before syntax validation")
