@@ -731,8 +731,8 @@ After a crash, an ordinary unfinished 0.4.0 run reports
 or adopt its session. `terminationUncertain` indicates that activity may have
 survived the interruption. A remote MCP question whose answer was sent without
 a confirmed response stays reserved; while its call's termination is uncertain,
-the human projection reports that request as `terminationUncertain` rather
-than `resolved`.
+the human projection reports that request as `uncertain` with
+`phase: "afterResolution"` rather than `resolved`.
 
 An explicit 0.4.0 whole-run stop survives reopening the file. Recovery can
 settle a Start that never crossed the executor boundary and a local approval

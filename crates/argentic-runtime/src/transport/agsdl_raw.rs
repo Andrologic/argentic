@@ -132,7 +132,13 @@ pub(crate) fn receipt(raw: String) -> Result<McpReceipt> {
             .map_err(|e| CallError::transport(format!("Invalid MCP content: {e}")))?;
         for block in blocks {
             let item = object(block.get())?;
-            if item.get("type").map(|v| string(v)).transpose()?.as_deref() == Some("text") {
+            // MCP requires a type on every content block.
+            let kind = item
+                .get("type")
+                .map(|v| string(v))
+                .transpose()?
+                .ok_or_else(|| CallError::transport("MCP content block has no type"))?;
+            if kind == "text" {
                 texts.push(string(
                     item.get("text")
                         .ok_or_else(|| CallError::transport("Missing MCP text"))?,

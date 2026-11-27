@@ -103,7 +103,9 @@ pub(crate) async fn read(
                     .iter()
                     .any(|activation| activation.physical && work_ids.contains(&activation.id))
             {
-                json!({"kind":"terminationUncertain","receiptId":receipt,"resolution":resolved})
+                // The AgSDL run UI contract (Macro) names this state
+                // `uncertain` after resolution.
+                json!({"kind":"uncertain","receiptId":receipt,"phase":"afterResolution","resolution":resolved})
             } else if expired {
                 json!({"kind":"expired","resolution":resolved})
             } else if delivery == "acknowledged" {

@@ -121,7 +121,7 @@ async fn http_handler(
             }
             if state.mode == "redirect" { return (axum::http::StatusCode::TEMPORARY_REDIRECT, [("location", "/other")]).into_response(); }
             if state.mode == "lost" { return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response(); }
-            if matches!(state.mode, "modern" | "modern-bad-state" | "modern-rejected-input" | "modern-null-input" | "modern-invalid-complete" | "modern-invalid-next") {
+            if matches!(state.mode, "modern" | "modern-bad-state" | "modern-rejected-input" | "modern-null-input" | "modern-invalid-complete" | "modern-untyped-block" | "modern-invalid-next") {
                 assert_eq!(headers.get("mcp-protocol-version").unwrap(), "2026-07-28");
                 assert_eq!(headers.get("mcp-method").unwrap(), "tools/call");
                 assert_eq!(headers.get("mcp-name").unwrap(), "synthetic");
@@ -139,6 +139,7 @@ async fn http_handler(
                     match state.mode {
                         "modern-null-input" => "null".into(),
                         "modern-invalid-complete" => r#"{"resultType":"complete","content":null}"#.into(),
+                        "modern-untyped-block" => r#"{"resultType":"complete","content":[{}]}"#.into(),
                         "modern-invalid-next" => r#"{"resultType":"input_required","requestState":123}"#.into(),
                         _ => r#"{"resultType":"complete","content":[],"structuredContent":{"large":9007199254740993},"isError":true}"#.into(),
                     }
@@ -690,6 +691,7 @@ async fn malformed_modern_continuation_results_do_not_acknowledge_delivery() {
     for mode in [
         "modern-null-input",
         "modern-invalid-complete",
+        "modern-untyped-block",
         "modern-invalid-next",
     ] {
         let (server, fixture, task) = http_fixture(mode).await;

@@ -1383,7 +1383,12 @@ async fn lost_http_answer_response_projects_human_termination_uncertainty() {
         .unwrap();
     assert!(run.termination_uncertain);
     let page = f.host.human_page(&f.pool, scope, None).await.unwrap();
-    assert_eq!(page.requests[0].status, "terminationUncertain");
+    assert_eq!(page.requests[0].status, "uncertain");
+    let facts: serde_json::Value =
+        serde_json::from_str(page.requests[0].flow_json.as_deref().unwrap()).unwrap();
+    assert_eq!(facts["state"]["kind"], "uncertain");
+    assert_eq!(facts["state"]["phase"], "afterResolution");
+    assert_eq!(facts["state"]["resolution"]["reason"], "person");
     assert_no_secrets(&f._temp.path().join("run.db"));
 }
 
