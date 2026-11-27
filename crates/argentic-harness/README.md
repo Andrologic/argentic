@@ -248,12 +248,14 @@ For `"reviewer": "model"`, set `"reviewerModel": "local/reviewer-model"` at the
 top level of the Host's provider configuration and list `reviewer-model` in
 that provider's `models`. The reviewer receives the exact action and arguments,
 the policy context, the active mission, delivered steer messages and bounded
-excerpts from the recent conversation. It has
-no tools and must return a JSON object such as `{"verdict":"APPROVE"}`. The
-Host records `APPROVE`, `DENY` or `ESCALATE` as a `reviewerDecision` work event.
-The Host rechecks policy before delivering an approval. Provider errors, invalid
-replies and a 15-second deadline yield denial. Shell and MCP asks require a
-person because the reviewer cannot inspect their effects.
+excerpts from the recent conversation. It has no tools and must return a JSON
+object such as `{"verdict":"APPROVE"}`. The Host records `APPROVE`, `DENY` or
+`ESCALATE` as a `reviewerDecision` work event.
+The Host rechecks policy before delivering an approval and records the final
+outcome as a `reviewerAuthorization` event with the same request ID. Provider
+errors, invalid replies and a 15-second deadline yield denial. Shell and MCP
+asks require a person because the reviewer cannot inspect their effects.
+
 Model reviews are limited to four requests per agent turn and 32 per work.
 With `maxTotalTokens`, the host reserves prompt and output tokens before a
 review and charges the reported usage to the work. A review that cannot fit

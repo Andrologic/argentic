@@ -2076,6 +2076,49 @@ async fn argentic_review_caps_requests_per_turn_and_work() {
     close(&host).await;
 }
 
+#[tokio::test]
+async fn argentic_review_records_a_refusal_at_final_policy_check() {
+    let mut server = Server::start().await;
+    let (doc, cfg) = reviewer_fixture(&server);
+    let f = Fixture::new(&doc.to_string());
+    let host = open(&f, true)
+        .await
+        .with_argentic(serde_json::from_value(cfg).unwrap())
+        .unwrap();
+    let run = start(&host).await;
+    write_memo(server.next().await);
+    let review = server.next().await;
+    assert_eq!(review.body["model"], "reviewer");
+    host.policies.0.write().await.policy.read_only = true;
+    send_text(review, r#"{"verdict":"APPROVE"}"#);
+    let next = server.next().await;
+    assert!(!f.workspace.join("memo.txt").exists());
+    submit_done(next);
+    completed(&finish(&host, &run).await);
+    let bodies: Vec<String> = sqlx::query_scalar(
+        "SELECT ticket_json -> 'input' ->> 'eventJson' FROM engine_flow030_work_events WHERE decision_json IS NOT NULL ORDER BY rowid",
+    ).fetch_all(&host.pool).await.unwrap();
+    let events: Vec<Value> = bodies
+        .iter()
+        .map(|body| serde_json::from_str(body).unwrap())
+        .collect();
+    let verdict = events
+        .iter()
+        .find(|entry| entry["event"]["kind"] == "reviewerDecision")
+        .unwrap();
+    assert_eq!(verdict["event"]["verdict"], "APPROVE");
+    assert!(
+        events.iter().any(|entry| {
+            let event = &entry["event"];
+            event["kind"] == "reviewerAuthorization"
+                && event["requestId"] == verdict["event"]["requestId"]
+                && event["allowed"] == false
+        }),
+        "{events:?}"
+    );
+    close(&host).await;
+}
+
 fn delegate_document(effect: &str) -> Value {
     let mut doc = document();
     doc["agents"]["worker"]["permissions"] = json!({

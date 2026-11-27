@@ -87,6 +87,11 @@ fn event_key(event: &Value) -> Result<Option<Text>> {
         ("planPresented", "planId", "plan:"),
         ("planResolved", "planId", "planDecision:"),
         ("reviewerDecision", "requestId", "reviewerDecision:"),
+        (
+            "reviewerAuthorization",
+            "requestId",
+            "reviewerAuthorization:",
+        ),
         ("checkEnded", "checkId", "check:"),
     ] {
         if event.get("kind").eq_str(kind) {
@@ -445,6 +450,16 @@ impl Controller {
                 .any(|v| event.get("verdict").eq_str(v))
             {
                 return correlation("/verdict", "Invalid reviewer verdict.");
+            }
+            return Ok(waiting("provider"));
+        }
+        if kind.eq_str("reviewerAuthorization") {
+            let mut key = Text::from("reviewerDecision:");
+            key.push(text(event.get("requestId"))?);
+            if !matches!(event.get("allowed"), Value::Bool(_))
+                || !self.operations.contains_key(&key)
+            {
+                return correlation("/requestId", "Invalid or unmatched reviewer authorization.");
             }
             return Ok(waiting("provider"));
         }

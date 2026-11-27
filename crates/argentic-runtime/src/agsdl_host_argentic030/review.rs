@@ -243,6 +243,7 @@ impl CommandApprovals030 for ModelReviewer {
                 return respond(false).await;
             }
 
+            let request_id = native["id"].clone();
             if method == "argentic/tool/requestApproval" {
                 // The model needs exact arguments. The journal and the person
                 // broker retain the tool's existing digest-based payload.
@@ -251,7 +252,12 @@ impl CommandApprovals030 for ModelReviewer {
                     .ok_or_else(|| failure("CORRELATION", "review", "Approval arguments absent"))?
                     .remove("reviewArguments");
             }
-            match (decision, &self.person) {
+            let mut allowed = false;
+            let respond: Respond030<'_> = Box::new(|yes| {
+                allowed = yes;
+                respond(yes)
+            });
+            let result = match (decision, &self.person) {
                 (Verdict::Approve, _) => {
                     payload["reviewer"] = json!("model");
                     self.authorization
@@ -262,7 +268,19 @@ impl CommandApprovals030 for ModelReviewer {
                     person.answer(work, payload, cancel, respond).await
                 }
                 _ => respond(false).await,
-            }
+            };
+            // The approval broker owns the policy and admission guards while
+            // calling respond. The work journal takes those locks itself.
+            let authorization = self
+                .events
+                .emit(
+                    json!({"kind":"reviewerAuthorization","requestId":request_id,"allowed":allowed}),
+                    cancel,
+                )
+                .await;
+            result?;
+            authorization?;
+            Ok(())
         })
     }
 }
