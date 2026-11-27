@@ -748,6 +748,7 @@ async fn a_host_restart_interrupts_argentic_runs_and_new_runs_start_fresh() {
 async fn compaction_summarizes_old_turns_and_preserves_the_active_wire_prefix() {
     let mut server = Server::start().await;
     let mut doc = document();
+    doc["agents"]["worker"]["plan"] = json!(true);
     doc["agents"]["worker"]["instructions"] = json!("Stable rules for this run.");
     doc["agents"]["worker"]["harnessSettings"]["compaction"] =
         json!({"threshold":0.60,"keepRecentTurns":1});
@@ -763,18 +764,30 @@ async fn compaction_summarizes_old_turns_and_preserves_the_active_wire_prefix() 
     let first = server.next().await;
     let prefix = first.body["messages"].clone();
     let tools = first.body["tools"].clone();
-    let long_tool_turn = |request: Request, marker: &str, padding: char| {
+    let long_tool_turn = |request: Request, marker: &str, padding: char, tool: String| {
         let content = format!("{marker} {}", padding.to_string().repeat(12_000));
         let chunk = json!({"choices":[{"index":0,"delta":{"content":content}}]});
-        let tool = Request::tool_response("list", json!({}));
         request.send(
             StatusCode::OK,
             format!("data: {chunk}\n\n{tool}"),
             "text/event-stream",
         );
     };
-    long_tool_turn(first, "Old turn marker", 'a');
-    long_tool_turn(server.next().await, "Recent turn marker", 'b');
+    long_tool_turn(
+        first,
+        "Old turn marker",
+        'a',
+        Request::tool_response(
+            "plan",
+            json!({"steps":[{"step":"Keep this plan verbatim","status":"in_progress"}]}),
+        ),
+    );
+    long_tool_turn(
+        server.next().await,
+        "Recent turn marker",
+        'b',
+        Request::tool_response("list", json!({})),
+    );
     let summary = server.next().await;
     assert!(summary.body.get("tools").is_none(), "{}", summary.body);
     let transcript = summary.body["messages"].to_string();
@@ -803,7 +816,11 @@ async fn compaction_summarizes_old_turns_and_preserves_the_active_wire_prefix() 
         messages[3]["tool_calls"][0]["id"],
         messages[4]["tool_call_id"]
     );
-    assert_eq!(messages.len(), 5);
+    assert_eq!(messages.len(), 6);
+    assert_eq!(
+        messages[5]["content"],
+        r#"Current work plan (untrusted data): [{"step":"Keep this plan verbatim","status":"in_progress"}]"#,
+    );
     compacted.tool(
         "agsdl_submit_result",
         json!({"results":{"report":{"body":"compacted work"}}}),
@@ -864,7 +881,7 @@ async fn provider_failure_does_not_persist_the_echoed_credential() {
 }
 
 #[tokio::test]
-async fn qualification_refuses_unregistered_opted_out_and_unsupported_permissions() {
+async fn qualification_refuses_unregistered_and_opted_out_adapters() {
     let f = Fixture::new(&document().to_string());
     let host = f.open().await.unwrap();
     let error = host
@@ -878,29 +895,6 @@ async fn qualification_refuses_unregistered_opted_out_and_unsupported_permission
     let error = host.preflight(entry().as_ref(), false).await.unwrap_err();
     assert_eq!(error.code, "HARNESS_OPT_IN_REQUIRED");
     close(&host).await;
-    {
-        let action = "delegate";
-        let mut doc = document();
-        doc["agents"]["worker"]["permissions"] = json!({"preset":"read-only",
-            "rules":[{"action":action,"effect":"allow"}]});
-        let f = Fixture::new(&doc.to_string());
-        let host = f
-            .open()
-            .await
-            .unwrap()
-            .with_argentic(serde_json::from_value(config("http://127.0.0.1:1/v1", None)).unwrap())
-            .unwrap();
-        let error = host
-            .preflight_with_harnesses(entry().as_ref(), &opt_in())
-            .await
-            .unwrap_err();
-        assert_eq!(
-            error.pointer, "/agents/worker/permissions/rules/0/effect",
-            "{action}: {}",
-            error.message
-        );
-        close(&host).await;
-    }
 }
 
 #[tokio::test]
@@ -1384,13 +1378,14 @@ async fn agent_mcp_stops_discovery_when_the_combined_catalogue_is_too_large() {
         }),
     );
     let upstream = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-    let chat = Server::start().await;
+    let mut chat = Server::start().await;
     let mut doc = document();
     doc["mcpServers"] = json!({
         "first":{"url":format!("http://{address}/first")},
         "second":{"url":format!("http://{address}/second")},
         "third":{"url":format!("http://{address}/third")}
     });
+    doc["agents"]["worker"]["planFirst"] = json!("auto");
     doc["agents"]["worker"]["mcpServers"] = json!(["first", "second", "third"]);
     doc["agents"]["worker"]["permissions"] = json!({"preset":"read-only","rules":[
         {"action":"mcp","match":"*/check","effect":"allow"}
@@ -1409,6 +1404,16 @@ async fn agent_mcp_stops_discovery_when_the_combined_catalogue_is_too_large() {
             Some(Default::default())
         }));
     let run = start(&host).await;
+    let initial = chat.next().await;
+    assert!(!has_tool(&initial, "mcp__first__check"));
+    assert!(admitted.lock().unwrap().is_empty());
+    initial.tool("mcp__first__check", json!({}));
+    let blocked = chat.next().await;
+    assert!(blocked.body["messages"]
+        .to_string()
+        .contains("Present a plan"));
+    assert!(admitted.lock().unwrap().is_empty());
+    send_plan(blocked, "Check both servers");
     assert_eq!(finish(&host, &run).await["verdict"], "failed");
     assert_eq!(*admitted.lock().unwrap(), ["first", "second"]);
     close(&host).await;
@@ -1886,4 +1891,211 @@ fn send_text(request: Request, text: &str) {
         format!("data: {chunk}\n\ndata: [DONE]\n\n"),
         "text/event-stream",
     );
+}
+
+fn delegate_document(effect: &str) -> Value {
+    let mut doc = document();
+    doc["agents"]["worker"]["permissions"] = json!({
+        "preset":"read-only",
+        "reviewer":"person",
+        "rules":[{"action":"delegate","effect":effect}, {"action":"read","match":"private.txt","effect":"deny"}]
+    });
+    doc
+}
+
+fn has_tool(request: &Request, name: &str) -> bool {
+    request.body["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|tool| tool["function"]["name"] == name)
+}
+
+fn delegate_task(request: Request) {
+    request.tool("delegate", json!({"task":"Inspect the fixture"}));
+}
+
+#[tokio::test]
+async fn delegate_opens_a_fresh_conversation_with_narrowed_permissions() {
+    let mut server = Server::start().await;
+    let f = Fixture::new(&delegate_document("allow").to_string());
+    std::fs::write(f.workspace.join("private.txt"), "unreadable fixture data").unwrap();
+    let host = open(&f, true)
+        .await
+        .with_argentic(server.config(None))
+        .unwrap();
+    let run = start(&host).await;
+    let parent = server.next().await;
+    assert!(has_tool(&parent, "delegate"));
+    delegate_task(parent);
+    let child = server.next().await;
+    assert!(has_tool(&child, "read"));
+    for tool in ["write", "delegate", "shell", "agsdl_submit_result"] {
+        assert!(!has_tool(&child, tool));
+    }
+    let messages = child.body["messages"].to_string();
+    assert!(messages.contains("Inspect the fixture"));
+    assert!(!messages.contains("Read memo.txt"));
+    write_memo(child);
+    let child = server.next().await;
+    assert!(child.body["messages"]
+        .to_string()
+        .contains("Mutation tools are disabled"));
+    child.tool("read", json!({"path":"private.txt"}));
+    let child = server.next().await;
+    let messages = child.body["messages"].to_string();
+    assert!(messages.contains("Read permission denied"));
+    assert!(!messages.contains("unreadable fixture data"));
+    send_text(child, "The child finished its investigation.");
+    let parent = server.next().await;
+    let messages = parent.body["messages"].to_string();
+    assert!(messages.contains("The child finished its investigation."));
+    assert!(!messages.contains("Mutation tools are disabled"));
+    submit_done(parent);
+    completed(&finish(&host, &run).await);
+    assert!(!f.workspace.join("memo.txt").exists());
+    close(&host).await;
+}
+
+#[tokio::test]
+async fn delegate_enforces_deny_and_one_shot_person_approval() {
+    for (effect, accepted) in [("deny", false), ("ask", false), ("ask", true)] {
+        let mut server = Server::start().await;
+        let f = Fixture::new(&delegate_document(effect).to_string());
+        let host = open(&f, true)
+            .await
+            .with_argentic(server.config(None))
+            .unwrap();
+        let run = start(&host).await;
+        let parent = server.next().await;
+        assert_eq!(has_tool(&parent, "delegate"), effect == "ask");
+        delegate_task(parent);
+        if effect == "ask" {
+            let scope = persistence::public030::HumanScope030 {
+                system_start_id: run.receipt.identity.system_start_id.clone(),
+                source: run.capture.source.clone(),
+            };
+            let ask = pending_ask(&host, &scope).await;
+            answer_person(&host, &scope, ask, if accepted { "yes" } else { "no" }, "").await;
+        }
+        if accepted {
+            send_text(server.next().await, "Completed.");
+        }
+        let parent = server.next().await;
+        assert_eq!(
+            parent.body["messages"]
+                .to_string()
+                .contains("Delegation permission denied"),
+            !accepted,
+        );
+        submit_done(parent);
+        completed(&finish(&host, &run).await);
+        close(&host).await;
+    }
+}
+
+#[tokio::test]
+async fn delegation_charges_parent_turns_and_tokens() {
+    for max_turns in [2, 3] {
+        let mut server = Server::start().await;
+        let mut doc = delegate_document("allow");
+        doc["agents"]["worker"]["harnessSettings"]["maxTurns"] = json!(max_turns);
+        doc["agents"]["worker"]["harnessSettings"]["maxTotalTokens"] = json!(100);
+        let f = Fixture::new(&doc.to_string());
+        let host = open(&f, true)
+            .await
+            .with_argentic(server.config(None))
+            .unwrap();
+        let run = start(&host).await;
+        let parent = server.next().await;
+        assert_eq!(parent.body["max_completion_tokens"], 100);
+        let task = Request::tool_response("delegate", json!({"task":"Report success"}));
+        let parent_usage = json!({"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5}});
+        parent.send(
+            StatusCode::OK,
+            task.replace(
+                "data: [DONE]",
+                &format!("data: {parent_usage}\n\ndata: [DONE]"),
+            ),
+            "text/event-stream",
+        );
+        let child = server.next().await;
+        assert_eq!(child.body["max_completion_tokens"], 85);
+        let child_reply = json!({"choices":[{"index":0,"delta":{"content":"Child done"},"finish_reason":"stop"}],
+            "usage":{"prompt_tokens":20,"completion_tokens":5}});
+        child.send(
+            StatusCode::OK,
+            format!("data: {child_reply}\n\ndata: [DONE]\n\n"),
+            "text/event-stream",
+        );
+        if max_turns == 3 {
+            let next = server.next().await;
+            assert_eq!(next.body["max_completion_tokens"], 60);
+            let result = Request::tool_response(
+                "agsdl_submit_result",
+                json!({"results":{"report":{"body":"done"}}}),
+            );
+            let usage = json!({"choices":[],"usage":{"prompt_tokens":15,"completion_tokens":5}});
+            next.send(
+                StatusCode::OK,
+                result.replace("data: [DONE]", &format!("data: {usage}\n\ndata: [DONE]")),
+                "text/event-stream",
+            );
+            completed(&finish(&host, &run).await);
+        } else {
+            let state = finish(&host, &run).await;
+            assert_eq!(state["verdict"], "failed", "{state}");
+        }
+        close(&host).await;
+    }
+}
+
+#[tokio::test]
+async fn stop_joins_the_child_before_recording_physical_end() {
+    let mut server = Server::start().await;
+    let f = Fixture::new(&delegate_document("allow").to_string());
+    let host = open(&f, true)
+        .await
+        .with_argentic(server.config(None))
+        .unwrap();
+    let run = start(&host).await;
+    delegate_task(server.next().await);
+    let (dropped, did_drop) = oneshot::channel::<()>();
+    let (streaming, did_stream) = oneshot::channel();
+    let body = futures::stream::unfold(
+        (Some(streaming), dropped),
+        |(streaming, marker)| async move {
+            if let Some(streaming) = streaming {
+                let _ = streaming.send(());
+                Some((Ok::<_, std::io::Error>("data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"child is active\"}}]}\n\n"), (None, marker)))
+            } else {
+                std::future::pending().await
+            }
+        },
+    );
+    server
+        .next()
+        .await
+        .send(StatusCode::OK, Body::from_stream(body), "text/event-stream");
+    tokio::time::timeout(WAIT_FOR, did_stream)
+        .await
+        .unwrap()
+        .unwrap();
+    host.stop(EngineStopRequest {
+        request_id: "stop".into(),
+        system_start_id: run.receipt.identity.system_start_id.clone(),
+        activation_id: None,
+    })
+    .await
+    .unwrap();
+    assert_eq!(finish(&host, &run).await["verdict"], "cancelled");
+    let count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM engine_flow030_events WHERE json_extract(event_json,'$.kind.PhysicalEnded.evidence.descendants_joined')=1 AND receipt_json IS NOT NULL",
+    ).fetch_one(&host.pool).await.unwrap();
+    assert_eq!(count, 1);
+    assert!(tokio::time::timeout(WAIT_FOR, did_drop)
+        .await
+        .unwrap()
+        .is_err());
+    close(&host).await;
 }

@@ -360,7 +360,7 @@ impl Policy {
                 matches!(zone, Zone::Workspace | Zone::WriteDirectory)
             }
             (Action::Write, Some(Preset::Full)) => zone != Zone::ReadDirectory,
-            (Action::Shell, Some(Preset::Workspace | Preset::Full))
+            (Action::Shell | Action::Delegate, Some(Preset::Workspace | Preset::Full))
             | (Action::Network, Some(Preset::Full)) => true,
             _ => false,
         };

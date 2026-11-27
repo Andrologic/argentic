@@ -639,6 +639,7 @@ impl Executor {
         let mut harness = Harness::new(provider, Arc::new(registry), settings)
             .with_context_window(context_window)
             .with_plan(plan_mode)
+            .with_delegation()
             .with_hook(Arc::new(port.clone()));
         if let Some(reviewer) = model_reviewer {
             harness = harness.with_hook(reviewer);

@@ -80,6 +80,7 @@ pub enum Approval<'a> {
     Read(&'a Path),
     Write(&'a Path),
     Shell(&'a str),
+    Delegate,
 }
 
 #[async_trait::async_trait]
@@ -310,10 +311,70 @@ impl Registry {
                 Approval::Read(_) => "Read",
                 Approval::Write(_) => "Write",
                 Approval::Shell(_) => "Shell",
+                Approval::Delegate => "Delegation",
             };
             return Err(format!("{action} permission denied"));
         }
         check_cancel(cancel).map_err(|error| error.to_string())
+    }
+
+    fn delegation_effect(&self) -> Effect {
+        self.policy
+            .iter()
+            .map(|policy| policy.decide(Action::Delegate, "", Zone::Workspace))
+            .max()
+            .unwrap_or(Effect::Deny)
+    }
+
+    pub(crate) fn may_delegate(&self) -> bool {
+        match self.delegation_effect() {
+            Effect::Allow => true,
+            Effect::Ask => self.authorizer.is_some(),
+            Effect::Deny => false,
+        }
+    }
+
+    pub(crate) async fn authorize_delegate(
+        &self,
+        call: &ToolCall,
+        cancel: &CancellationToken,
+    ) -> Result<(), String> {
+        self.authorize(self.delegation_effect(), call, Approval::Delegate, cancel)
+            .await
+    }
+
+    pub(crate) fn read_only_child(&self) -> Result<Self, String> {
+        let roots = self
+            .roots
+            .iter()
+            .map(|root| {
+                Ok((
+                    root.path.clone(),
+                    root.directory.try_clone().map_err(|e| e.to_string())?,
+                ))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let child_policy = Policy::compile_rules(
+            &self.roots[0].path,
+            None,
+            Some(crate::policy::Preset::ReadOnly),
+            Some(false),
+            &[],
+        )?
+        .with_directories(
+            roots
+                .iter()
+                .skip(1)
+                .map(|(path, _)| (path.clone(), Zone::ReadDirectory))
+                .collect(),
+        );
+        let mut policies = self.policy.clone();
+        policies.push(child_policy);
+        let mut registry = Self::with_open_roots(roots, policies, json!(false))?;
+        registry
+            .definitions
+            .retain(|tool| tool.name != SUBMIT_RESULT);
+        Ok(registry)
     }
 
     fn allows(&self, root: &Root, path: &Path) -> bool {

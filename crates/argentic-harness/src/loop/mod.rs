@@ -1,6 +1,7 @@
 //! Runs one AgSDL work in a fresh or continuing conversation.
 
 mod compaction;
+mod delegate;
 mod plan;
 pub use plan::{PlanDecision, PlanMode, PlanStatus, PlanStep};
 
@@ -9,7 +10,7 @@ use std::{
     collections::{HashSet, VecDeque},
     sync::{
         atomic::{AtomicU8, Ordering},
-        Arc,
+        Arc, Mutex, MutexGuard,
     },
     time::Duration,
 };
@@ -278,6 +279,7 @@ pub struct Harness {
     settings: Settings,
     context_window: Option<u32>,
     plan: PlanMode,
+    delegation: bool,
     hooks: Vec<Arc<dyn Hook>>,
 }
 
@@ -289,6 +291,7 @@ impl Harness {
             settings,
             context_window: None,
             plan: PlanMode::Off,
+            delegation: false,
             hooks: Vec::new(),
         }
     }
@@ -303,6 +306,11 @@ impl Harness {
         self
     }
 
+    pub fn with_delegation(mut self) -> Self {
+        self.delegation = true;
+        self
+    }
+
     pub fn with_hook(mut self, hook: Arc<dyn Hook>) -> Self {
         self.hooks.push(hook);
         self
@@ -310,81 +318,126 @@ impl Harness {
 
     pub async fn run(
         &self,
-        mut work: Work,
+        work: Work,
         port: &dyn WorkPort,
         steer: mpsc::Receiver<Steer>,
         parent: CancellationToken,
     ) -> RunReport {
-        let cancel = parent.child_token();
-        let _cancel_on_drop = cancel.clone().drop_guard();
-        let tracker = TaskTracker::new();
-        let tool_choice_rejected = AtomicU8::new(0);
-        let mut instance = Instance {
-            harness: self,
-            port,
-            steer,
-            cancel: &cancel,
-            tracker: &tracker,
-            text: String::new(),
-            artifacts: Vec::new(),
-            corrections: 0,
-            force_submission: false,
-            tool_choice_rejected: &tool_choice_rejected,
-            history_end: work.messages.len(),
-            protected_prefix: compaction::prefix_len(&work.messages),
-            mission_index: matches!(work.messages.last(), Some(Message::User(_)))
-                .then(|| work.messages.len() - 1),
-            correction_start: None,
-            response_text_start: None,
-            pending_steer: VecDeque::new(),
-            host_steer_pending: false,
-            accepted_steer: Vec::new(),
-            delivery: DeliveryProgress::default(),
-            plan_locked: self.plan.locked(),
-            plan_context: None,
-        };
-        let (outcome, forced) = {
-            let future = instance.execute(&mut work);
-            tokio::pin!(future);
-            tokio::select! {
-                biased;
-                _ = cancel.cancelled() => {
-                    let grace = Duration::from_millis(u64::from(self.settings.limit("cancelGraceMs")));
-                    let forced = tokio::time::timeout(grace, &mut future).await.is_err();
-                    (Err(Failure::Cancelled), forced)
+        let settings = &self.settings;
+        let turns = settings.limit("maxTurns");
+        let tokens = settings
+            .get("maxTotalTokens")
+            .filter(|(_, layer)| *layer != Layer::Default)
+            .map(|(limit, _)| u64::from(limit));
+        let budget = Arc::new(Mutex::new(Budget { turns, tokens }));
+        self.run_with_budget(work, port, steer, parent, budget, turns)
+            .await
+    }
+
+    fn run_with_budget<'a>(
+        &'a self,
+        mut work: Work,
+        port: &'a dyn WorkPort,
+        steer: mpsc::Receiver<Steer>,
+        parent: CancellationToken,
+        budget: Arc<Mutex<Budget>>,
+        turn_limit: u32,
+    ) -> futures::future::BoxFuture<'a, RunReport> {
+        Box::pin(async move {
+            let cancel = parent.child_token();
+            let _cancel_on_drop = cancel.clone().drop_guard();
+            let tracker = TaskTracker::new();
+            let tool_choice_rejected = AtomicU8::new(0);
+            let mut instance = Instance {
+                harness: self,
+                port,
+                steer,
+                cancel: &cancel,
+                tracker: &tracker,
+                text: String::new(),
+                artifacts: Vec::new(),
+                corrections: 0,
+                force_submission: false,
+                tool_choice_rejected: &tool_choice_rejected,
+                history_end: work.messages.len(),
+                protected_prefix: compaction::prefix_len(&work.messages),
+                mission_index: matches!(work.messages.last(), Some(Message::User(_)))
+                    .then(|| work.messages.len() - 1),
+                correction_start: None,
+                response_text_start: None,
+                pending_steer: VecDeque::new(),
+                host_steer_pending: false,
+                accepted_steer: Vec::new(),
+                delivery: DeliveryProgress::default(),
+                plan_locked: self.plan.locked(),
+                plan_context: None,
+                budget,
+                turn_limit,
+            };
+            let (outcome, forced) = {
+                let future = instance.execute(&mut work);
+                tokio::pin!(future);
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => {
+                        let grace = Duration::from_millis(u64::from(self.settings.limit("cancelGraceMs")));
+                        let forced = tokio::time::timeout(grace, &mut future).await.is_err();
+                        (Err(Failure::Cancelled), forced)
+                    }
+                    outcome = &mut future => (outcome, false),
                 }
-                outcome = &mut future => (outcome, false),
+            };
+            let steer_result = instance.settle_steer().await;
+            instance.persist_steer(&mut work.messages);
+            let outcome = if cancel.is_cancelled() {
+                Err(Failure::Cancelled)
+            } else {
+                outcome.and_then(|outcome| steer_result.map(|()| outcome))
+            };
+            cancel.cancel();
+            // Closing drops any undelivered steer receipt before joining workers.
+            instance.steer.close();
+            while instance.steer.try_recv().is_ok() {}
+            tracker.close();
+            tracker.wait().await;
+            if matches!(outcome, Err(Failure::Cancelled)) {
+                instance.finish_interrupted_history(&mut work.messages);
+            } else {
+                work.messages.truncate(instance.history_end);
             }
-        };
-        let steer_result = instance.settle_steer().await;
-        instance.persist_steer(&mut work.messages);
-        let outcome = if cancel.is_cancelled() {
-            Err(Failure::Cancelled)
-        } else {
-            outcome.and_then(|outcome| steer_result.map(|()| outcome))
-        };
-        cancel.cancel();
-        // Closing drops any undelivered steer receipt before joining workers.
-        instance.steer.close();
-        while instance.steer.try_recv().is_ok() {}
-        tracker.close();
-        tracker.wait().await;
-        if matches!(outcome, Err(Failure::Cancelled)) {
-            instance.finish_interrupted_history(&mut work.messages);
-        } else {
-            work.messages.truncate(instance.history_end);
-        }
-        compaction::bound_history(&mut work.messages, instance.protected_prefix);
-        RunReport {
-            outcome,
-            physical_end: PhysicalEnd { forced },
-            artifacts: instance.artifacts,
-            messages: work.messages,
-        }
+            compaction::bound_history(&mut work.messages, instance.protected_prefix);
+            RunReport {
+                outcome,
+                physical_end: PhysicalEnd { forced },
+                artifacts: instance.artifacts,
+                messages: work.messages,
+            }
+        })
     }
 }
 
 const PLAN_REQUIRED: &str = r#"{"error":"Present a plan using the plan tool before proceeding."}"#;
+
+struct Budget {
+    turns: u32,
+    tokens: Option<u64>,
+}
+
+impl Budget {
+    fn has_turn(&self) -> bool {
+        self.turns > 0 && self.tokens != Some(0)
+    }
+
+    fn charge(&mut self, tokens: u64) {
+        self.tokens = self
+            .tokens
+            .map(|remaining| remaining.saturating_sub(tokens));
+    }
+
+    fn exhaust(&mut self) {
+        self.charge(u64::MAX);
+    }
+}
 
 struct Instance<'a> {
     harness: &'a Harness,
@@ -408,18 +461,15 @@ struct Instance<'a> {
     delivery: DeliveryProgress,
     plan_locked: bool,
     plan_context: Option<String>,
+    budget: Arc<Mutex<Budget>>,
+    turn_limit: u32,
 }
 
 impl Instance<'_> {
     async fn execute(&mut self, work: &mut Work) -> Result<Outcome, Failure> {
         let settings = &self.harness.settings;
-        let turn_limit = settings.limit("maxTurns");
+        let turn_limit = self.turn_limit;
         let min_output = self.harness.provider.min_output_tokens();
-        let total = settings
-            .get("maxTotalTokens")
-            .filter(|(_, layer)| *layer != Layer::Default)
-            .map(|(limit, _)| u64::from(limit));
-        let mut spent = 0u64;
         let mut definitions: Vec<_> = self
             .harness
             .registry
@@ -429,10 +479,17 @@ impl Instance<'_> {
         if self.harness.plan != PlanMode::Off {
             definitions.push(plan::definition());
         }
+        if self.harness.delegation && self.harness.registry.may_delegate() {
+            definitions.push(delegate::definition());
+        }
         let mut extensions_ready = false;
         for turn in 1..=turn_limit {
             self.active()?;
-            let remaining = total.map(|limit| limit.saturating_sub(spent));
+            let remaining = {
+                let mut budget = self.budget()?;
+                budget.turns = budget.turns.checked_sub(1).ok_or(Failure::TurnLimit)?;
+                budget.tokens
+            };
             let max_output = u64::from(settings.limit("maxOutputTokens"))
                 .min(remaining.unwrap_or(u64::MAX)) as u32;
             if max_output < min_output {
@@ -441,26 +498,23 @@ impl Instance<'_> {
             if turn == 1 {
                 self.prune_start_history(work).await?;
             }
-            let mut definitions = definitions.clone();
-            if !self.plan_locked {
-                if !extensions_ready {
-                    self.harness
-                        .registry
-                        .prepare_extensions(self.tracker)
-                        .await
-                        .map_err(Failure::Port)?;
-                    extensions_ready = true;
-                }
+            if !self.plan_locked && !extensions_ready {
+                self.harness
+                    .registry
+                    .prepare_extensions(self.tracker)
+                    .await
+                    .map_err(Failure::Port)?;
                 definitions.extend(self.harness.registry.extension_definitions());
+                extensions_ready = true;
             }
             let tool_bytes = compaction::tool_bytes(&definitions)
                 .saturating_add(self.plan_context.as_ref().map_or(0, String::len));
             let charged = self
                 .compact(turn, work, tool_bytes, remaining, max_output)
-                .await?;
-            spent = spent.saturating_add(charged);
-            let remaining = total.map_or(u64::MAX, |limit| limit.saturating_sub(spent));
-            let max_output = u64::from(settings.limit("maxOutputTokens")).min(remaining) as u32;
+                .await;
+            let remaining = self.account(charged)?;
+            let max_output = u64::from(settings.limit("maxOutputTokens"))
+                .min(remaining.unwrap_or(u64::MAX)) as u32;
             if max_output < min_output {
                 return Err(Failure::TokenLimit);
             }
@@ -471,12 +525,18 @@ impl Instance<'_> {
             self.response_text_start = Some(self.text.len());
             let response = self.request(turn, work, &definitions, max_output).await;
             self.persist_steer(&mut work.messages);
-            let response = response?;
-            spent = spent.saturating_add(compaction::token_charge(
+            let response = match response {
+                Ok(response) => response,
+                Err(error) => {
+                    self.budget()?.exhaust();
+                    return Err(error);
+                }
+            };
+            self.account(compaction::token_charge(
                 response.usage,
-                total.map(|_| remaining),
+                remaining,
                 max_output,
-            )?);
+            ))?;
             let finish = response.finish;
             let calls = response.calls;
             self.response_text_start = None;
@@ -498,7 +558,7 @@ impl Instance<'_> {
                     .take_while(|call| call.name != SUBMIT_RESULT)
                     .count();
                 let (reads, tail) = pending.split_at(read_count);
-                self.tool_batch(turn, reads, &mut work.messages).await?;
+                self.tool_batch(turn, reads, work).await?;
                 let Some((call, tail)) = tail.split_first() else {
                     break;
                 };
@@ -561,7 +621,7 @@ impl Instance<'_> {
                     submission: Some(submission),
                 });
             }
-            let can_continue = turn < turn_limit && total.is_none_or(|limit| spent < limit);
+            let can_continue = turn < turn_limit && self.budget()?.has_turn();
             if can_continue && self.collect_steer().await? {
                 continue;
             }
@@ -606,6 +666,26 @@ impl Instance<'_> {
             }
         }
         Err(Failure::TurnLimit)
+    }
+
+    fn budget(&self) -> Result<MutexGuard<'_, Budget>, Failure> {
+        self.budget
+            .lock()
+            .map_err(|_| Failure::Port("Work budget unavailable".into()))
+    }
+
+    fn account(&self, charge: Result<u64, Failure>) -> Result<Option<u64>, Failure> {
+        let mut budget = self.budget()?;
+        match charge {
+            Ok(charge) => {
+                budget.charge(charge);
+                Ok(budget.tokens)
+            }
+            Err(error) => {
+                budget.exhaust();
+                Err(error)
+            }
+        }
     }
 
     async fn request(
@@ -771,7 +851,7 @@ impl Instance<'_> {
         &mut self,
         turn: u32,
         calls: &[ToolCall],
-        messages: &mut Vec<Message>,
+        work: &mut Work,
     ) -> Result<(), Failure> {
         let parallelism = self.harness.settings.limit("maxParallelReads") as usize;
         let mut pending = calls;
@@ -791,7 +871,8 @@ impl Instance<'_> {
             if call.name == plan::TOOL && self.harness.plan != PlanMode::Off {
                 self.before(turn, call).await?;
                 let result = self.update_plan(call).await?;
-                self.publish_tool(turn, call, &result, messages).await?;
+                self.publish_tool(turn, call, &result, &mut work.messages)
+                    .await?;
                 continue;
             }
             if self.plan_locked
@@ -800,22 +881,26 @@ impl Instance<'_> {
                     "read" | "list" | "glob" | "grep" | crate::tools::SKILL
                 )
             {
-                self.publish_tool(turn, call, PLAN_REQUIRED, messages)
+                self.publish_tool(turn, call, PLAN_REQUIRED, &mut work.messages)
                     .await?;
                 continue;
             }
             for call in batch {
                 self.before(turn, call).await?;
             }
-            let outputs = stream::iter(batch.iter().cloned())
-                .map(|call| {
-                    self.harness
-                        .registry
-                        .execute(call, self.cancel.child_token(), self.tracker)
-                })
-                .buffered(batch.len())
-                .collect::<Vec<_>>()
-                .await;
+            let outputs = if call.name == delegate::TOOL {
+                vec![self.delegate(work, call).await]
+            } else {
+                stream::iter(batch.iter().cloned())
+                    .map(|call| {
+                        self.harness
+                            .registry
+                            .execute(call, self.cancel.child_token(), self.tracker)
+                    })
+                    .buffered(batch.len())
+                    .collect::<Vec<_>>()
+                    .await
+            };
             self.active()?;
             for (call, output) in batch.iter().zip(outputs) {
                 let content = match output {
@@ -833,7 +918,8 @@ impl Instance<'_> {
                     }
                     Err(error) => json!({"error":error}).to_string(),
                 };
-                self.publish_tool(turn, call, &content, messages).await?;
+                self.publish_tool(turn, call, &content, &mut work.messages)
+                    .await?;
             }
         }
         Ok(())

@@ -38,14 +38,6 @@ pub(super) fn qualify(agent: &Value, pointer: &str) -> Result<()> {
                 "Argentic supports at most eight additional roots per agent",
             ));
         }
-        for (index, rule) in permissions.rules.iter().enumerate() {
-            if rule.action == Action::Delegate && rule.effect != Effect::Deny {
-                return Err(unsupported(
-                    &format!("{at}/rules/{index}/effect"),
-                    "delegation permissions",
-                ));
-            }
-        }
     }
     if shell_requested(&permissions) {
         #[cfg(target_os = "linux")]

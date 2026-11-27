@@ -44,6 +44,15 @@ impl Authorizer for ToolApprovals {
         let (title, actions) = match action {
             Approval::Read(path) => file_request(path, false)?,
             Approval::Write(path) => file_request(path, true)?,
+            Approval::Delegate => {
+                let args: serde_json::Value = serde_json::from_str(&call.arguments)
+                    .map_err(|_| "Invalid delegation arguments")?;
+                let task = args["task"].as_str().ok_or("Missing delegation task")?;
+                (
+                    format!("Delegate read-only task: {task}"),
+                    vec![ActionRequest::Delegate {}],
+                )
+            }
             Approval::Shell(command) => {
                 let actions = argentic_harness::policy::subcommands(command)?
                     .into_iter()

@@ -86,9 +86,10 @@
       "note": "Each tool is evaluated by server/tool across the effective policy. MCP asks require a person and are denied without one."
     },
     "delegate": {
-      "allow": "absent",
-      "ask": "absent",
-      "deny": "harness"
+      "allow": "harness",
+      "ask": "harness",
+      "deny": "harness",
+      "note": "Sub-agents inherit the parent ceilings and can only read from admitted roots. Their provider work is joined on Stop."
     }
   },
   "settings": {
