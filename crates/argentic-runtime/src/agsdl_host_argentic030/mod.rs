@@ -678,10 +678,7 @@ impl Executor {
         // Only carry conversation messages forward. Each work rebuilds its
         // instructions, submission schema and tools from its admitted policy.
         let history = if continuous {
-            let idle = self.sessions.lock().unwrap().remove(&instance);
-            idle.map(session::IdleHistory::wake)
-                .transpose()?
-                .unwrap_or_default()
+            session::IdleHistory::take(&mut self.sessions.lock().unwrap(), &instance)?
         } else {
             Vec::new()
         };
