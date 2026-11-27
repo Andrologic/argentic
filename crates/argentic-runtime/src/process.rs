@@ -197,7 +197,14 @@ pub fn apply_background_containment(command: &mut tokio::process::Command) {
 
 #[derive(Debug)]
 pub struct ContainedBackgroundProcess {
+    #[cfg(target_os = "linux")]
+    child: Box<tokio::process::Child>,
+    #[cfg(not(target_os = "linux"))]
     child: tokio::process::Child,
+    #[cfg(target_os = "linux")]
+    command_status: tokio::net::unix::pipe::Receiver,
+    #[cfg(target_os = "linux")]
+    command_exit: Option<ExitStatus>,
     #[cfg(unix)]
     process_group_id: Option<u32>,
     #[cfg(unix)]
@@ -233,17 +240,26 @@ impl ContainedBackgroundProcess {
             marker
         };
         #[cfg(target_os = "linux")]
-        {
+        let (status_writer, command_status) = {
+            use std::os::fd::AsRawFd;
             use std::os::unix::process::CommandExt;
+            let (writer, reader) = tokio::net::unix::pipe::pipe()?;
+            let descriptor = writer.as_raw_fd();
+            // Drop signals the workload. The reaper must survive long enough
+            // to wait for any children it adopts.
+            command.kill_on_drop(false);
             unsafe {
                 command
                     .as_std_mut()
-                    .pre_exec(install_linux_process_supervisor);
+                    .pre_exec(move || install_linux_process_supervisor(descriptor));
             }
-        }
+            (writer, reader)
+        };
         #[cfg(windows)]
         command.creation_flags(CREATE_NO_WINDOW | CREATE_SUSPENDED);
         let child = command.spawn()?;
+        #[cfg(target_os = "linux")]
+        drop(status_writer);
         #[cfg(unix)]
         let process_group_id = child.id();
         #[cfg(windows)]
@@ -261,7 +277,14 @@ impl ContainedBackgroundProcess {
             return Err(error);
         }
         Ok(Self {
+            #[cfg(target_os = "linux")]
+            child: Box::new(child),
+            #[cfg(not(target_os = "linux"))]
             child,
+            #[cfg(target_os = "linux")]
+            command_status,
+            #[cfg(target_os = "linux")]
+            command_exit: None,
             #[cfg(unix)]
             process_group_id,
             #[cfg(unix)]
@@ -311,6 +334,29 @@ impl ContainedBackgroundProcess {
     }
 
     pub async fn wait(&mut self) -> io::Result<ExitStatus> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            use tokio::io::AsyncReadExt;
+
+            // Match Child::wait for callers that did not take stdin.
+            drop(self.child.stdin.take());
+            if let Some(status) = self.command_exit {
+                return Ok(status);
+            }
+            // The reaper reports one atomic four-byte pipe write. Use a
+            // cancellation-safe read because callers select against Stop.
+            let mut bytes = [0; std::mem::size_of::<i32>()];
+            if self.command_status.read(&mut bytes).await? != bytes.len() {
+                return Err(io::Error::other(
+                    "Linux reaper did not report the command status",
+                ));
+            }
+            let status = ExitStatus::from_raw(i32::from_ne_bytes(bytes));
+            self.command_exit = Some(status);
+            Ok(status)
+        }
+        #[cfg(not(target_os = "linux"))]
         self.child.wait().await
     }
 
@@ -343,21 +389,39 @@ impl ContainedBackgroundProcess {
     }
 
     #[cfg(unix)]
-    async fn terminate_unix(&mut self, grace_period: Duration) -> io::Result<ExitStatus> {
-        if self.process_group_id.is_none() {
-            return self.child.wait().await;
-        }
+    fn stop_unix_workload(&self) -> (Vec<u32>, Option<io::Error>) {
         let (process_ids, inspection_error) = suspend_unix_process_tree(
             self.process_group_id,
             &self.containment_id,
             self.containment_marker_path(),
         );
+        #[cfg(target_os = "linux")]
+        let process_ids: Vec<_> = process_ids
+            .into_iter()
+            .filter(|pid| Some(*pid) != self.process_group_id)
+            .collect();
         for process_id in &process_ids {
             signal_process(*process_id, libc::SIGKILL);
         }
         if let Some(process_group_id) = self.process_group_id {
+            #[cfg(not(target_os = "linux"))]
             signal_process_group(process_group_id, libc::SIGKILL);
+            #[cfg(target_os = "linux")]
+            if self.child.id().is_some() {
+                // The inspection stopped the reaper along with the workload.
+                // Resume only the reaper so it can adopt and collect children.
+                signal_process(process_group_id, libc::SIGCONT);
+            }
         }
+        (process_ids, inspection_error)
+    }
+
+    #[cfg(unix)]
+    async fn terminate_unix(&mut self, grace_period: Duration) -> io::Result<ExitStatus> {
+        if self.process_group_id.is_none() {
+            return self.wait().await;
+        }
+        let (process_ids, inspection_error) = self.stop_unix_workload();
         let reap_timeout = if grace_period.is_zero() {
             HARD_REAP_TIMEOUT
         } else {
@@ -369,6 +433,13 @@ impl ContainedBackgroundProcess {
                 Some(error) => Err(io::Error::other(IncompleteProcessTreeInspection(error))),
                 None => {
                     let status = status?;
+                    #[cfg(target_os = "linux")]
+                    let status = {
+                        if !status.success() {
+                            return Err(io::Error::other("Linux reaper did not confirm tree exit"));
+                        }
+                        self.wait().await?
+                    };
                     // SIGKILL delivery and the leader's reap do not establish
                     // that descendants with detached streams have exited.
                     wait_for_processes_exit(&process_ids, deadline).await?;
@@ -478,52 +549,22 @@ fn next_containment_id() -> String {
 }
 
 #[cfg(target_os = "linux")]
-fn install_linux_process_supervisor() -> io::Result<()> {
-    let mut status_pipe = [-1; 2];
-    if unsafe { libc::pipe2(status_pipe.as_mut_ptr(), libc::O_CLOEXEC) } == -1 {
+fn install_linux_process_supervisor(status_descriptor: i32) -> io::Result<()> {
+    if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) } == -1 {
         return Err(io::Error::last_os_error());
     }
-
-    let supervisor_process_id = unsafe { libc::fork() };
-    if supervisor_process_id == -1 {
-        unsafe {
-            libc::close(status_pipe[0]);
-            libc::close(status_pipe[1]);
-        }
+    let command_process_id = unsafe { libc::fork() };
+    if command_process_id == -1 {
         return Err(io::Error::last_os_error());
     }
-    if supervisor_process_id == 0 {
+    if command_process_id == 0 {
         unsafe {
-            libc::close(status_pipe[0]);
+            libc::close(status_descriptor);
         }
-        if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) } == -1 {
-            return Err(io::Error::last_os_error());
-        }
-
-        let command_process_id = unsafe { libc::fork() };
-        if command_process_id == -1 {
-            return Err(io::Error::last_os_error());
-        }
-        if command_process_id == 0 {
-            unsafe {
-                libc::close(status_pipe[1]);
-            }
-            return Ok(());
-        }
-
-        close_linux_file_descriptors_except(status_pipe[1]);
-        supervise_linux_command(command_process_id, status_pipe[1]);
+        return Ok(());
     }
-
-    unsafe {
-        libc::close(status_pipe[1]);
-    }
-    close_linux_file_descriptors_except(status_pipe[0]);
-    let command_status = read_linux_command_status(status_pipe[0]);
-    unsafe {
-        libc::close(status_pipe[0]);
-    }
-    exit_linux_process_with_status(command_status)
+    close_linux_file_descriptors_except(status_descriptor);
+    supervise_linux_command(command_process_id, status_descriptor)
 }
 
 #[cfg(target_os = "linux")]
@@ -554,30 +595,6 @@ fn supervise_linux_command(command_process_id: libc::pid_t, status_descriptor: i
             _ => unsafe { libc::_exit(1) },
         }
     }
-}
-
-#[cfg(target_os = "linux")]
-fn read_linux_command_status(descriptor: i32) -> i32 {
-    let mut status = 0_i32;
-    let mut read_bytes = 0_usize;
-    while read_bytes < std::mem::size_of::<i32>() {
-        let result = unsafe {
-            libc::read(
-                descriptor,
-                (&mut status as *mut i32 as *mut u8).add(read_bytes) as *mut _,
-                std::mem::size_of::<i32>() - read_bytes,
-            )
-        };
-        if result > 0 {
-            read_bytes += result as usize;
-            continue;
-        }
-        if result == -1 && io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
-            continue;
-        }
-        unsafe { libc::_exit(1) }
-    }
-    status
 }
 
 #[cfg(target_os = "linux")]
@@ -619,22 +636,6 @@ fn close_linux_file_descriptors_except(preserved_descriptor: i32) {
             let _ = unsafe { libc::close(descriptor) };
         }
     }
-}
-
-#[cfg(target_os = "linux")]
-fn exit_linux_process_with_status(status: i32) -> ! {
-    if libc::WIFEXITED(status) {
-        unsafe { libc::_exit(libc::WEXITSTATUS(status)) }
-    }
-    if libc::WIFSIGNALED(status) {
-        let signal = libc::WTERMSIG(status);
-        unsafe {
-            libc::signal(signal, libc::SIG_DFL);
-            libc::raise(signal);
-            libc::_exit(128 + signal);
-        }
-    }
-    unsafe { libc::_exit(1) }
 }
 
 #[cfg(unix)]
@@ -1371,18 +1372,7 @@ impl Drop for ContainedBackgroundProcess {
             if self.process_group_id.is_none() {
                 return;
             }
-            for process_id in suspend_unix_process_tree(
-                self.process_group_id,
-                &self.containment_id,
-                self.containment_marker_path(),
-            )
-            .0
-            {
-                signal_process(process_id, libc::SIGKILL);
-            }
-            if let Some(process_group_id) = self.process_group_id {
-                signal_process_group(process_group_id, libc::SIGKILL);
-            }
+            self.stop_unix_workload();
         }
         #[cfg(windows)]
         {
@@ -1874,6 +1864,35 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
+    async fn contained_stop_collects_the_linux_reaper_acknowledgement() {
+        use super::{background_contained_tokio_command, ContainedBackgroundProcess};
+        use std::{process::Stdio, time::Duration};
+        use tokio::io::{AsyncBufReadExt, BufReader};
+
+        let mut command = background_contained_tokio_command("/bin/sh");
+        command
+            .args(["-c", "echo ready; read value"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let mut process = ContainedBackgroundProcess::spawn(command).unwrap();
+        let _stdin = process.take_stdin().unwrap();
+        let mut stdout = BufReader::new(process.take_stdout().unwrap());
+        let mut ready = String::new();
+        tokio::time::timeout(Duration::from_secs(2), stdout.read_line(&mut ready))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ready.trim_end(), "ready");
+
+        let status = process.terminate_with_grace(Duration::ZERO).await.unwrap();
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
+        assert!(process.child.wait().await.unwrap().success());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
     async fn contained_process_wait_preserves_the_command_exit_status() {
         use super::{background_contained_tokio_command, ContainedBackgroundProcess};
         use std::process::Stdio;
@@ -1881,8 +1900,8 @@ mod tests {
 
         let mut command = background_contained_tokio_command("sh");
         command
-            .args(["-c", "exit 23"])
-            .stdin(Stdio::null())
+            .args(["-c", "cat >/dev/null; exit 23"])
+            .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         let mut process = ContainedBackgroundProcess::spawn(command).expect("spawn command");

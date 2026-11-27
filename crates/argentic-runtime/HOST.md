@@ -509,6 +509,9 @@ supplies `codex-code-mode-host` as a sibling. Argentic checks the expected
 helpers and binds their digests to the capture. An incomplete package
 reports `CODEX_PACKAGE_INCOMPLETE` before a model thread.
 
+On Linux, Argentic waits for the process supervisor to reap its adopted
+children before confirming that the contained process tree has stopped.
+
 For Codex 0.171.0 on macOS ARM64 or Linux ARM64, use the read-only host
 profile and the private login. On Linux, provision the login outside
 `/tmp`. The app-server gets a private temporary runtime directory for its
