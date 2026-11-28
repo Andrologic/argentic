@@ -355,7 +355,7 @@ pub fn read_supervised(
                     }
                 }
                 if bytes.len() as u64 > super::file_helper::MAX_BYTES {
-                    failure = Some(io::Error::other("Content exceeds limit"));
+                    failure = Some(io::ErrorKind::FileTooLarge.into());
                 }
             } else if count == 0 {
                 eof = true;
@@ -382,6 +382,9 @@ pub fn read_supervised(
                             io::ErrorKind::PermissionDenied,
                             "Content helper refused the file",
                         ),
+                        (false, super::file_helper::FILE_TOO_LARGE_EXIT_CODE) => {
+                            io::ErrorKind::FileTooLarge.into()
+                        }
                         (false, -1) => io::Error::other(
                             "Content helper exit status unavailable. Check the host's SIGCHLD disposition and child reaper.",
                         ),

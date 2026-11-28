@@ -86,7 +86,7 @@ fn read_file(parent: Dir, name: &Path, cancel: &CancellationToken) -> io::Result
         ));
     }
     if metadata.len() > MAX_BYTES {
-        return Err(io::Error::other("File exceeds limit"));
+        return Err(io::ErrorKind::FileTooLarge.into());
     }
     if cancel.is_cancelled() {
         return Err(cancelled());
@@ -94,7 +94,7 @@ fn read_file(parent: Dir, name: &Path, cancel: &CancellationToken) -> io::Result
     let mut bytes = Vec::new();
     file.by_ref().take(MAX_BYTES + 1).read_to_end(&mut bytes)?;
     if bytes.len() as u64 > MAX_BYTES {
-        return Err(io::Error::other("File exceeds limit"));
+        return Err(io::ErrorKind::FileTooLarge.into());
     }
     super::single_link_metadata(&file)?;
     Ok(bytes)

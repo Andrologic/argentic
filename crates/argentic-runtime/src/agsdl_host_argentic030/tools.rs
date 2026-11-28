@@ -87,17 +87,18 @@ fn mcp_aliases_distinguish_pairs_across_rediscovery() {
 const SKILL_RESOURCE_MAX_BYTES: usize = 50 * 1024;
 const SKILL_RESOURCE_MAX_LINES: usize = 2000;
 
+fn skill_resource_limit_error() -> String {
+    format!(
+        "INPUT_LIMIT: Skill resources must fit within {SKILL_RESOURCE_MAX_BYTES} bytes and {SKILL_RESOURCE_MAX_LINES} lines."
+    )
+}
+
 fn skill_resource_page(text: String, credential: Option<&str>) -> Result<Page, String> {
     fn fits(text: &str) -> bool {
         text.len() <= SKILL_RESOURCE_MAX_BYTES && text.lines().count() <= SKILL_RESOURCE_MAX_LINES
     }
-    let limit_error = || {
-        format!(
-            "INPUT_LIMIT: Skill resources must fit within {SKILL_RESOURCE_MAX_BYTES} bytes and {SKILL_RESOURCE_MAX_LINES} lines."
-        )
-    };
     if !fits(&text) {
-        return Err(limit_error());
+        return Err(skill_resource_limit_error());
     }
 
     let mut text = Value::String(text);
@@ -108,7 +109,7 @@ fn skill_resource_page(text: String, credential: Option<&str>) -> Result<Page, S
         unreachable!("credential screening preserves the value type");
     };
     if !fits(&text) {
-        return Err(limit_error());
+        return Err(skill_resource_limit_error());
     }
     Ok(Page {
         text,
@@ -338,7 +339,13 @@ impl Extensions for Tools {
                 let text = sources
                     .skill_resource(skill, active, &path)
                     .await
-                    .map_err(|error| format!("{}: Could not read skill resource", error.code))?;
+                    .map_err(|error| {
+                        if error.code == "INPUT_LIMIT" {
+                            skill_resource_limit_error()
+                        } else {
+                            format!("{}: Could not read skill resource", error.code)
+                        }
+                    })?;
                 return skill_resource_page(text, self.credential.as_deref());
             }
             let active = sources

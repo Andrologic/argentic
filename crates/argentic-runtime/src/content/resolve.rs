@@ -122,15 +122,23 @@ fn payload(bytes: &[u8], media: &str) -> ContentResult<ContentPayload> {
 
 fn file_read_error(
     cancelled: bool,
+    skill_resource: bool,
     error_value: crate::content_io::admitted::ReadError,
 ) -> ContentError {
-    if matches!(&error_value, crate::content_io::admitted::ReadError::Io { source, .. } if source.kind() == std::io::ErrorKind::TimedOut)
-    {
-        error("CONTENT_TERMINATION_UNCERTAIN", error_value)
-    } else if cancelled {
-        error("CANCELLED", "Content read cancelled.")
-    } else {
-        error("CONTENT_UNAVAILABLE", error_value)
+    use crate::content_io::admitted::ReadError;
+    use std::io::ErrorKind;
+
+    match &error_value {
+        ReadError::Io { source, .. } if source.kind() == ErrorKind::TimedOut => {
+            error("CONTENT_TERMINATION_UNCERTAIN", error_value)
+        }
+        _ if cancelled => error("CANCELLED", "Content read cancelled."),
+        ReadError::Io { source, .. }
+            if skill_resource && source.kind() == ErrorKind::FileTooLarge =>
+        {
+            error("INPUT_LIMIT", error_value)
+        }
+        _ => error("CONTENT_UNAVAILABLE", error_value),
     }
 }
 
@@ -445,11 +453,9 @@ async fn read_uri(
             )
             .await;
             let (bytes, resolved, parent_identity) = read.map_err(|e| {
-                denial
-                    .lock()
-                    .unwrap()
-                    .take()
-                    .unwrap_or_else(|| file_read_error(context.cancel.is_cancelled(), e))
+                denial.lock().unwrap().take().unwrap_or_else(|| {
+                    file_read_error(context.cancel.is_cancelled(), root.is_some(), e)
+                })
             })?;
             if let Some(root) = root_after_read {
                 if crate::content_io::admitted::workspace_root_identity(&root).ok() != root_identity
@@ -564,7 +570,7 @@ mod termination_tests {
             std::path::Path::new("/synthetic/data"),
         );
         assert_eq!(
-            file_read_error(true, error_value).code,
+            file_read_error(true, false, error_value).code,
             "CONTENT_TERMINATION_UNCERTAIN"
         );
     }
@@ -574,9 +580,9 @@ mod termination_tests {
         let failure = || crate::content_io::admitted::ReadError::Filesystem {
             message: "synthetic failure".into(),
         };
-        assert_eq!(file_read_error(true, failure()).code, "CANCELLED");
+        assert_eq!(file_read_error(true, false, failure()).code, "CANCELLED");
         assert_eq!(
-            file_read_error(false, failure()).code,
+            file_read_error(false, false, failure()).code,
             "CONTENT_UNAVAILABLE"
         );
     }
