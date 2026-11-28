@@ -9,13 +9,15 @@ struct Approval {
 }
 pub(super) struct Projection {
     registry: HumanWaitRegistry,
-    clocks: Vec<(Text, SharedClock)>,
-    retired: Vec<(Text, Value)>,
-    requests: Vec<(Text, Value)>,
-    answers: Vec<(Text, Value)>,
-    signatures: Vec<(Text, String)>,
-    accepted: Vec<Value>,
-    approvals: Vec<(Text, Approval)>,
+    clocks: Keyed<SharedClock>,
+    retired: Keyed<Value>,
+    requests: Keyed<Value>,
+    answers: Keyed<Value>,
+    signatures: Keyed<String>,
+    accepted: HashSet<Text>,
+    /// The first accepted native answer of each request.
+    accepted_answers: HashMap<Text, Value>,
+    approvals: Keyed<Approval>,
     last: Option<BigInteger>,
     slice: Value,
 }
@@ -23,13 +25,14 @@ impl Projection {
     pub(super) fn new(slice: Value) -> Self {
         Self {
             registry: Default::default(),
-            clocks: vec![],
-            retired: vec![],
-            requests: vec![],
-            answers: vec![],
-            signatures: vec![],
-            accepted: vec![],
-            approvals: vec![],
+            clocks: Keyed::default(),
+            retired: Keyed::default(),
+            requests: Keyed::default(),
+            answers: Keyed::default(),
+            signatures: Keyed::default(),
+            accepted: HashSet::new(),
+            accepted_answers: HashMap::new(),
+            approvals: Keyed::default(),
             last: None,
             slice,
         }
@@ -131,9 +134,9 @@ impl Projection {
                 )?;
                 let accepted = !already
                     && !resolution.get("expired").truthy()
-                    && !contains(&self.accepted, event.get("requestId"));
+                    && !has_text(&self.accepted, event.get("requestId"));
                 if accepted {
-                    self.accepted.push(event.get("requestId").clone());
+                    self.accept(event.get("requestId"), native_id);
                 }
                 put(&mut self.signatures, native_id, signature);
                 put(
@@ -252,7 +255,7 @@ impl Projection {
             }
         }
         let mut next = self.registry.next_wake(now_raw, &self.slice)?;
-        for (_, approval) in &self.approvals {
+        for (_, approval) in self.approvals.iter() {
             if approval.resolution.is_some() {
                 continue;
             }
@@ -330,9 +333,21 @@ impl Projection {
             ("nextWakeMs", delay(next)),
         ]))
     }
+    /// Only question and action answers; approvals keep their own resolution.
+    fn accept(&mut self, request: &Value, native_id: &Value) {
+        let request = request.text().unwrap().clone();
+        self.accepted.insert(request.clone());
+        self.accepted_answers
+            .entry(request)
+            .or_insert_with(|| native_id.clone());
+    }
     fn expire_approvals(&mut self, now_raw: &Value) -> Result<()> {
         let now = monotone(now_raw)?;
-        for (id, approval) in &mut self.approvals {
+        for (id, approval) in self.approvals.iter_mut() {
+            // Opening validated the time, and a resolution never reopens.
+            if approval.resolution.is_some() {
+                continue;
+            }
             let opened = monotone(&approval.opened)?;
             let elapsed = now.sub(&opened);
             if let Some(timeout) = &approval.timeout {
@@ -363,14 +378,12 @@ impl Projection {
             if raw.get("expired").truthy() {
                 o([("kind", s("expired"))])
             } else {
-                let Some((_, reference)) = self.answers.iter().find(|(_, r)| {
-                    strict_equal(r.get("requestId"), id) && r.get("accepted").truthy()
-                }) else {
+                let Some(native_id) = id.text().and_then(|id| self.accepted_answers.get(id)) else {
                     return plain("question resolution lacks a native receipt.");
                 };
                 o([
                     ("kind", s("native")),
-                    ("nativeReceiptId", reference.get("nativeReceiptId").clone()),
+                    ("nativeReceiptId", native_id.clone()),
                 ])
             }
         } else {

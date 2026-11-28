@@ -12,11 +12,13 @@ struct Request {
 }
 #[derive(Default)]
 pub(crate) struct HumanWaitRegistry {
-    works: Vec<(Text, RegisteredWork)>,
-    requests: Vec<(Text, Request)>,
+    works: Keyed<RegisteredWork>,
+    requests: Keyed<Request>,
+    /// Requests without a resolution, by position. Requests are never removed.
+    open: std::collections::BTreeSet<usize>,
     last: Option<BigInteger>,
-    registered: Vec<Value>,
-    pending: Vec<(Text, Value)>,
+    registered: HashSet<Text>,
+    pending: Keyed<Value>,
 }
 impl HumanWaitRegistry {
     pub(crate) fn register_work(
@@ -25,10 +27,10 @@ impl HumanWaitRegistry {
         clock: SharedClock,
         timeout: &Value,
     ) -> Result<()> {
-        if trimmed(id, "workId.trim", false)? || contains(&self.registered, id) {
+        if trimmed(id, "workId.trim", false)? || has_text(&self.registered, id) {
             return correlation("", "Work must be registered exactly once.");
         }
-        self.registered.push(id.clone());
+        self.registered.insert(id.text().unwrap().clone());
         let timeout = integer(timeout)?;
         put(&mut self.works, id, RegisteredWork { clock, timeout });
         Ok(())
@@ -52,7 +54,7 @@ impl HumanWaitRegistry {
         };
         let clock = self.works[i].1.clock.clone();
         self.tick(now)?;
-        for i in 0..self.requests.len() {
+        for i in self.open.iter().copied().collect::<Vec<_>>() {
             let request = &mut self.requests[i].1;
             if request.resolution.is_some() || !contains(&request.attached, id) {
                 continue;
@@ -89,6 +91,7 @@ impl HumanWaitRegistry {
         let works = self.work_ids(input.get("workIds"))?;
         self.tick(input.get("openedAtMs"))?;
         let timeout = self.limit(input.get("reviewer"), &works)?;
+        self.open.insert(self.requests.len());
         put(
             &mut self.requests,
             id,
@@ -185,7 +188,8 @@ impl HumanWaitRegistry {
             return correlation("", "Human registry time moved backwards.");
         }
         let mut due = vec![];
-        for (i, (_, request)) in self.requests.iter().enumerate() {
+        for &i in &self.open {
+            let request = &self.requests[i].1;
             if request.resolution.is_some() {
                 continue;
             }
@@ -217,7 +221,7 @@ impl HumanWaitRegistry {
                 &s(deadline.to_js_string()),
             )?);
         }
-        for (_, work) in &self.works {
+        for (_, work) in self.works.iter() {
             work.clock.borrow_mut().advance(now)?;
         }
         self.last = Some(at);
@@ -227,7 +231,8 @@ impl HumanWaitRegistry {
         self.tick(now)?;
         let at = monotone(now)?;
         let mut delays = vec![];
-        for (_, request) in &self.requests {
+        for &i in &self.open {
+            let request = &self.requests[i].1;
             if request.resolution.is_some() {
                 continue;
             }
@@ -242,7 +247,7 @@ impl HumanWaitRegistry {
                 );
             }
         }
-        for (_, work) in &self.works {
+        for (_, work) in self.works.iter() {
             if let Some(delay) = work.clock.borrow().next_wake(slice)? {
                 delays.push(delay);
             }
@@ -289,6 +294,7 @@ impl HumanWaitRegistry {
             ),
         ]);
         request.resolution = Some(resolution.clone());
+        self.open.remove(&i);
         put(
             &mut self.pending,
             request.input.get("requestId"),

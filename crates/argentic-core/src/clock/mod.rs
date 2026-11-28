@@ -13,7 +13,13 @@ use super::{
 };
 pub(crate) use journal::evaluate_host;
 pub(crate) use registry::HumanWaitRegistry;
-use std::{cell::RefCell, cmp::Ordering, rc::Rc};
+use std::{
+    cell::RefCell,
+    cmp::Ordering,
+    collections::{HashMap, HashSet},
+    ops::{Index, IndexMut},
+    rc::Rc,
+};
 pub(crate) use work_clock::WorkClock;
 pub(crate) type SharedClock = Rc<RefCell<WorkClock>>;
 fn plain<T>(message: &str) -> Result<T> {
@@ -89,18 +95,66 @@ fn contains(values: &[Value], value: &Value) -> bool {
 fn strict_equal(a: &Value, b: &Value) -> bool {
     !matches!(a, Value::Array(_) | Value::Object(_)) && native::equal(a, b)
 }
-fn text_key(value: &Value) -> Option<&Text> {
-    value.text()
+/// Entries in first-insertion order, found by text identity without a scan.
+/// A journal replays every entry on each event, so linear lookups made a
+/// replay quadratic in the number of works and requests.
+pub(crate) struct Keyed<T> {
+    items: Vec<(Text, T)>,
+    index: HashMap<Text, usize>,
 }
-pub(crate) fn find<T>(items: &[(Text, T)], key: &Value) -> Option<usize> {
-    text_key(key).and_then(|k| items.iter().position(|(id, _)| id == k))
-}
-pub(crate) fn put<T>(items: &mut Vec<(Text, T)>, key: &Value, value: T) {
-    if let Some(i) = find(items, key) {
-        items[i].1 = value;
-    } else {
-        items.push((key.text().unwrap().clone(), value));
+impl<T> Default for Keyed<T> {
+    fn default() -> Self {
+        Self {
+            items: vec![],
+            index: HashMap::new(),
+        }
     }
+}
+impl<T> Keyed<T> {
+    pub(crate) fn len(&self) -> usize {
+        self.items.len()
+    }
+    pub(crate) fn iter(&self) -> std::slice::Iter<'_, (Text, T)> {
+        self.items.iter()
+    }
+    pub(crate) fn iter_mut(&mut self) -> std::slice::IterMut<'_, (Text, T)> {
+        self.items.iter_mut()
+    }
+    /// Removal keeps the order of the remaining entries.
+    pub(crate) fn remove(&mut self, i: usize) {
+        let (key, _) = self.items.remove(i);
+        self.index.remove(&key);
+        for (position, (key, _)) in self.items.iter().enumerate().skip(i) {
+            *self.index.get_mut(key).expect("indexed entry") = position;
+        }
+    }
+}
+impl<T> Index<usize> for Keyed<T> {
+    type Output = (Text, T);
+    fn index(&self, i: usize) -> &Self::Output {
+        &self.items[i]
+    }
+}
+impl<T> IndexMut<usize> for Keyed<T> {
+    fn index_mut(&mut self, i: usize) -> &mut Self::Output {
+        &mut self.items[i]
+    }
+}
+pub(crate) fn find<T>(items: &Keyed<T>, key: &Value) -> Option<usize> {
+    key.text().and_then(|k| items.index.get(k).copied())
+}
+pub(crate) fn put<T>(items: &mut Keyed<T>, key: &Value, value: T) {
+    if let Some(i) = find(items, key) {
+        items.items[i].1 = value;
+    } else {
+        let key = key.text().unwrap().clone();
+        items.index.insert(key.clone(), items.items.len());
+        items.items.push((key, value));
+    }
+}
+/// Identities are validated text, so set membership matches strict equality.
+fn has_text(set: &HashSet<Text>, value: &Value) -> bool {
+    value.text().is_some_and(|text| set.contains(text))
 }
 fn object(value: &Value) -> Result<()> {
     if value.object().is_none() {

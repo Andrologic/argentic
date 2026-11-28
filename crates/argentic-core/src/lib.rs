@@ -50,7 +50,10 @@ pub use reader::{
     check_source_json, parse_source_json, source_document_tokens_equal, source_json_equal,
     validate_document_json, validate_document_json_with_budget, validate_source,
 };
-pub use resource::{SourceBudget, MAX_SOURCE_BYTES, MAX_SOURCE_JSON_DEPTH, MAX_SOURCE_WORK};
+pub use resource::{
+    SourceBudget, MAX_HUMAN_CLOCK_JOURNAL_BYTES, MAX_ROUTE_RESULT_BYTES, MAX_SOURCE_BYTES,
+    MAX_SOURCE_JSON_DEPTH, MAX_SOURCE_WORK,
+};
 
 /// Optional local version probe for a bundled descriptive harness.
 pub fn harness_version_probe(name: &str) -> Option<(&'static str, &'static str)> {

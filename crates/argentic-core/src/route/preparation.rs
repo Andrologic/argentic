@@ -9,11 +9,49 @@ use crate::argentic_core::{
         CapturedContent,
     },
     native::{self, a, o, s, Value},
+    resource::{json_depth, ByteCount, MAX_ROUTE_RESULT_BYTES, MAX_SOURCE_JSON_DEPTH},
     route::{
         self, Expansion, ItemContext, RouteSource, RouteTarget, Scope, ScopeStep, TargetBatch,
     },
 };
 use std::collections::HashSet;
+/// Encoded length of a native value, counted without building the text.
+fn json_len(v: &Value) -> usize {
+    let mut count = ByteCount::default();
+    v.stringify_to(&mut count).expect("counting never fails");
+    count.0
+}
+fn depth_limit<T>(what: &str) -> Result<T> {
+    c::fail(
+        "INPUT_LIMIT",
+        "",
+        &format!(
+            "{what} nests {MAX_SOURCE_JSON_DEPTH} or more levels; route JSON must stay below that depth."
+        ),
+    )
+}
+/// A prepared result must fit the host's route transport. A fan-out that
+/// would exceed it fails as that target's fan-out limit, a fixed target as an
+/// input limit. Either way the result is refused before it is built.
+fn result_limit(ordinal: usize, fanout: bool) -> Result<Value> {
+    let message =
+        format!("Prepared route result exceeds the limit of {MAX_ROUTE_RESULT_BYTES} bytes.");
+    if !fanout {
+        return c::fail("INPUT_LIMIT", "", &message);
+    }
+    Ok(o([
+        ("kind", s("failed")),
+        ("targetOrdinal", number(ordinal)),
+        (
+            "error",
+            o([
+                ("code", s("FANOUT_LIMIT")),
+                ("message", s(message)),
+                ("details", a([])),
+            ]),
+        ),
+    ]))
+}
 fn get<'a>(v: &'a E, k: &str) -> Option<&'a E> {
     v.as_object().and_then(|o| o.get(k))
 }
@@ -294,8 +332,12 @@ fn prepare(
     }
     let document_json = txt(get(&plan, "documentJson"))?;
     let document = exact::decode(document_json)?;
-    exact::record(Some(&document), "")?;
+    let document_object = exact::record(Some(&document), "")?;
     let typed_source: RouteSource = c::dto(source)?;
+    // Every fan-out item and selected message value comes from this output.
+    if json_depth(&typed_source.output_json) >= MAX_SOURCE_JSON_DEPTH {
+        return depth_limit("Route source output");
+    }
     if source.get("kind").eq_str("agent") {
         let agents = exact::record(get(&document, "agents"), "")?;
         let name = c::text(source.get("producerAgent"))?
@@ -351,7 +393,27 @@ fn prepare(
     };
     let mut prepared = vec![];
     let mut provenance = vec![];
+    // The source output is decoded once, on first delivery, for all items.
+    let mut output: Option<E> = None;
+    // Exact encoded size of the result, charged as each part is prepared.
+    // Every occurrence repeats the source and producer, so a large fan-out
+    // grows the result by their size for each item.
+    let source_bytes = json_len(source);
+    let producer_bytes = json_len(producer);
+    let mut total = r#"{"kind":"ready","batches":[],"provenance":[]}"#.len();
     for (ordinal, batch) in batches.iter().enumerate() {
+        let fanout = matches!(batch, TargetBatch::Fanout { .. });
+        let encoded_target =
+            decoder.parse(&native::Text::from(exact::encode(&captured[ordinal])))?;
+        total += usize::from(ordinal > 0)
+            + json_len(&o([
+                ("targetOrdinal", number(ordinal)),
+                ("target", encoded_target.clone()),
+                ("items", a([])),
+            ]));
+        if total > MAX_ROUTE_RESULT_BYTES {
+            return result_limit(ordinal, fanout);
+        }
         let target = match batch {
             TargetBatch::Fixed { target } | TargetBatch::Fanout { target, .. } => target,
         };
@@ -384,12 +446,18 @@ fn prepare(
                     mission,
                     instruction_authority,
                     ..
-                } => ItemContext::Element {
-                    index: index.to_string(),
-                    value_json: exact::encode(value),
-                    mission: *mission,
-                    instruction_authority: instruction_authority.clone(),
-                },
+                } => {
+                    let value_json = exact::encode(value);
+                    if json_depth(&value_json) >= MAX_SOURCE_JSON_DEPTH {
+                        return depth_limit("Fan-out item");
+                    }
+                    ItemContext::Element {
+                        index: index.to_string(),
+                        value_json,
+                        mission: *mission,
+                        instruction_authority: instruction_authority.clone(),
+                    }
+                }
             };
             let resolved = (|| {
                 let mut recipient = steps.iter().find(|step| {
@@ -437,8 +505,12 @@ fn prepare(
                         .as_deref_mut()
                         .map(|r| r as &mut dyn messages::CapturedSource),
                 };
-                let resolved = messages::resolve_route_message(
-                    document_json,
+                if output.is_none() {
+                    output = Some(exact::decode(&typed_source.output_json)?);
+                }
+                let resolved = messages::resolve_route_message_decoded(
+                    document_object,
+                    output.as_ref().expect("decoded source output"),
                     target,
                     &typed_source,
                     &item,
@@ -489,12 +561,18 @@ fn prepare(
                     return Err(e);
                 }
             };
+            if resolved
+                .as_ref()
+                .is_some_and(|r| json_depth(&r.message_json) >= MAX_SOURCE_JSON_DEPTH)
+            {
+                return depth_limit("Prepared message");
+            }
             let prompt = if let Some(resolved) = &resolved {
                 decoder.parse(c::text(&serialize(&resolved.prompt_provenance))?)?
             } else {
                 o([("kind", s("none"))])
             };
-            items.push(o([
+            let item_value = o([
                 (
                     "messageJson",
                     resolved.map(|r| s(r.message_json)).unwrap_or(Value::Null),
@@ -508,28 +586,38 @@ fn prepare(
                     },
                 ),
                 ("occurrence", occurrence.clone()),
-            ]));
-            provenance.push(o([
-                ("occurrence", occurrence),
-                ("prompt", prompt),
-                ("source", source.clone()),
-                ("producer", producer.clone()),
-            ]));
+            ]);
+            let proof = o([("occurrence", occurrence), ("prompt", prompt)]);
+            total += usize::from(!items.is_empty())
+                + json_len(&item_value)
+                + usize::from(!provenance.is_empty())
+                + json_len(&proof)
+                + r#","source":"#.len()
+                + source_bytes
+                + r#","producer":"#.len()
+                + producer_bytes;
+            if total > MAX_ROUTE_RESULT_BYTES {
+                return result_limit(ordinal, fanout);
+            }
+            items.push(item_value);
+            let mut proof = proof;
+            proof.set("source", source.clone());
+            proof.set("producer", producer.clone());
+            provenance.push(proof);
         }
         prepared.push(o([
             ("targetOrdinal", number(ordinal)),
-            (
-                "target",
-                decoder.parse(&native::Text::from(exact::encode(&captured[ordinal])))?,
-            ),
+            ("target", encoded_target),
             ("items", a(items)),
         ]));
     }
-    Ok(o([
+    let result = o([
         ("kind", s("ready")),
         ("batches", a(prepared)),
         ("provenance", a(provenance)),
-    ]))
+    ]);
+    debug_assert_eq!(json_len(&result), total, "route result accounting");
+    Ok(result)
 }
 fn number(n: usize) -> Value {
     Value::Number(native::Number::Finite(n.to_string()))

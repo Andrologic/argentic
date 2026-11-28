@@ -11,6 +11,16 @@ pub const MAX_SOURCE_WORK: usize = 8_000_000;
 pub const MAX_SOURCE_BYTES: usize = 256 * 1024 * 1024;
 /// Maximum JSON container depth checked before allocating the parsed tree.
 pub const MAX_SOURCE_JSON_DEPTH: usize = 128;
+/// Maximum bytes of a prepared route result (`resultJson`). It matches the
+/// runtime's 8,000,000-byte route transport limit, so preparation fails while
+/// building instead of producing a result the host would refuse.
+pub const MAX_ROUTE_RESULT_BYTES: usize = 8_000_000;
+/// Maximum size of one flow invocation's human-clock journal, counted as the
+/// JSON string (`stateJson`) that carries it. The runtime refuses a clock
+/// input above 8,000,000 bytes; the difference leaves room for the next event
+/// and its envelope, so a transition is refused before the journal it
+/// produces could no longer be submitted.
+pub const MAX_HUMAN_CLOCK_JOURNAL_BYTES: usize = 7_500_000;
 
 /// Budget for one source operation. Clones share the same counters. Hosts that
 /// parse and assemble components can pass the same budget to validation.
@@ -111,6 +121,45 @@ impl SourceBudget {
             self.0.work.load(Ordering::Relaxed),
             self.0.bytes.load(Ordering::Relaxed),
         )
+    }
+}
+
+/// Container nesting depth of JSON text, without parsing it. Brackets inside
+/// strings do not count. Invalid text yields a meaningless but finite depth.
+pub(crate) fn json_depth(text: &str) -> usize {
+    let (mut depth, mut deepest) = (0usize, 0usize);
+    let (mut string, mut escape) = (false, false);
+    for byte in text.bytes() {
+        if string {
+            if escape {
+                escape = false;
+            } else if byte == b'\\' {
+                escape = true;
+            } else if byte == b'"' {
+                string = false;
+            }
+            continue;
+        }
+        match byte {
+            b'"' => string = true,
+            b'{' | b'[' => {
+                depth += 1;
+                deepest = deepest.max(depth);
+            }
+            b'}' | b']' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    deepest
+}
+
+/// Counts encoded bytes without keeping them.
+#[derive(Default)]
+pub(crate) struct ByteCount(pub(crate) usize);
+impl std::fmt::Write for ByteCount {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        self.0 += s.len();
+        Ok(())
     }
 }
 
