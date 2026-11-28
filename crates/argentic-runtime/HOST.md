@@ -187,9 +187,10 @@ transition that would make it exceed
 clock input's `stateJson`) fails with `INPUT_LIMIT` at `/stateJson`, and the
 journal keeps its previous revision. This leaves room for the next event
 within the 8,000,000-byte clock input. With an admission, two clock ticks and
-a retirement per work, the limit is reached after about 640 transitions, or
-about 160 works in one flow invocation. Human requests, approvals and longer
-identities reduce that number. Later clock transitions of that invocation are
+a retirement per work and 36-character work identities, the limit is reached
+after about 145 works in one flow invocation (about 580 transitions). Each
+human request or approval adds to every later receipt: with one question per
+work the ceiling drops to about 50 works. Later clock transitions of that invocation are
 refused, so split longer flows across several invocations.
 
 Expansion allows 8,192 graph nodes, 32,768 route targets and 32 nested

@@ -25,7 +25,9 @@ fn depth_limit<T>(what: &str) -> Result<T> {
     c::fail(
         "INPUT_LIMIT",
         "",
-        &format!("{what} exceeds the JSON nesting depth limit of {MAX_SOURCE_JSON_DEPTH}."),
+        &format!(
+            "{what} nests {MAX_SOURCE_JSON_DEPTH} or more levels; route JSON must stay below that depth."
+        ),
     )
 }
 /// A prepared result must fit the host's route transport. A fan-out that
@@ -333,7 +335,7 @@ fn prepare(
     let document_object = exact::record(Some(&document), "")?;
     let typed_source: RouteSource = c::dto(source)?;
     // Every fan-out item and selected message value comes from this output.
-    if json_depth(&typed_source.output_json) > MAX_SOURCE_JSON_DEPTH {
+    if json_depth(&typed_source.output_json) >= MAX_SOURCE_JSON_DEPTH {
         return depth_limit("Route source output");
     }
     if source.get("kind").eq_str("agent") {
@@ -446,7 +448,7 @@ fn prepare(
                     ..
                 } => {
                     let value_json = exact::encode(value);
-                    if json_depth(&value_json) > MAX_SOURCE_JSON_DEPTH {
+                    if json_depth(&value_json) >= MAX_SOURCE_JSON_DEPTH {
                         return depth_limit("Fan-out item");
                     }
                     ItemContext::Element {
@@ -561,7 +563,7 @@ fn prepare(
             };
             if resolved
                 .as_ref()
-                .is_some_and(|r| json_depth(&r.message_json) > MAX_SOURCE_JSON_DEPTH)
+                .is_some_and(|r| json_depth(&r.message_json) >= MAX_SOURCE_JSON_DEPTH)
             {
                 return depth_limit("Prepared message");
             }

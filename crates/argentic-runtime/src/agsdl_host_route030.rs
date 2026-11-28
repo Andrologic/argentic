@@ -305,11 +305,17 @@ fn response(output: HostRouteOutput030) -> Result<String> {
                 "CONTENT_UNAVAILABLE" | "CORRELATION" => {
                     (code, "Captured route could not be prepared")
                 }
-                "INPUT_LIMIT" => (code, "Native result would exceed the transport limit"),
+                "INPUT_LIMIT" => (code, "Native input or result exceeds an engine limit"),
                 _ => (
                     "ROUTE_PREPARATION_FAILED".into(),
                     "Captured route could not be prepared",
                 ),
+            };
+            // Whole-route limit refusals carry no pointer; report them on the route.
+            let pointer = if code == "INPUT_LIMIT" && pointer.is_empty() {
+                "route".into()
+            } else {
+                pointer
             };
             Err(failure(&code, &pointer, message))
         }
@@ -335,6 +341,12 @@ mod tests {
             (limit.code.as_str(), limit.pointer.as_str()),
             ("INPUT_LIMIT", "/stateJson")
         );
+        let whole_route = response(HostRouteOutput030::Failed {
+            code: "INPUT_LIMIT".into(),
+            pointer: String::new(),
+        })
+        .unwrap_err();
+        assert_eq!(whole_route.pointer, "route");
         assert_eq!(refused("PARSE").code, "ROUTE_PREPARATION_FAILED");
         assert_eq!(refused("CORRELATION").code, "CORRELATION");
     }

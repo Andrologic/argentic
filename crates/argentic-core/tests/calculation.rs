@@ -162,12 +162,14 @@ fn depth_failure(output: &Value) -> Value {
 
 #[test]
 fn fanout_preparation_applies_the_source_depth_limit() {
-    // At 124 the output nests 127 levels and the default message, which puts
-    // the selected list one level deeper than the output does, exactly 128.
-    let ready = json!({"text": "", "results": {"items": [nested(124)]}});
+    // JSON parsers downstream accept at most 127 nested levels. At 123 the
+    // output nests 126 levels and the default message, which puts the
+    // selected list one level deeper than the output does, 127.
+    let ready = json!({"text": "", "results": {"items": [nested(123)]}});
     assert_eq!(depth_failure(&ready)["kind"], "ready");
-    // At 125 the output still fits but its message does not; beyond, neither.
-    for item_depth in [125, 126, 1000] {
+    // At 124 the output still fits but its message would nest 128 levels;
+    // beyond, neither fits.
+    for item_depth in [124, 125, 126, 1000] {
         let output = json!({"text": "", "results": {"items": [nested(item_depth)]}});
         let report = depth_failure(&output);
         assert_eq!(report["kind"], "failed", "{item_depth}: {report}");
