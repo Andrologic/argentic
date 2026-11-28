@@ -476,23 +476,25 @@ pub(crate) async fn run_command(
     let err = child.take_stderr().expect("piped stderr");
     // Draining concurrently avoids deadlock on a full stderr or stdout pipe.
     let (stream_failure_tx, mut stream_failure_rx) = tokio::sync::mpsc::unbounded_channel();
+    let output_limit = limits.map(|v| v.0);
+    let output_error = |error: std::io::Error| CallError::new("OUTPUT_INVALID", error.to_string());
     let stdout_failure_tx = stream_failure_tx.clone();
     let mut stdout = tokio::spawn(async move {
         let result = match crate::agsdl_host_confinement::attest(&mut out).await {
-            Ok(()) => collect(out, limits.map(|v| v.0)).await,
-            Err(error) => Err(std::io::Error::other(format!(
+            Ok(()) => collect(out, output_limit).await.map_err(output_error),
+            Err(error) => Err(CallError::transport(format!(
                 "Sandbox startup not attested: {error}"
             ))),
         };
         if let Err(error) = &result {
-            let _ = stdout_failure_tx.send(error.to_string());
+            let _ = stdout_failure_tx.send(error.clone());
         }
         result
     });
     let mut stderr = tokio::spawn(async move {
-        let result = collect(err, limits.map(|v| v.0)).await;
+        let result = collect(err, output_limit).await.map_err(output_error);
         if let Err(error) = &result {
-            let _ = stream_failure_tx.send(error.to_string());
+            let _ = stream_failure_tx.send(error.clone());
         }
         result
     });
@@ -507,7 +509,7 @@ pub(crate) async fn run_command(
         biased;
         error = control.cancelled() => { failure = Some(error); None },
         _ = deadline => { failure = Some(CallError::new("CHECK_TIMEOUT", "Host completion-check time limit expired")); None },
-        Some(error) = stream_failure_rx.recv() => { failure = Some(CallError::new("UNCERTAIN", format!("Command output could not be collected: {error}"))); None },
+        Some(error) = stream_failure_rx.recv() => { failure = Some(error); None },
         status = child.wait() => match status {
             Ok(status) => Some(status),
             Err(error) => { failure = Some(CallError::transport(error.to_string())); None },
@@ -519,26 +521,21 @@ pub(crate) async fn run_command(
         failure = Some(CallError::new("UNCERTAIN", error.to_string()));
     }
     let joined = tokio::time::timeout(Duration::from_secs(5), async {
-        let out = (&mut stdout)
-            .await
-            .map_err(|e| e.to_string())?
-            .map_err(|e| e.to_string())?;
-        let err = (&mut stderr)
-            .await
-            .map_err(|e| e.to_string())?
-            .map_err(|e| e.to_string())?;
-        Ok::<_, String>((out, err))
+        tokio::join!(&mut stdout, &mut stderr)
     })
     .await;
     let evidence = PhysicalEvidence::Local {
         policy_digest: policy.policy_digest().into(),
         profile_digest: policy.profile_digest().into(),
-        leader_reaped: status.is_some() || terminated.is_ok(),
+        leader_reaped: child.id().is_none() || terminated.is_ok(),
         tree_termination_succeeded: terminated.is_ok(),
-        streams_joined: matches!(joined, Ok(Ok(_))),
+        streams_joined: matches!(joined, Ok((Ok(_), Ok(_)))),
     };
     let (out, err) = match joined {
-        Ok(Ok(streams)) => streams,
+        Ok((Ok(out), Ok(err))) => match (out, err) {
+            (Ok(out), Ok(err)) => (out, err),
+            (Err(error), _) | (_, Err(error)) => return (None, failure.or(Some(error)), evidence),
+        },
         _ => {
             stdout.abort();
             stderr.abort();

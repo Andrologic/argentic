@@ -113,7 +113,14 @@ async fn http_handler(
                 let raw = format!("data: {{\"jsonrpc\":\"2.0\",\"id\":\"server-human\",\"method\":\"elicitation/create\",\"params\":{{\"message\":\"Continue?\",\"requestedSchema\":{{\"type\":\"object\"}}}}}}\n\ndata: {{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"resultType\":\"complete\",\"content\":[]}}}}\n\n");
                 return ([("content-type", "text/event-stream")], raw).into_response();
             }
-            if state.mode == "resume" { return ([("content-type", "text/event-stream"), ("mcp-session-id", "captured")], "id: cursor-1\nretry: 0\ndata:\n\n").into_response(); }
+            if matches!(state.mode, "resume" | "resume-partial") {
+                let stream = if state.mode == "resume-partial" {
+                    "id: cursor-1\nretry: 0\ndata:\n\nid: incomplete\ndata: {"
+                } else {
+                    "id: cursor-1\nretry: 0\ndata:\n\n"
+                };
+                return ([("content-type", "text/event-stream"), ("mcp-session-id", "captured")], stream).into_response();
+            }
             let error = match state.mode {
                 "rpc-error-null" => Some("null"),
                 "rpc-error-string-code" => Some(r#"{"code":"-32603","message":"failed"}"#),
@@ -336,6 +343,7 @@ async fn http_exact_receipts_human_waits_modern_continuation_and_no_replay() {
         "legacy-2025-06-18",
         "sse",
         "resume",
+        "resume-partial",
         "modern",
         "modern-bad-state",
         "redirect",
@@ -351,10 +359,14 @@ async fn http_exact_receipts_human_waits_modern_continuation_and_no_replay() {
             }
             _ => {
                 let receipt = result.unwrap_or_else(|error| panic!("{mode}: {error:?}"));
-                if mode == "sse" || mode == "resume" {
+                if matches!(mode, "sse" | "resume" | "resume-partial") {
                     assert_eq!(
                         receipt.text,
-                        if mode == "resume" { "resumed" } else { "done" }
+                        if mode.starts_with("resume") {
+                            "resumed"
+                        } else {
+                            "done"
+                        }
                     );
                 } else {
                     assert!(receipt
@@ -370,7 +382,7 @@ async fn http_exact_receipts_human_waits_modern_continuation_and_no_replay() {
                 }
             }
         }
-        if mode == "resume" {
+        if mode.starts_with("resume") {
             assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
             assert!(fixture
                 .requests

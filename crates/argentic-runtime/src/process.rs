@@ -382,7 +382,47 @@ impl ContainedBackgroundProcess {
             self.command_exit = Some(status);
             Ok(status)
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::unix::process::ExitStatusExt;
+
+            drop(self.child.stdin.take());
+            let Some(pid) = self.child.id() else {
+                return self.child.wait().await;
+            };
+            // Keep the leader unreaped so its PID and PGID cannot be reused
+            // while tree inspection and signalling still use those numbers.
+            loop {
+                let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+                if unsafe {
+                    libc::waitid(
+                        libc::P_PID,
+                        pid as libc::id_t,
+                        &mut info,
+                        libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+                    )
+                } == -1
+                {
+                    let error = io::Error::last_os_error();
+                    if error.kind() == io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    return Err(error);
+                }
+                if unsafe { info.si_pid() } != 0 {
+                    let status = unsafe { info.si_status() };
+                    let raw = match info.si_code {
+                        libc::CLD_EXITED => (status & 0xff) << 8,
+                        libc::CLD_KILLED => status & 0x7f,
+                        libc::CLD_DUMPED => (status & 0x7f) | 0x80,
+                        _ => return Err(io::Error::other("Unexpected macOS leader exit status")),
+                    };
+                    return Ok(ExitStatus::from_raw(raw));
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         self.child.wait().await
     }
 
@@ -444,9 +484,19 @@ impl ContainedBackgroundProcess {
             grace_period
         };
         let deadline = tokio::time::Instant::now() + reap_timeout;
+        #[cfg(target_os = "macos")]
+        {
+            if let Some(error) = inspection_error {
+                return Err(io::Error::other(IncompleteProcessTreeInspection(error)));
+            }
+            // The unreaped leader is still visible to kill(pid, 0).
+            let mut descendants = targets;
+            descendants.retain(|pid| Some(*pid) != self.process_group_id);
+            wait_for_processes_exit(&descendants, deadline).await?;
+        }
         match tokio::time::timeout_at(deadline, self.child.wait()).await {
             Ok(status) => {
-                #[cfg(not(target_os = "linux"))]
+                #[cfg(not(any(target_os = "linux", target_os = "macos")))]
                 if let Some(error) = inspection_error {
                     return Err(io::Error::other(IncompleteProcessTreeInspection(error)));
                 }
@@ -462,6 +512,7 @@ impl ContainedBackgroundProcess {
                 };
                 // SIGKILL delivery and the leader's reap do not establish
                 // that descendants with detached streams have exited.
+                #[cfg(not(target_os = "macos"))]
                 wait_for_processes_exit(&targets, deadline).await?;
                 // Retire only after all observed processes disappeared.
                 // Drop must not scan the machine again or signal a reused PID.
@@ -2979,15 +3030,22 @@ mod tests {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         let mut process = ContainedBackgroundProcess::spawn(command).expect("spawn helper");
+        let leader = process.id().expect("leader PID");
         let status = tokio::time::timeout(Duration::from_secs(1), process.wait())
             .await
             .expect("wait must return after the helper exits")
             .expect("wait for helper status");
         assert!(status.success(), "the helper status must be preserved");
+        assert_eq!(
+            process.id(),
+            Some(leader),
+            "cleanup must still own the leader PID"
+        );
         process
             .terminate_with_grace(Duration::ZERO)
             .await
             .expect("terminate macOS double-forked process tree");
+        assert_eq!(process.id(), None, "cleanup must reap the leader");
         tokio::time::sleep(Duration::from_millis(1_200)).await;
 
         assert!(

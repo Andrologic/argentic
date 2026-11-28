@@ -381,11 +381,9 @@ fn parameter_headers(schema: &str, arguments: &str) -> Result<reqwest::header::H
     Ok(headers)
 }
 
-pub(crate) type ToolAdmission = Box<
-    dyn Fn() -> futures::future::BoxFuture<'static, Result<tokio::sync::OwnedMutexGuard<()>>>
-        + Send
-        + Sync,
->;
+/// Acquires the native admission guard retained until the tool body is handed off.
+pub(crate) type ToolAdmission =
+    Box<dyn Fn() -> futures::future::BoxFuture<'static, Result<Box<dyn Send>>> + Send + Sync>;
 
 pub(crate) struct Session {
     server: String,
@@ -1544,7 +1542,7 @@ impl HttpWire {
                     let message = tokio::select! {
                         biased;
                         _ = control.cancelled() => return,
-                        message = body.next() => message,
+                        message = body.next(true) => message,
                     };
                     match message {
                         Ok(Some(message)) => {
@@ -1766,19 +1764,20 @@ impl Wire {
                         "MCP HTTP has no response stream; effect will not be retried",
                     )
                 })?;
+                let can_resume = http.version != Some("2026-07-28");
                 let unsolicited = &mut http.unsolicited;
                 let received = tokio::select! {
                     biased;
                     Some(message) = async {
                         match unsolicited { Some(rx) => rx.recv().await, None => std::future::pending().await }
                     } => return message,
-                    message = body.next() => message?,
+                    message = body.next(can_resume) => message?,
                 };
                 if let Some(value) = received {
                     return Ok(value);
                 }
                 let body = http.responses.pop_front().expect("response exists");
-                if body.sse && http.version != Some("2026-07-28") {
+                if body.sse && can_resume {
                     if let Some(id) = body.last_event_id {
                         // Resume only the response stream. The original POST is never replayed.
                         tokio::time::sleep(Duration::from_millis(body.retry_ms)).await;
@@ -1859,7 +1858,7 @@ impl SseFraming {
 }
 
 impl Body {
-    async fn next(&mut self) -> Result<Option<String>> {
+    async fn next(&mut self, can_resume: bool) -> Result<Option<String>> {
         loop {
             if self.sse {
                 if let Some(event) = self.framing.take_event(&mut self.buffer) {
@@ -1905,6 +1904,10 @@ impl Body {
                     return Ok(None);
                 }
                 if self.sse {
+                    if can_resume && self.last_event_id.is_some() {
+                        self.buffer.clear();
+                        return Ok(None);
+                    }
                     return Err(CallError::transport(
                         "MCP SSE ended with an incomplete event",
                     ));
@@ -1914,7 +1917,7 @@ impl Body {
                     .map_err(|_| CallError::transport("MCP HTTP JSON is not UTF-8"));
             }
             match self.response.chunk().await {
-                Err(_) if self.sse && self.last_event_id.is_some() => {
+                Err(_) if self.sse && can_resume && self.last_event_id.is_some() => {
                     self.buffer.clear();
                     self.eof = true;
                 }

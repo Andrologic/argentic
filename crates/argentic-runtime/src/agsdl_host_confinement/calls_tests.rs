@@ -145,6 +145,51 @@ async fn collector_retains_calls_and_explicitly_bounds_checks() {
     assert_eq!(bounded.bytes.len(), 128);
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn oversized_command_output_keeps_confirmed_cleanup() {
+    use std::process::Stdio;
+
+    let root = tempfile::tempdir().unwrap();
+    use crate::agsdl_host_confinement::{FileAccess, OsCeiling, PathScope};
+
+    let ceiling = OsCeiling {
+        read: FileAccess {
+            allow: vec![PathScope::Subtree(root.path().canonicalize().unwrap())],
+            block: vec![],
+        },
+        write: FileAccess::default(),
+        network: false,
+    };
+    let policy = SandboxPolicy::from_authorized_ceilings("test".into(), &[ceiling]).unwrap();
+    for output in ["1", "2"] {
+        // Exercise the output and cleanup path independently of Seatbelt.
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command
+            .args([
+                "-c",
+                &format!(
+                    r"printf 'MACRO_SEATBELT_STARTED_V1\n'; head -c 67108865 /dev/zero >&{output}"
+                ),
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let process = ContainedBackgroundProcess::spawn(command).unwrap();
+        let (receipt, failure, evidence) = run_command(process, &policy, &control(), None).await;
+        assert!(receipt.is_none());
+        assert_eq!(failure.unwrap().code, "OUTPUT_INVALID");
+        assert!(matches!(
+            evidence,
+            PhysicalEvidence::Local {
+                leader_reaped: true,
+                tree_termination_succeeded: true,
+                streams_joined: true,
+                ..
+            }
+        ));
+    }
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[tokio::test]
 #[ignore = "Real Darwin Seatbelt/process test; run outside the agent sandbox"]
