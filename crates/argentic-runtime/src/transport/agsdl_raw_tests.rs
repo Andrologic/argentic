@@ -94,6 +94,21 @@ async fn http_handler(
                 && tokio::time::timeout(std::time::Duration::from_secs(2), state.answer_seen.notified()).await.is_err() {
                     return axum::http::StatusCode::GATEWAY_TIMEOUT.into_response();
                 }
+            if state.mode == "sse-line-endings" {
+                let chunks = [
+                    "id: cursor-1\r".to_owned(),
+                    "\nretry: 10\r: heartbeat\r".to_owned(),
+                    "\ndata: {\r".to_owned(),
+                    format!("data: \"jsonrpc\":\"2.0\",\"id\":{id},\n"),
+                    "data: \"result\":{\"content\":[{\"type\":\"text\",\"text\":\"complete\"}]}}\r"
+                        .to_owned(),
+                    "\r".to_owned(),
+                ];
+                let body = axum::body::Body::from_stream(futures::stream::iter(
+                    chunks.into_iter().map(Ok::<_, std::convert::Infallible>),
+                ));
+                return ([("content-type", "text/event-stream")], body).into_response();
+            }
             if state.mode == "modern-push" {
                 let raw = format!("data: {{\"jsonrpc\":\"2.0\",\"id\":\"server-human\",\"method\":\"elicitation/create\",\"params\":{{\"message\":\"Continue?\",\"requestedSchema\":{{\"type\":\"object\"}}}}}}\n\ndata: {{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"resultType\":\"complete\",\"content\":[]}}}}\n\n");
                 return ([("content-type", "text/event-stream")], raw).into_response();
@@ -304,6 +319,14 @@ async fn isolated(
     let (evidence, cleanup) = session.shutdown(result.is_ok()).await;
     assert!(cleanup.is_none(), "{cleanup:?}");
     (result, evidence)
+}
+
+#[tokio::test]
+async fn sse_frames_mixed_line_endings_across_chunks() {
+    let (server, _, task) = http_fixture("sse-line-endings").await;
+    let (result, _) = isolated(&dummy_host(), server).await;
+    task.abort();
+    assert_eq!(result.unwrap().text, "complete");
 }
 
 #[tokio::test]

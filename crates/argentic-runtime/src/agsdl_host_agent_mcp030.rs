@@ -4,8 +4,11 @@ use crate::{
     agsdl_host_call_executor030::{agent_mcp_grant, mcp_server, remote_mcp, NoHuman},
     agsdl_host_calls::{raw_mcp, CallIdentity, Control, PhysicalEvidence},
     agsdl_host_flow030::FlowWorkAttempt030,
-    host::HostContext,
-    permissions::{evaluate_effective, may_equip_mcp, ActionRequest, Effect, ExecutionPurpose},
+    host::{HostContext, HostPolicyLease, ProjectPolicyLease},
+    permissions::{
+        evaluate_effective, evaluate_requested, may_equip_mcp, normalize_requested, ActionRequest,
+        Effect, ExecutionPurpose, PathContext,
+    },
     persistence::{failure, Result},
 };
 use axum::{
@@ -66,6 +69,9 @@ struct Bridge {
     termination_uncertain: AtomicBool,
     auth: String,
     work: FlowWorkAttempt030,
+    host: HostContext,
+    project_id: String,
+    paths: PathContext,
     remote_tool_budget: Option<Duration>,
     approvals: Option<Arc<dyn CommandApprovals030>>,
     admission: crate::agsdl_host_flow030::operator030::AgentOperator030,
@@ -98,6 +104,7 @@ impl Equipment {
         cancel: &CancellationToken,
     ) -> Result<Self> {
         let mut state = Bridge::new(
+            context,
             work,
             (!authored_budget)
                 .then(|| Duration::from_millis(context.remote_mcp_tool_budget_ms().get())),
@@ -409,6 +416,7 @@ impl Upstream {
 
 impl Bridge {
     fn new(
+        host: &HostContext,
         work: &AgentWork030,
         remote_tool_budget: Option<Duration>,
         approvals: Option<Arc<dyn CommandApprovals030>>,
@@ -420,6 +428,15 @@ impl Bridge {
             termination_uncertain: AtomicBool::new(false),
             auth,
             work: work.attempt.clone(),
+            host: host.clone(),
+            project_id: work.capture.source.owner.project_id.clone(),
+            paths: work
+                .policy
+                .policies()
+                .next()
+                .expect("captured agent policy")
+                .context()
+                .clone(),
             remote_tool_budget,
             approvals,
             admission: work.operator.clone(),
@@ -515,7 +532,18 @@ impl Bridge {
         if wire.tool_in_flight() || wire.guard_secrets(&arguments_json).is_err() {
             return None;
         }
-        if *effect == Effect::Ask {
+        let (effect, policy) = tokio::select! {
+            biased;
+            _ = self.stop.cancelled() => return None,
+            policy = lock_tool_policy(&self.host, &self.project_id, &self.paths, server, tool, *effect) => policy.ok()?,
+        };
+        if effect == Effect::Deny {
+            return None;
+        }
+        if effect == Effect::Ask {
+            // The broker reacquires current policy before delivery. Drop these
+            // guards before invoking it or waiting on a person.
+            drop(policy);
             let approvals = self.approvals.as_ref()?;
             let (handed_off, dispatched) = oneshot::channel();
             let args = arguments_json.as_str();
@@ -568,6 +596,7 @@ impl Bridge {
         let admission = self.admission.track_mcp_gate(admission);
         let sent = self.dispatch(wire, tool, &arguments_json, &control).await;
         drop(admission);
+        drop(policy);
         self.finish(wire, upstream, sent.ok()?, &control).await
     }
 
@@ -601,6 +630,29 @@ impl Bridge {
         }
         serde_json::from_str(&receipt.ok()?.raw_result_json).ok()
     }
+}
+
+async fn lock_tool_policy(
+    host: &HostContext,
+    project_id: &str,
+    paths: &PathContext,
+    server: &str,
+    tool: &str,
+    captured: Effect,
+) -> Result<(Effect, (HostPolicyLease, ProjectPolicyLease))> {
+    // Use the same ceiling -> project -> operator order as the approval broker.
+    let (ceiling, project) = host.lock_ceiling_and_project(project_id).await?;
+    let request = ActionRequest::Mcp {
+        server: server.into(),
+        tool: Some(tool.into()),
+    };
+    let mut effect = captured;
+    for permissions in [ceiling.permissions(), &project.agsdl_host_permissions] {
+        let invalid = |_| mcp_error("MCP_POLICY", "Invalid current MCP policy");
+        let policy = normalize_requested(permissions.clone(), paths.clone()).map_err(invalid)?;
+        effect = effect.max(evaluate_requested(&policy, &request).map_err(invalid)?);
+    }
+    Ok((effect, (ceiling, project)))
 }
 
 async fn handle(
@@ -698,7 +750,10 @@ pub(crate) async fn call_test_session(
     } else {
         Effect::Allow
     };
-    let mut state = Bridge::new(work, budget, approvals, cancel, String::new());
+    let paths = work.policy.policies().next().unwrap().context();
+    let (host, policy) = crate::test_context::context_with_policy(paths.workspace.clone());
+    policy.workspace().await;
+    let mut state = Bridge::new(&host, work, budget, approvals, cancel, String::new());
     let mut upstream = Upstream::new(session, &work.attempt);
     upstream.tools.insert("check".into(), (effect, Value::Null));
     state.upstreams.insert("issues".into(), upstream);
@@ -726,4 +781,71 @@ pub(crate) async fn call_test_session(
         .call(upstream, "issues", &json!({"name":"check"}))
         .await;
     Ok((result, equipment.close().await))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        host::{PolicyFuture, PolicySource},
+        permissions::RequestedPermissions,
+    };
+    use tokio::sync::RwLock;
+
+    struct CurrentPolicy {
+        ceiling: Arc<RwLock<RequestedPermissions>>,
+        project: Arc<RwLock<RequestedPermissions>>,
+    }
+
+    impl PolicySource for CurrentPolicy {
+        fn lock_ceiling(&self) -> PolicyFuture<'_, HostPolicyLease> {
+            Box::pin(async move {
+                let guard = self.ceiling.clone().read_owned().await;
+                Ok(HostPolicyLease::new(guard.clone(), "test".into(), guard))
+            })
+        }
+
+        fn lock_project<'a>(&'a self, _: &'a str) -> PolicyFuture<'a, ProjectPolicyLease> {
+            Box::pin(async move {
+                let guard = self.project.clone().read_owned().await;
+                Ok(ProjectPolicyLease::new(Value::Null, guard.clone(), guard))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn current_mcp_effect_respects_both_locked_policy_layers() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = PathContext {
+            workspace: dir.path().to_owned(),
+            home: dir.path().to_owned(),
+        };
+        let ask = serde_json::from_value(json!({
+            "preset": "workspace",
+            "rules": [{"action":"mcp","match":"issues/check","effect":"ask"}]
+        }))
+        .unwrap();
+        let workspace = serde_json::from_value::<RequestedPermissions>(json!("workspace")).unwrap();
+        let deny = serde_json::from_value(json!("read-only")).unwrap();
+        let policy = Arc::new(CurrentPolicy {
+            ceiling: Arc::new(RwLock::new(workspace.clone())),
+            project: Arc::new(RwLock::new(workspace.clone())),
+        });
+        let host = HostContext::new(paths.workspace.clone(), policy.clone());
+        let lock =
+            |captured| lock_tool_policy(&host, "project", &paths, "issues", "check", captured);
+        let (effect, lease) = lock(Effect::Allow).await.unwrap();
+        assert_eq!(effect, Effect::Allow);
+        assert!(policy.ceiling.try_write().is_err());
+        assert!(policy.project.try_write().is_err());
+        drop(lease);
+
+        *policy.ceiling.try_write().unwrap() = ask;
+        assert_eq!(lock(Effect::Allow).await.unwrap().0, Effect::Ask);
+        *policy.project.try_write().unwrap() = deny;
+        assert_eq!(lock(Effect::Allow).await.unwrap().0, Effect::Deny);
+        *policy.ceiling.try_write().unwrap() = workspace.clone();
+        *policy.project.try_write().unwrap() = workspace;
+        assert_eq!(lock(Effect::Ask).await.unwrap().0, Effect::Ask);
+    }
 }

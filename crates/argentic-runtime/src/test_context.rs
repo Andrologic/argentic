@@ -2,13 +2,17 @@
 use crate::{host::*, persistence::Result};
 use serde_json::{json, Value};
 use std::{path::PathBuf, sync::Arc};
-#[derive(Default)]
 pub(crate) struct Policy {
     ceiling: Arc<tokio::sync::RwLock<bool>>,
+    project: Arc<tokio::sync::RwLock<crate::permissions::RequestedPermissions>>,
 }
 impl Policy {
     pub(crate) async fn workspace(&self) {
         *self.ceiling.write().await = true;
+        self.set_project(Self::permissions(true)).await;
+    }
+    pub(crate) async fn set_project(&self, permissions: crate::permissions::RequestedPermissions) {
+        *self.project.write().await = permissions;
     }
     fn permissions(allowed: bool) -> crate::permissions::RequestedPermissions {
         serde_json::from_value(json!(if allowed { "workspace" } else { "read-only" })).unwrap()
@@ -17,10 +21,10 @@ impl Policy {
 impl PolicySource for Policy {
     fn lock_project<'a>(&'a self, _: &'a str) -> PolicyFuture<'a, ProjectPolicyLease> {
         Box::pin(async move {
-            let guard = self.ceiling.clone().read_owned().await;
+            let guard = self.project.clone().read_owned().await;
             Ok(ProjectPolicyLease::new(
                 json!({"riskLevel":"balanced"}),
-                Self::permissions(*guard),
+                guard.clone(),
                 guard,
             ))
         })
@@ -41,7 +45,10 @@ pub(crate) fn context(root: PathBuf) -> HostContext {
 }
 pub(crate) fn context_with_policy(root: PathBuf) -> (HostContext, Arc<Policy>) {
     std::fs::create_dir_all(&root).unwrap();
-    let policy = Arc::new(Policy::default());
+    let policy = Arc::new(Policy {
+        ceiling: Arc::new(tokio::sync::RwLock::new(false)),
+        project: Arc::new(tokio::sync::RwLock::new(Policy::permissions(false))),
+    });
     (HostContext::new(root, policy.clone()), policy)
 }
 /// Explicit captured tool projection used by the old native fixtures. Macro's

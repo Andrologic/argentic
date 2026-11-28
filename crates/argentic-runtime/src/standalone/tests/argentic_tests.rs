@@ -1855,6 +1855,123 @@ async fn provider_credential_in_mcp_arguments_never_reaches_approval_or_upstream
 
 #[cfg(unix)]
 #[tokio::test]
+async fn argentic_mcp_checks_project_revocation_between_provider_requests() {
+    mcp_project_policy_change("deny").await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn argentic_mcp_waits_for_approval_when_project_policy_changes_to_ask() {
+    mcp_project_policy_change("ask").await;
+}
+
+#[cfg(unix)]
+async fn mcp_project_policy_change(effect: &str) {
+    use crate::test_context::mcp::{Peer, REQUIREMENTS};
+
+    let peer = Peer::start().await;
+    let mut server = Server::start().await;
+    let mut doc = document();
+    doc["projectFormat"] = json!("agsdl-project-1");
+    doc["mcpServers"] = peer.servers();
+    doc["secrets"] = json!({"file":"requirements.json"});
+    let worker = &mut doc["agents"]["worker"];
+    worker["mcpServers"] = json!(["first", "second"]);
+    worker["permissions"] = json!({"preset":"read-only","reviewer":"person","rules":[
+        {"action":"mcp","match":"*/check","effect":"allow"}
+    ]});
+    let mut f = Fixture::new("");
+    f.source = f.workspace.with_file_name("project");
+    std::fs::create_dir(&f.source).unwrap();
+    std::fs::write(f.source.join("agsdl.json"), doc.to_string()).unwrap();
+    std::fs::write(f.source.join("requirements.json"), REQUIREMENTS).unwrap();
+    let mut host = open(&f, false).await;
+    // Keep the host ceiling and the broker's standalone input policy fixed.
+    let (context, policy) = crate::test_context::context_with_policy(f.data.clone());
+    policy.workspace().await;
+    host.context = peer.configure(context);
+    let host = host.with_argentic(server.config(None)).unwrap();
+    let ceiling_fingerprint = host
+        .context
+        .lock_agsdl_host_permissions()
+        .await
+        .unwrap()
+        .fingerprint()
+        .to_owned();
+    let run = start(&host).await;
+
+    let first = server.next().await;
+    assert!(has_tool(&first, "mcp__first__check"));
+    assert!(has_tool(&first, "mcp__second__check"));
+    first.tool("mcp__first__check", json!({"value":"first result"}));
+    let second = server.next().await;
+    assert!(second.body["messages"].to_string().contains("first result"));
+    let first_call = ("first".into(), "check".into());
+    assert_eq!(peer.calls(), std::slice::from_ref(&first_call));
+
+    tokio::time::timeout(WAIT_FOR, policy.set_project(serde_json::from_value(json!({
+        "preset":"workspace","rules":[{"action":"mcp","match":"second/check","effect":effect}]
+    })).unwrap())).await.expect("project policy update blocked between provider requests");
+    assert_eq!(
+        host.context
+            .lock_agsdl_host_permissions()
+            .await
+            .unwrap()
+            .fingerprint(),
+        ceiling_fingerprint
+    );
+    assert!(has_tool(&second, "mcp__second__check"));
+    second.tool("mcp__second__check", json!({"value":"second result"}));
+
+    if effect == "ask" {
+        let scope = persistence::public030::HumanScope030 {
+            system_start_id: run.receipt.identity.system_start_id.clone(),
+            source: run.capture.source.clone(),
+        };
+        let ask = pending_ask(&host, &scope).await;
+        assert_eq!(peer.calls(), std::slice::from_ref(&first_call));
+        host.submit_person(HumanSubmission {
+            scope,
+            request_id: ask.id,
+            expected_revision: ask.revision,
+            answer: api::HumanAnswer030::Decision {
+                decision: "yes".into(),
+                comment: String::new(),
+            },
+        })
+        .await
+        .unwrap();
+    }
+
+    let next = server.next().await;
+    let messages = next.body["messages"].as_array().unwrap();
+    let tool_result = messages
+        .iter()
+        .rev()
+        .find(|message| message["role"] == "tool")
+        .unwrap();
+    if effect == "ask" {
+        assert!(tool_result.to_string().contains("second result"));
+        assert_eq!(
+            peer.calls(),
+            [first_call, ("second".into(), "check".into())]
+        );
+    } else {
+        assert!(
+            tool_result
+                .to_string()
+                .contains("MCP call denied, cancelled or unavailable"),
+            "{tool_result}"
+        );
+        assert_eq!(peer.calls(), [first_call]);
+    }
+    submit_done(next);
+    completed(&finish(&host, &run).await);
+    close(&host).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn agent_mcp_uses_per_tool_rules_and_joins_after_stop() {
     use crate::test_context::mcp::{Peer, REQUIREMENTS};
     for person in [true, false] {
