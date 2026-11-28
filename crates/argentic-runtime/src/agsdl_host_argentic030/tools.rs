@@ -1,6 +1,6 @@
 use argentic_harness::{
     providers::{contains_credential, redact_credential_values, ToolCall, ToolDefinition},
-    tools::{Extensions, Page, SKILL},
+    tools::{Extensions, Page, ToolOutput, SKILL},
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use serde::Deserialize;
@@ -213,7 +213,12 @@ impl Extensions for Tools {
             .collect()
     }
 
-    async fn execute(&self, call: &ToolCall, cancel: &CancellationToken) -> Result<Page, String> {
+    async fn execute(
+        &self,
+        call: &ToolCall,
+        cancel: &CancellationToken,
+        output: &ToolOutput,
+    ) -> Result<Page, String> {
         if call.name != SKILL {
             if self
                 .credential
@@ -240,7 +245,9 @@ impl Extensions for Tools {
             if let Some(key) = &self.credential {
                 redact_credential_values(&mut reply, key);
             }
-            return Page::one_shot(&reply.to_string(), &call.id).map_err(|error| error.to_string());
+            return output
+                .one_shot(&reply.to_string(), &call.id)
+                .map_err(|error| error.to_string());
         }
         if self.skills.is_empty() {
             return Err("No skill is selected for this work".into());
@@ -255,7 +262,8 @@ impl Extensions for Tools {
             if let Some(key) = &self.credential {
                 redact_credential_values(&mut catalogue, key);
             }
-            return Page::one_shot(&catalogue.to_string(), &call.id)
+            return output
+                .one_shot(&catalogue.to_string(), &call.id)
                 .map_err(|error| error.to_string());
         };
         let skill = self
@@ -274,7 +282,8 @@ impl Extensions for Tools {
                     .skill_resource(skill, active, &path)
                     .await
                     .map_err(|error| format!("{}: Could not read skill resource", error.code))?;
-                return Page::one_shot_screened(&text, &call.id, self.credential.as_deref())
+                return output
+                    .one_shot(&text, &call.id)
                     .map_err(|error| error.to_string());
             }
             let active = sources

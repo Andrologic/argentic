@@ -12,7 +12,7 @@ pub use shell::{
 mod confined;
 mod output;
 mod submission;
-pub use output::Page;
+pub use output::{OverflowFile, Page, ToolOutput};
 
 use std::{
     io::{self, Read},
@@ -288,7 +288,13 @@ pub trait Extensions: Send + Sync {
         Vec::new()
     }
 
-    async fn execute(&self, call: &ToolCall, cancel: &CancellationToken) -> Result<Page, String>;
+    /// Use `output` to paginate responses and charge overflow files to this work.
+    async fn execute(
+        &self,
+        call: &ToolCall,
+        cancel: &CancellationToken,
+        output: &ToolOutput,
+    ) -> Result<Page, String>;
 }
 
 impl Registry {
@@ -600,7 +606,9 @@ impl Registry {
         cancel: CancellationToken,
     ) -> Result<Page, String> {
         let tracker = TaskTracker::new();
-        let output = self.execute(call, cancel, &tracker, None).await;
+        let output = self
+            .execute(call, cancel, &tracker, &ToolOutput::default())
+            .await;
         tracker.close();
         tracker.wait().await;
         output
@@ -611,18 +619,18 @@ impl Registry {
         call: ToolCall,
         cancel: CancellationToken,
         tracker: &TaskTracker,
-        credential: Option<&str>,
+        output: &ToolOutput,
     ) -> Result<Page, String> {
         if call.name == "shell" {
-            return self.shell(call, cancel, tracker, credential).await;
+            return self.shell(call, cancel, tracker, output).await;
         }
         if matches!(call.name.as_str(), "write" | "edit" | "apply_patch") {
-            return self.mutate(call, cancel, tracker, credential).await;
+            return self.mutate(call, cancel, tracker, output).await;
         }
         if !matches!(call.name.as_str(), "read" | "list" | "glob" | "grep") {
             check_cancel(&cancel).map_err(|error| error.to_string())?;
             if let Some(tools) = &self.extensions {
-                return tools.execute(&call, &cancel).await;
+                return tools.execute(&call, &cancel, output).await;
             }
             return Err("Unknown tool".into());
         }
@@ -640,10 +648,10 @@ impl Registry {
             .await?;
         let policy = self.lock_dispatch(&call, &[action], &cancel).await?;
         let registry = self.clone();
-        let credential = credential.map(str::to_owned);
+        let output = output.clone();
         tracker
             .spawn_blocking(move || {
-                registry.read_sync(&call, args, &path, &cancel, &policy, credential.as_deref())
+                registry.read_sync(&call, args, &path, &cancel, &policy, &output)
             })
             .await
             .map_err(|e| e.to_string())?
@@ -654,7 +662,7 @@ impl Registry {
         call: ToolCall,
         cancel: CancellationToken,
         tracker: &TaskTracker,
-        credential: Option<&str>,
+        output: &ToolOutput,
     ) -> Result<Page, String> {
         if !self.toolbox.writes {
             return Err("Mutation tools are disabled".into());
@@ -694,12 +702,13 @@ impl Registry {
         let guards = mutation::lock_paths(locks, &cancel).await?;
         let policy = self.lock_dispatch(&call, &approvals, &cancel).await?;
         let registry = self.clone();
-        let credential = credential.map(str::to_owned);
+        let output = output.clone();
         tracker
             .spawn_blocking(move || {
                 let (_guards, _workspace, _policy) = (guards, workspace, policy);
                 let text = mutation.run(&registry.roots[index], &cancel)?;
-                output::paginate(&text, &call.id, None, None, credential.as_deref())
+                output
+                    .paginate(&text, &call.id, None, None)
                     .map_err(|error| error.to_string())
             })
             .await
@@ -713,7 +722,7 @@ impl Registry {
         path: &Path,
         cancel: &CancellationToken,
         policy: &DispatchPolicy,
-        credential: Option<&str>,
+        output: &ToolOutput,
     ) -> Result<Page, String> {
         let root = &self.roots[args.root];
         let raw_path = args.path.as_deref().unwrap_or(".");
@@ -741,14 +750,9 @@ impl Registry {
         .map_err(|e| e.to_string())?;
         let scope = json!([call.name, args.root, raw_path, args.pattern]).to_string();
         check_cancel(cancel).map_err(|e| e.to_string())?;
-        output::paginate(
-            &text,
-            &scope,
-            args.cursor.as_deref(),
-            args.limit,
-            credential,
-        )
-        .map_err(|e| e.to_string())
+        output
+            .paginate(&text, &scope, args.cursor.as_deref(), args.limit)
+            .map_err(|e| e.to_string())
     }
 
     fn read_one(

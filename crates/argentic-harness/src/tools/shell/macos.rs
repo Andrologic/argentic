@@ -164,10 +164,16 @@ pub(super) fn run(
         proxy.map(|proxy| proxy.port),
         proxy.and_then(|proxy| proxy.ca_bundle.as_deref()),
     )?;
-    execute(
+    let result = execute(
         command, mounts, &scratch, proxy, &profile, timeout_ms, cancel,
     )
-    .map_err(|error| error.to_string())
+    .map_err(|error| error.to_string());
+    let errors = super::workspace::remove_temp_dir(dir)
+        .err()
+        .map(|error| format!("{}: {error}", scratch.display()))
+        .into_iter()
+        .collect();
+    super::cleanup_result(result, errors)
 }
 
 fn execute(

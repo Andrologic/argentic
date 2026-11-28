@@ -315,7 +315,8 @@ to `"blanket"`. In that mode a shell can use the proxy only if every policy
 layer grants network access unconditionally. Qualification rejects network
 rules with a host match when the agent can run shell commands. Blanket mode
 passes CONNECT bytes through without inspecting TLS or checking the
-authorities inside the tunnel.
+authorities inside the tunnel. A CONNECT tunnel forwards EOF to the peer
+and leaves the opposite direction open under the existing connection limits.
 
 Set `shellNetwork: "intercept"` to use host patterns. Argentic terminates
 client TLS with a CA generated for the shell invocation. It keeps the CA
@@ -419,7 +420,9 @@ A preview contains up to 2,000 lines and 50 KiB of UTF-8 text. Use its
 `next_cursor` with the same tool arguments to continue. A truncated first
 page also saves the complete bounded output to a temporary file. The
 `RunReport` keeps that file available to the host for as long as it owns
-the artifact. The model receives a cursor, and the host receives the file.
+the artifact. Argentic reserves space before writing each file. A work and
+its delegated agents share a 64 MiB budget for these files. A response that
+would exceed the remaining budget returns an explicit tool error.
 Read and scan budgets bound the work behind a preview. Shell output also has
 a capture cap. Shell previews omit the cursor because rerunning a shell call
 could repeat its effects.
@@ -447,12 +450,13 @@ harness masks literal echoes in assistant text and reasoning across stream
 deltas and counts the filtered bytes toward its response budget. Structured
 screening checks decoded JSON string values and member names. Screened tool
 arguments receive a correction in the same conversation, including
-`agsdl_submit_result`. Native replay keeps tool protocol IDs and tool names and
-masks echoes in editable Anthropic and Responses assistant text. A credential
-in a native replay member name or in signed or opaque replay data invalidates
-the reply. Tool results are screened before pagination and overflow-file
-creation. OpenAI Chat Completions and Responses emit refusal text as visible
-text and surface an explicit refusal as a filtered finish.
+`agsdl_submit_result`. A credential in a tool call ID or name invalidates the
+reply before any tool is dispatched. Native replay masks echoes in editable
+Anthropic and Responses assistant text. A credential in a native replay member
+name or in signed or opaque replay data invalidates the reply. The harness
+screens tool results before pagination and overflow-file creation. OpenAI
+Chat Completions and Responses emit refusal text as visible text and surface
+an explicit refusal as a filtered finish.
 
 - Agent and message resources appear as origin-labelled, untrusted reference
   data in a separate user message. The Host resolves local URIs under the

@@ -1,9 +1,11 @@
 //! Standalone Linux helper embedded by build.rs. The host mounts it read-only
 //! and runs it as PID 1 so exiting also terminates outstanding proxy streams.
+#![cfg(target_os = "linux")]
+
 use std::{
     env,
     io::{self, Read, Write},
-    net::{Ipv4Addr, TcpListener, TcpStream},
+    net::{Ipv4Addr, Shutdown, TcpListener, TcpStream},
     os::{
         fd::{AsRawFd, RawFd},
         unix::{net::UnixStream, process::ExitStatusExt},
@@ -15,7 +17,8 @@ use std::{
 
 const POLLIN: i16 = 0x001;
 const POLLOUT: i16 = 0x004;
-const POLL_ERROR: i16 = 0x008 | 0x010 | 0x020; // ERR, HUP, NVAL
+const POLL_ERROR: i16 = 0x008 | 0x020; // ERR, NVAL
+const POLLHUP: i16 = 0x010;
 const POLLRDHUP: i16 = 0x2000;
 
 #[repr(C)]
@@ -73,8 +76,12 @@ impl Buffer {
         }
     }
 
-    fn events(&self, outgoing: &Self) -> i16 {
-        (if self.empty() { POLLIN } else { 0 }) | (if outgoing.empty() { 0 } else { POLLOUT })
+    fn events(&self, incoming_closed: bool, outgoing: &Self) -> i16 {
+        (if !incoming_closed && self.empty() {
+            POLLIN
+        } else {
+            0
+        }) | (if outgoing.empty() { 0 } else { POLLOUT })
     }
 }
 
@@ -85,28 +92,34 @@ fn retry(error: &io::Error) -> bool {
     )
 }
 
-fn forward(mut client: TcpStream) -> io::Result<()> {
-    let mut proxy = UnixStream::connect("/run/argentic-proxy.sock")?;
+fn forward(client: TcpStream) -> io::Result<()> {
+    let proxy = UnixStream::connect("/run/argentic-proxy.sock")?;
+    relay(client, proxy)
+}
+
+fn relay(mut client: TcpStream, mut proxy: UnixStream) -> io::Result<()> {
     client.set_nonblocking(true)?;
     proxy.set_nonblocking(true)?;
     let mut upload = Buffer::new();
     let mut download = Buffer::new();
-    let mut proxy_closed = false;
-    loop {
-        let proxy_events = download.events(&upload);
+    let mut client_eof = false;
+    let mut proxy_eof = false;
+    let mut proxy_replied = false;
+    while !client_eof || !proxy_eof {
+        // CONNECT sends its response before forwarding tunnel data. While
+        // waiting for the first response, the proxy may stop reading for an
+        // approval. Watch for FIN even when upload backpressure stops reads.
+        let watch_disconnect = !proxy_replied && !client_eof && !upload.empty();
+        let proxy_events = download.events(proxy_eof, &upload);
         let mut fds = [
             PollFd {
                 fd: client.as_raw_fd(),
-                events: POLLRDHUP
-                    | if proxy_closed {
-                        upload.events(&download) & POLLOUT
-                    } else {
-                        upload.events(&download)
-                    },
+                events: upload.events(client_eof, &download)
+                    | if watch_disconnect { POLLRDHUP } else { 0 },
                 ready: 0,
             },
             PollFd {
-                fd: if proxy_events == 0 {
+                fd: if proxy_events == 0 && !proxy_eof {
                     -1
                 } else {
                     proxy.as_raw_fd()
@@ -124,31 +137,40 @@ fn forward(mut client: TcpStream) -> io::Result<()> {
             return Err(error);
         }
         let [client_fd, proxy_fd] = fds;
-        // Disconnects cancel pending proxy authorization even with a full
-        // upload buffer. Close both sides to wake the host immediately.
-        if client_fd.ready & (POLLRDHUP | POLL_ERROR) != 0 {
+        if client_fd.ready & (POLLHUP | POLL_ERROR) != 0 || proxy_fd.ready & POLL_ERROR != 0 {
             return Ok(());
         }
         if client_fd.ready & POLLOUT != 0 {
             download.write(&mut client)?;
         }
-        if proxy_fd.ready & POLL_ERROR != 0 {
-            proxy_closed = true;
+        if proxy_fd.ready & POLLHUP != 0 {
+            // The proxy closed both directions. Drain its buffered reply.
+            client_eof = true;
             upload.start = upload.end;
-        }
-        if !proxy_closed && proxy_fd.ready & POLLOUT != 0 {
+        } else if proxy_fd.ready & POLLOUT != 0 {
             upload.write(&mut proxy)?;
         }
-        if !proxy_closed && client_fd.ready & POLLIN != 0 && !upload.read(&mut client)? {
-            return Ok(());
+        if !client_eof && client_fd.ready & POLLIN != 0 && !upload.read(&mut client)? {
+            proxy.shutdown(Shutdown::Write)?;
+            client_eof = true;
         }
-        if proxy_fd.ready & (POLLIN | POLL_ERROR) != 0
-            && download.empty()
-            && !download.read(&mut proxy)?
+        if !proxy_eof && proxy_fd.ready & (POLLIN | POLLHUP) != 0 && download.empty() {
+            if download.read(&mut proxy)? {
+                proxy_replied |= !download.empty();
+            } else {
+                client.shutdown(Shutdown::Write)?;
+                proxy_eof = true;
+            }
+        }
+        if !proxy_replied
+            && client_fd.ready & POLLRDHUP != 0
+            && proxy_fd.ready & POLLOUT == 0
+            && !upload.empty()
         {
             return Ok(());
         }
     }
+    Ok(())
 }
 
 fn wait_for_shell(shell_pid: u32) -> io::Result<ExitStatus> {
@@ -196,4 +218,80 @@ fn main() -> io::Result<()> {
             .code()
             .unwrap_or_else(|| 128 + status.signal().unwrap_or(0)),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn relay_notifies_proxy_of_disconnect_while_upload_is_blocked() -> io::Result<()> {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+        let mut shell = TcpStream::connect(listener.local_addr()?)?;
+        let (client, _) = listener.accept()?;
+        let (mut proxy, host) = UnixStream::pair()?;
+        proxy.set_nonblocking(true)?;
+        loop {
+            match proxy.write(&[0; 16384]) {
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) => return Err(error),
+            }
+        }
+        let relay = thread::spawn(move || relay(client, proxy));
+
+        shell.write_all(b"partial request body")?;
+        drop(shell);
+        // The host is waiting for approval, so it does not drain this socket.
+        let mut host_fd = PollFd {
+            fd: host.as_raw_fd(),
+            events: POLLRDHUP,
+            ready: 0,
+        };
+        // The descriptor stays open and poll may write to host_fd.
+        let ready = unsafe { poll(&mut host_fd, 1, 2000) };
+        drop(host);
+        relay
+            .join()
+            .map_err(|_| io::Error::other("relay panicked"))??;
+        assert_eq!(ready, 1, "proxy did not learn of the client disconnect");
+        assert_ne!(host_fd.ready & POLLRDHUP, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn relay_drains_after_client_half_closes() -> io::Result<()> {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+        let mut shell = TcpStream::connect(listener.local_addr()?)?;
+        let (client, _) = listener.accept()?;
+        let (proxy, mut host) = UnixStream::pair()?;
+        let timeout = Some(Duration::from_secs(5));
+        shell.set_read_timeout(timeout)?;
+        host.set_read_timeout(timeout)?;
+        let relay = thread::spawn(move || relay(client, proxy));
+
+        host.write_all(b"connected")?;
+        let mut connected = [0; 9];
+        shell.read_exact(&mut connected)?;
+        assert_eq!(&connected, b"connected");
+
+        // Send more than fits in the relay buffer before the host drains it.
+        let sent = vec![b'x'; 512 * 1024];
+        shell.set_write_timeout(timeout)?;
+        shell.write_all(&sent)?;
+        shell.shutdown(Shutdown::Write)?;
+        let mut request = Vec::new();
+        host.read_to_end(&mut request)?;
+        assert_eq!(request, sent);
+
+        host.write_all(b"response")?;
+        host.shutdown(Shutdown::Write)?;
+        let mut response = Vec::new();
+        shell.read_to_end(&mut response)?;
+        assert_eq!(response, b"response");
+        relay
+            .join()
+            .map_err(|_| io::Error::other("relay panicked"))?
+    }
 }

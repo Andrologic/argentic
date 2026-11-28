@@ -29,9 +29,9 @@ use crate::{
     providers::{
         contains_credential, credential::TextScreen, Chunk, DeliveryProgress, DeliveryStatus,
         Finish, Message, ModelName, Provider, ProviderError, Request, ToolCall, ToolChoice,
-        ToolDefinition, Usage,
+        ToolDefinition, Usage, MIN_SCREENED_CREDENTIAL_BYTES,
     },
-    tools::{Registry, SUBMIT_RESULT},
+    tools::{Registry, ToolOutput, SUBMIT_RESULT},
 };
 
 pub struct Work {
@@ -351,7 +351,8 @@ impl Harness {
             tokens,
             ..Budget::default()
         }));
-        self.run_with_budget(work, port, steer, parent, budget, turns)
+        let output = ToolOutput::for_work(self.provider_credential.as_deref());
+        self.run_with_budget(work, port, steer, parent, (budget, output), turns)
             .await
     }
 
@@ -361,7 +362,7 @@ impl Harness {
         port: &'a dyn WorkPort,
         steer: mpsc::Receiver<Steer>,
         parent: CancellationToken,
-        budget: Arc<Mutex<Budget>>,
+        (budget, output): (Arc<Mutex<Budget>>, ToolOutput),
         turn_limit: u32,
     ) -> futures::future::BoxFuture<'a, RunReport> {
         Box::pin(async move {
@@ -393,6 +394,7 @@ impl Harness {
                 plan_locked: self.plan.locked(),
                 plan_context: None,
                 budget,
+                output,
                 turn_limit,
             };
             let grace = Duration::from_millis(u64::from(self.settings.limit("cancelGraceMs")));
@@ -446,7 +448,10 @@ impl Harness {
             while instance.steer.try_recv().is_ok() {}
             tracker.close();
             tracker.wait().await;
-            if matches!(outcome, Err(Failure::Cancelled)) {
+            // Once a tool result is recorded, keep its batch paired in history.
+            if matches!(outcome, Err(Failure::Cancelled))
+                || work.messages.len() > instance.history_end + 1
+            {
                 instance.finish_interrupted_history(&mut work.messages);
             } else {
                 work.messages.truncate(instance.history_end);
@@ -471,6 +476,7 @@ struct Budget {
     reviews: u32,
     review_turn: u32,
     reviews_this_turn: u32,
+    review_overrun: bool,
 }
 
 impl Budget {
@@ -503,7 +509,8 @@ impl ReviewBudget {
     pub fn reserve(&self, prompt_tokens: u64, max_output: u32) -> Option<ReviewReservation> {
         let mut budget = self.shared.lock().ok()?;
         let tokens = prompt_tokens.saturating_add(u64::from(max_output));
-        if self.turn < budget.review_turn
+        if budget.review_overrun
+            || self.turn < budget.review_turn
             || budget.reviews >= MAX_REVIEWS_PER_WORK
             || budget.tokens.is_some_and(|remaining| remaining < tokens)
         {
@@ -547,6 +554,7 @@ impl ReviewReservation {
             return false;
         };
         let actual = usage.prompt_tokens.saturating_add(usage.completion_tokens);
+        budget.review_overrun |= actual.saturating_sub(self.tokens) > remaining;
         budget.tokens = Some(if actual <= self.tokens {
             remaining.saturating_add(self.tokens - actual)
         } else {
@@ -600,6 +608,7 @@ struct Instance<'a> {
     plan_locked: bool,
     plan_context: Option<String>,
     budget: Arc<Mutex<Budget>>,
+    output: ToolOutput,
     turn_limit: u32,
 }
 
@@ -741,6 +750,7 @@ impl Instance<'_> {
                         validation.as_ref().err().map(String::as_str),
                     )
                     .await?;
+                self.check_review_budget()?;
                 let invalid = matches!(decision, Decision::CorrectSubmission(_));
                 match self.apply(decision, work.max_corrections)? {
                     None => {
@@ -833,6 +843,13 @@ impl Instance<'_> {
         self.budget
             .lock()
             .map_err(|_| Failure::Port("Work budget unavailable".into()))
+    }
+
+    fn check_review_budget(&self) -> Result<(), Failure> {
+        if self.budget()?.review_overrun {
+            return Err(Failure::TokenLimit);
+        }
+        Ok(())
     }
 
     fn account(&self, charge: Result<u64, Failure>) -> Result<Option<u64>, Failure> {
@@ -967,6 +984,12 @@ impl Instance<'_> {
                     reasoning.push_str(&part);
                 }
                 Chunk::ToolCall(mut call) => {
+                    if credential.is_some_and(|key| {
+                        key.len() >= MIN_SCREENED_CREDENTIAL_BYTES
+                            && (call.id.contains(key) || call.name.contains(key))
+                    }) {
+                        return Err(credential_in_response());
+                    }
                     if credential.is_some_and(|key| contains_credential(&call.arguments, key)) {
                         refused.insert(call.id.clone());
                         // Invalid JSON asks the Host's submission controller for its normal
@@ -1063,6 +1086,7 @@ impl Instance<'_> {
         let parallelism = self.harness.settings.limit("maxParallelReads") as usize;
         let mut pending = calls;
         while !pending.is_empty() {
+            self.check_review_budget()?;
             if refused.contains(&pending[0].id) {
                 self.publish_tool(
                     turn,
@@ -1125,7 +1149,7 @@ impl Instance<'_> {
                             call,
                             self.cancel.child_token(),
                             self.tracker,
-                            self.harness.provider_credential.as_deref(),
+                            &self.output,
                         )
                     })
                     .buffered(batch.len())
@@ -1134,24 +1158,26 @@ impl Instance<'_> {
             };
             self.active()?;
             for (call, output) in batch.iter().zip(outputs) {
-                let content = match output {
-                    Ok(mut page) => {
-                        let encoded = serde_json::to_string(&page)
-                            .map_err(|e| Failure::Port(e.to_string()))?;
-                        if let Some(file) = page.overflow.take() {
-                            self.artifacts.push(Artifact {
-                                turn,
-                                call_id: call.id.clone(),
-                                file,
-                            });
-                        }
-                        encoded
+                let content = match output.and_then(|mut page| {
+                    if let Some(overflow) = page.overflow.take() {
+                        let file = self.output.accept(overflow).map_err(|e| e.to_string())?;
+                        self.artifacts.push(Artifact {
+                            turn,
+                            call_id: call.id.clone(),
+                            file,
+                        });
+                    }
+                    Ok(page)
+                }) {
+                    Ok(page) => {
+                        serde_json::to_string(&page).map_err(|e| Failure::Port(e.to_string()))?
                     }
                     Err(error) => json!({"error":error}).to_string(),
                 };
                 self.publish_tool(turn, call, &content, &mut work.messages)
                     .await?;
             }
+            self.check_review_budget()?;
         }
         Ok(None)
     }
@@ -1184,10 +1210,12 @@ impl Instance<'_> {
 
     async fn before(&self, turn: u32, call: &ToolCall) -> Result<(), Failure> {
         self.active()?;
+        self.check_review_budget()?;
         for hook in &self.harness.hooks {
             hook.before_tool_call(turn, call, self.cancel).await?;
         }
-        self.active()
+        self.active()?;
+        self.check_review_budget()
     }
 
     async fn publish_tool(

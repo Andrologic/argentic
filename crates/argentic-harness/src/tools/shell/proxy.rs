@@ -27,6 +27,7 @@ use hyper_util::rt::{TokioIo, TokioTimer};
 use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
+    future::Future,
     io::{self, Read},
     net::{IpAddr, SocketAddr},
     os::fd::AsFd,
@@ -235,9 +236,8 @@ async fn accept(listener: Listener, context: Arc<Egress>) {
                         };
                         let base = context.clock.base_after(MAX_CONNECTION_TIME);
                         tokio::select! {
-                            _ = disconnected(fd) => {},
                             _ = context.clock.expire(base) => {},
-                            _ = serve(client, context.clone()) => {},
+                            _ = serve(client, context.clone(), disconnected(fd)) => {},
                         }
                     });
                 }
@@ -266,7 +266,11 @@ enum Tunnel {
     Intercept(Target),
 }
 
-async fn serve(client: impl AsyncRead + AsyncWrite + Unpin + Send + 'static, context: Arc<Egress>) {
+async fn serve(
+    client: impl AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    context: Arc<Egress>,
+    disconnect: impl Future<Output = ()> + Send,
+) {
     let lifetime = context.cancel.child_token();
     let _on_exit = lifetime.clone().drop_guard();
     let (tunnel, mut tunnel_rx) = mpsc::channel(1);
@@ -283,19 +287,25 @@ async fn serve(client: impl AsyncRead + AsyncWrite + Unpin + Send + 'static, con
             )
         }
     });
-    let _ = hyper::server::conn::http1::Builder::new()
+    let http = hyper::server::conn::http1::Builder::new()
         .keep_alive(false)
         .max_buf_size(MAX_HEADER_BYTES)
         .timer(TokioTimer::new())
         .header_read_timeout(Duration::from_secs(5))
         .serve_connection(TokioIo::new(client), service)
-        .with_upgrades()
-        .await;
+        .with_upgrades();
+    tokio::pin!(disconnect);
+    tokio::select! {
+        biased;
+        _ = http => {},
+        _ = &mut disconnect => return,
+    }
     if let Ok((upgrade, tunnel)) = tunnel_rx.try_recv() {
         let Ok(client) = upgrade.await else { return };
         let mut client = TokioIo::new(client);
         match tunnel {
             Tunnel::Opaque(target, mut dialed) => {
+                // copy_bidirectional propagates EOF while keeping the return stream open.
                 let copy = tokio::io::copy_bidirectional(&mut client, &mut dialed.stream);
                 tokio::pin!(copy);
                 // The dial checked live policy. Only consume subsequent refreshes.
@@ -324,28 +334,34 @@ async fn serve(client: impl AsyncRead + AsyncWrite + Unpin + Send + 'static, con
                 }
             }
             Tunnel::Intercept(target) => {
-                let Some(tls) = &context.tls else { return };
-                let Ok(Ok(client)) =
-                    tokio::time::timeout(MAX_DIAL_TIME, tls.accept(client, &target.host)).await
-                else {
-                    return;
+                let intercept = async {
+                    let Some(tls) = &context.tls else { return };
+                    let Ok(Ok(client)) =
+                        tokio::time::timeout(MAX_DIAL_TIME, tls.accept(client, &target.host)).await
+                    else {
+                        return;
+                    };
+                    let service = service_fn(|request| {
+                        let (context, lifetime) = (context.clone(), lifetime.clone());
+                        let target = &target;
+                        async move {
+                            let outcome = context.forward_tls(request, target, &lifetime).await;
+                            Ok::<_, std::convert::Infallible>(
+                                outcome.unwrap_or_else(|(status, error)| message(status, error)),
+                            )
+                        }
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .max_buf_size(MAX_HEADER_BYTES)
+                        .timer(TokioTimer::new())
+                        .header_read_timeout(Duration::from_secs(5))
+                        .serve_connection(TokioIo::new(client), service)
+                        .await;
                 };
-                let service = service_fn(|request| {
-                    let (context, lifetime) = (context.clone(), lifetime.clone());
-                    let target = &target;
-                    async move {
-                        let outcome = context.forward_tls(request, target, &lifetime).await;
-                        Ok::<_, std::convert::Infallible>(
-                            outcome.unwrap_or_else(|(status, error)| message(status, error)),
-                        )
-                    }
-                });
-                let _ = hyper::server::conn::http1::Builder::new()
-                    .max_buf_size(MAX_HEADER_BYTES)
-                    .timer(TokioTimer::new())
-                    .header_read_timeout(Duration::from_secs(5))
-                    .serve_connection(TokioIo::new(client), service)
-                    .await;
+                tokio::select! {
+                    _ = intercept => {},
+                    _ = disconnect => {},
+                }
             }
         }
     }
@@ -1015,7 +1031,7 @@ mod tests {
 
     async fn connect(context: Arc<Egress>, addr: SocketAddr) -> (tokio::io::DuplexStream, String) {
         let (mut client, proxy) = tokio::io::duplex(4096);
-        tokio::spawn(serve(proxy, context));
+        tokio::spawn(serve(proxy, context, std::future::pending()));
         client
             .write_all(
                 format!("CONNECT {addr} HTTP/1.1\r\nProxy-Authorization: Basic fixture\r\n\r\n")
@@ -1046,6 +1062,60 @@ mod tests {
         let (_, header) = connect(context, addr).await;
         assert_eq!(live.asks.load(Ordering::Relaxed), 1);
         assert!(header.starts_with("HTTP/1.1 403"), "{header}");
+    }
+
+    #[tokio::test]
+    async fn opaque_tunnel_drains_after_client_half_closes() {
+        let root = tempfile::tempdir().unwrap();
+        let (context, _) = fixture(root.path(), Effect::Allow);
+        let _stop = context.cancel.clone().drop_guard();
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = upstream.local_addr().unwrap();
+        #[cfg(target_os = "linux")]
+        let (listener, mut client) = {
+            let path = root.path().join("proxy");
+            let listener = Listener::bind(&path).unwrap();
+            let client = tokio::net::UnixStream::connect(path).await.unwrap();
+            (listener, client)
+        };
+        #[cfg(target_os = "macos")]
+        let (listener, mut client) = {
+            let listener = Listener::bind("127.0.0.1:0").await.unwrap();
+            let client = TcpStream::connect(listener.local_addr().unwrap())
+                .await
+                .unwrap();
+            (listener, client)
+        };
+        tokio::spawn(accept(listener, context));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            client
+                .write_all(
+                    format!(
+                        "CONNECT {addr} HTTP/1.1\r\nProxy-Authorization: Basic fixture\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            let mut header = Vec::new();
+            while !header.ends_with(b"\r\n\r\n") {
+                header.push(client.read_u8().await.unwrap());
+            }
+            assert!(header.starts_with(b"HTTP/1.1 200"));
+            let (mut remote, _) = upstream.accept().await.unwrap();
+            client.write_all(b"request").await.unwrap();
+            client.shutdown().await.unwrap();
+            let mut request = Vec::new();
+            remote.read_to_end(&mut request).await.unwrap();
+            assert_eq!(request, b"request");
+            remote.write_all(b"response").await.unwrap();
+            remote.shutdown().await.unwrap();
+            let mut response = Vec::new();
+            client.read_to_end(&mut response).await.unwrap();
+            assert_eq!(response, b"response");
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]

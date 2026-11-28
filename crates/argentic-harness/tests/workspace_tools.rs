@@ -186,6 +186,28 @@ fn bash_subcommands_use_syntax_and_original_text() {
 }
 
 #[tokio::test]
+async fn patch_finds_footer_after_repeated_context() {
+    let dir = tempfile::tempdir().unwrap();
+    let registry = Arc::new(registry(dir.path(), Some(Preset::Workspace), &[]));
+    let line = "x".repeat(150);
+    let context = format!("{line}\n").repeat(10);
+    let body = context.repeat(4_800);
+    let path = dir.path().join("export.txt");
+    fs::write(&path, format!("{body}{context}old footer\n")).unwrap();
+    let patch = format!(
+        "*** Begin Patch\n*** Update File: export.txt\n@@\n{}-old footer\n+new footer\n*** End Patch\n",
+        format!(" {line}\n").repeat(10)
+    );
+    call(&registry, "apply_patch", json!({"patch_text":patch}))
+        .await
+        .unwrap();
+    assert_eq!(
+        fs::read_to_string(path).unwrap(),
+        format!("{body}{context}new footer\n")
+    );
+}
+
+#[tokio::test]
 async fn opaque_shell_commands_use_the_strictest_shell_rule() {
     let dir = tempfile::tempdir().unwrap();
     let commands = [
@@ -381,6 +403,32 @@ fn sandbox_present() -> bool {
     }
     argentic_harness::tools::shell_preflight().unwrap();
     true
+}
+
+#[cfg(any(
+    all(
+        target_os = "linux",
+        any(target_arch = "aarch64", target_arch = "x86_64")
+    ),
+    all(target_os = "macos", target_arch = "aarch64")
+))]
+#[tokio::test]
+async fn shell_cleans_restrictive_staging_directories_after_failure() {
+    if !sandbox_present() {
+        return;
+    }
+    let workspace = tempfile::tempdir().unwrap();
+    let staging = tempfile::tempdir().unwrap();
+    let registry = Arc::new(
+        registry(workspace.path(), Some(Preset::Workspace), &[])
+            .with_shell()
+            .with_shell_staging_directory(staging.path().canonicalize().unwrap()),
+    );
+    let result = call(&registry, "shell", json!({
+        "command": "mkdir -p nested/private; touch nested/private/file; chmod 000 nested/private; exit 1"
+    })).await;
+    assert!(result.is_err());
+    assert_eq!(fs::read_dir(staging.path()).unwrap().count(), 0);
 }
 
 #[cfg(all(
