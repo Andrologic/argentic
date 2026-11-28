@@ -176,12 +176,6 @@ impl Replay {
                 if name.contains(key) {
                     return false;
                 }
-                if arguments.is_some()
-                    && matches!(name.as_str(), "id" | "call_id" | "name")
-                    && value.is_string()
-                {
-                    continue;
-                }
                 if Some(name.as_str()) == arguments {
                     if name == "input" && value_contains_credential(value, key) {
                         *value = serde_json::json!({});

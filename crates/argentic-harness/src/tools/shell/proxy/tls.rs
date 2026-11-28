@@ -225,7 +225,7 @@ mod tests {
             stream.shutdown().await.unwrap();
         });
         let (mut client, server) = duplex(8192);
-        let proxy = tokio::spawn(super::super::serve(server, context));
+        let proxy = tokio::spawn(super::super::serve(server, context, std::future::pending()));
         client
             .write_all(
                 format!("CONNECT {address} HTTP/1.1\r\nProxy-Authorization: Basic test\r\n\r\n")

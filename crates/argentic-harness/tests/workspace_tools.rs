@@ -383,6 +383,32 @@ fn sandbox_present() -> bool {
     true
 }
 
+#[cfg(any(
+    all(
+        target_os = "linux",
+        any(target_arch = "aarch64", target_arch = "x86_64")
+    ),
+    all(target_os = "macos", target_arch = "aarch64")
+))]
+#[tokio::test]
+async fn shell_cleans_restrictive_staging_directories_after_failure() {
+    if !sandbox_present() {
+        return;
+    }
+    let workspace = tempfile::tempdir().unwrap();
+    let staging = tempfile::tempdir().unwrap();
+    let registry = Arc::new(
+        registry(workspace.path(), Some(Preset::Workspace), &[])
+            .with_shell()
+            .with_shell_staging_directory(staging.path().canonicalize().unwrap()),
+    );
+    let result = call(&registry, "shell", json!({
+        "command": "mkdir -p nested/private; touch nested/private/file; chmod 000 nested/private; exit 1"
+    })).await;
+    assert!(result.is_err());
+    assert_eq!(fs::read_dir(staging.path()).unwrap().count(), 0);
+}
+
 #[cfg(all(
     target_os = "linux",
     any(target_arch = "aarch64", target_arch = "x86_64")

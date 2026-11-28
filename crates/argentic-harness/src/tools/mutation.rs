@@ -2,6 +2,7 @@ use super::{
     check_cancel, confined, denied, file_text, model_path,
     patch::{
         apply_patch_hunks_to_content, join_text_lines, parse_apply_patch, ParsedPatchOperation,
+        MAX_CONTEXT_SEARCH,
     },
     private_project_path, Root, MAX_FILE_BYTES,
 };
@@ -200,6 +201,7 @@ impl Mutation {
             }
             Self::Patch(ops) => {
                 let mut total = 0usize;
+                let mut remaining = MAX_CONTEXT_SEARCH;
                 for op in ops {
                     check_cancel(cancel)?;
                     let target =
@@ -221,9 +223,14 @@ impl Mutation {
                             move_to,
                         } => {
                             let text = target.read(root, cancel)?;
-                            let updated =
-                                apply_patch_hunks_to_content(&path, &text, &hunks, cancel)
-                                    .map_err(io::Error::other)?;
+                            let updated = apply_patch_hunks_to_content(
+                                &path,
+                                &text,
+                                &hunks,
+                                &mut remaining,
+                                cancel,
+                            )
+                            .map_err(io::Error::other)?;
                             total = total.saturating_add(updated.len());
                             check_size(total)?;
                             if let Some(destination) = move_to {

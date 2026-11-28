@@ -10,8 +10,8 @@ use argentic_harness::{
         Chunk, Finish, Message, Provider, ProviderError, ProviderStream, Request, ScriptedProvider,
         ToolCall, ToolChoice, Usage,
     },
-    r#loop::{Event, Failure, Harness, Hook, Steer, Work, WorkPort},
-    tools::Registry,
+    r#loop::{Event, Failure, Harness, Hook, ReviewBudget, Steer, Work, WorkPort},
+    tools::{Approval, Authorizer, Registry},
 };
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -854,34 +854,130 @@ async fn text_only_submission_gets_a_tool_call_correction() {
 }
 
 #[tokio::test]
-async fn short_keys_and_tool_metadata_do_not_trigger_screening() {
-    for key in ["42", "agsdl_submit_result"] {
-        let work = work(true);
-        let replay = serde_json::from_value(json!({
-            "format": "Responses",
-            "model": work.model,
-            "items": [{"type":"function_call","id":key,"call_id":key,
-                       "name":"agsdl_submit_result","arguments":"{\"results\":{\"answer\":42}}"}]
-        }))
-        .unwrap();
+async fn short_keys_do_not_trigger_screening() {
+    let key = "42";
+    let work = work(true);
+    let replay = serde_json::from_value(json!({
+        "format": "Responses",
+        "model": work.model,
+        "items": [{"type":"function_call","id":key,"call_id":key,
+                   "name":"agsdl_submit_result","arguments":"{\"results\":{\"answer\":42}}"}]
+    }))
+    .unwrap();
+    let (_dir, harness) = fixture(
+        vec![vec![
+            submit(key, json!({"answer":42})),
+            Chunk::Replay(replay),
+            end(Finish::ToolCalls),
+        ]],
+        json!({}),
+    );
+    let (_, steer) = mpsc::channel(1);
+    let report = harness
+        .with_provider_credential(Some(key.into()))
+        .run(work, &(), steer, CancellationToken::new())
+        .await;
+    assert_eq!(
+        report.outcome.unwrap().submission,
+        Some(json!({"results":{"answer":42}}))
+    );
+}
+
+#[tokio::test]
+async fn credential_in_tool_metadata_rejects_the_entire_batch() {
+    const KEY: &str = "provider-fixture-key";
+    for (id, name) in [(KEY, "read"), ("second", KEY)] {
         let (_dir, harness) = fixture(
             vec![vec![
-                submit(key, json!({"answer":42})),
-                Chunk::Replay(replay),
+                call("first", "read", json!({"path":"notes.txt"})),
+                call(id, name, json!({"path":"notes.txt"})),
                 end(Finish::ToolCalls),
             ]],
             json!({}),
         );
+        let trace = Trace::default();
         let (_, steer) = mpsc::channel(1);
         let report = harness
-            .with_provider_credential(Some(key.into()))
-            .run(work, &(), steer, CancellationToken::new())
+            .with_provider_credential(Some(KEY.into()))
+            .run(work(false), &trace, steer, CancellationToken::new())
             .await;
-        assert_eq!(
-            report.outcome.unwrap().submission,
-            Some(json!({"results":{"answer":42}}))
-        );
+        assert!(matches!(
+            report.outcome,
+            Err(Failure::Provider(ProviderError::Invalid(_)))
+        ));
+        assert!(trace.0.lock().unwrap().is_empty());
+        assert!(!serde_json::to_string(&report.messages)
+            .unwrap()
+            .contains(KEY));
     }
+}
+
+#[tokio::test]
+async fn credential_in_native_tool_item_id_rejects_the_reply() {
+    const KEY: &str = "provider-fixture-key";
+    let work = work(true);
+    let replay = serde_json::from_value(json!({
+        "format": "Responses",
+        "model": work.model,
+        "items": [{"type":"function_call","id":KEY,"call_id":"safe",
+                   "name":"agsdl_submit_result","arguments":"{\"results\":{\"answer\":42}}"}]
+    }))
+    .unwrap();
+    let (_dir, harness) = fixture(
+        vec![vec![
+            submit("safe", json!({"answer":42})),
+            Chunk::Replay(replay),
+            end(Finish::ToolCalls),
+        ]],
+        json!({}),
+    );
+    let trace = Trace::default();
+    let (_, steer) = mpsc::channel(1);
+    let report = harness
+        .with_provider_credential(Some(KEY.into()))
+        .run(work, &trace, steer, CancellationToken::new())
+        .await;
+    assert!(matches!(
+        report.outcome,
+        Err(Failure::Provider(ProviderError::Invalid(_)))
+    ));
+    assert!(trace.0.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn tool_artifacts_share_a_per_work_byte_limit() {
+    let reads = (0..11).map(|index| {
+        call(
+            &format!("read-{index}"),
+            "read",
+            json!({"path":"notes.txt","limit":1}),
+        )
+    });
+    let (dir, harness) = fixture(
+        vec![
+            reads.chain([end(Finish::ToolCalls)]).collect(),
+            vec![end(Finish::Stop)],
+        ],
+        json!({"maxParallelReads":4}),
+    );
+    std::fs::write(dir.path().join("notes.txt"), "x\n".repeat(4 * 1024 * 1024)).unwrap();
+    let trace = Trace::default();
+    let (_, steer) = mpsc::channel(1);
+    let report = harness
+        .run(work(false), &trace, steer, CancellationToken::new())
+        .await;
+    assert!(report.outcome.is_ok());
+    assert_eq!(report.artifacts.len(), 8);
+    assert_eq!(
+        trace
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| event.contains("Artifact byte budget exceeded"))
+            .count(),
+        3,
+    );
 }
 
 #[tokio::test]
@@ -1078,7 +1174,7 @@ fn delegation_fixture(turns: Vec<Vec<Chunk>>, limits: Value) -> (tempfile::TempD
     let policy = ReadPolicy::compile_rules(
         &root,
         None,
-        Some(Preset::ReadOnly),
+        Some(Preset::Workspace),
         None,
         &[Rule {
             action: Action::Delegate,
@@ -1087,7 +1183,9 @@ fn delegation_fixture(turns: Vec<Vec<Chunk>>, limits: Value) -> (tempfile::TempD
         }],
     )
     .unwrap();
-    let registry = Registry::new(&[root], policy, json!(true)).unwrap();
+    let registry = Registry::new(&[root], policy, json!(true))
+        .unwrap()
+        .with_writes();
     let settings = Settings::resolve(&json!({}), &json!({}), &limits).unwrap();
     let harness =
         Harness::new(Arc::new(scripted(turns)), Arc::new(registry), settings).with_delegation();
@@ -1116,6 +1214,129 @@ async fn child_budget_exhaustion_stops_the_parent_tool_batch() {
         assert!(matches!(report.outcome, Err(Failure::TokenLimit)));
         assert!(trace.0.lock().unwrap().is_empty());
     }
+}
+
+#[derive(Default)]
+struct FixtureReview(Mutex<Option<ReviewBudget>>);
+
+#[async_trait]
+impl Hook for FixtureReview {
+    fn begin_tool_batch(&self, budget: &ReviewBudget) {
+        *self.0.lock().unwrap() = Some(budget.clone());
+    }
+}
+
+#[async_trait]
+impl Authorizer for FixtureReview {
+    async fn approve(
+        &self,
+        _: &ToolCall,
+        action: Approval<'_>,
+        _: &CancellationToken,
+    ) -> Result<bool, String> {
+        assert!(matches!(action, Approval::Delegate));
+        let budget = self.0.lock().unwrap().clone().unwrap();
+        Ok(budget.reserve(5, 5).unwrap().settle(Some(Usage {
+            prompt_tokens: 45,
+            completion_tokens: 5,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+        })))
+    }
+}
+
+#[tokio::test]
+async fn review_total_overrun_stops_the_batch_after_a_refusal() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let policy = ReadPolicy::compile_rules(
+        &root,
+        None,
+        Some(Preset::ReadOnly),
+        None,
+        &[Rule {
+            action: Action::Delegate,
+            pattern: None,
+            effect: Effect::Ask,
+        }],
+    )
+    .unwrap();
+    let review = Arc::new(FixtureReview::default());
+    let registry = Arc::new(
+        Registry::new(&[root], policy, json!(true))
+            .unwrap()
+            .with_authorizer(review.clone()),
+    );
+    for (limit, exceeded) in [(60, true), (65, false)] {
+        let harness = Harness::new(
+            Arc::new(scripted(vec![vec![
+                call("reviewed", "delegate", json!({"task":"Inspect a fixture"})),
+                submit("submit", json!({"answer":42})),
+                end(Finish::ToolCalls),
+            ]])),
+            registry.clone(),
+            Settings::resolve(&json!({}), &json!({}), &json!({"maxTotalTokens":limit})).unwrap(),
+        )
+        .with_delegation()
+        .with_hook(review.clone());
+        let trace = Trace::default();
+        let (_, steer) = mpsc::channel(1);
+        let report = harness
+            .run(work(true), &trace, steer, CancellationToken::new())
+            .await;
+        if exceeded {
+            assert!(matches!(report.outcome, Err(Failure::TokenLimit)));
+        } else {
+            assert!(report.outcome.unwrap().submission.is_some());
+        }
+        assert_eq!(
+            trace
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|entry| entry.starts_with("submit ")),
+            !exceeded,
+        );
+    }
+}
+
+#[tokio::test]
+async fn failed_batch_retains_completed_tool_results() {
+    let (dir, harness) = delegation_fixture(
+        vec![
+            vec![
+                call(
+                    "first",
+                    "write",
+                    json!({"path":"notes.txt","content":"fixture contents"}),
+                ),
+                call("child", "delegate", json!({"task":"Inspect the workspace"})),
+                submit("submit", json!({"answer":42})),
+                end(Finish::ToolCalls),
+            ],
+            vec![Chunk::Text("Child reply".into()), end(Finish::Stop)],
+        ],
+        json!({"maxTotalTokens":30}),
+    );
+    let (_, steer) = mpsc::channel(1);
+    let report = harness
+        .run(work(true), &(), steer, CancellationToken::new())
+        .await;
+    assert!(matches!(report.outcome, Err(Failure::TokenLimit)));
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("notes.txt")).unwrap(),
+        "fixture contents"
+    );
+    assert!(matches!(
+        &report.messages[1..],
+        [Message::Assistant { calls, .. }, Message::Tool { call_id, content },
+         Message::Tool { call_id: child, content: child_result },
+         Message::Tool { call_id: submit, content: submit_result }]
+        if calls.len() == 3 && call_id == "first" && content.contains("Applied 1 file change")
+            && child == "child" && submit == "submit"
+            && child_result.contains("before a tool result") && submit_result.contains("before a tool result")
+    ));
 }
 
 #[tokio::test]

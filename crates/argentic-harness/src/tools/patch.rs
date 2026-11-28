@@ -181,10 +181,14 @@ pub(crate) fn join_text_lines(lines: &[String], trailing_newline: bool) -> Strin
     joined
 }
 
+// Bound byte and line comparisons across all hunks of a patch.
+pub(super) const MAX_CONTEXT_SEARCH: usize = 64 * 1024 * 1024;
+
 fn find_line_sequence(
     lines: &[(&str, &str)],
     needle: &[&str],
     start_index: usize,
+    remaining: &mut usize,
     cancel: &CancellationToken,
 ) -> Result<Option<usize>, String> {
     if needle.is_empty() {
@@ -196,11 +200,22 @@ fn find_line_sequence(
 
     for candidate_start in start_index..=lines.len().saturating_sub(needle.len()) {
         super::check_cancel(cancel).map_err(|error| error.to_string())?;
-        if lines[candidate_start..candidate_start + needle.len()]
-            .iter()
-            .map(|(text, _)| *text)
-            .eq(needle.iter().copied())
-        {
+        let mut matches = true;
+        for ((text, _), expected) in lines[candidate_start..].iter().zip(needle) {
+            let cost = if text.len() == expected.len() {
+                text.len().max(1)
+            } else {
+                1
+            };
+            *remaining = remaining
+                .checked_sub(cost)
+                .ok_or("Patch context search budget exceeded")?;
+            if text != expected {
+                matches = false;
+                break;
+            }
+        }
+        if matches {
             return Ok(Some(candidate_start));
         }
     }
@@ -211,6 +226,7 @@ pub(crate) fn apply_patch_hunks_to_content(
     path: &str,
     current_content: &str,
     hunks: &[PatchHunk],
+    remaining: &mut usize,
     cancel: &CancellationToken,
 ) -> Result<String, String> {
     let mut lines = split_text_lines(current_content);
@@ -229,8 +245,9 @@ pub(crate) fn apply_patch_hunks_to_content(
             .map(|line| line.content.as_str())
             .collect::<Vec<_>>();
 
-        let replace_at = find_line_sequence(&lines, &old_lines, search_start, cancel)?
-            .ok_or_else(|| format!("Patch hunk could not be applied cleanly to {}.", path))?;
+        let replace_at =
+            find_line_sequence(&lines, &old_lines, search_start, remaining, cancel)?
+                .ok_or_else(|| format!("Patch hunk could not be applied cleanly to {}.", path))?;
         let replace_end = replace_at + old_lines.len();
         let mut old = lines[replace_at..replace_end].iter().copied();
         let mut replacement = Vec::new();
@@ -255,4 +272,26 @@ pub(crate) fn apply_patch_hunks_to_content(
         }
     }
     Ok(output)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn context_search_bounds_work_on_repetitive_lines() {
+        let repeated = "x".repeat(512);
+        let lines = vec![(repeated.as_str(), "\n"); 1024];
+        let mut needle = vec![repeated.as_str(); 256];
+        needle.push("different");
+        let mut remaining = MAX_CONTEXT_SEARCH;
+        let result = find_line_sequence(
+            &lines,
+            &needle,
+            0,
+            &mut remaining,
+            &CancellationToken::new(),
+        );
+        assert!(matches!(result, Err(error) if error.contains("search budget")));
+    }
 }

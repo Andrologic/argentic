@@ -20,8 +20,13 @@ use std::{
 };
 use tokio_util::sync::CancellationToken;
 
+use std::{
+    ffi::{CString, OsStr},
+    os::{fd::AsRawFd, unix::ffi::OsStrExt},
+};
+
 #[cfg(target_os = "linux")]
-use std::os::fd::AsRawFd;
+use std::os::fd::FromRawFd;
 
 use ring::digest::{digest, Digest, SHA256};
 
@@ -122,8 +127,12 @@ impl Snapshot {
         self.staging.path()
     }
 
+    pub(super) fn close(self) -> io::Result<()> {
+        remove_temp_dir(self.staging)
+    }
+
     pub(super) fn changes(
-        mut self,
+        &mut self,
         root: &Root,
         cancel: &CancellationToken,
         allowed: impl Fn(&Path) -> bool,
@@ -173,7 +182,7 @@ impl Snapshot {
                 Ok(())
             },
         )?;
-        for (path, (target, _, _)) in self.original {
+        for (path, (target, _, _)) in std::mem::take(&mut self.original) {
             if !allowed(&path) {
                 return Err(denied());
             }
@@ -181,6 +190,88 @@ impl Snapshot {
             changes.push(target.bytes(None));
         }
         Ok(changes)
+    }
+}
+
+/// The shell has joined. Repair only directories inside this staging tree,
+/// then remove and verify it through its parent handle.
+pub(super) fn remove_temp_dir(staging: tempfile::TempDir) -> io::Result<()> {
+    let path = staging.keep();
+    let parent = Dir::open_ambient_dir(path.parent().ok_or_else(changed)?, ambient_authority())?;
+    let name = path.file_name().ok_or_else(changed)?;
+    let root = removable_directory(&parent, name)?;
+    let mut stack = vec![(root.entries()?, root)];
+    while let Some((entries, dir)) = stack.last_mut() {
+        let Some(entry) = entries.next() else {
+            stack.pop();
+            continue;
+        };
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            let child = removable_directory(dir, &entry.file_name())?;
+            stack.push((child.entries()?, child));
+        }
+    }
+    parent.remove_dir_all(name)?;
+    match parent.symlink_metadata(name) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+        Ok(_) => Err(io::Error::other(
+            "Temporary directory still exists after removal",
+        )),
+    }
+}
+
+fn removable_directory(parent: &Dir, name: &OsStr) -> io::Result<Dir> {
+    let metadata = parent.symlink_metadata(name)?;
+    if !metadata.is_dir() {
+        return Err(changed());
+    }
+    if metadata.permissions().mode() & 0o700 != 0o700 {
+        let name = CString::new(name.as_bytes())?;
+        restore_directory_access(parent, &name)?;
+    }
+    parent.open_dir_nofollow(name)
+}
+
+#[cfg(target_os = "linux")]
+fn restore_directory_access(parent: &Dir, name: &std::ffi::CStr) -> io::Result<()> {
+    // O_PATH opens even a mode-000 directory. The kernel's procfs entry
+    // identifies that inode for chmod without resolving the staging name again.
+    // SAFETY: name is NUL-terminated and parent remains open.
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: openat returned a fresh descriptor.
+    let dir = unsafe { fs::File::from_raw_fd(fd) };
+    fs::set_permissions(
+        format!("/proc/self/fd/{}", dir.as_raw_fd()),
+        fs::Permissions::from_mode(0o700),
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn restore_directory_access(parent: &Dir, name: &std::ffi::CStr) -> io::Result<()> {
+    // SAFETY: name is a single NUL-terminated component, and parent remains open.
+    let result = unsafe {
+        libc::fchmodat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            0o700,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
     }
 }
 
@@ -501,6 +592,21 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_leaves_a_symlink_target_untouched() -> io::Result<()> {
+        let staging = tempfile::tempdir()?;
+        let outside = tempfile::tempdir()?;
+        let private = staging.path().join("private");
+        fs::create_dir(&private)?;
+        let path = staging.path().to_owned();
+        std::os::unix::fs::symlink(outside.path(), private.join("link"))?;
+        fs::set_permissions(private, fs::Permissions::from_mode(0o000))?;
+        remove_temp_dir(staging)?;
+        assert!(!path.exists());
+        assert!(outside.path().is_dir());
+        Ok(())
+    }
+
+    #[test]
     fn publication_rejects_a_host_edit_with_restored_mtime() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().canonicalize().unwrap();
@@ -512,7 +618,7 @@ mod tests {
             path,
         };
         let cancel = CancellationToken::new();
-        let snapshot = Snapshot::new(&root, None, &cancel, true, |_| true).unwrap();
+        let mut snapshot = Snapshot::new(&root, None, &cancel, true, |_| true).unwrap();
         fs::write(snapshot.path().join("file"), "new").unwrap();
         let changes = snapshot.changes(&root, &cancel, |_| true).unwrap();
         assert_eq!(changes.len(), 1);

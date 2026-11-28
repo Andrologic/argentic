@@ -57,10 +57,13 @@ impl Instance<'_> {
         }
         self.check_delegate_budget()
             .map_err(DelegateError::Budget)?;
-        self.harness
+        let authorized = self
+            .harness
             .registry
             .authorize_delegate(call, self.cancel)
-            .await?;
+            .await;
+        self.check_review_budget().map_err(DelegateError::Budget)?;
+        authorized?;
         let registry = self.harness.registry.read_only_child()?;
         // Child tools still consult the same host ceiling. Request hooks and
         // the parent's port would mix the child and parent conversations.
@@ -83,7 +86,7 @@ impl Instance<'_> {
             max_corrections: 0,
         };
         let cancel = self.cancel.child_token();
-        let budget = self.budget.clone();
+        let resources = (self.budget.clone(), self.output.clone());
         // Track the child future itself. A forced drop of the parent's turn
         // still waits for the child's provider and its blocking read workers.
         let result = self
@@ -91,7 +94,7 @@ impl Instance<'_> {
             .spawn(async move {
                 let (_send, inbox) = tokio::sync::mpsc::channel(1);
                 harness
-                    .run_with_budget(child, &(), inbox, cancel, budget, MAX_CHILD_TURNS)
+                    .run_with_budget(child, &(), inbox, cancel, resources, MAX_CHILD_TURNS)
                     .await
             })
             .await;
@@ -121,15 +124,18 @@ impl Instance<'_> {
                 _ => None,
             })
             .unwrap_or_default();
-        Page::one_shot(text, &call.id).map_err(|error| error.to_string().into())
+        self.output
+            .one_shot(text, &call.id)
+            .map_err(|error| error.to_string().into())
     }
 
     fn check_delegate_budget(&self) -> Result<(), Failure> {
         let min_output = self.harness.provider.min_output_tokens();
         let budget = self.budget()?;
-        if budget
-            .tokens
-            .is_some_and(|tokens| tokens == 0 || tokens < u64::from(min_output))
+        if budget.review_overrun
+            || budget
+                .tokens
+                .is_some_and(|tokens| tokens == 0 || tokens < u64::from(min_output))
         {
             return Err(Failure::TokenLimit);
         }

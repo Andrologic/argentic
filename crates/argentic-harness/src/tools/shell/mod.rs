@@ -178,7 +178,7 @@ impl Registry {
         call: ToolCall,
         cancel: CancellationToken,
         tracker: &TaskTracker,
-        credential: Option<&str>,
+        output: &super::ToolOutput,
     ) -> Result<Page, String> {
         if !self.toolbox.shell {
             return Err("Shell tool is disabled".into());
@@ -225,14 +225,15 @@ impl Registry {
             )
             .await?;
         let registry = self.clone();
-        let credential = credential.map(str::to_owned);
+        let output = output.clone();
         tracker
             .spawn_blocking(move || {
                 let _guards = guards;
                 let text = run(registry, &args, &call, approved_by, admission, &cancel)?;
                 // Shell output starts with its status and is retained once. Replaying
                 // a shell call to retrieve a cursor would repeat its effects.
-                Page::one_shot_screened(&text, &call.id, credential.as_deref())
+                output
+                    .one_shot(&text, &call.id)
                     .map_err(|error| error.to_string())
             })
             .await
@@ -355,32 +356,45 @@ fn run(
             proxy.as_ref(),
             args.timeout_ms,
             cancel,
-        )?;
+        );
         drop(proxy);
-        let publication = tokio::runtime::Handle::current().block_on(registry.lock_dispatch(
-            call,
-            &[DispatchAction {
-                action: Approval::Shell(&args.command),
-                approved_by,
-            }],
-            cancel,
-        ))?;
-        recheck_shell(&publication, &args.command, approved_by)?;
-        let mut pending = Vec::new();
-        for (root, (snapshot, write)) in registry.roots.iter().zip(snapshots) {
-            if write {
-                let changes = snapshot
-                    .changes(root, cancel, |path| {
-                        let absolute = root.path.join(path);
-                        [Action::Read, Action::Write].into_iter().all(|action| {
-                            registry.live_path_effect(&publication, root, action, &absolute)
-                                == Effect::Allow
+        let result = outcome.and_then(|outcome| {
+            let publication =
+                tokio::runtime::Handle::current().block_on(registry.lock_dispatch(
+                    call,
+                    &[DispatchAction {
+                        action: Approval::Shell(&args.command),
+                        approved_by,
+                    }],
+                    cancel,
+                ))?;
+            recheck_shell(&publication, &args.command, approved_by)?;
+            let mut pending = Vec::new();
+            for (root, (snapshot, write)) in registry.roots.iter().zip(&mut snapshots) {
+                if *write {
+                    let changes = snapshot
+                        .changes(root, cancel, |path| {
+                            let absolute = root.path.join(path);
+                            [Action::Read, Action::Write].into_iter().all(|action| {
+                                registry.live_path_effect(&publication, root, action, &absolute)
+                                    == Effect::Allow
+                            })
                         })
-                    })
-                    .map_err(|error| format!("Shell workspace publication: {error}"))?;
-                pending.extend(changes.into_iter().map(|change| (root, change)));
+                        .map_err(|error| format!("Shell workspace publication: {error}"))?;
+                    pending.extend(changes.into_iter().map(|change| (root, change)));
+                }
+            }
+            Ok((outcome, publication, pending))
+        });
+        let mut cleanup_errors = Vec::new();
+        for (snapshot, _) in snapshots {
+            let path = snapshot.path().to_owned();
+            if let Err(error) = snapshot.close() {
+                cleanup_errors.push(format!("{}: {error}", path.display()));
             }
         }
+        let result = cleanup_result(result, cleanup_errors)?;
+        let (outcome, _publication, pending) = result;
         let total = pending.len();
         for (index, (root, change)) in pending.into_iter().enumerate() {
             change.apply(root, cancel).map_err(|error| {
@@ -400,6 +414,27 @@ fn run(
         let _ = (registry, args, call, approved_by, admission, cancel);
         preflight()?;
         unreachable!()
+    }
+}
+
+#[cfg(any(
+    all(
+        target_os = "linux",
+        any(target_arch = "aarch64", target_arch = "x86_64")
+    ),
+    all(target_os = "macos", target_arch = "aarch64")
+))]
+fn cleanup_result<T>(result: Result<T, String>, errors: Vec<String>) -> Result<T, String> {
+    if errors.is_empty() {
+        return result;
+    }
+    let cleanup = format!(
+        "Shell temporary directory cleanup failed: {}",
+        errors.join(", ")
+    );
+    match result {
+        Ok(_) => Err(cleanup),
+        Err(error) => Err(format!("{error}\n{cleanup}")),
     }
 }
 
