@@ -382,6 +382,67 @@ async fn operator_schedule_mcp_http_budget_interrupts_the_active_codex_turn() {
     budget_interrupts_turn(true).await;
 }
 
+#[tokio::test]
+async fn codex_mcp_checks_project_revocation_between_calls() {
+    use crate::test_context::mcp::{Peer, REQUIREMENTS};
+
+    let peer = Peer::start().await;
+    let project = tempfile::tempdir().unwrap();
+    let document = json!({
+        "projectFormat":"agsdl-project-1","contract":"agsdl-0.4.0","id":"agent-mcp-revocation",
+        "mcpServers":peer.servers(),
+        "secrets":{"file":"requirements.json"},
+        "agents":{"worker":{"harness":"codex","permissions":{"preset":"read-only","rules":[
+            {"action":"mcp","match":"*/check","effect":"allow"}
+        ]},"mcpServers":["first","second"]}},
+        "flow":{"entry":"work","steps":{"work":{"type":"agent","agent":"worker"}}}
+    });
+    std::fs::write(project.path().join("agsdl.json"), document.to_string()).unwrap();
+    std::fs::write(project.path().join("requirements.json"), REQUIREMENTS).unwrap();
+    let mut f = Fixture::from_project(project.path()).await;
+    f.config = peer.configure(f.config);
+    f.policy.workspace().await;
+    let trace = f._temp.path().join("mcp.jsonl");
+    let mut scripted = envelope(json!({"results":{}}));
+    scripted["_mcp"] = json!({
+        "first":{"tools":["check"],"calls":{"check":"first"}},
+        "second":{"tools":["check"],"calls":{"check":null}}
+    });
+    std::fs::write(
+        trace.with_extension("jsonl.script"),
+        json!([scripted]).to_string(),
+    )
+    .unwrap();
+
+    let waiting = arm(&f, "mcp.dispatch.wait");
+    let tasks = StreamTasks::default();
+    start(&f, &tasks, Arc::new(executor(&f, &trace, None))).await;
+    reached(&waiting, "mcp.dispatch.wait").await;
+    operator_wait(async || (!peer.calls().is_empty()).then_some(())).await;
+    let first = [("first".into(), "check".into())];
+    assert_eq!(peer.calls(), first);
+    tokio::time::timeout(WAIT, f.policy.set_project(serde_json::from_value(json!({
+        "preset":"workspace","rules":[{"action":"mcp","match":"second/check","effect":"deny"}]
+    })).unwrap())).await.expect("project policy update blocked by the first response");
+    waiting.release();
+
+    tokio::time::timeout(
+        WAIT,
+        f.host
+            .flow030()
+            .supervisors
+            .wait(&f.identity.system_start_id),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        inspect(&f).await.state.verdict.as_deref(),
+        Some("succeeded")
+    );
+    assert_eq!(peer.calls(), first);
+}
+
 async fn budget_interrupts_turn(ask: bool) {
     use crate::test_context::mcp::Peer as HttpPeer;
 

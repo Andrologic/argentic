@@ -64,6 +64,19 @@ impl HostPolicyLease {
 pub trait PolicySource: Send + Sync {
     fn lock_project<'a>(&'a self, project: &'a str) -> PolicyFuture<'a, ProjectPolicyLease>;
     fn lock_ceiling(&self) -> PolicyFuture<'_, HostPolicyLease>;
+
+    /// Retains both policy projections through one admission. Sources that
+    /// share a lock must override this method and acquire that lock only once.
+    fn lock_ceiling_and_project<'a>(
+        &'a self,
+        project: &'a str,
+    ) -> PolicyFuture<'a, (HostPolicyLease, ProjectPolicyLease)> {
+        Box::pin(async move {
+            let ceiling = self.lock_ceiling().await?;
+            let project = self.lock_project(project).await?;
+            Ok((ceiling, project))
+        })
+    }
 }
 
 /// Resolves one server's declared secrets just before connecting or spawning.
@@ -182,6 +195,12 @@ impl HostContext {
     }
     pub async fn lock_agsdl_host_permissions(&self) -> Result<HostPolicyLease> {
         self.policy.lock_ceiling().await
+    }
+    pub(crate) async fn lock_ceiling_and_project(
+        &self,
+        project: &str,
+    ) -> Result<(HostPolicyLease, ProjectPolicyLease)> {
+        self.policy.lock_ceiling_and_project(project).await
     }
 }
 

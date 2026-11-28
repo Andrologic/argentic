@@ -614,6 +614,12 @@ and scopes must still match. `deliver` accepts the existing `DeliveryRequest030`
 contract from `api`. Start ids are idempotency keys: after an uncertain reply,
 inspect `runs` and use the same request, never submit a new id to guess success.
 `shutdown` has the same `approved` list as `quit` but keeps inspection available.
+
+Shutdown output is best-effort. After successful drainage, the host allows one
+second to write and flush its final stdout record, including the response to
+`quit`. The stream can end with a missing or partial record. Read complete
+newline-terminated records and discard any trailing partial line at EOF.
+
 Stop/shutdown waiter deadlines do not prove a physical end. Retry the same
 retirement. Once shutdown starts, admissions stay closed; the operator never
 resumes work or releases storage before successful drainage. EOF drainage retries
