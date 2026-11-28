@@ -13,6 +13,7 @@ pub(crate) struct TestHost {
     pub(crate) human_closed: AtomicUsize,
     pub(crate) human_delivered: Arc<AtomicUsize>,
     pub(crate) human_delay: Duration,
+    pub(crate) human_answer_ready: Option<Arc<tokio::sync::Notify>>,
 }
 impl TestHost {
     pub(crate) fn new(grant: impl Into<Option<LaunchGrant>>) -> Self {
@@ -28,6 +29,7 @@ impl TestHost {
             human_closed: AtomicUsize::new(0),
             human_delivered: Arc::new(AtomicUsize::new(0)),
             human_delay: Duration::from_millis(30),
+            human_answer_ready: None,
         }
     }
 }
@@ -70,6 +72,9 @@ impl HostPort for TestHost {
         Ok(HumanTicket::new(id.into(), std::sync::Weak::new()))
     }
     async fn human_answer(&self, ticket: &str) -> Result<HumanReply> {
+        if let Some(ready) = &self.human_answer_ready {
+            ready.notified().await;
+        }
         tokio::time::sleep(self.human_delay).await;
         let delivered = self.human_delivered.clone();
         Ok(HumanReply {

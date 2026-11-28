@@ -5,6 +5,7 @@ pub(crate) const MAX_MCP_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 pub(crate) const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const HTTP_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
 const TOOL_HANDOFF_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_SSE_RESUMES_WITHOUT_PROGRESS: usize = 3;
 pub(crate) const TOOL_BUDGET_EXPIRED: &str = "MCP_TOOL_BUDGET_EXPIRED";
 const HTTP_SESSION_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -20,9 +21,10 @@ use serde::Serialize;
 use serde_json::value::RawValue;
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
-    sync::oneshot,
+    sync::{oneshot, watch},
     time::Instant,
 };
+use tokio_util::sync::CancellationToken;
 
 use crate::agsdl_host_calls::{
     CallError, CallIdentity, CommandGrant, Control, HostPort, HumanReply, HumanTicket,
@@ -381,9 +383,10 @@ fn parameter_headers(schema: &str, arguments: &str) -> Result<reqwest::header::H
     Ok(headers)
 }
 
-/// Acquires the native admission guard retained until the tool body is handed off.
-pub(crate) type ToolAdmission =
-    Box<dyn Fn() -> futures::future::BoxFuture<'static, Result<Box<dyn Send>>> + Send + Sync>;
+/// Acquires the native admission guard retained until the HTTP body is handed off.
+pub(crate) type ToolAdmission = std::sync::Arc<
+    dyn Fn() -> futures::future::BoxFuture<'static, Result<Box<dyn Send>>> + Send + Sync,
+>;
 
 pub(crate) struct Session {
     server: String,
@@ -414,12 +417,12 @@ struct HttpWire {
     responses: VecDeque<Body>,
     tool_schema: Option<(String, String)>,
     parameter_headers: reqwest::header::HeaderMap,
-    unsolicited: Option<tokio::sync::mpsc::UnboundedReceiver<Result<String>>>,
+    listener_failure: Option<ListenerFailure>,
     listener: Option<tokio::task::JoinHandle<()>>,
-    listener_stop: Option<tokio_util::sync::CancellationToken>,
-    listener_failed: tokio_util::sync::CancellationToken,
+    listener_stop: Option<CancellationToken>,
 }
 type PostResponse = futures::future::BoxFuture<'static, reqwest::Result<reqwest::Response>>;
+type ListenerFailure = watch::Receiver<Option<CallError>>;
 
 pub(crate) struct PendingToolCall {
     base: String,
@@ -435,6 +438,7 @@ struct Body {
     eof: bool,
     last_event_id: Option<String>,
     retry_ms: u64,
+    resume_attempts: usize,
 }
 
 pub(crate) fn require_stdio() -> Result<()> {
@@ -605,10 +609,9 @@ fn start_with_stdio(
                 responses: VecDeque::new(),
                 tool_schema: config.tool_schema,
                 parameter_headers: Default::default(),
-                unsolicited: None,
+                listener_failure: None,
                 listener: None,
                 listener_stop: None,
-                listener_failed: tokio_util::sync::CancellationToken::new(),
             })
         }
     };
@@ -771,6 +774,7 @@ impl Session {
                     control.clone(),
                     self.server.clone(),
                     self.secret_values.clone(),
+                    self.tool_admission.clone(),
                 );
             }
         }
@@ -901,40 +905,39 @@ impl Session {
         budget_deadline: Option<Instant>,
     ) -> Result<(String, Option<PostResponse>)> {
         let (id, message) = self.rpc_request("tools/call", params)?;
-        let _admission = match &self.tool_admission {
-            Some(admit) => Some(admit().await?),
-            None => None,
+        let response = match &self.wire {
+            Wire::Http(http) => {
+                let delivery = HttpDelivery {
+                    admission: self.tool_admission.as_ref(),
+                    control,
+                    listener_failure: http.listener_failure.as_ref(),
+                    budget_deadline,
+                };
+                Some(
+                    delivery
+                        .handoff(
+                            http.post(&message)?,
+                            message,
+                            Some(&mut self.tool_in_flight),
+                        )
+                        .await?,
+                )
+            }
+            Wire::Stdio { .. } => {
+                control.check()?;
+                let deadline = handoff_deadline(budget_deadline)?;
+                // A partial stdio write may already have reached the process.
+                self.tool_in_flight = true;
+                tokio::select! {
+                    biased;
+                    error = control.cancelled() => return Err(error),
+                    _ = tokio::time::sleep_until(deadline) => return Err(handoff_timeout(budget_deadline)),
+                    sent = self.wire.send(&message) => sent?,
+                }
+                None
+            }
         };
-        control.check()?;
-        let now = Instant::now();
-        if budget_deadline.is_some_and(|deadline| deadline <= now) {
-            return Err(tool_budget_expired());
-        }
-        let handoff_limit = now + TOOL_HANDOFF_TIMEOUT;
-        let deadline = budget_deadline.map_or(handoff_limit, |budget| budget.min(handoff_limit));
-        let remote = self.is_remote();
-        let listener_failed = match &self.wire {
-            Wire::Http(http) => http.listener_failed.clone(),
-            Wire::Stdio { .. } => Default::default(),
-        };
-        let (handoff, mut accepted) = oneshot::channel();
-        // A partial stdio write may already have reached the process.
-        self.tool_in_flight |= !remote;
-        let response = tokio::select! {
-            biased;
-            error = control.cancelled() => Err(error),
-            _ = listener_failed.cancelled() => Err(CallError::new("UNCERTAIN", "MCP listener failed during delivery")),
-            _ = tokio::time::sleep_until(deadline) => Err(CallError::new("TIMEOUT", "MCP tool delivery timed out")),
-            sent = self.wire.dispatch(message, deadline, handoff, &mut accepted) => sent,
-        };
-        // Close before checking so a concurrent HTTP body poll either handed
-        // off the payload already or can no longer do so.
-        accepted.close();
-        self.tool_in_flight |= response.is_ok() || accepted.try_recv().is_ok();
-        if response.is_err() && budget_deadline.is_some_and(|budget| budget <= Instant::now()) {
-            return Err(tool_budget_expired());
-        }
-        Ok((id, response?))
+        Ok((id, response))
     }
 
     pub(crate) async fn finish_tool_call(
@@ -1027,30 +1030,42 @@ impl Session {
         control: &Control,
     ) -> Result<String> {
         if let Some(response) = response {
-            let response = tokio::select! {
-                biased;
-                error = control.cancelled() => return Err(error),
-                response = response => response.map_err(|e| CallError::transport(e.to_string()))?,
-            };
             let Wire::Http(http) = &mut self.wire else {
                 unreachable!("HTTP response requires an HTTP session");
             };
-            http.accept_response(response)?;
+            http.receive_post(response, control).await?;
         }
         self.receive_rpc(&id, "tools/call", host, identity, control)
             .await
     }
 
+    async fn send_human_reply(&mut self, message: String, control: &Control) -> Result<()> {
+        let Wire::Http(http) = &mut self.wire else {
+            return self.send(&message, control).await;
+        };
+        let delivery = HttpDelivery {
+            admission: self.tool_admission.as_ref(),
+            control,
+            listener_failure: http.listener_failure.as_ref(),
+            budget_deadline: None,
+        };
+        let response = delivery
+            .handoff(
+                http.post(&message)?,
+                message,
+                Some(&mut self.tool_in_flight),
+            )
+            .await?;
+        http.receive_post(response, control).await
+    }
+
     async fn send(&mut self, message: &str, control: &Control) -> Result<()> {
         control.check()?;
-        let listener_failed = match &self.wire {
-            Wire::Http(http) => Some(http.listener_failed.clone()),
-            _ => None,
-        };
+        let listener = self.wire.listener_failure();
         tokio::select! {
             biased;
             error = control.cancelled() => Err(error),
-            _ = async { match listener_failed { Some(token) => token.cancelled().await, None => std::future::pending().await } } => Err(CallError::new("UNCERTAIN", "MCP listener failed during delivery")),
+            error = listener_error(listener.as_ref()) => Err(error),
             sent = self.wire.send(message) => sent,
         }
     }
@@ -1096,10 +1111,12 @@ impl Session {
         identity: &CallIdentity,
         control: &Control,
     ) -> Result<String> {
+        let listener = self.wire.listener_failure();
         loop {
             let raw = tokio::select! {
                 biased;
                 error = control.cancelled() => return Err(error),
+                error = listener_error(listener.as_ref()) => return Err(error),
                 raw = self.wire.receive() => raw?,
             };
             let fields = object(&raw)?;
@@ -1135,14 +1152,15 @@ impl Session {
                         "Method not supported by this captured call",
                     ) {
                         Ok(response) => {
-                            self.send(
-                                &format!(
-                                    "{{\"jsonrpc\":\"2.0\",\"id\":{},{response}}}",
-                                    request_id.get()
-                                ),
-                                control,
-                            )
-                            .await
+                            let message = format!(
+                                "{{\"jsonrpc\":\"2.0\",\"id\":{},{response}}}",
+                                request_id.get()
+                            );
+                            if human.is_some() {
+                                self.send_human_reply(message, control).await
+                            } else {
+                                self.send(&message, control).await
+                            }
                         }
                         Err(error) => Err(error),
                     };
@@ -1409,6 +1427,16 @@ impl HttpWire {
         Ok(request)
     }
 
+    async fn receive_post(&mut self, response: PostResponse, control: &Control) -> Result<()> {
+        let response = tokio::select! {
+            biased;
+            error = control.cancelled() => return Err(error),
+            error = listener_error(self.listener_failure.as_ref()) => return Err(error),
+            response = response => response.map_err(|e| CallError::transport(e.to_string()))?,
+        };
+        self.accept_response(response)
+    }
+
     fn accept_response(&mut self, response: reqwest::Response) -> Result<()> {
         if !response.status().is_success() {
             return Err(CallError::transport(format!(
@@ -1463,6 +1491,7 @@ impl HttpWire {
             eof: false,
             last_event_id: None,
             retry_ms: 1000,
+            resume_attempts: 0,
         });
         Ok(())
     }
@@ -1474,6 +1503,7 @@ impl HttpWire {
         control: Control,
         server: String,
         secret_values: Vec<String>,
+        admission: Option<ToolAdmission>,
     ) {
         if self.listener.is_some() {
             return;
@@ -1491,12 +1521,18 @@ impl HttpWire {
             stop,
             machine_timeout: control.machine_timeout,
         };
-        let failed = self.listener_failed.clone();
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        self.unsolicited = Some(rx);
+        let (tx, rx) = watch::channel(None);
+        self.listener_failure = Some(rx);
         self.listener = Some(tokio::spawn(async move {
             let mut cursor: Option<String> = None;
             let mut delay = 1000u64;
+            let mut resume_attempts = 0;
+            let delivery = HttpDelivery {
+                admission: admission.as_ref(),
+                control: &control,
+                listener_failure: None,
+                budget_deadline: None,
+            };
             loop {
                 let mut request = client
                     .get(url.clone())
@@ -1537,6 +1573,7 @@ impl HttpWire {
                     eof: false,
                     last_event_id: cursor.clone(),
                     retry_ms: delay,
+                    resume_attempts,
                 };
                 loop {
                     let message = tokio::select! {
@@ -1557,28 +1594,31 @@ impl HttpWire {
                                 &server,
                                 &message,
                                 &secret_values,
-                                &control,
+                                &delivery,
                             )
                             .await;
                             if let Err(error) = result {
-                                let _ = tx.send(Err(error));
-                                failed.cancel();
+                                tx.send_replace(Some(error));
                                 return;
                             }
                         }
                         Ok(None) => break,
                         Err(error) => {
-                            let _ = tx.send(Err(error));
-                            failed.cancel();
+                            tx.send_replace(Some(error));
                             return;
                         }
                     }
                 }
-                cursor = body.last_event_id;
+                cursor = match body.next_resume() {
+                    Ok(Some(id)) => Some(id),
+                    Ok(None) => break,
+                    Err(error) => {
+                        tx.send_replace(Some(error));
+                        return;
+                    }
+                };
                 delay = body.retry_ms;
-                if cursor.is_none() {
-                    break;
-                }
+                resume_attempts = body.resume_attempts;
                 tokio::select! {
                     biased;
                     _ = control.cancelled() => return,
@@ -1601,8 +1641,9 @@ async fn process_listener_message(
     server: &str,
     raw: &str,
     secret_values: &[String],
-    control: &Control,
+    delivery: &HttpDelivery<'_>,
 ) -> Result<()> {
+    let control = delivery.control;
     if !secret_values.is_empty() {
         reject_secret_echo(raw, secret_values)?;
     }
@@ -1632,7 +1673,8 @@ async fn process_listener_message(
         None
     };
     let response = legacy_reply(&method, &human, "Method not supported");
-    let delivery = async {
+    let has_human_answer = human.is_some();
+    let result = async {
         let response = response?;
         let body = format!("{{\"jsonrpc\":\"2.0\",\"id\":{},{response}}}", id.get());
         let mut request = client
@@ -1640,27 +1682,160 @@ async fn process_listener_message(
             .headers(headers.clone())
             .header("accept", "application/json, text/event-stream")
             .header("content-type", "application/json")
-            .header("mcp-protocol-version", version)
-            .body(body);
+            .header("mcp-protocol-version", version);
         if let Some(session) = session {
             request = request.header("mcp-session-id", session);
         }
-        let response = tokio::select! { biased; error = control.cancelled() => return Err(error), response = request.send() => response.map_err(|e| CallError::transport(e.to_string()))? };
+        let response = if has_human_answer {
+            delivery.handoff(request, body, None).await?
+        } else {
+            Box::pin(request.body(body).send())
+        };
+        let response = tokio::select! {
+            biased;
+            error = control.cancelled() => return Err(error),
+            response = response => response.map_err(|e| CallError::transport(e.to_string()))?,
+        };
         if response.status() != reqwest::StatusCode::ACCEPTED {
             return Err(CallError::transport(
                 "MCP GET request response was not accepted",
             ));
         }
         Ok(())
-    }.await;
-    complete_human(host, human, delivery).await
+    }
+    .await;
+    complete_human(host, human, result).await
 }
 
 fn tool_budget_expired() -> CallError {
     CallError::new(TOOL_BUDGET_EXPIRED, "Remote MCP tool budget expired")
 }
 
+fn handoff_timeout(budget_deadline: Option<Instant>) -> CallError {
+    if budget_deadline.is_some_and(|deadline| deadline <= Instant::now()) {
+        tool_budget_expired()
+    } else {
+        CallError::new("TIMEOUT", "MCP request delivery timed out")
+    }
+}
+
+fn handoff_deadline(budget_deadline: Option<Instant>) -> Result<Instant> {
+    let now = Instant::now();
+    if budget_deadline.is_some_and(|deadline| deadline <= now) {
+        return Err(tool_budget_expired());
+    }
+    let limit = now + TOOL_HANDOFF_TIMEOUT;
+    Ok(budget_deadline.map_or(limit, |budget| budget.min(limit)))
+}
+
+async fn listener_error(listener: Option<&ListenerFailure>) -> CallError {
+    if let Some(mut listener) = listener.cloned() {
+        if let Ok(error) = listener.wait_for(Option::is_some).await {
+            return error.clone().expect("listener reported an error");
+        }
+    }
+    std::future::pending().await
+}
+
+struct HttpDelivery<'a> {
+    admission: Option<&'a ToolAdmission>,
+    control: &'a Control,
+    listener_failure: Option<&'a ListenerFailure>,
+    budget_deadline: Option<Instant>,
+}
+
+impl HttpDelivery<'_> {
+    async fn handoff(
+        &self,
+        request: reqwest::RequestBuilder,
+        message: String,
+        in_flight: Option<&mut bool>,
+    ) -> Result<PostResponse> {
+        let _lease = tokio::select! {
+            biased;
+            error = self.control.cancelled() => return Err(error),
+            error = listener_error(self.listener_failure) => return Err(error),
+            _ = async {
+                match self.budget_deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending().await,
+                }
+            } => return Err(tool_budget_expired()),
+            lease = async {
+                match self.admission {
+                    Some(admit) => admit().await.map(Some),
+                    None => Ok(None),
+                }
+            } => lease?,
+        };
+        self.control.check()?;
+        let deadline = handoff_deadline(self.budget_deadline)?;
+        let (handoff, mut accepted) = oneshot::channel();
+        let control = self.control.clone();
+        let length = message.len();
+        let body = futures::stream::once(async move {
+            // The connection can poll the body before the caller observes Stop
+            // or its timer. Check both at the handoff.
+            if Instant::now() < deadline && control.check().is_ok() && handoff.send(()).is_ok() {
+                return Ok(message);
+            }
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "MCP request delivery cancelled",
+            ))
+        });
+        let mut response: PostResponse = Box::pin(
+            request
+                .header(reqwest::header::CONTENT_LENGTH, length)
+                .body(reqwest::Body::wrap_stream(body))
+                .send(),
+        );
+        let sent = tokio::select! {
+            biased;
+            error = self.control.cancelled() => Err(error),
+            error = listener_error(self.listener_failure) => Err(error),
+            _ = tokio::time::sleep_until(deadline) => Err(handoff_timeout(self.budget_deadline)),
+            handed_off = &mut accepted => {
+                handed_off.map(|_| response).map_err(|_| CallError::transport("MCP request body was discarded"))
+            }
+            reply = &mut response => {
+                if accepted.try_recv().is_ok() {
+                    Ok(Box::pin(std::future::ready(reply)) as PostResponse)
+                } else {
+                    Err(match reply {
+                        Ok(reply) => CallError::transport(format!("MCP HTTP returned {} before request delivery", reply.status())),
+                        Err(error) => CallError::transport(error.to_string()),
+                    })
+                }
+            }
+        };
+        // Close before checking so a concurrent body poll either handed off the
+        // payload already or can no longer do so. Release the lease on return.
+        accepted.close();
+        if let Some(in_flight) = in_flight {
+            *in_flight |= sent.is_ok() || accepted.try_recv().is_ok();
+        }
+        if sent.is_err() {
+            self.control.check()?;
+            if self
+                .budget_deadline
+                .is_some_and(|budget| budget <= Instant::now())
+            {
+                return Err(tool_budget_expired());
+            }
+        }
+        sent
+    }
+}
+
 impl Wire {
+    fn listener_failure(&self) -> Option<ListenerFailure> {
+        match self {
+            Wire::Http(http) => http.listener_failure.clone(),
+            Wire::Stdio { .. } => None,
+        }
+    }
+
     async fn send(&mut self, message: &str) -> Result<()> {
         match self {
             Wire::Stdio { stdin, .. } => {
@@ -1685,52 +1860,6 @@ impl Wire {
                     .await
                     .map_err(|e| CallError::transport(e.to_string()))?;
                 http.accept_response(response)
-            }
-        }
-    }
-
-    async fn dispatch(
-        &mut self,
-        message: String,
-        deadline: Instant,
-        handoff: oneshot::Sender<()>,
-        accepted: &mut oneshot::Receiver<()>,
-    ) -> Result<Option<PostResponse>> {
-        let Self::Http(http) = self else {
-            self.send(&message).await?;
-            return Ok(None);
-        };
-        let request = http.post(&message)?;
-        let length = message.len();
-        let stream = futures::stream::once(async move {
-            // The connection can poll the body on another task before the
-            // caller observes its timer. Check the deadline at the handoff.
-            if Instant::now() < deadline && handoff.send(()).is_ok() {
-                return Ok(message);
-            }
-            Err(std::io::Error::new(
-                std::io::ErrorKind::Interrupted,
-                "MCP tool delivery cancelled",
-            ))
-        });
-        let mut response: PostResponse = Box::pin(
-            request
-                .header(reqwest::header::CONTENT_LENGTH, length)
-                .body(reqwest::Body::wrap_stream(stream))
-                .send(),
-        );
-        tokio::select! {
-            biased;
-            handed_off = &mut *accepted => {
-                handed_off.map_err(|_| CallError::transport("MCP request body was discarded"))?;
-                Ok(Some(response))
-            }
-            reply = &mut response => {
-                if accepted.try_recv().is_ok() {
-                    return Ok(Some(Box::pin(std::future::ready(reply))));
-                }
-                let reply = reply.map_err(|e| CallError::transport(e.to_string()))?;
-                Err(CallError::transport(format!("MCP HTTP returned {} before tool delivery", reply.status())))
             }
         }
     }
@@ -1765,20 +1894,12 @@ impl Wire {
                     )
                 })?;
                 let can_resume = http.version != Some("2026-07-28");
-                let unsolicited = &mut http.unsolicited;
-                let received = tokio::select! {
-                    biased;
-                    Some(message) = async {
-                        match unsolicited { Some(rx) => rx.recv().await, None => std::future::pending().await }
-                    } => return message,
-                    message = body.next(can_resume) => message?,
-                };
-                if let Some(value) = received {
+                if let Some(value) = body.next(can_resume).await? {
                     return Ok(value);
                 }
-                let body = http.responses.pop_front().expect("response exists");
+                let mut body = http.responses.pop_front().expect("response exists");
                 if body.sse && can_resume {
-                    if let Some(id) = body.last_event_id {
+                    if let Some(id) = body.next_resume()? {
                         // Resume only the response stream. The original POST is never replayed.
                         tokio::time::sleep(Duration::from_millis(body.retry_ms)).await;
                         let response = http
@@ -1811,6 +1932,7 @@ impl Wire {
                             eof: false,
                             last_event_id: Some(id),
                             retry_ms: body.retry_ms,
+                            resume_attempts: body.resume_attempts,
                         });
                     }
                 }
@@ -1858,21 +1980,32 @@ impl SseFraming {
 }
 
 impl Body {
+    fn next_resume(&mut self) -> Result<Option<String>> {
+        let Some(id) = self.last_event_id.take() else {
+            return Ok(None);
+        };
+        if self.resume_attempts == MAX_SSE_RESUMES_WITHOUT_PROGRESS {
+            return Err(CallError::new(
+                "UNCERTAIN",
+                "MCP SSE resumption limit reached without a new event",
+            ));
+        }
+        self.resume_attempts += 1;
+        Ok(Some(id))
+    }
+
     async fn next(&mut self, can_resume: bool) -> Result<Option<String>> {
         loop {
             if self.sse {
                 if let Some(event) = self.framing.take_event(&mut self.buffer) {
                     let event = String::from_utf8(event)
                         .map_err(|_| CallError::transport("MCP SSE is not UTF-8"))?;
+                    let mut event_id = None;
                     for line in event.split(['\r', '\n']) {
                         if let Some(value) = line.strip_prefix("id:") {
                             let value = value.strip_prefix(' ').unwrap_or(value);
                             if !value.contains('\0') {
-                                self.last_event_id = if value.is_empty() {
-                                    None
-                                } else {
-                                    Some(value.to_owned())
-                                };
+                                event_id = Some(value);
                             }
                         } else if let Some(value) = line.strip_prefix("retry:") {
                             let value = value.strip_prefix(' ').unwrap_or(value);
@@ -1881,6 +2014,15 @@ impl Body {
                                     self.retry_ms = ms;
                                 }
                             }
+                        }
+                    }
+                    let mut repeated = false;
+                    if let Some(id) = event_id {
+                        let id = (!id.is_empty()).then_some(id);
+                        repeated = id.is_some() && id == self.last_event_id.as_deref();
+                        if id != self.last_event_id.as_deref() {
+                            self.last_event_id = id.map(str::to_owned);
+                            self.resume_attempts = 0;
                         }
                     }
                     let data: Vec<_> = event
@@ -1893,6 +2035,9 @@ impl Body {
                     if !data.is_empty() {
                         let data = data.join("\n");
                         if !data.is_empty() {
+                            if !repeated {
+                                self.resume_attempts = 0;
+                            }
                             return Ok(Some(data));
                         }
                     }

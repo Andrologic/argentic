@@ -39,6 +39,8 @@ struct HttpFixture {
     calls: AtomicUsize,
     mode: &'static str,
     answer_seen: tokio::sync::Notify,
+    call_seen: tokio::sync::Notify,
+    release_response: tokio::sync::Notify,
 }
 async fn http_handler(
     axum::extract::State(state): axum::extract::State<Arc<HttpFixture>>,
@@ -71,6 +73,9 @@ async fn http_handler(
                 return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
             }
             state.answer_seen.notify_one();
+            if state.mode == "answer-stall" {
+                state.release_response.notified().await;
+            }
         }
         return axum::http::StatusCode::ACCEPTED.into_response();
     }
@@ -89,6 +94,10 @@ async fn http_handler(
         }
         "tools/call" => {
             let call = state.calls.fetch_add(1, Ordering::SeqCst);
+            state.call_seen.notify_one();
+            if matches!(state.mode, "call-stall" | "get-resume-stall") {
+                state.release_response.notified().await;
+            }
             assert!(body.contains("9007199254740993"));
             if state.mode == "get-blocking"
                 && tokio::time::timeout(std::time::Duration::from_secs(2), state.answer_seen.notified()).await.is_err() {
@@ -113,8 +122,8 @@ async fn http_handler(
                 let raw = format!("data: {{\"jsonrpc\":\"2.0\",\"id\":\"server-human\",\"method\":\"elicitation/create\",\"params\":{{\"message\":\"Continue?\",\"requestedSchema\":{{\"type\":\"object\"}}}}}}\n\ndata: {{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"resultType\":\"complete\",\"content\":[]}}}}\n\n");
                 return ([("content-type", "text/event-stream")], raw).into_response();
             }
-            if matches!(state.mode, "resume" | "resume-partial") {
-                let stream = if state.mode == "resume-partial" {
+            if state.mode.starts_with("resume") {
+                let stream = if state.mode != "resume" {
                     "id: cursor-1\nretry: 0\ndata:\n\nid: incomplete\ndata: {"
                 } else {
                     "id: cursor-1\nretry: 0\ndata:\n\n"
@@ -166,7 +175,7 @@ async fn http_handler(
                         _ => r#"{"resultType":"complete","content":[],"structuredContent":{"large":9007199254740993},"isError":true}"#.into(),
                     }
                 }
-            } else if matches!(state.mode, "sse" | "rejected-human-response") {
+            } else if matches!(state.mode, "sse" | "answer-stall" | "rejected-human-response") {
                 let raw = format!("data: {{\"jsonrpc\":\"2.0\",\"id\":\"human\",\"method\":\"elicitation/create\",\"params\":{{\"message\":\"Continue?\",\"requestedSchema\":{{\"type\":\"object\"}}}}}}\r\n\r\ndata: {{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"content\":[{{\"type\":\"text\",\"text\":\"done\"}}],\"isError\":false}}}}\r\n\r\n");
                 return ([("content-type", "text/event-stream"), ("mcp-session-id", "captured")], raw).into_response();
             } else { r#"{"content":[{"type":"text","text":"complete"}],"structuredContent":{"n":9007199254740993,"exp":1e999999},"isError":false}"#.into() }
@@ -189,14 +198,46 @@ async fn resume_handler(
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
     if !headers.contains_key("last-event-id") {
+        if state.mode == "get-resume-stall" {
+            state.call_seen.notified().await;
+            return (
+                [("content-type", "text/event-stream")],
+                "id: cursor-1\nretry: 0\ndata:\n\n",
+            )
+                .into_response();
+        }
         if state.mode == "get-blocking" {
+            state.call_seen.notified().await;
             return ([("content-type", "text/event-stream")], "data: {\"jsonrpc\":\"2.0\",\"id\":\"push-human\",\"method\":\"elicitation/create\",\"params\":{\"message\":\"continue?\",\"requestedSchema\":{\"type\":\"object\"}}}\n\n").into_response();
         }
         return axum::http::StatusCode::METHOD_NOT_ALLOWED.into_response();
     }
-    assert_eq!(headers.get("last-event-id").unwrap(), "cursor-1");
     assert_eq!(headers.get("mcp-session-id").unwrap(), "captured");
-    state.requests.lock().await.push("GET resume".into());
+    let mut requests = state.requests.lock().await;
+    requests.push("GET resume".into());
+    let attempts = requests.iter().filter(|r| *r == "GET resume").count();
+    let cursor = if state.mode == "resume-progress" && attempts >= 4 {
+        "cursor-2"
+    } else {
+        "cursor-1"
+    };
+    assert_eq!(headers.get("last-event-id").unwrap(), cursor);
+    if matches!(state.mode, "resume-stall" | "get-resume-stall")
+        || (state.mode == "resume-progress" && matches!(attempts, 1 | 2 | 4 | 5))
+    {
+        return (
+            [("content-type", "text/event-stream")],
+            ": heartbeat\n\nid: incomplete\ndata: {",
+        )
+            .into_response();
+    }
+    if state.mode == "resume-progress" && attempts == 3 {
+        return (
+            [("content-type", "text/event-stream")],
+            "id: cursor-2\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"}\n\n",
+        )
+            .into_response();
+    }
     ([("content-type", "text/event-stream")], "id: cursor-2\ndata: {\"jsonrpc\":\"2.0\",\"id\":\"2\",\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"resumed\"}]}}\n\n").into_response()
 }
 
@@ -246,6 +287,8 @@ async fn http_fixture_at(
         calls: AtomicUsize::new(0),
         mode,
         answer_seen: tokio::sync::Notify::new(),
+        call_seen: tokio::sync::Notify::new(),
+        release_response: tokio::sync::Notify::new(),
     });
     let address = listener.local_addr().unwrap();
     let app = axum::Router::new()
@@ -344,6 +387,7 @@ async fn http_exact_receipts_human_waits_modern_continuation_and_no_replay() {
         "sse",
         "resume",
         "resume-partial",
+        "resume-progress",
         "modern",
         "modern-bad-state",
         "redirect",
@@ -359,7 +403,7 @@ async fn http_exact_receipts_human_waits_modern_continuation_and_no_replay() {
             }
             _ => {
                 let receipt = result.unwrap_or_else(|error| panic!("{mode}: {error:?}"));
-                if matches!(mode, "sse" | "resume" | "resume-partial") {
+                if mode == "sse" || mode.starts_with("resume") {
                     assert_eq!(
                         receipt.text,
                         if mode.starts_with("resume") {
@@ -707,6 +751,190 @@ async fn legacy_get_request_is_answered_before_post_response_headers() {
     ));
     task.abort();
     let _ = task.await;
+}
+
+fn policy_admission(policy: Arc<tokio::sync::RwLock<bool>>) -> ToolAdmission {
+    Arc::new(move || {
+        let policy = policy.clone();
+        Box::pin(async move {
+            let lease = policy.read_owned().await;
+            if !*lease {
+                return Err(CallError::new("PERMISSION", "Policy revoked"));
+            }
+            Ok(Box::new(lease) as Box<dyn Send>)
+        })
+    })
+}
+
+#[tokio::test]
+async fn legacy_human_answer_requires_live_policy_on_both_streams() {
+    for mode in ["sse", "get-blocking"] {
+        let (server, fixture, task) = http_fixture(mode).await;
+        let mut host = TestHost::new(None);
+        let answer_ready = Arc::new(tokio::sync::Notify::new());
+        host.human_answer_ready = Some(answer_ready.clone());
+        let host = Arc::new(host);
+        let policy = Arc::new(tokio::sync::RwLock::new(true));
+        let mut session = start(server).unwrap();
+        session.set_tool_admission(policy_admission(policy.clone()));
+        let running = {
+            let host = host.clone();
+            tokio::spawn(async move {
+                let result = session
+                    .call(
+                        "synthetic",
+                        r#"{"n":9007199254740993}"#,
+                        host.clone(),
+                        &identity(),
+                        &host.control,
+                    )
+                    .await;
+                let in_flight = session.tool_in_flight();
+                session.shutdown(result.is_ok()).await;
+                (result, in_flight)
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while host.human_open.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+            *policy.write().await = false;
+        })
+        .await
+        .expect("human request opened and policy writer acquired the lease");
+        answer_ready.notify_one();
+        let (result, in_flight) = tokio::time::timeout(Duration::from_secs(1), running)
+            .await
+            .expect("revocation must interrupt even a pending tool response")
+            .unwrap();
+        assert_eq!(result.unwrap_err().code, "PERMISSION", "{mode}");
+        assert!(in_flight, "{mode}");
+        assert_eq!(host.human_closed.load(Ordering::SeqCst), 1, "{mode}");
+        assert_eq!(host.human_delivered.load(Ordering::SeqCst), 0, "{mode}");
+        assert!(
+            !fixture
+                .requests
+                .lock()
+                .await
+                .iter()
+                .any(|r| r.contains(r#""action":"decline""#)),
+            "{mode}"
+        );
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 1, "{mode}");
+        task.abort();
+    }
+}
+
+#[tokio::test]
+async fn busy_policy_writer_does_not_block_stop_or_either_budget() {
+    for code in ["STOPPED", "TIMEOUT", TOOL_BUDGET_EXPIRED] {
+        let (server, fixture, task) = http_fixture("json").await;
+        let host = dummy_host();
+        let identity = identity();
+        let mut session = start(server).unwrap();
+        session
+            .initialize(host.clone(), &identity, &host.control)
+            .await
+            .unwrap();
+        let policy = Arc::new(tokio::sync::RwLock::new(true));
+        let _writer = policy.clone().write_owned().await;
+        let started = Arc::new(tokio::sync::Notify::new());
+        let admit = policy_admission(policy);
+        session.set_tool_admission(Arc::new({
+            let started = started.clone();
+            move || {
+                started.notify_one();
+                admit()
+            }
+        }));
+        let budget =
+            (code == TOOL_BUDGET_EXPIRED).then(|| Instant::now() + Duration::from_millis(50));
+        let delivery = session.dispatch_tool(
+            "synthetic",
+            r#"{"n":9007199254740993}"#,
+            &host.control,
+            budget,
+        );
+        let cancel = async {
+            started.notified().await;
+            match code {
+                "STOPPED" => host.control.stop.cancel(),
+                "TIMEOUT" => host.control.machine_timeout.cancel(),
+                _ => {}
+            }
+        };
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(delivery, cancel)
+        })
+        .await
+        .expect("delivery must exit while the writer still holds the lock");
+        assert_eq!(result.err().expect("delivery was blocked").code, code);
+        assert!(!session.tool_in_flight());
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+        session.shutdown(false).await;
+        task.abort();
+    }
+}
+
+#[tokio::test]
+async fn policy_lease_is_released_before_http_response_headers() {
+    for mode in ["call-stall", "answer-stall"] {
+        let (server, fixture, task) = http_fixture(mode).await;
+        let host = dummy_host();
+        let policy = Arc::new(tokio::sync::RwLock::new(true));
+        let mut session = start(server).unwrap();
+        session.set_tool_admission(policy_admission(policy.clone()));
+        let identity = identity();
+        let running = session.call(
+            "synthetic",
+            r#"{"n":9007199254740993}"#,
+            host.clone(),
+            &identity,
+            &host.control,
+        );
+        let writer = async {
+            if mode == "call-stall" {
+                fixture.call_seen.notified().await;
+            } else {
+                fixture.answer_seen.notified().await;
+            }
+            let _writer = policy.write().await;
+            fixture.release_response.notify_one();
+        };
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(running, writer)
+        })
+        .await
+        .expect("policy writer must proceed before the server responds");
+        assert!(result.is_ok(), "{mode}: {result:?}");
+        session.shutdown(true).await;
+        task.abort();
+    }
+}
+
+#[tokio::test]
+async fn sse_resume_stops_after_three_attempts_without_progress() {
+    for mode in ["resume-stall", "get-resume-stall"] {
+        let (server, fixture, task) = http_fixture(mode).await;
+        let (result, _) =
+            tokio::time::timeout(Duration::from_secs(1), isolated(&dummy_host(), server))
+                .await
+                .expect("resumption must end before the call budget");
+        assert_eq!(result.unwrap_err().code, "UNCERTAIN", "{mode}");
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 1, "{mode}");
+        assert_eq!(
+            fixture
+                .requests
+                .lock()
+                .await
+                .iter()
+                .filter(|r| *r == "GET resume")
+                .count(),
+            3,
+            "{mode}"
+        );
+        task.abort();
+    }
 }
 
 #[tokio::test]

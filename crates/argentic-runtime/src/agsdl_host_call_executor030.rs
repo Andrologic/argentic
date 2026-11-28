@@ -443,7 +443,7 @@ fn remote_tool_admission(
     config: HostContext,
     project_id: String,
 ) -> raw_mcp::ToolAdmission {
-    Box::new(move || {
+    std::sync::Arc::new(move || {
         let (host, pool, owner, attempt, config, project_id) = (
             host.clone(),
             pool.clone(),
