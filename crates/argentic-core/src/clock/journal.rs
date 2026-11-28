@@ -195,7 +195,7 @@ fn event(raw: &Value, expected_owner: &Value, decoder: &impl JsonDecoder) -> Res
 }
 struct Replay {
     projection: Projection,
-    operations: Vec<(String, String)>,
+    operations: HashMap<String, String>,
     latest: String,
 }
 impl Replay {
@@ -217,10 +217,7 @@ impl Replay {
             ("event", event.clone()),
         ])
         .stringify();
-        if let Some((_, previous)) = key
-            .as_ref()
-            .and_then(|k| self.operations.iter().find(|(old, _)| old == k))
-        {
+        if let Some(previous) = key.as_ref().and_then(|k| self.operations.get(k)) {
             if *previous != signature {
                 return plain("operation identity has conflicting content.");
             }
@@ -228,7 +225,7 @@ impl Replay {
         }
         let receipt = self.projection.dispatch(input)?.stringify();
         if let Some(key) = key {
-            self.operations.push((key, signature));
+            self.operations.insert(key, signature);
         }
         self.latest = receipt.clone();
         Ok(receipt)
@@ -283,11 +280,11 @@ pub(crate) fn evaluate_host(
     }
     let mut replay = Replay {
         projection: Projection::new(slice.clone()),
-        operations: vec![],
+        operations: HashMap::new(),
         latest: String::new(),
     };
     let mut entries = vec![];
-    let mut seen: Vec<(Text, Value)> = vec![];
+    let mut seen: Keyed<Value> = Keyed::default();
     for entry in current.get("entries").array().unwrap() {
         object(entry)?;
         keys(entry, &["eventJson", "receiptJson"])?;
@@ -333,8 +330,21 @@ pub(crate) fn evaluate_host(
         ("options", o([("maxSliceMs", slice.clone())])),
         ("entries", a(entries)),
     ]);
+    // Every receipt repeats the retired clocks, requests and answers so far,
+    // so the journal grows quadratically with the works it has admitted.
+    let state_json = next.stringify();
+    if crate::resource::quoted_bytes(&state_json) > crate::MAX_HUMAN_CLOCK_JOURNAL_BYTES {
+        return Err(Error::Failure(native::Error::new(
+            "INPUT_LIMIT",
+            "/stateJson",
+            format!(
+                "The human-clock journal of this flow invocation would exceed {} bytes.",
+                crate::MAX_HUMAN_CLOCK_JOURNAL_BYTES
+            ),
+        )));
+    }
     Ok(o([
-        ("stateJson", s(next.stringify())),
+        ("stateJson", s(state_json)),
         ("receiptJson", s(receipt)),
     ]))
 }

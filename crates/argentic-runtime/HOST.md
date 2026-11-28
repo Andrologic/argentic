@@ -165,6 +165,34 @@ document above that limit. `Engine::compile_document` then returns
 `INPUT_LIMIT` at `/source` or `/registry`. The native compiler result has a
 separate 8,000,000-byte transport limit.
 
+Route preparation and human-clock transitions share an 8,000,000-byte
+transport. A prepared route repeats the route source and producer for each
+delivery, and an agent's default message repeats its result lists. A fan-out
+result therefore grows with the item count times the source output's size.
+Preparation stops once the result would exceed
+`argentic_core::MAX_ROUTE_RESULT_BYTES` (8,000,000 bytes). A fan-out then
+fails at that target with `FANOUT_LIMIT`, as when it exceeds `max`, and the
+route's error handling applies. A single delivery fails with `INPUT_LIMIT`.
+In measurements, 300 items selected from a 4 KB agent output prepared 4.3 MB,
+and 1,000 items from a 13 KB output reached the limit. Set `max` or select a
+smaller list to stay below it. A source output, fan-out item or prepared
+message nested more than 128 levels deep fails with `INPUT_LIMIT`.
+
+Each flow invocation keeps one human-clock journal. Every agent, call and
+approval work is admitted to it and retired from it, and every receipt
+repeats the retired work clocks, requests and native answers recorded so far.
+The journal therefore grows quadratically with the number of works. A
+transition that would make it exceed
+`argentic_core::MAX_HUMAN_CLOCK_JOURNAL_BYTES` (7,500,000 bytes encoded as the
+clock input's `stateJson`) fails with `INPUT_LIMIT` at `/stateJson`, and the
+journal keeps its previous revision. This leaves room for the next event
+within the 8,000,000-byte clock input. With an admission, two clock ticks and
+a retirement per work and 36-character work identities, the limit is reached
+after about 145 works in one flow invocation (about 580 transitions). Each
+human request or approval adds to every later receipt: with one question per
+work the ceiling drops to about 50 works. Later clock transitions of that invocation are
+refused, so split longer flows across several invocations.
+
 Expansion allows 8,192 graph nodes, 32,768 route targets and 32 nested
 composition bodies. Join analysis allows 131,072 branch and membership
 records per pass. Join diagnostics have their own limit of 1,024.
