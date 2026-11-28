@@ -207,27 +207,74 @@ fn repair_unquoted_colon_values(frontmatter: &str) -> Option<String> {
     changed.then(|| repaired.join("\n"))
 }
 
+const YAML_REFERENCES: &str = "SKILL.md frontmatter does not support YAML anchors or aliases.";
+
+fn scan_frontmatter(frontmatter: &str) -> Result<(), &'static str> {
+    use libyaml_rs::*;
+    use std::mem::MaybeUninit;
+
+    let mut parser = MaybeUninit::<yaml_parser_t>::uninit();
+    let parser = parser.as_mut_ptr();
+    // The input outlives the parser. Delete each scanned token and the parser
+    // on every exit. Scanning recognizes reference tokens without expanding them.
+    unsafe {
+        if yaml_parser_initialize(parser).fail {
+            return Err("Cannot initialize SKILL.md frontmatter scanner.");
+        }
+        yaml_parser_set_input_string(parser, frontmatter.as_ptr(), frontmatter.len() as _);
+        let result = loop {
+            let mut token = MaybeUninit::<yaml_token_t>::uninit();
+            if yaml_parser_scan(parser, token.as_mut_ptr()).fail {
+                break Err("Invalid YAML in SKILL.md frontmatter.");
+            }
+            let mut token = token.assume_init();
+            let kind = token.type_;
+            yaml_token_delete(&mut token);
+            match kind {
+                YAML_ANCHOR_TOKEN | YAML_ALIAS_TOKEN => break Err(YAML_REFERENCES),
+                YAML_STREAM_END_TOKEN => break Ok(()),
+                _ => {}
+            }
+        };
+        yaml_parser_delete(parser);
+        result
+    }
+}
+
+fn deserialize_frontmatter(frontmatter: &str) -> Result<Mapping, String> {
+    scan_frontmatter(frontmatter).map_err(str::to_owned)?;
+    serde_yaml::from_str::<Mapping>(frontmatter)
+        .map_err(|error| format!("Invalid SKILL.md frontmatter: {error}"))
+}
+
 fn parse_frontmatter_mapping(
     frontmatter: &str,
     diagnostics: &mut Vec<SkillDiagnostic>,
 ) -> Option<Mapping> {
-    match serde_yaml::from_str::<Mapping>(frontmatter) {
+    match deserialize_frontmatter(frontmatter) {
         Ok(mapping) => Some(mapping),
-        Err(first_error) => {
-            if let Some(repaired) = repair_unquoted_colon_values(frontmatter) {
-                if let Ok(mapping) = serde_yaml::from_str::<Mapping>(&repaired) {
-                    diagnostics.push(skill_diagnostic(
-                        "warning",
-                        "frontmatter_repaired",
-                        "SKILL.md frontmatter used an unquoted colon value; Macro repaired it for compatibility.",
-                    ));
-                    return Some(mapping);
+        Err(mut first_error) => {
+            let repaired = (first_error != YAML_REFERENCES)
+                .then(|| repair_unquoted_colon_values(frontmatter))
+                .flatten();
+            if let Some(repaired) = repaired {
+                match deserialize_frontmatter(&repaired) {
+                    Ok(mapping) => {
+                        diagnostics.push(skill_diagnostic(
+                            "warning",
+                            "frontmatter_repaired",
+                            "SKILL.md frontmatter used an unquoted colon value. Macro repaired it for compatibility.",
+                        ));
+                        return Some(mapping);
+                    }
+                    Err(error) if error == YAML_REFERENCES => first_error = error,
+                    Err(_) => {}
                 }
             }
             diagnostics.push(skill_diagnostic(
                 "error",
                 "invalid_frontmatter",
-                format!("Invalid SKILL.md frontmatter: {}", first_error),
+                first_error,
             ));
             None
         }
@@ -324,6 +371,31 @@ fn empty_skill_frontmatter_reports_validation_error() {
         assert!(!parsed.is_valid);
         assert!(parsed.body.is_empty());
         assert!(parse_admitted_skill_text(path, input).is_err());
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn skill_frontmatter_rejects_alias_expansion_within_byte_limit() {
+    let path = Path::new("review/SKILL.md");
+    let scalar = "x".repeat(120_000);
+    let references = "*shared, ".repeat(128);
+    let raw = format!(
+        "---\nname: review\ndescription: Review\nmetadata:\n  seed: &shared {scalar}\n  repeated: [{references}]\n---\n"
+    );
+    assert!(raw.len() < 262_144);
+    let error = parse_admitted_skill_text(path, &raw).unwrap_err();
+    assert!(error.contains(YAML_REFERENCES), "{error}");
+}
+
+#[cfg(test)]
+#[test]
+fn skill_frontmatter_allows_literal_reference_characters() {
+    let path = Path::new("review/SKILL.md");
+    for description in ["'&* text'", "|-\n  &* text", "Review: use &* text"] {
+        let raw = format!("---\nname: review\ndescription: {description}\n---\n");
+        let (_, description, _) = parse_admitted_skill_text(path, &raw).unwrap();
+        assert!(description.ends_with("&* text"));
     }
 }
 

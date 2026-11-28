@@ -128,11 +128,8 @@ impl OpenedSource {
         } else {
             None
         };
-        let file = match &dir {
-            Some(dir) => read_regular(dir, Path::new(MANIFEST), MAX_JSON_TOTAL, &budget),
-            None => read_local(&path, MAX_JSON_TOTAL, &budget),
-        }
-        .map_err(|e| {
+        let origin = path.canonicalize().map_err(|_| source_unavailable())?;
+        let read_error = |e: std::io::Error| {
             if let Some(error) = read_limit(name.to_str().unwrap_or(""), &e) {
                 error
             } else if e.kind() == std::io::ErrorKind::FileTooLarge {
@@ -140,7 +137,20 @@ impl OpenedSource {
             } else {
                 source_unavailable()
             }
-        })?;
+        };
+        let opened = match &dir {
+            Some(dir) => open_regular(dir, Path::new(MANIFEST)),
+            None => open_local(&path),
+        }
+        .map_err(read_error)?;
+        verify_source_origin(&path, &origin, &opened)?;
+        let file = if dir.is_some() {
+            read_project_file(&opened, MAX_JSON_TOTAL, &budget).map_err(read_error)?
+        } else {
+            let size = opened.metadata().map_err(read_error)?.len();
+            let bytes = bounded_read(&opened, size, MAX_JSON_TOTAL, &budget).map_err(read_error)?;
+            ProjectFile::new(bytes, false)
+        };
         if let Some(dir) = dir {
             let manifest = parse_json(&file.bytes, MANIFEST, false, &budget)?;
             if manifest.get("projectFormat").is_some() {
@@ -155,9 +165,10 @@ impl OpenedSource {
         let authored = String::from_utf8(file.bytes)
             .map_err(|_| failure("PARSE", "source", "Source must be UTF-8"))?;
         validate_source_syntax(&authored, name.to_str().unwrap_or(""), &budget)?;
+        verify_source_origin(&path, &origin, &opened)?;
         Ok(Self {
             authored,
-            origin: Some(path.canonicalize().map_err(|_| source_unavailable())?),
+            origin: Some(origin),
             project: None,
         })
     }
@@ -653,11 +664,38 @@ fn bounded_read(
     }
 }
 
-fn read_local(path: &Path, limit: u64, budget: &SourceBudget) -> std::io::Result<ProjectFile> {
-    let file = open_local(path)?;
-    let meta = file.metadata()?;
-    let bytes = bounded_read(file, meta.len(), limit, budget)?;
-    Ok(ProjectFile::new(bytes, false))
+fn verify_source_origin(path: &Path, origin: &Path, opened: &std::fs::File) -> Result<()> {
+    use crate::content_io::admitted::WorkspaceRootIdentity;
+
+    fn identity(file: &std::fs::File, _path: &Path) -> Result<WorkspaceRootIdentity> {
+        #[cfg(unix)]
+        {
+            use crate::content_io::admitted::workspace_root_identity_from_std;
+            let metadata = file.metadata().map_err(|_| source_unavailable())?;
+            Ok(workspace_root_identity_from_std(&metadata))
+        }
+        #[cfg(windows)]
+        {
+            use crate::content_io::admitted::workspace_root_identity_from_handle;
+            use std::os::windows::io::AsRawHandle;
+            workspace_root_identity_from_handle(file.as_raw_handle(), _path)
+                .map_err(|_| source_unavailable())
+        }
+    }
+
+    // Keep the original handle open until both names have been checked. A
+    // replacement at the same canonical path still has a different identity.
+    let expected = identity(opened, path)?;
+    for name in [origin, path] {
+        let current = open_local(name).map_err(|_| source_unavailable())?;
+        if identity(&current, name)? != expected {
+            return Err(source_unavailable());
+        }
+    }
+    if path.canonicalize().map_err(|_| source_unavailable())? != origin {
+        return Err(source_unavailable());
+    }
+    Ok(())
 }
 
 fn read_regular(
@@ -666,10 +704,17 @@ fn read_regular(
     limit: u64,
     budget: &SourceBudget,
 ) -> std::io::Result<ProjectFile> {
-    let mut file = open_regular(dir, path)?;
+    read_project_file(&open_regular(dir, path)?, limit, budget)
+}
+
+fn read_project_file(
+    file: &std::fs::File,
+    limit: u64,
+    budget: &SourceBudget,
+) -> std::io::Result<ProjectFile> {
     let meta = file.metadata()?;
-    let bytes = bounded_read(&mut file, meta.len(), limit, budget)?;
-    crate::content_io::single_link_metadata(&file)?;
+    let bytes = bounded_read(file, meta.len(), limit, budget)?;
+    crate::content_io::single_link_metadata(file)?;
     #[cfg(unix)]
     let executable = {
         use std::os::unix::fs::PermissionsExt;
@@ -678,6 +723,46 @@ fn read_regular(
     #[cfg(not(unix))]
     let executable = false;
     Ok(ProjectFile::new(bytes, executable))
+}
+
+#[cfg(test)]
+#[test]
+fn plain_json_origin_rejects_replacement_at_the_same_path() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("document.json");
+    std::fs::write(&path, b"{}").unwrap();
+    let origin = path.canonicalize().unwrap();
+    let opened = open_local(&path).unwrap();
+    verify_source_origin(&path, &origin, &opened).unwrap();
+    std::fs::rename(&path, temp.path().join("original.json")).unwrap();
+    std::fs::write(&path, b"{}").unwrap();
+    assert_eq!(path.canonicalize().unwrap(), origin);
+    let error = verify_source_origin(&path, &origin, &opened).unwrap_err();
+    assert_eq!(error.code, "SOURCE_UNAVAILABLE");
+}
+
+#[cfg(all(test, unix))]
+#[test]
+fn plain_json_origin_rejects_a_new_location_for_the_same_file() {
+    use std::{fs, os::unix::fs::symlink};
+
+    let temp = tempfile::tempdir().unwrap();
+    let first = temp.path().join("first");
+    let second = temp.path().join("second");
+    let alias = temp.path().join("alias");
+    fs::create_dir(&first).unwrap();
+    fs::create_dir(&second).unwrap();
+    fs::write(first.join("document.json"), b"{}").unwrap();
+    fs::hard_link(first.join("document.json"), second.join("document.json")).unwrap();
+    symlink(&first, &alias).unwrap();
+    let path = alias.join("document.json");
+    let origin = path.canonicalize().unwrap();
+    let opened = open_local(&path).unwrap();
+    verify_source_origin(&path, &origin, &opened).unwrap();
+    fs::remove_file(&alias).unwrap();
+    symlink(&second, &alias).unwrap();
+    let error = verify_source_origin(&path, &origin, &opened).unwrap_err();
+    assert_eq!(error.code, "SOURCE_UNAVAILABLE");
 }
 
 fn file_url(path: &Path) -> Result<Url> {

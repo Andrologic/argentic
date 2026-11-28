@@ -1,5 +1,5 @@
 use super::*;
-use std::path::Path;
+use std::{ffi::OsStr, path::Path};
 use url::Url;
 
 /// Native-only handle, retained by the host and never deserialized from a tool.
@@ -21,6 +21,20 @@ pub struct SkillDescriptor {
     pub path: String,
     pub source: ResolvedContentReceipt,
     pub handle: SkillHandle,
+}
+
+impl SkillDescriptor {
+    pub(crate) fn resource_uri(&self, relative_path: &str) -> ContentResult<Url> {
+        skill_resource_uri(&self.handle.root_uri()?, relative_path)
+    }
+}
+
+impl SkillHandle {
+    fn root_uri(&self) -> ContentResult<Url> {
+        resolve::absolute_uri(&self.final_uri)?
+            .join(".")
+            .map_err(|e| error("CONTENT_URI", e))
+    }
 }
 
 pub struct LoadedSkill {
@@ -159,9 +173,7 @@ pub async fn load_skill(
         return Err(error("CORRELATION", "Skill changed since discovery."));
     }
     let (_, _, instructions) = parse_skill(&receipt)?;
-    let root = resolve::absolute_uri(&handle.final_uri)?
-        .join(".")
-        .map_err(|e| error("CONTENT_URI", e))?;
+    let root = handle.root_uri()?;
     if root.scheme() == "file" {
         let path = root
             .to_file_path()
@@ -205,21 +217,7 @@ pub async fn read_skill_resource(
             "Skill handle belongs to another capture.",
         ));
     }
-    if relative_path.is_empty()
-        || relative_path.starts_with('/')
-        || relative_path.contains('\\')
-        || relative_path.split('/').any(|p| p == ".." || p == ".")
-    {
-        return Err(error(
-            "CONTENT_URI",
-            "Skill resource must be a relative path within its root.",
-        ));
-    }
-    let target = loaded
-        .root
-        .uri
-        .join(relative_path)
-        .map_err(|e| error("CONTENT_URI", e))?;
+    let target = skill_resource_uri(&loaded.root.uri, relative_path)?;
     let mut source = serde_json::json!({"uri": target.as_str()});
     if let Some(media) = media_type {
         source["mediaType"] = media.into();
@@ -234,4 +232,56 @@ pub async fn read_skill_resource(
         Some(&loaded.root),
     )
     .await
+}
+
+/// Resolve a slash-separated literal path relative to the skill directory.
+fn skill_resource_uri(root: &Url, relative_path: &str) -> ContentResult<Url> {
+    let invalid_path = || {
+        error(
+            "CONTENT_URI",
+            "Skill resource must be a relative path within its root.",
+        )
+    };
+    if relative_path.contains(['\\', '\0']) {
+        return Err(invalid_path());
+    }
+    #[cfg(windows)]
+    if relative_path.contains(':') {
+        return Err(invalid_path());
+    }
+    let mut target = root
+        .to_file_path()
+        .map_err(|()| error("CONTENT_URI", "Invalid skill root."))?;
+    for part in relative_path.split('/') {
+        if Path::new(part).file_name() != Some(OsStr::new(part)) {
+            return Err(invalid_path());
+        }
+        target.push(part);
+    }
+    Url::from_file_path(target).map_err(|()| invalid_path())
+}
+
+#[cfg(test)]
+#[test]
+fn skill_resource_uri_preserves_literal_path_components() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = Url::from_directory_path(temp.path()).unwrap();
+    let nested = temp.path().join("nested%2f");
+    std::fs::create_dir(&nested).unwrap();
+    let file = nested.join("notes#2.md");
+    std::fs::write(&file, b"literal resource").unwrap();
+    let target = skill_resource_uri(&root, "nested%2f/notes#2.md").unwrap();
+    assert_eq!(target.fragment(), None);
+    let path = resolve::local_file_path(target.as_str(), None).unwrap();
+    assert_eq!(path, file);
+    assert_eq!(std::fs::read(path).unwrap(), b"literal resource");
+    #[cfg(unix)]
+    {
+        let literal = "notes\t2.md";
+        let target = skill_resource_uri(&root, literal).unwrap();
+        assert_eq!(target.to_file_path().unwrap(), temp.path().join(literal));
+    }
+    for path in ["", "/absolute", "../escape", "nested/./file", "a\\b"] {
+        assert!(skill_resource_uri(&root, path).is_err(), "{path}");
+    }
 }

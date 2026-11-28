@@ -491,6 +491,10 @@ The executable is in `crates/argentic-runtime/target/debug/examples/argentic-hos
 If `CARGO_TARGET_DIR` is set, use its `debug/examples/argentic-host` instead.
 On macOS the runtime build requires the Swift toolchain. The example calls
 `content_io::file_helper::initialize` before Tokio.
+The macOS content reader needs to collect its helpers' exit status. Initialization
+fails if the host ignores `SIGCHLD` with `SIG_IGN` or sets `SA_NOCLDWAIT`. Keep
+both settings disabled while the reader is in use and leave helper reaping to
+the runtime.
 
 Choose a disposable workspace containing an existing regular `sentinel.txt` with
 `before` and a newline. Keep the private data directory outside that workspace,
@@ -637,6 +641,12 @@ and scopes must still match. `deliver` accepts the existing `DeliveryRequest030`
 contract from `api`. Start ids are idempotency keys: after an uncertain reply,
 inspect `runs` and use the same request, never submit a new id to guess success.
 `shutdown` has the same `approved` list as `quit` but keeps inspection available.
+
+Shutdown output is best-effort. After successful drainage, the host allows one
+second to write and flush its final stdout record, including the response to
+`quit`. The stream can end with a missing or partial record. Read complete
+newline-terminated records and discard any trailing partial line at EOF.
+
 Stop/shutdown waiter deadlines do not prove a physical end. Retry the same
 retirement. Once shutdown starts, admissions stay closed; the operator never
 resumes work or releases storage before successful drainage. EOF drainage retries

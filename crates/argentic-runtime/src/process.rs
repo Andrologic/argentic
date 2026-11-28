@@ -19,7 +19,9 @@ use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use windows_sys::Win32::Foundation::ERROR_PROCESS_ABORTED;
 #[cfg(windows)]
 use windows_sys::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject, TerminateJobObject,
+    AssignProcessToJobObject, CreateJobObjectW, JobObjectBasicAccountingInformation,
+    QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
+    JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -242,26 +244,48 @@ impl ContainedBackgroundProcess {
             marker
         };
         #[cfg(target_os = "linux")]
-        let (status_writer, command_status) = {
+        let (status_writer, command_status, mut startup_reader, startup_writer) = {
             use std::os::fd::AsRawFd;
-            use std::os::unix::process::CommandExt;
+            use std::os::unix::{net::UnixStream, process::CommandExt};
             let (writer, reader) = tokio::net::unix::pipe::pipe()?;
             let descriptor = writer.as_raw_fd();
+            let (startup_reader, startup_writer) = UnixStream::pair()?;
+            let startup_descriptor = startup_writer.as_raw_fd();
+            #[cfg(test)]
+            let fail_after_sweep = FAIL_LINUX_SETUP_AFTER_SWEEP.take();
             // Drop signals the workload. The reaper must survive long enough
             // to wait for any children it adopts.
             command.kill_on_drop(false);
             unsafe {
-                command
-                    .as_std_mut()
-                    .pre_exec(move || install_linux_process_supervisor(descriptor));
+                command.as_std_mut().pre_exec(move || {
+                    install_linux_process_supervisor(
+                        descriptor,
+                        startup_descriptor,
+                        #[cfg(test)]
+                        fail_after_sweep,
+                    )
+                });
             }
-            (writer, reader)
+            (writer, reader, startup_reader, startup_writer)
         };
         #[cfg(windows)]
         command.creation_flags(CREATE_NO_WINDOW | CREATE_SUSPENDED);
         let child = command.spawn()?;
         #[cfg(target_os = "linux")]
-        drop(status_writer);
+        {
+            use std::io::Read;
+
+            drop(status_writer);
+            drop(startup_writer);
+            // The descriptor sweep closes Rust's exec-error descriptor.
+            // Require a complete, explicit acknowledgement from the supervisor.
+            let mut status = [0; std::mem::size_of::<i32>()];
+            startup_reader.read_exact(&mut status)?;
+            let status = i32::from_ne_bytes(status);
+            if status != 0 {
+                return Err(io::Error::from_raw_os_error(status));
+            }
+        }
         #[cfg(unix)]
         let process_group_id = child.id();
         #[cfg(windows)]
@@ -479,22 +503,63 @@ impl ContainedBackgroundProcess {
 
     #[cfg(windows)]
     async fn terminate_windows(&mut self, grace_period: Duration) -> io::Result<ExitStatus> {
-        // Descendants can remain in the job after its original leader exits.
-        // Terminating an empty job is harmless, so never gate this on child.id().
-        unsafe { TerminateJobObject(self.job_object.as_raw_handle() as _, ERROR_PROCESS_ABORTED) };
         let reap_timeout = if grace_period.is_zero() {
             HARD_REAP_TIMEOUT
         } else {
             grace_period
         };
-        match tokio::time::timeout(reap_timeout, self.child.wait()).await {
-            Ok(status) => status,
-            Err(_) => Err(io::Error::new(
+        let deadline = tokio::time::Instant::now() + reap_timeout;
+        // The leader may already have exited while descendants remain active.
+        if unsafe {
+            TerminateJobObject(self.job_object.as_raw_handle() as _, ERROR_PROCESS_ABORTED)
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        self.wait_for_windows_job_exit(deadline).await
+    }
+
+    #[cfg(windows)]
+    async fn wait_for_windows_job_exit(
+        &mut self,
+        deadline: tokio::time::Instant,
+    ) -> io::Result<ExitStatus> {
+        match tokio::time::timeout_at(deadline, async {
+            let status = self.child.wait().await?;
+            while windows_job_active_processes(&self.job_object)? != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Ok(status)
+        })
+        .await
+        {
+            // Tokio can poll a ready inner future after its timer expires.
+            Ok(Ok(status)) if tokio::time::Instant::now() < deadline => Ok(status),
+            Ok(Err(error)) => Err(error),
+            _ => Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "contained process tree did not exit after job termination",
             )),
         }
     }
+}
+
+#[cfg(windows)]
+fn windows_job_active_processes(job: &JobObjectHandle) -> io::Result<u32> {
+    let mut info = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+    if unsafe {
+        QueryInformationJobObject(
+            job.as_raw_handle() as _,
+            JobObjectBasicAccountingInformation,
+            (&mut info as *mut JOBOBJECT_BASIC_ACCOUNTING_INFORMATION).cast(),
+            std::mem::size_of_val(&info) as u32,
+            std::ptr::null_mut(),
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(info.ActiveProcesses)
 }
 
 /// Observe the same processes discovered and suspended by the existing tree
@@ -596,8 +661,46 @@ fn next_containment_id() -> String {
     )
 }
 
+#[cfg(all(test, target_os = "linux"))]
+thread_local! {
+    static FAIL_LINUX_SETUP_AFTER_SWEEP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 #[cfg(target_os = "linux")]
-fn install_linux_process_supervisor(status_descriptor: i32) -> io::Result<()> {
+fn install_linux_process_supervisor(
+    status_descriptor: i32,
+    startup_descriptor: i32,
+    #[cfg(test)] fail_after_sweep: bool,
+) -> io::Result<()> {
+    match setup_linux_supervisor(
+        status_descriptor,
+        startup_descriptor,
+        #[cfg(test)]
+        fail_after_sweep,
+    ) {
+        Ok(None) => Ok(()),
+        Ok(Some(command_process_id)) => {
+            write_linux_status(startup_descriptor, 0);
+            unsafe { libc::close(startup_descriptor) };
+            supervise_linux_command(command_process_id, status_descriptor)
+        }
+        Err(error) => {
+            write_linux_status(
+                startup_descriptor,
+                error.raw_os_error().unwrap_or(libc::EIO),
+            );
+            // The descriptor sweep may have closed Rust's exec-error channel.
+            unsafe { libc::_exit(1) }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn setup_linux_supervisor(
+    status_descriptor: i32,
+    startup_descriptor: i32,
+    #[cfg(test)] fail_after_sweep: bool,
+) -> io::Result<Option<libc::pid_t>> {
     if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) } == -1 {
         return Err(io::Error::last_os_error());
     }
@@ -610,26 +713,30 @@ fn install_linux_process_supervisor(status_descriptor: i32) -> io::Result<()> {
         0 => unsafe { libc::_exit(0) },
         _ => {}
     }
-    match start_linux_workload(supervisor_group, status_descriptor) {
-        Ok(None) => Ok(()),
-        Ok(Some(command_process_id)) => {
-            close_linux_file_descriptors_except(status_descriptor);
-            supervise_linux_command(command_process_id, status_descriptor)
-        }
-        Err(error) => {
-            reap_linux_setup_child(supervisor_group);
-            Err(error)
-        }
+    let result = start_linux_workload(
+        supervisor_group,
+        status_descriptor,
+        startup_descriptor,
+        #[cfg(test)]
+        fail_after_sweep,
+    );
+    if result.is_err() {
+        reap_linux_setup_child(supervisor_group);
     }
+    result
 }
 
 #[cfg(target_os = "linux")]
 fn start_linux_workload(
     supervisor_group: libc::pid_t,
     status_descriptor: i32,
+    startup_descriptor: i32,
+    #[cfg(test)] fail_after_sweep: bool,
 ) -> io::Result<Option<libc::pid_t>> {
-    use std::io::{Read, Write};
-    use std::os::unix::net::UnixStream;
+    use std::{
+        io::{Read, Write},
+        os::{fd::AsRawFd, unix::net::UnixStream},
+    };
 
     // Linux retains the group of an exited child until it is reaped.
     if unsafe { libc::setpgid(supervisor_group, supervisor_group) } == -1 {
@@ -642,8 +749,12 @@ fn start_linux_workload(
     }
     if pid == 0 {
         drop(ready_writer);
-        unsafe { libc::close(status_descriptor) };
-        // Do not exec while the supervisor is still in the workload group.
+        unsafe {
+            libc::close(status_descriptor);
+            libc::close(startup_descriptor);
+        };
+        // Do not exec until the supervisor is in its own group and has
+        // closed its unrelated descriptors.
         if ready_reader.read_exact(&mut [0]).is_err() {
             unsafe { libc::_exit(1) };
         }
@@ -651,11 +762,21 @@ fn start_linux_workload(
     }
 
     drop(ready_reader);
-    let ready = if unsafe { libc::setpgid(0, supervisor_group) } == -1 {
-        Err(io::Error::last_os_error())
-    } else {
+    let ready = (|| {
+        if unsafe { libc::setpgid(0, supervisor_group) } == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        close_linux_file_descriptors_except([
+            status_descriptor,
+            startup_descriptor,
+            ready_writer.as_raw_fd(),
+        ])?;
+        #[cfg(test)]
+        if fail_after_sweep {
+            return Err(io::Error::from_raw_os_error(libc::EIO));
+        }
         ready_writer.write_all(&[1])
-    };
+    })();
     drop(ready_writer);
     if let Err(error) = ready {
         reap_linux_setup_child(pid);
@@ -681,7 +802,7 @@ fn supervise_linux_command(command_process_id: libc::pid_t, status_descriptor: i
         let mut status = 0;
         let waited = unsafe { libc::waitpid(-1, &mut status, 0) };
         if waited == command_process_id {
-            write_linux_command_status(status_descriptor, status);
+            write_linux_status(status_descriptor, status);
             unsafe {
                 libc::close(status_descriptor);
             }
@@ -702,7 +823,7 @@ fn supervise_linux_command(command_process_id: libc::pid_t, status_descriptor: i
 }
 
 #[cfg(target_os = "linux")]
-fn write_linux_command_status(descriptor: i32, status: i32) {
+fn write_linux_status(descriptor: i32, status: i32) {
     let mut written_bytes = 0_usize;
     while written_bytes < std::mem::size_of::<i32>() {
         let result = unsafe {
@@ -724,22 +845,91 @@ fn write_linux_command_status(descriptor: i32, status: i32) {
 }
 
 #[cfg(target_os = "linux")]
-fn close_linux_file_descriptors_except(preserved_descriptor: i32) {
-    let close_range = |first: u32, last: u32| {
-        first > last || unsafe { libc::syscall(libc::SYS_close_range, first, last, 0_u32) } == 0
+fn close_linux_file_descriptors_except<const N: usize>(preserved: [i32; N]) -> io::Result<()> {
+    let mut first = 0_u32;
+    let mut sorted = preserved.map(|fd| fd as u32);
+    sorted.sort_unstable();
+    for next in sorted.into_iter().chain([u32::MAX]) {
+        if first < next
+            && unsafe { libc::syscall(libc::SYS_close_range, first, next - 1, 0_u32) } != 0
+        {
+            return close_linux_file_descriptors_fallback(preserved);
+        }
+        first = next.saturating_add(1);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn close_linux_file_descriptors_fallback<const N: usize>(preserved: [i32; N]) -> io::Result<()> {
+    use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
+
+    // This runs after fork, so avoid allocating or acquiring libc/Rust locks.
+    // A descriptor may exceed the current resource limit if the limit was lowered.
+    let dir = unsafe {
+        libc::open(
+            c"/proc/self/fd".as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
     };
-    let lower_closed =
-        preserved_descriptor <= 0 || close_range(0, (preserved_descriptor - 1) as u32);
-    let upper_closed = close_range((preserved_descriptor + 1) as u32, u32::MAX);
-    if lower_closed && upper_closed {
-        return;
+    if dir < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let directory = unsafe { OwnedFd::from_raw_fd(dir) };
+    let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    if unsafe { libc::fstatfs(dir, stat.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if unsafe { stat.assume_init() }.f_type as u64 != libc::PROC_SUPER_MAGIC as u64 {
+        return Err(io::Error::from_raw_os_error(libc::ENOTSUP));
     }
 
-    for descriptor in 0..65_536 {
-        if descriptor != preserved_descriptor {
-            let _ = unsafe { libc::close(descriptor) };
+    let invalid_record = || io::Error::from_raw_os_error(libc::EIO);
+    let mut buffer = [0_u8; 4096];
+    loop {
+        let len =
+            unsafe { libc::syscall(libc::SYS_getdents64, dir, buffer.as_mut_ptr(), buffer.len()) };
+        if len == 0 {
+            break;
+        }
+        if len < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        let mut entries = &buffer[..len as usize];
+        while !entries.is_empty() {
+            // linux_dirent64 has two u64s, a u16 record length, a type byte,
+            // then the zero-terminated filename in that record.
+            let size = entries.get(16..18).ok_or_else(invalid_record)?;
+            let size = u16::from_ne_bytes([size[0], size[1]]) as usize;
+            let name = entries.get(19..size).ok_or_else(invalid_record)?;
+            let end = name
+                .iter()
+                .position(|&byte| byte == 0)
+                .ok_or_else(invalid_record)?;
+            let name = &name[..end];
+            if !matches!(name, b"." | b"..") {
+                let descriptor = std::str::from_utf8(name)
+                    .ok()
+                    .and_then(|name| name.parse::<i32>().ok())
+                    .ok_or_else(invalid_record)?;
+                if descriptor != dir
+                    && !preserved.contains(&descriptor)
+                    && unsafe { libc::close(descriptor) } == -1
+                {
+                    return Err(io::Error::last_os_error());
+                }
+            }
+            entries = &entries[size..];
         }
     }
+    if unsafe { libc::close(directory.into_raw_fd()) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -1861,6 +2051,70 @@ mod tests {
     use std::fs;
 
     #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn linux_spawn_reports_setup_failure_after_descriptor_sweep() {
+        super::FAIL_LINUX_SETUP_AFTER_SWEEP.set(true);
+        let error = super::ContainedBackgroundProcess::spawn_background("/bin/true").unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EIO));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_descriptor_fallback_closes_high_descriptors() {
+        // Isolate the descriptor table so the fallback can close everything
+        // except the nominated status descriptor.
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork descriptor fixture");
+        if child == 0 {
+            let preserved = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY) };
+            let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+            if preserved < 0
+                || unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) } != 0
+            {
+                unsafe { libc::_exit(2) }
+            }
+            let mut limit = unsafe { limit.assume_init() };
+            let minimum = if limit.rlim_max > 65_536 {
+                // Raise only the fixture's soft limit if the host permits it.
+                limit.rlim_cur = limit.rlim_cur.max(65_537);
+                if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) } != 0 {
+                    unsafe { libc::_exit(2) }
+                }
+                65_536
+            } else {
+                3
+            };
+            let duplicate = unsafe { libc::fcntl(preserved, libc::F_DUPFD_CLOEXEC, minimum) };
+            if duplicate < 0 {
+                unsafe { libc::_exit(2) }
+            }
+            let ready = unsafe { libc::fcntl(preserved, libc::F_DUPFD_CLOEXEC, 3) };
+            if ready < 0
+                || super::close_linux_file_descriptors_fallback([preserved, ready]).is_err()
+            {
+                unsafe { libc::_exit(2) }
+            }
+            let closed = unsafe { libc::fcntl(duplicate, libc::F_GETFD) } == -1;
+            let kept = [preserved, ready]
+                .into_iter()
+                .all(|fd| unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0);
+            unsafe { libc::_exit(i32::from(!(closed && kept))) }
+        }
+        let mut status = 0;
+        loop {
+            let waited = unsafe { libc::waitpid(child, &mut status, 0) };
+            if waited == child {
+                break;
+            }
+            assert_eq!(
+                std::io::Error::last_os_error().kind(),
+                std::io::ErrorKind::Interrupted
+            );
+        }
+        assert_eq!(status, 0, "descriptor fixture did not complete cleanly");
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn terminal_termination_ignores_a_recycled_group_id() {
         use std::os::unix::process::CommandExt;
@@ -2391,28 +2645,101 @@ mod tests {
     #[cfg(windows)]
     #[tokio::test]
     async fn contained_process_captures_an_immediate_windows_descendant() {
-        use super::{background_contained_tokio_command, ContainedBackgroundProcess};
+        use super::{
+            background_contained_tokio_command, windows_job_active_processes,
+            ContainedBackgroundProcess,
+        };
         use std::time::Duration;
-        let temp = tempfile::TempDir::new().expect("temp dir");
-        let marker = temp.path().join("escaped-descendant.txt");
-        let child_script = format!(
-            "Start-Sleep -Milliseconds 750; Set-Content -LiteralPath '{}' -Value escaped",
-            marker.to_string_lossy().replace('\'', "''")
-        );
-        let parent_script = format!(
-            "Start-Process -WindowStyle Hidden -FilePath powershell.exe -ArgumentList @('-NoProfile','-Command','{}')",
-            child_script.replace('\'', "''")
-        );
+        let parent_script = "Start-Process -WindowStyle Hidden -FilePath powershell.exe -ArgumentList '-NoProfile -Command Start-Sleep -Seconds 60'";
         let mut command = background_contained_tokio_command("powershell.exe");
-        command.args(["-NoProfile", "-Command", &parent_script]);
+        command.args(["-NoProfile", "-Command", parent_script]);
         let mut process = ContainedBackgroundProcess::spawn(command).expect("spawn parent");
-        process.wait().await.expect("wait parent");
+        assert!(process.wait().await.expect("wait parent").success());
+        assert!(
+            windows_job_active_processes(&process.job_object).unwrap() > 0,
+            "descendant must outlive the leader"
+        );
         process
             .terminate_with_grace(Duration::ZERO)
             .await
             .expect("terminate job");
-        tokio::time::sleep(Duration::from_millis(1_000)).await;
-        assert!(!marker.exists(), "descendant escaped its Windows job");
+        assert_eq!(
+            windows_job_active_processes(&process.job_object).unwrap(),
+            0,
+            "cleanup returned with a live job member"
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_cleanup_rejects_an_empty_job_at_an_expired_deadline() {
+        use super::{
+            background_contained_tokio_command, windows_job_active_processes,
+            ContainedBackgroundProcess,
+        };
+        use std::{io, time::Duration};
+        use tokio::time::Instant;
+
+        let mut command = background_contained_tokio_command("cmd.exe");
+        command.args(["/C", "exit", "0"]);
+        let mut process = ContainedBackgroundProcess::spawn(command).unwrap();
+        assert!(process.wait().await.unwrap().success());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while windows_job_active_processes(&process.job_object).unwrap() != 0 {
+            assert!(
+                Instant::now() < deadline,
+                "job still reports an active process"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let error = process
+            .wait_for_windows_job_exit(Instant::now() - Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_cleanup_rejects_a_failed_job_termination() {
+        use super::{background_contained_tokio_command, ContainedBackgroundProcess};
+        use std::{
+            os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
+            time::Duration,
+        };
+        use windows_sys::Win32::{
+            Foundation::{DuplicateHandle, ERROR_ACCESS_DENIED},
+            System::Threading::GetCurrentProcess,
+        };
+        let mut command = background_contained_tokio_command("cmd.exe");
+        command.args(["/C", "exit", "0"]);
+        let mut process = ContainedBackgroundProcess::spawn(command).expect("spawn command");
+        assert!(process.wait().await.expect("wait command").success());
+        let mut reduced = std::ptr::null_mut();
+        let current = unsafe { GetCurrentProcess() };
+        // Duplicate with zero access rights to exercise a real Win32 failure
+        // after the leader's exit has already been observed.
+        assert_ne!(
+            unsafe {
+                DuplicateHandle(
+                    current,
+                    process.job_object.as_raw_handle() as _,
+                    current,
+                    &mut reduced,
+                    0,
+                    0,
+                    0,
+                )
+            },
+            0
+        );
+        process.job_object = unsafe { OwnedHandle::from_raw_handle(reduced as _) };
+        let error = process
+            .terminate_with_grace(Duration::ZERO)
+            .await
+            .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(ERROR_ACCESS_DENIED as i32));
     }
 
     #[cfg(unix)]

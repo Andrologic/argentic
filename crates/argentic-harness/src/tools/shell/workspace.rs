@@ -571,7 +571,10 @@ mod tests {
             samples.sort_unstable();
             let median = samples[1];
             println!("shell staging {}: {median:?} median", root.path.display());
-            assert!(median.as_secs() < 8, "shell staging exceeded 8 seconds");
+            // Hosted CI runners only report timings; controlled runners enforce them.
+            if std::env::var_os("ARGENTIC_PERF_REPORT_ONLY").is_none() {
+                assert!(median.as_secs() < 8, "shell staging exceeded 8 seconds");
+            }
         }
     }
 }

@@ -156,18 +156,8 @@ impl PolicySource for Policies {
     fn lock_project<'a>(&'a self, project: &'a str) -> PolicyFuture<'a, ProjectPolicyLease> {
         Box::pin(async move {
             let guard = self.acquire().await?;
-            if project != guard.policy.owner.project_id {
-                return Err(failure(
-                    "PERMISSION",
-                    "project",
-                    "Project is outside the approved policy",
-                ));
-            }
-            Ok(ProjectPolicyLease::new(
-                json!({"riskLevel":"strict"}),
-                guard.policy.permissions.clone(),
-                guard,
-            ))
+            let (tools, permissions) = project_policy(project, &guard)?;
+            Ok(ProjectPolicyLease::new(tools, permissions, guard))
         })
     }
     fn lock_ceiling(&self) -> PolicyFuture<'_, HostPolicyLease> {
@@ -180,6 +170,38 @@ impl PolicySource for Policies {
             ))
         })
     }
+    fn lock_ceiling_and_project<'a>(
+        &'a self,
+        project: &'a str,
+    ) -> PolicyFuture<'a, (HostPolicyLease, ProjectPolicyLease)> {
+        Box::pin(async move {
+            let guard = Arc::new(self.acquire().await?);
+            let (tools, permissions) = project_policy(project, &guard)?;
+            let ceiling = HostPolicyLease::new(
+                guard.policy.permissions.clone(),
+                guard.policy_digest.clone(),
+                guard.clone(),
+            );
+            let project = ProjectPolicyLease::new(tools, permissions, guard);
+            Ok((ceiling, project))
+        })
+    }
+}
+fn project_policy(
+    project: &str,
+    inputs: &Inputs,
+) -> Result<(Value, crate::permissions::RequestedPermissions)> {
+    if project != inputs.policy.owner.project_id {
+        return Err(failure(
+            "PERMISSION",
+            "project",
+            "Project is outside the approved policy",
+        ));
+    }
+    Ok((
+        json!({"riskLevel":"strict"}),
+        inputs.policy.permissions.clone(),
+    ))
 }
 impl ActionPolicySource for Policies {
     fn lock_current<'a>(
@@ -2228,6 +2250,34 @@ mod tests {
         host.shutdown(&active).await.unwrap();
         host.close().await.unwrap();
     }
+    #[tokio::test]
+    async fn combined_policy_lease_completes_with_a_queued_writer() {
+        let f = Fixture::new(WAIT);
+        let host = f.open().await.unwrap();
+        let store = &host.policies.0;
+        let project = store.read().await.policy.owner.project_id.clone();
+        let initial = store.write().await;
+        let mut admission = std::pin::pin!(host.context.lock_ceiling_and_project(&project));
+        assert!(futures::poll!(&mut admission).is_pending());
+        let mut update = std::pin::pin!(store.write());
+        assert!(futures::poll!(&mut update).is_pending());
+        drop(initial);
+
+        // The admission's first read is ahead of the writer. Any second
+        // read on this lock would queue behind it and stall the admission.
+        let (ceiling, project) = match futures::poll!(&mut admission) {
+            std::task::Poll::Ready(result) => result.unwrap(),
+            std::task::Poll::Pending => panic!("admission blocked behind the queued writer"),
+        };
+        assert!(futures::poll!(&mut update).is_pending());
+        drop(ceiling);
+        assert!(futures::poll!(&mut update).is_pending());
+        drop(project);
+        assert!(futures::poll!(&mut update).is_ready());
+        host.shutdown(&[]).await.unwrap();
+        host.close().await.unwrap();
+    }
+
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[tokio::test]
     async fn current_action_policy_retains_real_input_guard_and_refuses_foreign_capture() {

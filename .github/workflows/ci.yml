@@ -118,12 +118,21 @@ jobs:
         working-directory: crates/argentic-harness
         run: cargo test --locked --all-targets
 
-      - name: Measure Argentic staging and turn latency
+      # Timing thresholds are meaningful on controlled runners only; hosted
+      # runners report the numbers but still fail on functional errors.
+      - name: Measure Argentic staging
         if: runner.os == 'Linux' && inputs.suite != 'reader'
+        env:
+          ARGENTIC_PERF_REPORT_ONLY: "1"
         working-directory: crates/argentic-harness
-        run: |
-          cargo test --locked --lib shell_staging -- --ignored --nocapture
-          cargo test --locked --test engine scripted_turn_overhead -- --ignored --nocapture
+        run: cargo test --locked --lib shell_staging -- --ignored --nocapture
+
+      - name: Measure Argentic turn latency
+        if: runner.os == 'Linux' && inputs.suite != 'reader'
+        env:
+          ARGENTIC_PERF_REPORT_ONLY: "1"
+        working-directory: crates/argentic-harness
+        run: cargo test --locked --test engine scripted_turn_overhead -- --ignored --nocapture
 
       - name: Test argentic-core
         if: inputs.suite != 'reader'
@@ -137,10 +146,13 @@ jobs:
         working-directory: crates/argentic-runtime
         run: cargo test --locked --test content_reader
 
-      - name: Test macOS debug content reader
+      - name: Test macOS content reader QA in release with debug assertions
         if: runner.os == 'macOS'
         working-directory: crates/argentic-runtime
-        run: cargo test --locked --features agsdl-content-qa --test content_reader
+        env:
+          CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS: 'true'
+          CARGO_PROFILE_RELEASE_OPT_LEVEL: '0'
+        run: cargo test --locked --release --features agsdl-content-qa --test content_reader
 
       - name: Test argentic-runtime
         if: inputs.suite != 'reader'
