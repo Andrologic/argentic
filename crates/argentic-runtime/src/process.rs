@@ -392,32 +392,46 @@ impl ContainedBackgroundProcess {
             };
             // Keep the leader unreaped so its PID and PGID cannot be reused
             // while tree inspection and signalling still use those numbers.
-            loop {
-                let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-                if unsafe {
-                    libc::waitid(
-                        libc::P_PID,
-                        pid as libc::id_t,
-                        &mut info,
-                        libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
-                    )
-                } == -1
-                {
-                    let error = io::Error::last_os_error();
-                    if error.kind() == io::ErrorKind::Interrupted {
-                        continue;
+            // siginfo_t holds a raw pointer, so it must not live across an
+            // await: poll in a plain function and sleep outside it.
+            let observe = || -> Option<io::Result<ExitStatus>> {
+                loop {
+                    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+                    if unsafe {
+                        libc::waitid(
+                            libc::P_PID,
+                            pid as libc::id_t,
+                            &mut info,
+                            libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+                        )
+                    } == -1
+                    {
+                        let error = io::Error::last_os_error();
+                        if error.kind() == io::ErrorKind::Interrupted {
+                            continue;
+                        }
+                        return Some(Err(error));
                     }
-                    return Err(error);
-                }
-                if unsafe { info.si_pid() } != 0 {
+                    if unsafe { info.si_pid() } == 0 {
+                        return None;
+                    }
                     let status = unsafe { info.si_status() };
                     let raw = match info.si_code {
                         libc::CLD_EXITED => (status & 0xff) << 8,
                         libc::CLD_KILLED => status & 0x7f,
                         libc::CLD_DUMPED => (status & 0x7f) | 0x80,
-                        _ => return Err(io::Error::other("Unexpected macOS leader exit status")),
+                        _ => {
+                            return Some(Err(io::Error::other(
+                                "Unexpected macOS leader exit status",
+                            )))
+                        }
                     };
-                    return Ok(ExitStatus::from_raw(raw));
+                    return Some(Ok(ExitStatus::from_raw(raw)));
+                }
+            };
+            loop {
+                if let Some(result) = observe() {
+                    return result;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
