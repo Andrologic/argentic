@@ -182,6 +182,13 @@ impl HostState {
             lease.owner(&input.scope.system_start_id)?
         };
         let inspection = flow::inspect_run(self.flow030(), self, pool, &owner).await?;
+        if input.scope.source != inspection.capture.source {
+            return Err(crate::persistence::failure(
+                "CORRELATION",
+                "humanClock",
+                "Public scope differs",
+            ));
+        }
         let broker = self
             .flow030()
             .humans

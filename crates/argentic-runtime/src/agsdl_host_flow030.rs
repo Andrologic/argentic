@@ -43,7 +43,7 @@ pub(crate) struct FlowHost030 {
     pub(crate) humans: crate::agsdl_host_human030::HumanRuntime030,
     committing: Mutex<BTreeMap<String, StartCommit030>>,
     pub(crate) call_commits: crate::agsdl_host_calls030::CallCommitFence030,
-    event_committing: Mutex<BTreeMap<(String, String), FlowEvent030>>,
+    event_committing: Mutex<BTreeMap<(String, String), EventCommit030>>,
     work_committing: Mutex<BTreeMap<(String, String), FlowWorkCommitMarker030>>,
     route_source_committing: Mutex<BTreeMap<(String, String), RouteSourceCommitMarker030>>,
     unadmitted: Mutex<BTreeMap<(String, String), Unadmitted030>>,
@@ -59,6 +59,14 @@ pub(crate) struct FlowHost030 {
     work_commit_hooks: Mutex<BTreeMap<(String, String), Arc<CommitTestHook030>>>,
     #[cfg(test)]
     handoff_commit_hooks: Mutex<BTreeMap<(String, String), Arc<CommitTestHook030>>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct EventCommit030 {
+    pub(crate) event: FlowEvent030,
+    // These writers hold admission through COMMIT, and their SQLite receipt
+    // is sufficient to distinguish a committed input from a rolled-back one.
+    rollback_readback: bool,
 }
 
 struct StartCommit030 {
@@ -463,7 +471,7 @@ impl FlowHost030 {
             .lock()
             .map_err(|_| unavailable())?
             .values()
-            .any(|event| event.identity.system_start_id == identity.system_start_id)
+            .any(|marker| marker.event.identity.system_start_id == identity.system_start_id)
         {
             return Err(uncertain());
         }
@@ -625,14 +633,17 @@ impl FlowHost030 {
         &self,
         identity: &FlowIdentity030,
         event_id: &str,
-    ) -> Result<Option<FlowEvent030>> {
+    ) -> Result<Option<EventCommit030>> {
         let pending = self.event_committing.lock().map_err(|_| unavailable())?;
         match pending.get(&(identity.system_start_id.clone(), event_id.into())) {
-            Some(event) if event.identity != *identity => Err(refused()),
-            event => Ok(event.cloned()),
+            Some(marker) if marker.event.identity != *identity => Err(refused()),
+            marker => Ok(marker.cloned()),
         }
     }
     pub(crate) fn begin_event_commit(&self, event: &FlowEvent030) -> Result<()> {
+        self.record_event_commit(event, false)
+    }
+    fn record_event_commit(&self, event: &FlowEvent030, rollback_readback: bool) -> Result<()> {
         let mut pending = self.event_committing.lock().map_err(|_| unavailable())?;
         let key = (
             event.identity.system_start_id.clone(),
@@ -641,7 +652,13 @@ impl FlowHost030 {
         if pending.contains_key(&key) {
             return Err(uncertain());
         }
-        pending.insert(key, event.clone());
+        pending.insert(
+            key,
+            EventCommit030 {
+                event: event.clone(),
+                rollback_readback,
+            },
+        );
         Ok(())
     }
     fn acknowledge_event_commit(&self, event: &FlowEvent030) {
@@ -650,7 +667,10 @@ impl FlowHost030 {
                 event.identity.system_start_id.clone(),
                 event.event_id.clone(),
             );
-            if pending.get(&key) == Some(event) {
+            if pending
+                .get(&key)
+                .is_some_and(|marker| marker.event == *event)
+            {
                 pending.remove(&key);
                 self.supervisors.wake(&event.identity.system_start_id);
             }
@@ -1429,18 +1449,25 @@ pub(crate) async fn apply_native_event_transaction030(
         lease,
     };
     if let Some(marker) = runtime.pending_event_commit(&event.identity, &event.event_id)? {
-        if serde_json::to_string(&marker)? != serde_json::to_string(event)? {
-            return Err(refused());
-        }
         authority
             .owner(&mut tx, &event.identity)
             .await
             .map_err(store_error)?;
-        return resolve_native_event_commit_tx(runtime, lease, tx, &marker)
-            .await?
-            .ok_or_else(uncertain);
+        let result = read_event_commit_tx(&mut tx, &marker.event).await?;
+        if result.is_some() || !marker.rollback_readback {
+            if marker.event != *event {
+                return Err(refused());
+            }
+            tx.commit().await?;
+            lease.ensure_live()?;
+            if let Some(result) = result {
+                runtime.acknowledge_event_commit(event);
+                return Ok(result);
+            }
+            return Err(uncertain());
+        }
     }
-    reconcile_events_tx(runtime, &authority, &mut tx, &event.identity).await?;
+    reconcile_events_tx(runtime, &authority, &mut tx, &event.identity, false).await?;
     let result = flow_store030::apply_tx(&mut tx, &authority, event)
         .await
         .map_err(store_error)?;
@@ -1450,7 +1477,7 @@ pub(crate) async fn apply_native_event_transaction030(
             .await?;
     }
     lease.ensure_live()?;
-    runtime.begin_event_commit(event)?;
+    runtime.record_event_commit(event, true)?;
     #[cfg(test)]
     let point = match &event.kind {
         FlowEventKind030::Operator(crate::persistence::flow030::OperatorEvent030::Held {
@@ -1552,24 +1579,24 @@ pub(crate) async fn reconcile_event_commits_locked030(
     };
     let mut db = pool.acquire().await?;
     let mut tx = db.begin_with("BEGIN IMMEDIATE").await?;
-    if !read_pending_events_tx(runtime, &authority, &mut tx, &pending).await? {
+    if !read_pending_events_tx(runtime, &authority, &mut tx, &pending, false).await? {
         return Ok(false);
     }
     tx.commit().await?;
     lease.ensure_live()?;
-    for event in &pending {
-        runtime.acknowledge_event_commit(event);
+    for marker in &pending {
+        runtime.acknowledge_event_commit(&marker.event);
     }
     Ok(true)
 }
 
-fn pending_flow_events(runtime: &FlowHost030, system_id: &str) -> Result<Vec<FlowEvent030>> {
+fn pending_flow_events(runtime: &FlowHost030, system_id: &str) -> Result<Vec<EventCommit030>> {
     Ok(runtime
         .event_committing
         .lock()
         .map_err(|_| unavailable())?
         .values()
-        .filter(|event| event.identity.system_start_id == system_id)
+        .filter(|marker| marker.event.identity.system_start_id == system_id)
         .cloned()
         .collect())
 }
@@ -1578,9 +1605,11 @@ async fn read_pending_events_tx<A: Authority030>(
     runtime: &FlowHost030,
     authority: &A,
     tx: &mut SqliteConnection,
-    pending: &[FlowEvent030],
+    pending: &[EventCommit030],
+    new_stop: bool,
 ) -> Result<bool> {
-    for event in pending {
+    for marker in pending {
+        let event = &marker.event;
         authority
             .owner(tx, &event.identity)
             .await
@@ -1593,14 +1622,20 @@ async fn read_pending_events_tx<A: Authority030>(
             };
             let control = system_stop_control(runtime, &request)?;
             match stored_system_stop(tx, &control, &request).await? {
-                Some(receipt) if stop_marker(&receipt) == *event => true,
-                Some(_) => return Err(refused()),
+                Some(receipt) if stop_marker(&receipt) != *event => return Err(refused()),
+                // Another Stop request must wait for the exact request or
+                // supervisor to acknowledge a previously committed Stop.
+                Some(_) if new_stop => return Ok(false),
+                Some(_) => true,
                 None => false,
             }
         } else {
             read_event_commit_tx(tx, event).await?.is_some()
         };
-        if !committed {
+        // BEGIN IMMEDIATE under admission waits out the prior writer,
+        // including SQLite's rollback after cancellation. An absent row
+        // for these inputs proves rollback even if COMMIT was in flight.
+        if !committed && !marker.rollback_readback {
             return Ok(false);
         }
     }
@@ -1613,13 +1648,14 @@ async fn reconcile_events_tx<A: Authority030>(
     authority: &A,
     db: &mut SqliteConnection,
     identity: &FlowIdentity030,
+    new_stop: bool,
 ) -> Result<()> {
     let pending = pending_flow_events(runtime, &identity.system_start_id)?;
-    if !read_pending_events_tx(runtime, authority, db, &pending).await? {
+    if !read_pending_events_tx(runtime, authority, db, &pending, new_stop).await? {
         return Err(uncertain());
     }
-    for event in &pending {
-        runtime.acknowledge_event_commit(event);
+    for marker in &pending {
+        runtime.acknowledge_event_commit(&marker.event);
     }
     runtime.available(identity)
 }
@@ -3243,16 +3279,7 @@ async fn commit_system_stop030(
         runtime.acknowledge_event_commit(&stop_marker(&receipt));
         return Ok(NativeSystemStop030 { receipt, control });
     }
-    // A new Stop can read through a durable operator or delivery commit.
-    // An outstanding Stop still requires its exact request to be read back
-    // by the caller or the supervisor before admitting a new request ID.
-    if pending_flow_events(runtime, &control.identity.system_start_id)?
-        .iter()
-        .any(|event| event.event_id.starts_with("system-stop:"))
-    {
-        return Err(uncertain());
-    }
-    reconcile_events_tx(runtime, control.as_ref(), &mut tx, &control.identity).await?;
+    reconcile_events_tx(runtime, control.as_ref(), &mut tx, &control.identity, true).await?;
     let view = flow_store030::read_tx(&mut tx, control.as_ref(), &control.identity)
         .await
         .map_err(store_error)?;
@@ -3314,7 +3341,7 @@ async fn commit_system_stop030(
     sqlx::query("INSERT INTO engine_flow030_system_stop_requests(request_id,system_id,invocation_id,owner_epoch,generation,request_json,receipt_json,event_id) VALUES(?,?,?,?,?,?,?,?)")
         .bind(&request.request_id).bind(&control.identity.system_start_id).bind(&control.identity.flow_invocation_id).bind(&control.owner.owner_epoch).bind(&control.generation)
         .bind(serde_json::to_string(request)?).bind(serde_json::to_string(&receipt)?).bind(&receipt.flow_event_id).execute(&mut *tx).await?;
-    runtime.begin_event_commit(&marker)?;
+    runtime.record_event_commit(&marker, true)?;
     #[cfg(test)]
     runtime.operator_test_yield("stop.commit").await;
     tx.commit().await.map_err(|_| uncertain())?;
@@ -3787,7 +3814,7 @@ impl FlowControl030 {
                 self.identity.system_start_id.clone(),
                 event.event_id.clone(),
             ))
-            .is_some_and(|pending| pending != &event)
+            .is_some_and(|marker| marker.event != event)
         {
             return Err(refused());
         }

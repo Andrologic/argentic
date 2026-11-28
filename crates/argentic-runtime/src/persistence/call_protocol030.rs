@@ -1503,6 +1503,7 @@ pub(crate) async fn finish_controlled_tx<A: CallAuthority030>(
     db: &mut SqliteConnection,
     authority: &A,
     joined: &JoinedCall030,
+    clock: Option<&crate::agsdl_host_human030::HumanBroker030>,
 ) -> Result<Option<CallSettlement030>> {
     if let Some(diagnostic) = read_diagnostic_tx(
         db,
@@ -1530,7 +1531,7 @@ pub(crate) async fn finish_controlled_tx<A: CallAuthority030>(
     } else {
         return Ok(None);
     };
-    Ok(Some(finish_tx(db, authority, joined, result).await?))
+    Ok(Some(finish_tx(db, authority, joined, result, clock).await?))
 }
 
 pub(crate) async fn finish_tx<A: CallAuthority030>(
@@ -1538,6 +1539,7 @@ pub(crate) async fn finish_tx<A: CallAuthority030>(
     authority: &A,
     joined: &JoinedCall030,
     mut result: CallResult030,
+    clock: Option<&crate::agsdl_host_human030::HumanBroker030>,
 ) -> Result<CallSettlement030> {
     if let Some(diagnostic) = read_diagnostic_tx(
         db,
@@ -1608,7 +1610,14 @@ pub(crate) async fn finish_tx<A: CallAuthority030>(
         return Ok(CallSettlement030::Diagnostic { diagnostic });
     }
     sqlx::query("UPDATE engine_flow030_calls SET status='terminal',receipt_json=? WHERE call_id=? AND status='received'")
-        .bind(serde_json::to_string(&receipt)?).bind(&attempt.call_id).execute(db).await?;
+        .bind(serde_json::to_string(&receipt)?).bind(&attempt.call_id).execute(&mut *db).await?;
+    if let Some(clock) = clock.filter(|_| !state.stopping) {
+        // Clock admission and terminal publication share the native writer gate.
+        // Reserve retirement here so a crash or later Stop has the exact ticket.
+        clock
+            .reserve_call_retirement_tx(db, &attempt.work().activation_id)
+            .await?;
+    }
     Ok(CallSettlement030::Terminal { receipt })
 }
 
@@ -1768,6 +1777,45 @@ pub(crate) async fn read_diagnostic_tx<A: CallAuthority030>(
         candidate,
         diagnostic: stored.diagnostic,
     }))
+}
+
+/// A handed-off worker can be joined before it launches, and before a
+/// separate StopWork handoff. Correlate its durable NotStarted proof.
+pub(crate) async fn verify_not_started_stop_tx(
+    db: &mut SqliteConnection,
+    event: &FlowEvent030,
+    work: &WorkRef030,
+    evidence: &PhysicalEvidence030,
+) -> Result<bool> {
+    let row: Option<(String, String, String, String, String, String, String)> = sqlx::query_as(
+        "SELECT c.call_id,c.start_effect_id,c.attempt_json,c.received_json,c.receipt_json,o.owner_epoch,o.generation
+         FROM engine_flow030_calls c JOIN engine_flow030_owners o USING(system_id,invocation_id)
+         WHERE c.system_id=? AND c.invocation_id=? AND c.activation_id=? AND c.status='terminal'",
+    )
+    .bind(&event.identity.system_start_id)
+    .bind(&event.identity.flow_invocation_id)
+    .bind(&work.activation_id)
+    .fetch_optional(db)
+    .await?;
+    let Some((call_id, start, attempt, received, receipt, owner, generation)) = row else {
+        return Ok(false);
+    };
+    let receipt = decode_receipt(&receipt)?;
+    let attempt = decode_attempt(&attempt)?;
+    Ok(receipt.attempt == attempt
+        && receipt.received == decode_received(&received)?
+        && attempt.identity() == &event.identity
+        && attempt.work() == work
+        && start == work.start_effect_id
+        && attempt.owner_epoch == owner
+        && attempt.generation == generation
+        && attempt.call_id == call_id
+        && event.event_id == format!("call:{call_id}:terminal")
+        && receipt.event_id == event.event_id
+        && receipt.not_started()
+        && receipt.received.end == CallEnd030::Stopped
+        && receipt.result == CallResult030::Stopped
+        && receipt.physical() == *evidence)
 }
 
 /// A resolved MCP question can remain reserved when the call fails while

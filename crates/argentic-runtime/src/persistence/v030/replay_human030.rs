@@ -549,7 +549,49 @@ pub(super) async fn verify(
                 SupersededClockTicket030::new(&ticket.event_id, row.try_get("ticket_json")?);
             observed_supersession = superseded == Some(&exact);
             observed_interruption = interrupted_ticket.as_ref() == Some(&exact);
-            if (observed_supersession || observed_interruption) && kind == "retire" {
+            // A completed flow retains its verdict on reopen, so there is no
+            // interruption receipt to attest its last call's retirement.
+            let mut terminal_call_retirement = false;
+            if kind == "retire"
+                && state.verdict.is_some()
+                && !state.stopping
+                && native_owner.try_get::<&str, _>("status")? == "revoked"
+            {
+                if let Some(work) = works
+                    .iter()
+                    .find(|work| work.kind == "call" && !work.retired && event["workId"] == work.id)
+                {
+                    let terminal: Option<(String, String)> = sqlx::query_as(
+                        "SELECT 'call:' || call_id || ':terminal',
+                                json_extract(receipt_json,'$.received.physical.receiptId')
+                         FROM engine_flow030_calls
+                         WHERE system_id=? AND invocation_id=? AND activation_id=? AND status='terminal'
+                             AND json_extract(receipt_json,'$.eventId') = 'call:' || call_id || ':terminal'",
+                    )
+                    .bind(&id.system_start_id)
+                    .bind(&id.flow_invocation_id)
+                    .bind(&work.id)
+                    .fetch_optional(&mut *db)
+                    .await?;
+                    if let Some((event_id, receipt_id)) = terminal {
+                        terminal_call_retirement = state.events.get(&event_id).is_some_and(|record| {
+                            serde_json::from_str::<ReadEvent>(&record.event_json).is_ok_and(
+                                |ReadEvent(event)| matches!(
+                                    event.kind,
+                                    FlowEventKind030::WorkResult { work: visit, physical: Some(proof), .. }
+                                    | FlowEventKind030::PhysicalEnded { work: visit, evidence: proof, .. }
+                                    if visit.activation_id == work.id
+                                        && proof.descendants_joined
+                                        && proof.native_receipt_id == receipt_id
+                                ),
+                            )
+                        });
+                    }
+                }
+            }
+            if kind == "retire"
+                && (observed_supersession || observed_interruption || terminal_call_retirement)
+            {
                 superseded_retirement = event["workId"].as_str().map(str::to_owned);
             }
             let legacy_interrupted_hold =
@@ -558,7 +600,8 @@ pub(super) async fn verify(
                 (observed_supersession
                     || observed_interruption
                     || fenced_stop
-                    || legacy_interrupted_hold)
+                    || legacy_interrupted_hold
+                    || terminal_call_retirement)
                     && index + 1 == events.len(),
                 "Uncommitted clock ticket",
             )?;
@@ -832,6 +875,11 @@ pub(super) async fn verify(
                 row.try_get::<Option<String>, _>("resolution_json")?
                     .is_none(),
                 "Invented resolution",
+            )?;
+            require(
+                row.try_get::<&str, _>("revision")? == "0"
+                    && row.try_get::<&str, _>("delivery")? == "pending",
+                "Unresolved request must have initial revision and pending delivery",
             )?;
         }
     }

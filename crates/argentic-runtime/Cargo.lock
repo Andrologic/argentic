@@ -108,6 +108,7 @@ dependencies = [
  "crc32fast",
  "flate2",
  "futures",
+ "jsonschema",
  "libc",
  "libyaml-rs",
  "percent-encoding",

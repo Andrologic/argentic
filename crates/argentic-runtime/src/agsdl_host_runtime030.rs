@@ -1568,17 +1568,23 @@ pub(crate) async fn supervise_with_steer_port030(
                 if let Some(joined) = joined? {
                     let authority = crate::agsdl_host_call_authority030::NativeCallAuthority030::capture(host, owner).await?;
                     let broker = host.start_lease().await?.call_data030()?;
-                    match crate::agsdl_host_calls030::finish_joined_call030(pool, &authority, &broker, &joined, &CancellationToken::new()).await? {
+                    let clock = if executors.clock.as_ref().is_some_and(|clock| clock.tracks_humans()) {
+                        Some(host.flow030().humans.broker(host, pool, joined.attempt().identity()).await?)
+                    } else {
+                        None
+                    };
+                    match crate::agsdl_host_calls030::finish_joined_call030(
+                        pool, &authority, &broker, &joined, &CancellationToken::new(),
+                        clock.as_deref().map(|clock| (host, clock)),
+                    ).await? {
                         crate::agsdl_host_calls030::CallSettlement030::Terminal { .. } => (),
                         _ => return Err(failure("UNCERTAIN", "call", "Call completion has a diagnostic")),
                     }
-                    if executors.clock.as_ref().is_some_and(|clock| clock.tracks_humans()) {
-                        let view = flow::inspect_run(host.flow030(), host, pool, owner).await?;
-                        if !view.flow.state.stopping {
-                            let broker = host.flow030().humans.broker(host, pool, &view.capture.identity).await?;
-                            let _operation = broker.operation.lock().await;
-                            broker.retire_finished(host, &key).await?;
-                        }
+                    #[cfg(test)]
+                    host.flow030().operator_test_yield("call.terminal").await;
+                    if let Some(clock) = clock {
+                        let _operation = clock.operation.lock().await;
+                        clock.pump_call_retirement(host).await?;
                     }
                     driver.joined_calls.insert(key.clone(), joined);
                 }

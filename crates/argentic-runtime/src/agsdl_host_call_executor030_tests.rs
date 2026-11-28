@@ -878,7 +878,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":"1","result":{"protocolVersion":"2025-11-25
 IFS= read -r initialized
 IFS= read -r call
 exec 0<&-
-printf '%s\n' '{"jsonrpc":"2.0","id":"person","method":"elicitation/create","params":{"message":"Continue?","requestedSchema":{"type":"object"}}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":"person","method":"elicitation/create","params":{"message":"Continue?","requestedSchema":{"type":"object","properties":{}}}}'
 "#;
     let mut doc = document(json!({"type":"call","mcp":{"server":"local","tool":"check"}}));
     doc["contract"] = json!(argentic_core::AGSDL_040);
@@ -1818,5 +1818,123 @@ async fn shutdown_attests_expired_remote_call_deadlines_for_replay() {
         .await;
         assert_eq!(replay.divergence.unwrap().field, "human.readback");
         server.abort();
+    }
+}
+
+#[cfg(unix)]
+struct ScheduledCommand(std::sync::atomic::AtomicUsize);
+
+#[cfg(unix)]
+impl crate::agsdl_host_call_executor030::CallTransport030 for ScheduledCommand {
+    fn start(
+        &self,
+        _: crate::agsdl_host_calls::CommandGrant,
+        _: crate::agsdl_host_calls030::PreparedCall030,
+        _: StartCapture030,
+        _: crate::agsdl_host_calls030::CallAttempt030,
+        _: crate::agsdl_host_calls::Control,
+        _: crate::agsdl_host_calls::raw_mcp::ToolAdmission,
+    ) -> crate::agsdl_host_calls::Result<
+        BoxFuture<'static, Result<crate::persistence::call_protocol030::CallEnd030>>,
+    > {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(Box::pin(async {
+            Ok(crate::persistence::call_protocol030::CallEnd030::Returned {
+                event: crate::agsdl_host_calls030::CallEvent030::StartFailed,
+            })
+        }))
+    }
+}
+
+#[cfg(unix)]
+async fn scheduled_command(with_recovery: bool) -> Fixture {
+    let mut doc = document(json!({"type":"call","command":"printf done","timeoutMs":60000}));
+    doc["contract"] = json!(argentic_core::AGSDL_040);
+    if with_recovery {
+        doc["flow"]["steps"]["check"]["onError"] = json!("recover");
+        doc["flow"]["steps"]["recover"] = json!({"type":"call","command":"printf recovered"});
+    }
+    Fixture::new(&json!({"document":doc,"entry":{},"timeline":[]}).to_string()).await
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn stop_between_call_handoff_and_clock_admission_settles_not_started() {
+    let f = scheduled_command(false).await;
+    let runtime = f.host.flow030();
+    let gap = runtime.install_operator_test_hook("call.clock_admission");
+    let transport = Arc::new(ScheduledCommand(0.into()));
+    let _tasks = start_calls(&f, f.config.clone(), transport.clone());
+    tokio::time::timeout(std::time::Duration::from_secs(10), gap.reached())
+        .await
+        .unwrap();
+    flow::request_system_stop030(
+        runtime,
+        &f.pool,
+        &EngineStopRequest {
+            system_start_id: f.identity.system_start_id.clone(),
+            request_id: "stop-before-clock".into(),
+            activation_id: None,
+        },
+    )
+    .await
+    .unwrap();
+    gap.release();
+    assert_eq!(finish(&f).await.state.verdict.as_deref(), Some("cancelled"));
+    assert_eq!(transport.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+    let path = f._temp.path().join("run.db");
+    let reopened = crate::sqlite::open_file(&path).await.unwrap();
+    let physical: String = sqlx::query_scalar(
+        "SELECT json_extract(receipt_json,'$.received.physical.kind') FROM engine_flow030_calls",
+    )
+    .fetch_one(&reopened)
+    .await
+    .unwrap();
+    assert_eq!(physical, "notStarted");
+    let replay = crate::persistence::replay_verify030::verify_path030(
+        &path,
+        &f.identity.system_start_id,
+        &f.identity.flow_invocation_id,
+    )
+    .await;
+    assert!(replay.ok, "{:?}", replay.divergence);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn replay_after_crash_immediately_following_call_terminal_commit() {
+    for with_recovery in [false, true] {
+        let f = scheduled_command(with_recovery).await;
+        let runtime = f.host.flow030();
+        let gap = runtime.install_operator_test_hook("call.terminal");
+        let _tasks = start_calls(&f, f.config.clone(), Arc::new(ScheduledCommand(0.into())));
+        tokio::time::timeout(std::time::Duration::from_secs(10), gap.reached())
+            .await
+            .unwrap();
+        let view = flow::inspect_run(runtime, &f.host, &f.pool, &f.owner)
+            .await
+            .unwrap()
+            .flow;
+        assert_eq!(
+            view.state.verdict.as_deref(),
+            if with_recovery { None } else { Some("failed") }
+        );
+        runtime
+            .supervisors
+            .crash_operator_fixture(&f.identity.system_start_id)
+            .await;
+        let path = f._temp.path().join("run.db");
+        let reopened = crate::sqlite::open_file(&path).await.unwrap();
+        crate::api::interrupt_previous_runs(&reopened)
+            .await
+            .unwrap();
+        let replay = crate::persistence::replay_verify030::verify_path030(
+            &path,
+            &f.identity.system_start_id,
+            &f.identity.flow_invocation_id,
+        )
+        .await;
+        assert!(replay.ok, "{:?}", replay.divergence);
     }
 }

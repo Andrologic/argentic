@@ -5,6 +5,26 @@ use crate::agsdl_host_clock030::{HostClockCompletion030, HostClockJob030};
 use tokio::io::AsyncWriteExt;
 
 #[tokio::test]
+async fn call_settlement_with_no_clock_ticket_needs_no_admission_or_writer_lock() {
+    let f = fixture("call", Some(60000), Some(600000)).await;
+    let admission = f.host.admission_lock();
+    let _gate = admission.lock().await;
+    let mut db = f.broker.pool.acquire().await.unwrap();
+    let tx = db.begin_with("BEGIN IMMEDIATE").await.unwrap();
+
+    let cancel = CancellationToken::new();
+    let _operation = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        f.broker.lock_call_settlement(&f.host, &cancel),
+    )
+    .await
+    .expect("an empty queue only needs a read")
+    .unwrap();
+    assert!(f.broker.operation.try_lock().is_err());
+    tx.rollback().await.unwrap();
+}
+
+#[tokio::test]
 async fn diagnostic_action_broker_keeps_attach_admit_open_and_pump_failures_distinct() {
     use crate::agsdl_host_action_approval030::CommandApprovals030;
     struct UnusedPolicy;
@@ -690,10 +710,105 @@ async fn native_large_elapse_stabilizes_at_intermediate_deadlines() {
 }
 
 #[tokio::test]
-async fn native_protocol_answer_requires_attested_validator_and_preserves_exact_bytes() {
+async fn mcp_question_rejects_unsupported_schema_before_opening() {
+    use crate::{
+        agsdl_host_calls::{CallIdentity, HostPort},
+        agsdl_host_human_executor030::CallHumans030,
+    };
+    let f = fixture("call", Some(60000), Some(600000)).await;
+    let identity = f.attempt.identity().clone();
+    let port = CallHumans030 {
+        app: f.host.clone(),
+        pool: f.broker.pool.clone(),
+        identity: identity.clone(),
+    };
+    let call = CallIdentity {
+        system_id: identity.system_start_id,
+        run_id: identity.flow_invocation_id,
+        group_id: String::new(),
+        work_id: f.attempt.work().activation_id.clone(),
+        epoch: String::new(),
+        effect_id: f.attempt.start_effect_id().into(),
+        provider_attempt_id: None,
+        native_call_id: "native-call".into(),
+    };
+    for schema in [
+        json!({"type":"object","properties":{"nested":{"type":"object"}}}),
+        json!({"type":"object","properties":{"field":{"type":"string","$ref":"other"}}}),
+        json!({"type":"object","properties":{"field":{"type":"array","items":{"type":"object"}}}}),
+        json!({"type":"object","properties":{"field":{"type":"string","oneOf":[{"type":"string"}]}}}),
+        json!({"type":"object","properties":{},"additionalProperties":{"type":"string"}}),
+    ] {
+        let raw = json!({"method":"elicitation/create","params":{"message":"Continue?","requestedSchema":schema}});
+        let error = port
+            .human_open(&call, "test", &raw.to_string())
+            .await
+            .err()
+            .expect("unsupported schema should fail");
+        assert_eq!(error.code, "INPUT_CONSTRAINT");
+        assert!(error.detail.contains("MCP elicitation schema"));
+    }
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM engine_flow030_human_requests")
+        .fetch_one(&f.broker.pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+}
+
+#[tokio::test]
+async fn native_protocol_validator_is_released_when_the_transport_drops_the_ticket() {
     struct Validator;
     impl QuestionValidator030 for Validator {
+        fn validate(&self, _: &Value, _: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+    let f = fixture("call", Some(60000), Some(600000)).await;
+    let work = f
+        .broker
+        .admit_host_work(&f.host, f.attempt.start_effect_id())
+        .await
+        .unwrap();
+    pump(&f).await;
+    let open = |receipt: &'static str| {
+        f.broker.open_question(
+            &f.host,
+            &work,
+            json!({"nativeCallId":"native-call","protocolReceiptId":receipt}),
+            Arc::new(Validator),
+        )
+    };
+    let first = open("first").await.unwrap();
+    pump(&f).await;
+    let first_id = first.id.clone();
+    drop(first);
+    assert!(f.broker.question_validators.lock().unwrap().is_empty());
+
+    let second = open("second").await.unwrap();
+    assert_ne!(first_id, second.id);
+    assert_eq!(f.broker.question_validators.lock().unwrap().len(), 1);
+    // Stop can fence the flow before the newly opened question's pump commits.
+    stop_fence(&f).await;
+    let error = f
+        .broker
+        .pump(&f.host, &CancellationToken::new())
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(error.code, "CORRELATION");
+    drop(second);
+    assert!(f.broker.question_validators.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn native_protocol_answer_requires_attested_validator_and_preserves_exact_bytes() {
+    struct Validator(Arc<tokio::sync::Mutex<()>>);
+    impl QuestionValidator030 for Validator {
         fn validate(&self, payload: &Value, answer: &str) -> Result<()> {
+            assert!(
+                self.0.try_lock().is_ok(),
+                "Validation holds the admission lock"
+            );
             require(
                 payload["protocolReceiptId"] == "native-protocol-receipt"
                     && answer == "{\"count\":9007199254740993}",
@@ -708,7 +823,8 @@ async fn native_protocol_answer_requires_attested_validator_and_preserves_exact_
         .await
         .unwrap();
     pump(&f).await;
-    let request = f.broker.open_question(&f.host,&work,json!({"nativeCallId":"native-call","protocolReceiptId":"native-protocol-receipt","schema":"count"}),Arc::new(Validator)).await.unwrap();
+    let ticket = f.broker.open_question(&f.host,&work,json!({"nativeCallId":"native-call","protocolReceiptId":"native-protocol-receipt","schema":"count"}),Arc::new(Validator(f.host.admission_lock()))).await.unwrap();
+    let request = &ticket.id;
     pump(&f).await;
     assert!(f
         .broker
@@ -716,7 +832,7 @@ async fn native_protocol_answer_requires_attested_validator_and_preserves_exact_
             &f.host,
             submission(
                 &f,
-                &request,
+                request,
                 "0",
                 HumanAnswer030::Question {
                     answer_json: "{\"count\":false}".into()
@@ -732,7 +848,7 @@ async fn native_protocol_answer_requires_attested_validator_and_preserves_exact_
             &f.host,
             submission(
                 &f,
-                &request,
+                request,
                 "0",
                 HumanAnswer030::Question {
                     answer_json: exact.into(),
@@ -743,7 +859,8 @@ async fn native_protocol_answer_requires_attested_validator_and_preserves_exact_
         .await
         .unwrap();
     pump(&f).await;
-    let decision = f.broker.take_resolution(&f.host, &request).await.unwrap();
+    assert!(f.broker.question_validators.lock().unwrap().is_empty());
+    let decision = f.broker.take_resolution(&f.host, request).await.unwrap();
     assert_eq!(
         f.broker
             .protocol_answer(&decision)
@@ -1695,7 +1812,7 @@ async fn replay_rejects_a_second_acknowledgment_of_one_resolution() {
         .await
         .unwrap();
     pump(&f).await;
-    let request = f
+    let ticket = f
         .broker
         .open_question(
             &f.host,
@@ -1705,13 +1822,14 @@ async fn replay_rejects_a_second_acknowledgment_of_one_resolution() {
         )
         .await
         .unwrap();
+    let request = &ticket.id;
     pump(&f).await;
     f.broker
         .submit(
             &f.host,
             submission(
                 &f,
-                &request,
+                request,
                 "0",
                 HumanAnswer030::Question {
                     answer_json: r#"{"action":"accept","content":{}}"#.into(),
@@ -1722,7 +1840,7 @@ async fn replay_rejects_a_second_acknowledgment_of_one_resolution() {
         .await
         .unwrap();
     pump(&f).await;
-    let decision = f.broker.take_resolution(&f.host, &request).await.unwrap();
+    let decision = f.broker.take_resolution(&f.host, request).await.unwrap();
     f.broker.acknowledge(&f.host, &decision).await.unwrap();
     pump(&f).await;
     let id = f.attempt.identity();
@@ -1744,4 +1862,39 @@ async fn replay_rejects_a_second_acknowledgment_of_one_resolution() {
     )
     .await;
     assert_eq!(replay.unwrap_err(), "Invalid request acknowledgment");
+}
+
+#[tokio::test]
+async fn replay_rejects_non_initial_unresolved_requests() {
+    let f = fixture("approval", None, None).await;
+    f.broker
+        .admit_host_work(&f.host, f.attempt.start_effect_id())
+        .await
+        .unwrap();
+    pump(&f).await;
+    let id = f.attempt.identity();
+    let path = f._tmp.path().join("human.db");
+    let replay = || {
+        crate::persistence::replay_verify030::verify_human_path030(
+            &path,
+            &id.system_start_id,
+            &id.flow_invocation_id,
+        )
+    };
+    assert!(replay().await.is_ok());
+    for (revision, delivery) in [("1", "pending"), ("0", "reserved"), ("0", "acknowledged")] {
+        let updated = sqlx::query(
+            "UPDATE engine_flow030_human_requests SET revision=?,delivery=? WHERE resolution_json IS NULL",
+        )
+        .bind(revision)
+        .bind(delivery)
+        .execute(&f.broker.pool)
+        .await
+        .unwrap();
+        assert_eq!(updated.rows_affected(), 1);
+        assert_eq!(
+            replay().await.unwrap_err(),
+            "Unresolved request must have initial revision and pending delivery"
+        );
+    }
 }

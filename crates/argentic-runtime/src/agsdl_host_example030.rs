@@ -116,8 +116,10 @@ async fn start_scripted_call030(
                     .map_err(|_| failure("UNCERTAIN", "call", "Call timeline closed"))?;
                 let joined = owned.join().await?;
                 let authority = NativeCallAuthority030::capture(&host, &owner).await?;
-                match calls::finish_joined_call030(&pool, &authority, &broker, &joined, &cancelled)
-                    .await?
+                match calls::finish_joined_call030(
+                    &pool, &authority, &broker, &joined, &cancelled, None,
+                )
+                .await?
                 {
                     calls::CallSettlement030::Terminal { .. } => Ok(joined),
                     calls::CallSettlement030::Diagnostic { .. } => {

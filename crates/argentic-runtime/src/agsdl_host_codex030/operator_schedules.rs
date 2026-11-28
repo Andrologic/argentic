@@ -1142,3 +1142,93 @@ async fn operator_schedule_crash_at_work_and_retirement_boundaries() {
         journal(&f).await;
     }
 }
+
+#[tokio::test]
+async fn operator_schedule_stop_after_rolled_back_input() {
+    let mut failures = Vec::new();
+    for boundary in ["operator.commit", "delivery.commit", "stop.commit"] {
+        let f = Arc::new(
+            Fixture::with_document(json!({
+                "contract":"agsdl-0.4.0","id":"rollback-input",
+                "agents":{"worker":{"harness":"codex","permissions":"read-only"}}
+            }))
+            .await,
+        );
+        let scope = operator_scope(&f).await;
+        let tasks = StreamTasks::default();
+        let dispatch = arm(&f, "supervisor.pass");
+        start(&f, &tasks, Arc::new(ScheduledAgent::default())).await;
+        reached(&dispatch, "supervisor.pass").await;
+        // Ensure the graphless run has entered before aborting a second input.
+        deliver_operator(&f, &scope, "initial", "queue")
+            .await
+            .unwrap();
+        let gate = arm(&f, boundary);
+        let caller = tokio::spawn({
+            let f = f.clone();
+            async move {
+                match boundary {
+                    "operator.commit" => {
+                        operator_control(&f, &scope, "pause", Action::PauseRun)
+                            .await
+                            .unwrap();
+                    }
+                    "delivery.commit" => {
+                        deliver_operator(&f, &scope, "delivery", "queue")
+                            .await
+                            .unwrap();
+                    }
+                    _ => {
+                        flow::request_system_stop030(
+                            f.host.flow030(),
+                            &f.pool,
+                            &EngineStopRequest {
+                                system_start_id: f.identity.system_start_id.clone(),
+                                request_id: "aborted-stop".into(),
+                                activation_id: None,
+                            },
+                        )
+                        .await
+                        .unwrap();
+                    }
+                }
+            }
+        });
+        reached(&gate, boundary).await;
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+
+        let result = flow::request_system_stop030(
+            f.host.flow030(),
+            &f.pool,
+            &EngineStopRequest {
+                system_start_id: f.identity.system_start_id.clone(),
+                request_id: "new-stop".into(),
+                activation_id: None,
+            },
+        )
+        .await;
+        dispatch.release();
+        match result {
+            Ok(_) => {
+                f.host
+                    .flow030()
+                    .supervisors
+                    .wake(&f.identity.system_start_id);
+                stopped(&f).await;
+            }
+            Err(error) => {
+                failures.push((boundary, error.code));
+                f.host
+                    .flow030()
+                    .supervisors
+                    .crash_operator_fixture(&f.identity.system_start_id)
+                    .await;
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "Stop was fenced after rollback: {failures:?}"
+    );
+}
