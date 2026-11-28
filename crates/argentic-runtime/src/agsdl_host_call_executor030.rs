@@ -10,7 +10,8 @@ use crate::{
     agsdl_host_flow030::{self as flow, NativeFlowInspection030},
     agsdl_host_mcp_http::{self as http, RemoteMcp},
     agsdl_host_runtime030::HostExecutor030,
-    host::HostContext,
+    host::{HostContext, HostPolicyLease, ProjectPolicyLease},
+    permissions::{Preset, RequestedPermissions},
     persistence::{
         dto::EngineOwner, failure, flow030::FlowEffect030, start030::StartCapture030, Result,
     },
@@ -111,29 +112,10 @@ impl HostExecutor030 for CallExecutor030 {
                         };
                         let prepared = prepared(&pool, &owned_attempt).await?;
                         // Keep approved configuration leases until the synchronous spawn.
-                        let global = config.lock_agsdl_host_permissions().await.map_err(|_| {
-                            failure("PERMISSION", "call", "Host permissions unavailable")
-                        })?;
-                        let project = config
-                            .lock_execution_tools(&inspection.capture.source.owner.project_id)
-                            .await
-                            .map_err(|_| {
-                                failure("PERMISSION", "call", "Project permissions unavailable")
-                            })?;
-                        let mut grant = grant(
-                            config.root(),
-                            &inspection.capture,
-                            &serde_json::to_value(global.permissions())?,
-                            &project.tools,
-                            &prepared,
-                        );
-                        if serde_json::to_value(&project.agsdl_host_permissions)? != "workspace" {
-                            grant = Err(failure(
-                                "PERMISSION",
-                                "call",
-                                "Current project permissions do not allow calls",
-                            ));
-                        }
+                        let project_id = &inspection.capture.source.owner.project_id;
+                        let (global, project) = lock_call_policy(&config, project_id).await?;
+                        let grant = require_current_call_policy(&global, &project)
+                            .and_then(|()| grant(config.root(), &inspection.capture, &prepared));
                         #[cfg(test)]
                         host.flow030()
                             .operator_test_yield("call.before_launch")
@@ -163,6 +145,8 @@ impl HostExecutor030 for CallExecutor030 {
                                                 pool.clone(),
                                                 owner.clone(),
                                                 owned_attempt.clone(),
+                                                config.clone(),
+                                                project_id.clone(),
                                             ),
                                         )
                                     })
@@ -273,13 +257,48 @@ async fn prepared(pool: &SqlitePool, attempt: &CallAttempt030) -> Result<Prepare
     Ok(serde_json::from_str(&raw)?)
 }
 
-/// Calls have no agent permissions to borrow. Both captured and current host
-/// ceilings must explicitly allow local work; project read-only remains a ceiling.
+fn require_current_call_policy(
+    global: &HostPolicyLease,
+    project: &ProjectPolicyLease,
+) -> Result<()> {
+    if !matches!(
+        global.permissions(),
+        RequestedPermissions::Preset(Preset::Workspace)
+    ) || !matches!(
+        project.agsdl_host_permissions,
+        RequestedPermissions::Preset(Preset::Workspace)
+    ) || project.tools.get("readOnly").and_then(Value::as_bool) == Some(true)
+    {
+        return Err(failure(
+            "PERMISSION",
+            "call",
+            "Calls require current host and project workspace permissions",
+        ));
+    }
+    Ok(())
+}
+
+async fn lock_call_policy(
+    config: &HostContext,
+    project_id: &str,
+) -> Result<(HostPolicyLease, ProjectPolicyLease)> {
+    config
+        .lock_ceiling_and_project(project_id)
+        .await
+        .map_err(|_| {
+            failure(
+                "PERMISSION",
+                "call",
+                "Host or project permissions unavailable",
+            )
+        })
+}
+
+/// Calls have no agent permissions to borrow. The captured host ceiling must
+/// explicitly allow workspace access.
 fn grant(
     data: &Path,
     capture: &StartCapture030,
-    current_host: &Value,
-    tools: &Value,
     prepared: &PreparedCall030,
 ) -> Result<CommandGrant> {
     let private: Value = serde_json::from_str(&capture.private_capture_json)?;
@@ -294,9 +313,7 @@ fn grant(
             .ok_or_else(|| failure("PERMISSION", "call", "Call permissions missing"))?,
     )?;
     if captured["agsdlHostPermissions"] != "workspace"
-        || current_host != "workspace"
         || crate::tool_policy::agsdl_native_read_only(&captured)
-        || tools.get("readOnly").and_then(Value::as_bool) == Some(true)
     {
         return Err(failure(
             "PERMISSION",
@@ -423,13 +440,23 @@ fn remote_tool_admission(
     pool: SqlitePool,
     owner: EngineOwner,
     attempt: CallAttempt030,
+    config: HostContext,
+    project_id: String,
 ) -> raw_mcp::ToolAdmission {
-    Box::new(move || {
-        let (host, pool, owner, attempt) =
-            (host.clone(), pool.clone(), owner.clone(), attempt.clone());
+    std::sync::Arc::new(move || {
+        let (host, pool, owner, attempt, config, project_id) = (
+            host.clone(),
+            pool.clone(),
+            owner.clone(),
+            attempt.clone(),
+            config.clone(),
+            project_id.clone(),
+        );
         Box::pin(async move {
             let admit = async {
                 let authority = NativeCallAuthority030::capture(&host, &owner).await?;
+                let policy = lock_call_policy(&config, &project_id).await?;
+                require_current_call_policy(&policy.0, &policy.1)?;
                 let gate = host.admission_lock().lock_owned().await;
                 let mut tx = pool.begin().await?;
                 crate::persistence::call_protocol030::admit_remote_tool_tx(
@@ -437,7 +464,8 @@ fn remote_tool_admission(
                 )
                 .await?;
                 tx.commit().await?;
-                Ok::<_, crate::persistence::dto::EngineFailure>(gate)
+                let guard: Box<dyn Send> = Box::new((gate, policy));
+                Ok::<_, crate::persistence::dto::EngineFailure>(guard)
             };
             admit
                 .await
@@ -928,4 +956,33 @@ fn no_human() -> transport::CallError {
         "HOST_CAPABILITY",
         "MCP human requests are not supported in this run",
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn remote_handoff_policy_requires_both_current_workspace_grants() {
+        let root = tempfile::tempdir().unwrap();
+        let (config, policy) = crate::test_context::context_with_policy(root.path().to_owned());
+        policy
+            .set_project(RequestedPermissions::Preset(Preset::Workspace))
+            .await;
+        let (global, project) = lock_call_policy(&config, "project").await.unwrap();
+        assert!(require_current_call_policy(&global, &project).is_err());
+        drop((global, project));
+
+        policy.workspace().await;
+        let (global, project) = lock_call_policy(&config, "project").await.unwrap();
+        assert!(require_current_call_policy(&global, &project).is_ok());
+        let mut revoke =
+            std::pin::pin!(policy.set_project(RequestedPermissions::Preset(Preset::ReadOnly)));
+        assert!(futures::poll!(&mut revoke).is_pending());
+        drop((global, project));
+        revoke.await;
+
+        let (global, project) = lock_call_policy(&config, "project").await.unwrap();
+        assert!(require_current_call_policy(&global, &project).is_err());
+    }
 }

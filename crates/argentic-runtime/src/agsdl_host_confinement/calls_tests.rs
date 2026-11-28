@@ -13,6 +13,7 @@ pub(crate) struct TestHost {
     pub(crate) human_closed: AtomicUsize,
     pub(crate) human_delivered: Arc<AtomicUsize>,
     pub(crate) human_delay: Duration,
+    pub(crate) human_answer_ready: Option<Arc<tokio::sync::Notify>>,
 }
 impl TestHost {
     pub(crate) fn new(grant: impl Into<Option<LaunchGrant>>) -> Self {
@@ -28,6 +29,7 @@ impl TestHost {
             human_closed: AtomicUsize::new(0),
             human_delivered: Arc::new(AtomicUsize::new(0)),
             human_delay: Duration::from_millis(30),
+            human_answer_ready: None,
         }
     }
 }
@@ -70,6 +72,9 @@ impl HostPort for TestHost {
         Ok(HumanTicket::new(id.into(), std::sync::Weak::new()))
     }
     async fn human_answer(&self, ticket: &str) -> Result<HumanReply> {
+        if let Some(ready) = &self.human_answer_ready {
+            ready.notified().await;
+        }
         tokio::time::sleep(self.human_delay).await;
         let delivered = self.human_delivered.clone();
         Ok(HumanReply {
@@ -143,6 +148,51 @@ async fn collector_retains_calls_and_explicitly_bounds_checks() {
     let bounded = collect(bytes.as_slice(), Some(128)).await.unwrap();
     assert_eq!(bounded.total, bytes.len() as u64);
     assert_eq!(bounded.bytes.len(), 128);
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn oversized_command_output_keeps_confirmed_cleanup() {
+    use std::process::Stdio;
+
+    let root = tempfile::tempdir().unwrap();
+    use crate::agsdl_host_confinement::{FileAccess, OsCeiling, PathScope};
+
+    let ceiling = OsCeiling {
+        read: FileAccess {
+            allow: vec![PathScope::Subtree(root.path().canonicalize().unwrap())],
+            block: vec![],
+        },
+        write: FileAccess::default(),
+        network: false,
+    };
+    let policy = SandboxPolicy::from_authorized_ceilings("test".into(), &[ceiling]).unwrap();
+    for output in ["1", "2"] {
+        // Exercise the output and cleanup path independently of Seatbelt.
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command
+            .args([
+                "-c",
+                &format!(
+                    r"printf 'MACRO_SEATBELT_STARTED_V1\n'; head -c 67108865 /dev/zero >&{output}"
+                ),
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let process = ContainedBackgroundProcess::spawn(command).unwrap();
+        let (receipt, failure, evidence) = run_command(process, &policy, &control(), None).await;
+        assert!(receipt.is_none());
+        assert_eq!(failure.unwrap().code, "OUTPUT_INVALID");
+        assert!(matches!(
+            evidence,
+            PhysicalEvidence::Local {
+                leader_reaped: true,
+                tree_termination_succeeded: true,
+                streams_joined: true,
+                ..
+            }
+        ));
+    }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

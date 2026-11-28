@@ -5,7 +5,7 @@ use std::future::Future;
 use std::process::ExitStatus;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::AsyncReadExt;
 use tokio::process::{ChildStdin, ChildStdout};
 use tokio::sync::{oneshot, watch};
 use tokio::task::{AbortHandle, JoinHandle};
@@ -459,21 +459,29 @@ impl StreamTasks {
         let (cancel, cancelled) = oneshot::channel::<()>();
         let (receipt, result) = watch::channel(None);
         let cleanup = tokio::spawn(async move {
-            let stderr_read =
-                async move {
-                    let mut output = Vec::new();
-                    if let Some(stderr) = stderr {
-                        let mut lines = BufReader::new(stderr).lines();
-                        while let Some(line) = lines.next_line().await.map_err(|error| {
+            let stderr_read = async move {
+                const TAIL_BYTES: usize = 64 * 1024;
+                let mut tail = std::collections::VecDeque::new();
+                if let Some(mut stderr) = stderr {
+                    let mut chunk = [0; 8192];
+                    loop {
+                        let n = stderr.read(&mut chunk).await.map_err(|error| {
                             format!("Failed to drain AI runtime stderr: {error}")
-                        })? {
-                            if !line.trim().is_empty() {
-                                output.push(line.trim().to_owned());
-                            }
+                        })?;
+                        if n == 0 {
+                            break;
                         }
+                        let discard = (tail.len() + n).saturating_sub(TAIL_BYTES);
+                        tail.drain(..discard);
+                        tail.extend(&chunk[..n]);
                     }
-                    Ok::<_, String>(output.join("\n"))
-                };
+                }
+                Ok::<_, String>(
+                    String::from_utf8_lossy(tail.make_contiguous())
+                        .trim()
+                        .into(),
+                )
+            };
             let process_end = async {
                 let status = tokio::select! {
                     status = process.wait() => status.map_err(|error| format!("Failed to wait for AI runtime process: {error}"))?,
@@ -1058,6 +1066,33 @@ mod process_tests {
     use super::*;
     use crate::process::background_tokio_command;
     use std::process::Stdio;
+
+    #[tokio::test]
+    async fn owned_process_keeps_a_bounded_lossy_stderr_tail() {
+        let registry = StreamTasks::default();
+        let owned = registry.clone();
+        let (send, receive) = oneshot::channel();
+        let mut command = background_tokio_command("/bin/sh");
+        command
+            .args([
+                "-c",
+                r"printf 'discard\n' >&2; head -c 262144 /dev/zero >&2; printf '\377tail\n' >&2",
+            ])
+            .stderr(Stdio::piped());
+        let process = ContainedBackgroundProcess::spawn(command).unwrap();
+        registry
+            .start("stderr-tail".into(), async move {
+                let mut process = owned.own_process("stderr-tail", process).unwrap();
+                let _ = send.send(process.wait().await);
+            })
+            .unwrap();
+        let (status, stderr) = receive.await.unwrap().unwrap();
+        assert!(status.success());
+        assert!(stderr.len() <= 64 * 1024 + 2);
+        assert!(!stderr.contains("discard"));
+        assert!(stderr.ends_with("\u{fffd}tail"));
+        registry.cancel("stderr-tail").await.unwrap();
+    }
 
     #[tokio::test]
     async fn cancel_joins_copilot_process_tree_and_stderr_receipt() {

@@ -332,13 +332,19 @@ Subsequent HTTP requests carry the negotiated version. On shutdown Argentic
 gives a stateful server up to two seconds to accept a session DELETE at the
 same pinned endpoint. The DELETE carries the protocol version when known.
 Argentic relies on the tool's terminal response to confirm that a dispatched
-remote call ended.
+remote call ended. A legacy SSE stream can resume with a GET from the last
+complete event ID. Each stream allows up to three consecutive resumes without
+a new event or an advancing cursor. Heartbeats and incomplete events do not
+reset this limit. Argentic reports a transport failure if the limit is exhausted.
 
 Remote DNS resolution and HTTP connection establishment each have a
 five-second limit. Remote initialization and tool discovery each have a
 ten-second limit, including the initialized notification and all tool list
 pages respectively. A tool handoff has a separate five-second limit for both
-HTTP and stdio.
+HTTP and stdio. A direct HTTP tool dispatch, continuation or form answer
+rechecks the live policy before handing its body to the transport. Stop and
+budget expiry interrupt acquisition of the policy leases. The leases are
+released at handoff, before waiting for the HTTP response.
 
 `HostContext::with_remote_mcp_tool_budget_ms(NonZeroU64)` sets the host's
 default budget for remote MCP tools. It defaults to 60 seconds. A direct call
