@@ -120,7 +120,7 @@ fn payload(bytes: &[u8], media: &str) -> ContentResult<ContentPayload> {
     }
 }
 
-fn file_read_error(
+pub(crate) fn file_read_error(
     cancelled: bool,
     error_value: crate::content_io::admitted::ReadError,
 ) -> ContentError {
@@ -138,8 +138,16 @@ pub async fn resolve_content(
     context: &ContentContext,
     usage: ContentUse,
 ) -> ContentResult<ResolvedContentReceipt> {
+    resolve_content_with_deadline(context, usage, &context.read_deadline()).await
+}
+
+pub(crate) async fn resolve_content_with_deadline(
+    context: &ContentContext,
+    usage: ContentUse,
+    deadline: &ReadDeadline<'_>,
+) -> ContentResult<ResolvedContentReceipt> {
     let pointer = usage.pointer.clone();
-    resolve_content_in_root(context, usage, None)
+    resolve_content_in_root(context, usage, None, deadline)
         .await
         .map_err(|mut error| {
             if error.pointer.is_empty() {
@@ -153,6 +161,7 @@ pub(super) async fn resolve_content_in_root(
     context: &ContentContext,
     usage: ContentUse,
     root: Option<&SkillRoot>,
+    deadline: &ReadDeadline<'_>,
 ) -> ContentResult<ResolvedContentReceipt> {
     context.active()?;
     let source_digest = digest(usage.source_json.as_bytes());
@@ -223,7 +232,7 @@ pub(super) async fn resolve_content_in_root(
                 .ok_or_else(|| error("INVALID_SOURCE", "Missing URI."))?;
             let uri = resolved_uri(context, &requested)?;
             let (bytes, final_uri, observed, file_parent_identity) =
-                read_uri(context, &uri, root, &usage, &source_digest).await?;
+                read_uri(context, &uri, root, &usage, &source_digest, deadline).await?;
             let media = declared
                 .clone()
                 .or_else(|| observed.clone())
@@ -278,12 +287,25 @@ fn within_root(uri: &Url, root: &Url) -> bool {
         && !path.contains("%5c")
 }
 
+async fn skill_root_unchanged(
+    deadline: &ReadDeadline<'_>,
+    path: std::path::PathBuf,
+    identity: crate::content_io::admitted::WorkspaceRootIdentity,
+) -> Result<bool, crate::content_io::admitted::ReadError> {
+    deadline
+        .blocking(move || {
+            crate::content_io::admitted::workspace_root_identity(&path).ok() == Some(identity)
+        })
+        .await
+}
+
 async fn read_uri(
     context: &ContentContext,
     uri: &Url,
     root: Option<&SkillRoot>,
     usage: &ContentUse,
     source_json_digest: &str,
+    deadline: &ReadDeadline<'_>,
 ) -> ContentResult<(Vec<u8>, String, Option<String>, Option<String>)> {
     if !uri.username().is_empty() || uri.password().is_some() {
         return Err(error("CONTENT_URI", "URI credentials are not accepted."));
@@ -332,48 +354,53 @@ async fn read_uri(
             let member_read = snapshot_member.is_some();
             let logical = crate::permissions::native_request_path(policy_path)
                 .ok_or_else(|| error("CONTENT_URI", "Unsupported local file path."))?;
-            let root_path = root
-                .map(|r| {
-                    r.uri
-                        .to_file_path()
-                        .map_err(|_| error("CONTENT_URI", "Invalid skill root."))
-                        .and_then(|p| {
-                            p.canonicalize()
-                                .map_err(|e| error("CONTENT_UNAVAILABLE", e))
+            let read_error = |err| file_read_error(deadline.cancel.is_cancelled(), err);
+            let skill_root = if let Some(root) = root {
+                let path = root
+                    .uri
+                    .to_file_path()
+                    .map_err(|_| error("CONTENT_URI", "Invalid skill root."))?;
+                let expected = root.uri.clone();
+                let expected_identity = root.file_identity.clone();
+                Some(
+                    deadline
+                        .blocking(move || {
+                            let canonical = path
+                                .canonicalize()
+                                .map_err(|e| error("CONTENT_UNAVAILABLE", e))?;
+                            let identity =
+                                crate::content_io::admitted::workspace_root_identity(&canonical)
+                                    .map_err(|e| error("CONTENT_UNAVAILABLE", e))?;
+                            if Url::from_directory_path(&canonical).ok().as_ref() != Some(&expected)
+                                || identity.observation_key() != expected_identity
+                                || expected_identity.is_none()
+                            {
+                                return Err(error(
+                                    "CORRELATION",
+                                    "Activated skill root was replaced.",
+                                ));
+                            }
+                            Ok((canonical, identity))
                         })
-                })
-                .transpose()?;
-            let root_identity = root_path
-                .as_deref()
-                .map(crate::content_io::admitted::workspace_root_identity)
-                .transpose()
-                .map_err(|e| error("CONTENT_UNAVAILABLE", e))?;
-            if let Some(root) = root {
-                let canonical_uri = root_path
-                    .as_ref()
-                    .and_then(|p| Url::from_directory_path(p).ok());
-                if canonical_uri.as_ref() != Some(&root.uri)
-                    || root_identity.and_then(|i| i.observation_key()).as_ref()
-                        != root.file_identity.as_ref()
-                    || root.file_identity.is_none()
-                {
-                    return Err(error("CORRELATION", "Activated skill root was replaced."));
-                }
-            }
+                        .await
+                        .map_err(read_error)??,
+                )
+            } else {
+                None
+            };
             // Keep the activated ancestor as well as the helper's immediate
             // parent: that same parent can be moved below a replaced root.
-            let root_after_read = root_path.clone();
+            let admission_root = skill_root.clone();
             let denial = Arc::new(Mutex::new(None));
             let admission_error = Arc::clone(&denial);
-            let read = crate::content_io::admitted::read_file_bytes_with_admission(
+            let read = crate::content_io::admitted::read_file_with_deadline(
                 &path,
-                &context.cancel,
+                deadline,
                 context.resource_owner.clone(),
                 move |resolved| async move {
-                    if let Some(root_path) = &root_path {
+                    if let Some((root_path, identity)) = &admission_root {
                         if !resolved.starts_with(root_path)
-                            || crate::content_io::admitted::workspace_root_identity(root_path).ok()
-                                != root_identity
+                            || !skill_root_unchanged(deadline, root_path.clone(), *identity).await?
                         {
                             *admission_error.lock().unwrap() = Some(error(
                                 "PERMISSION",
@@ -386,25 +413,26 @@ async fn read_uri(
                             );
                         }
                     }
-                    match context
+                    let decision = context
                         .admit(
                             ActionRequest::Read { path: logical },
                             base_effect,
                             expected_path.as_deref(),
+                            Some(deadline),
                         )
-                        .await
-                    {
+                        .await;
+                    let root_unchanged = match &admission_root {
+                        Some((path, identity)) if decision.is_ok() => {
+                            skill_root_unchanged(deadline, path.clone(), *identity).await?
+                        }
+                        _ => true,
+                    };
+                    match decision {
                         Ok(decision)
                             if expected_path.as_ref().map_or_else(
                                 || decision.resolved_path.as_deref() == resolved.to_str(),
                                 |expected| expected == &resolved,
-                            ) && root_path
-                                .as_deref()
-                                .map(crate::content_io::admitted::workspace_root_identity)
-                                .transpose()
-                                .ok()
-                                .flatten()
-                                == root_identity =>
+                            ) && root_unchanged =>
                         {
                             Ok(())
                         }
@@ -449,10 +477,12 @@ async fn read_uri(
                     .lock()
                     .unwrap()
                     .take()
-                    .unwrap_or_else(|| file_read_error(context.cancel.is_cancelled(), e))
+                    .unwrap_or_else(|| read_error(e))
             })?;
-            if let Some(root) = root_after_read {
-                if crate::content_io::admitted::workspace_root_identity(&root).ok() != root_identity
+            if let Some((root, identity)) = skill_root {
+                if !skill_root_unchanged(deadline, root, identity)
+                    .await
+                    .map_err(read_error)?
                 {
                     return Err(error(
                         "CORRELATION",
@@ -496,7 +526,7 @@ async fn read_uri(
                             .or_else(|| target.host_str().map(str::to_owned))
                             .unwrap_or_default();
                         context
-                            .admit(ActionRequest::Network { host }, effect, None)
+                            .admit(ActionRequest::Network { host }, effect, None, None)
                             .await
                             .map(|_| ())
                             .map_err(|e| {

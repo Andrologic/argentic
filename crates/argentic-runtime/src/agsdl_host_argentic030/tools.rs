@@ -84,6 +84,71 @@ fn mcp_aliases_distinguish_pairs_across_rediscovery() {
     assert_eq!(mcp_alias("first", "check"), "mcp__first__check");
 }
 
+const SKILL_RESOURCE_MAX_BYTES: usize = 50 * 1024;
+const SKILL_RESOURCE_MAX_LINES: usize = 2000;
+
+fn skill_resource_page(text: String, credential: Option<&str>) -> Result<Page, String> {
+    fn fits(text: &str) -> bool {
+        text.len() <= SKILL_RESOURCE_MAX_BYTES && text.lines().count() <= SKILL_RESOURCE_MAX_LINES
+    }
+    let limit_error = || {
+        format!(
+            "INPUT_LIMIT: Skill resources must fit within {SKILL_RESOURCE_MAX_BYTES} bytes and {SKILL_RESOURCE_MAX_LINES} lines."
+        )
+    };
+    if !fits(&text) {
+        return Err(limit_error());
+    }
+
+    let mut text = Value::String(text);
+    if let Some(key) = credential {
+        redact_credential_values(&mut text, key);
+    }
+    let Value::String(text) = text else {
+        unreachable!("credential screening preserves the value type");
+    };
+    if !fits(&text) {
+        return Err(limit_error());
+    }
+    Ok(Page {
+        text,
+        next_cursor: None,
+        overflow: None,
+    })
+}
+
+#[test]
+fn skill_resources_that_do_not_fit_are_rejected() {
+    for text in ["x".repeat(60 * 1024), "x\n".repeat(2001)] {
+        assert!(matches!(
+            skill_resource_page(text, None),
+            Err(error) if error.starts_with("INPUT_LIMIT:")
+        ));
+    }
+}
+
+#[test]
+fn skill_resources_fit_without_artifacts_and_keep_credential_screening() {
+    let text = "é".repeat(SKILL_RESOURCE_MAX_BYTES / 2);
+    let page = skill_resource_page(text.clone(), None).unwrap();
+    assert_eq!(page.text, text);
+    assert!(page.next_cursor.is_none());
+    assert!(page.overflow.is_none());
+
+    let text = "x\n".repeat(SKILL_RESOURCE_MAX_LINES);
+    assert_eq!(skill_resource_page(text.clone(), None).unwrap().text, text);
+
+    let key = "[credential-placeholder]";
+    let text = format!("prefix {key} suffix");
+    let page = skill_resource_page(text, Some(key)).unwrap();
+    assert_eq!(page.text, "prefix \n suffix");
+    let text = format!("{}{key}suffix", "x\n".repeat(SKILL_RESOURCE_MAX_LINES - 1));
+    assert!(matches!(
+        skill_resource_page(text, Some(key)),
+        Err(error) if error.starts_with("INPUT_LIMIT:")
+    ));
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SkillArguments {
@@ -160,7 +225,7 @@ impl Tools {
         vec![ToolDefinition {
             name: SKILL.into(),
             description: format!(
-                "List the selected AgSDL skills, activate one by its key, or read a relative file from an activated skill by providing its key and path (a literal relative file name such as notes#2.md, not URI-encoded). Skills grant no permissions. Selected skills: {}",
+                "List the selected AgSDL skills, activate one by its key, or read a relative file from an activated skill by providing its key and path (a literal relative file name such as notes#2.md, not URI-encoded). Companion files must fit within {SKILL_RESOURCE_MAX_BYTES} UTF-8 bytes and {SKILL_RESOURCE_MAX_LINES} lines. Skills grant no permissions. Selected skills: {}",
                 json!(self.catalogue())
             ),
             parameters: json!({
@@ -263,37 +328,32 @@ impl Extensions for Tools {
             .iter()
             .find(|skill| skill.key == name)
             .ok_or("Skill is not selected for this work")?;
-        let serve = async {
-            let sources = self.sources.lock().await;
-            let mut loaded = self.loaded.lock().await;
-            if let Some(path) = args.path {
-                let active = loaded
-                    .get(&name)
-                    .ok_or("Activate the skill before reading its files")?;
-                let text = sources
-                    .skill_resource(skill, active, &path)
-                    .await
-                    .map_err(|error| format!("{}: Could not read skill resource", error.code))?;
-                return Page::one_shot_screened(&text, &call.id, self.credential.as_deref())
-                    .map_err(|error| error.to_string());
-            }
-            let active = sources
-                .load_skill(skill)
-                .await
-                .map_err(|error| format!("{}: Skill activation failed", error.code))?;
-            // The shared resolver bounds the entire selected set at discovery.
-            let text = active.instructions.clone();
-            loaded.insert(name, active);
-            Ok(Page {
-                text,
-                next_cursor: None,
-                overflow: None,
-            })
-        };
-        tokio::select! {
+        let (sources, mut loaded) = tokio::select! {
             biased;
-            _ = cancel.cancelled() => Err("Skill call cancelled".into()),
-            result = serve => result,
+            _ = cancel.cancelled() => return Err("Skill call cancelled".into()),
+            guards = async { (self.sources.lock().await, self.loaded.lock().await) } => guards,
+        };
+        if let Some(path) = args.path {
+            let active = loaded
+                .get(&name)
+                .ok_or("Activate the skill before reading its files")?;
+            let text = sources
+                .skill_resource(skill, active, &path, cancel)
+                .await
+                .map_err(|error| format!("{}: Could not read skill resource", error.code))?;
+            return skill_resource_page(text, self.credential.as_deref());
         }
+        let active = sources
+            .load_skill(skill, cancel)
+            .await
+            .map_err(|error| format!("{}: Skill activation failed", error.code))?;
+        // The shared resolver bounds the entire selected set at discovery.
+        let text = active.instructions.clone();
+        loaded.insert(name, active);
+        Ok(Page {
+            text,
+            next_cursor: None,
+            overflow: None,
+        })
     }
 }

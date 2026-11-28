@@ -18,10 +18,20 @@ fn missing(field: &str) -> crate::persistence::dto::EngineFailure {
     failure("CORRELATION", field, "Native content correlation differs")
 }
 use crate::content::{
-    resolve_content, ContentContext, ContentPayload, ContentUsage, ContentUse,
-    ResolvedContentReceipt, SkillDescriptor,
+    file_read_error, resolve_content_with_deadline, ContentContext, ContentPayload, ContentUsage,
+    ContentUse, ResolvedContentReceipt, SkillDescriptor,
 };
+use crate::content_io::admitted::{ReadDeadline, ReadError};
 use crate::permissions::{normalize_requested, ExecutionPurpose};
+
+fn deadline_error(
+    deadline: &ReadDeadline<'_>,
+    pointer: &str,
+    error: ReadError,
+) -> crate::persistence::dto::EngineFailure {
+    let error = file_read_error(deadline.cancel.is_cancelled(), error);
+    failure(&error.code, pointer, &error.message)
+}
 
 pub(crate) fn validate_text_sources(
     document: &Value,
@@ -172,12 +182,20 @@ impl Sources030 {
             .context()
             .clone();
         let root = paths.workspace.clone();
-        let private = config
-            .root()
-            .canonicalize()
-            .map_err(|_| missing("contentPrivateRoot"))?;
-        let current = normalize_requested(ceiling.permissions().clone(), paths)
-            .map_err(|_| missing("contentPolicy"))?;
+        let host_data = config.root().to_path_buf();
+        let requested = ceiling.permissions().clone();
+        let deadline = ReadDeadline::new(cancel);
+        let (private, current) = deadline
+            .blocking(move || {
+                let private = host_data
+                    .canonicalize()
+                    .map_err(|_| missing("contentPrivateRoot"))?;
+                let current =
+                    normalize_requested(requested, paths).map_err(|_| missing("contentPolicy"))?;
+                Ok::<_, crate::persistence::dto::EngineFailure>((private, current))
+            })
+            .await
+            .map_err(|err| deadline_error(&deadline, "contentPolicy", err))??;
         let ceiling_digest = ceiling.fingerprint().to_owned();
         let location = crate::capture::captured_document_location(capture)?;
         let context = ContentContext::capture(
@@ -211,8 +229,12 @@ impl Sources030 {
             .with_resource_owner(Arc::new(move |cleanup| {
                 tasks.attach_cleanup030(&parent, cleanup)
             }));
-        let context = context
-            .with_captured_source(config.root(), capture)
+        let host_data = config.root().to_path_buf();
+        let captured_source = capture.clone();
+        let context = deadline
+            .blocking(move || context.with_captured_source(&host_data, &captured_source))
+            .await
+            .map_err(|err| deadline_error(&deadline, "content", err))?
             .map_err(content_error)?;
         let mut sources = Self::from_context(
             context,
@@ -276,14 +298,16 @@ impl Sources030 {
             .and_then(Value::as_str)
             .map(|name| &self.document["content"][name])
             .unwrap_or(source);
-        self.allowed_file(expanded, pointer)?;
-        let receipt = resolve_content(
+        let deadline = self.context.read_deadline();
+        self.allowed_file(expanded, pointer, &deadline).await?;
+        let receipt = resolve_content_with_deadline(
             &self.context,
             ContentUse {
                 source_json: source.to_string(),
                 usage,
                 pointer: pointer.into(),
             },
+            &deadline,
         )
         .await
         .map_err(content_error)?;
@@ -378,15 +402,27 @@ impl Sources030 {
 
     pub async fn skills(&mut self) -> HostResult<Vec<SkillDescriptor>> {
         let _ceiling = self.lock_ceiling("skills").await?;
-        qualify_skill_folders(
-            &self.document,
-            self.context.project_root().unwrap_or(&self.root),
-            self.context.document_location(),
-        )?;
+        let document = self.document.clone();
+        let root = self
+            .context
+            .project_root()
+            .unwrap_or(&self.root)
+            .to_path_buf();
+        let location = self.context.document_location().cloned();
+        let deadline = self.context.read_deadline();
+        deadline
+            .blocking(move || qualify_skill_folders(&document, &root, location.as_ref()))
+            .await
+            .map_err(|err| deadline_error(&deadline, "skills", err))??;
         let agent = &self.document["agents"][self.context.binding().map_err(content_error)?.agent];
         for key in agent["skills"].as_array().into_iter().flatten() {
             let name = key.as_str().ok_or_else(|| missing("skills"))?;
-            self.allowed_file(&self.document["skills"][name], &format!("/skills/{name}"))?;
+            self.allowed_file(
+                &self.document["skills"][name],
+                &format!("/skills/{name}"),
+                &deadline,
+            )
+            .await?;
         }
         let selected = crate::content::discover_skills(&self.context)
             .await
@@ -407,20 +443,17 @@ impl Sources030 {
                 "Selected skills exceed the work's content bound",
             ));
         }
-        for skill in selected.iter().filter(|_| agent["harness"] != "argentic") {
-            let root = Path::new(&skill.path)
-                .parent()
-                .ok_or_else(|| missing("skillRoot"))?;
-            for entry in std::fs::read_dir(root).map_err(|_| missing("skillRoot"))? {
-                let entry = entry.map_err(|_| missing("skillRoot"))?;
-                if entry.path() != Path::new(&skill.path)
-                    || !entry
-                        .file_type()
-                        .map_err(|_| missing("skillRoot"))?
-                        .is_file()
-                {
-                    return Err(failure("CONTENT_SOURCE_UNSUPPORTED","skills","Only single-file skills are represented; selected folders with resources, scripts, other files or links are refused"));
-                }
+        if agent["harness"] != "argentic" {
+            for skill in &selected {
+                let path = std::path::PathBuf::from(&skill.path);
+                let deadline = self.context.read_deadline();
+                deadline
+                    .blocking(move || {
+                        let root = path.parent().ok_or_else(|| missing("skillRoot"))?;
+                        check_single_file_skill(root, &path, "skills")
+                    })
+                    .await
+                    .map_err(|err| deadline_error(&deadline, "skills", err))??;
             }
         }
         self.receipts
@@ -431,10 +464,13 @@ impl Sources030 {
     pub async fn load_skill(
         &self,
         skill: &SkillDescriptor,
+        cancel: &CancellationToken,
     ) -> HostResult<crate::content::LoadedSkill> {
-        self.with_skill_ceiling("skills", async {
-            self.allowed_file(&self.document["skills"][&skill.key], "/skills")?;
-            crate::content::load_skill(&self.context, &skill.handle)
+        let deadline = ReadDeadline::new(cancel);
+        self.with_skill_ceiling("skills", &deadline, async {
+            self.allowed_file(&self.document["skills"][&skill.key], "/skills", &deadline)
+                .await?;
+            crate::content::load_skill_with_deadline(&self.context, &skill.handle, &deadline)
                 .await
                 .map_err(content_error)
         })
@@ -446,14 +482,23 @@ impl Sources030 {
         skill: &SkillDescriptor,
         loaded: &crate::content::LoadedSkill,
         path: &str,
+        cancel: &CancellationToken,
     ) -> HostResult<String> {
         let pointer = "/skills/resources";
-        self.with_skill_ceiling(pointer, async {
+        let deadline = ReadDeadline::new(cancel);
+        self.with_skill_ceiling(pointer, &deadline, async {
             let target = skill.resource_uri(path).map_err(content_error)?;
-            self.allowed_file(&json!({"uri": target.as_str()}), pointer)?;
-            let receipt = crate::content::read_skill_resource(&self.context, loaded, path, None)
-                .await
-                .map_err(content_error)?;
+            self.allowed_file(&json!({"uri": target.as_str()}), pointer, &deadline)
+                .await?;
+            let receipt = crate::content::read_skill_resource_with_deadline(
+                &self.context,
+                loaded,
+                path,
+                None,
+                &deadline,
+            )
+            .await
+            .map_err(content_error)?;
             match receipt.payload {
                 ContentPayload::Text { text } => Ok(text),
                 ContentPayload::Json { json } => Ok(json),
@@ -470,23 +515,36 @@ impl Sources030 {
     async fn with_skill_ceiling<T>(
         &self,
         pointer: &str,
+        deadline: &ReadDeadline<'_>,
         read: impl Future<Output = HostResult<T>>,
     ) -> HostResult<T> {
-        let _ceiling = self.lock_ceiling(pointer).await?;
+        let _ceiling = deadline
+            .wait(self.lock_ceiling(pointer))
+            .await
+            .map_err(|err| deadline_error(deadline, pointer, err))??;
         read.await
     }
 
-    fn allowed_file(&self, source: &Value, pointer: &str) -> HostResult<()> {
+    async fn allowed_file(
+        &self,
+        source: &Value,
+        pointer: &str,
+        deadline: &ReadDeadline<'_>,
+    ) -> HostResult<()> {
         if let Some(uri) = source.get("uri").and_then(Value::as_str) {
             let path = crate::content::local_file_path(uri, self.context.document_location())
                 .map_err(|error| failure("CONTENT_SOURCE_UNSUPPORTED", pointer, &error.message))?;
-            let path = path.canonicalize().map_err(|_| {
-                failure(
-                    "CONTENT_UNAVAILABLE",
-                    pointer,
-                    "Native content file is unavailable",
-                )
-            })?;
+            let path = deadline
+                .blocking(move || path.canonicalize())
+                .await
+                .map_err(|err| deadline_error(deadline, pointer, err))?
+                .map_err(|_| {
+                    failure(
+                        "CONTENT_UNAVAILABLE",
+                        pointer,
+                        "Native content file is unavailable",
+                    )
+                })?;
             // Project files are read from the retained snapshot. Any other
             // file keeps the workspace rule of an equivalent JSON document.
             let allowed = match self.context.project_root() {
@@ -549,14 +607,17 @@ pub(crate) fn qualify_skill_folders(
                 continue;
             }
             let directory = path.parent().ok_or_else(|| missing("skills"))?;
-            for entry in std::fs::read_dir(directory).map_err(|_| missing("skills"))? {
-                let entry = entry.map_err(|_| missing("skills"))?;
-                if entry.path() != path
-                    || !entry.file_type().map_err(|_| missing("skills"))?.is_file()
-                {
-                    return Err(failure("CONTENT_SOURCE_UNSUPPORTED",&pointer,"Only single-file skills are represented; folders with resources, scripts, other files or links are refused"));
-                }
-            }
+            check_single_file_skill(directory, &path, &pointer)?;
+        }
+    }
+    Ok(())
+}
+
+fn check_single_file_skill(directory: &Path, path: &Path, pointer: &str) -> HostResult<()> {
+    for entry in std::fs::read_dir(directory).map_err(|_| missing("skills"))? {
+        let entry = entry.map_err(|_| missing("skills"))?;
+        if entry.path() != path || !entry.file_type().map_err(|_| missing("skills"))?.is_file() {
+            return Err(failure("CONTENT_SOURCE_UNSUPPORTED", pointer, "Only single-file skills are represented; folders with resources, scripts, other files or links are refused"));
         }
     }
     Ok(())
@@ -625,7 +686,7 @@ mod tests {
         sources.ceiling_digest = "approved".into();
         for pointer in ["skills", "/skills/resources"] {
             sources
-                .with_skill_ceiling(pointer, async {
+                .with_skill_ceiling(pointer, &sources.context.read_deadline(), async {
                     tokio::task::yield_now().await;
                     assert!(
                         live.try_write().is_err(),
@@ -638,7 +699,11 @@ mod tests {
         }
         *live.try_write().unwrap() = false;
         let error = sources
-            .with_skill_ceiling::<()>("/skills/resources", async { panic!("revoked read ran") })
+            .with_skill_ceiling::<()>(
+                "/skills/resources",
+                &sources.context.read_deadline(),
+                async { panic!("revoked read ran") },
+            )
             .await
             .unwrap_err();
         assert_eq!(error.code, "CAPTURE_CHANGED");
@@ -646,7 +711,7 @@ mod tests {
 
     /// A run from a project keeps the message rules of an equivalent JSON
     /// document. Only paths inside the retained copy use its inventory.
-    fn project_read_rules(managed: bool) {
+    async fn project_read_rules(managed: bool) {
         let temp = tempfile::tempdir().unwrap();
         let base = temp.path().canonicalize().unwrap();
         let data = base.join("data");
@@ -710,7 +775,14 @@ mod tests {
         let review = document["agents"]["reviewer"]["resources"]["review"].clone();
         let sources = Sources030::from_context(context, document, workspace.clone(), data).unwrap();
         let uri = |path: &Path| json!({"uri":url::Url::from_file_path(path).unwrap().as_str()});
-        sources.allowed_file(&review, "/agents/reviewer").unwrap();
+        sources
+            .allowed_file(
+                &review,
+                "/agents/reviewer",
+                &sources.context.read_deadline(),
+            )
+            .await
+            .unwrap();
         let target = crate::content::local_file_path(
             review["uri"].as_str().unwrap(),
             sources.context.document_location(),
@@ -737,7 +809,12 @@ mod tests {
             assert_eq!(admitted.unwrap_err().code, "PERMISSION");
             assert_eq!(
                 sources
-                    .allowed_file(&uri(&notes), "/message/resources/0")
+                    .allowed_file(
+                        &uri(&notes),
+                        "/message/resources/0",
+                        &sources.context.read_deadline()
+                    )
+                    .await
                     .unwrap_err()
                     .code,
                 "PERMISSION"
@@ -745,12 +822,22 @@ mod tests {
         } else {
             assert_eq!(admitted.unwrap().effect, crate::permissions::Effect::Allow);
             sources
-                .allowed_file(&uri(&notes), "/message/resources/0")
+                .allowed_file(
+                    &uri(&notes),
+                    "/message/resources/0",
+                    &sources.context.read_deadline(),
+                )
+                .await
                 .unwrap();
         }
         assert_eq!(
             sources
-                .allowed_file(&uri(&workspace.join(".git/config")), "/message/resources/0")
+                .allowed_file(
+                    &uri(&workspace.join(".git/config")),
+                    "/message/resources/0",
+                    &sources.context.read_deadline()
+                )
+                .await
                 .unwrap_err()
                 .code,
             "PERMISSION"
@@ -767,7 +854,12 @@ mod tests {
         for private in [base.join("data/engine.lock"), index] {
             assert_eq!(
                 sources
-                    .allowed_file(&uri(&private), "/message/resources/0")
+                    .allowed_file(
+                        &uri(&private),
+                        "/message/resources/0",
+                        &sources.context.read_deadline()
+                    )
+                    .await
                     .unwrap_err()
                     .code,
                 "PERMISSION",
@@ -777,14 +869,14 @@ mod tests {
         }
     }
 
-    #[test]
-    fn project_runs_keep_workspace_rules_outside_the_snapshot() {
-        project_read_rules(false);
+    #[tokio::test]
+    async fn project_runs_keep_workspace_rules_outside_the_snapshot() {
+        project_read_rules(false).await;
     }
 
-    #[test]
-    fn managed_workspace_admits_only_captured_project_members() {
-        project_read_rules(true);
+    #[tokio::test]
+    async fn managed_workspace_admits_only_captured_project_members() {
+        project_read_rules(true).await;
     }
 
     #[tokio::test]
@@ -830,18 +922,30 @@ mod tests {
             let absolute = url::Url::from_file_path(&file).unwrap();
             let source = json!({"uri":"data.txt","mediaType":"text/plain"});
             sources
-                .allowed_file(&json!({"uri":absolute.as_str()}), "/resource")
+                .allowed_file(
+                    &json!({"uri":absolute.as_str()}),
+                    "/resource",
+                    &sources.context.read_deadline(),
+                )
+                .await
                 .unwrap();
-            sources.allowed_file(&source, "/resource").unwrap();
+            sources
+                .allowed_file(&source, "/resource", &sources.context.read_deadline())
+                .await
+                .unwrap();
             std::fs::remove_file(&file).unwrap();
             std::os::unix::fs::symlink(&destination, &file).unwrap();
             assert_eq!(
-                sources.allowed_file(&source, "/resource").unwrap_err().code,
+                sources
+                    .allowed_file(&source, "/resource", &sources.context.read_deadline())
+                    .await
+                    .unwrap_err()
+                    .code,
                 "PERMISSION"
             );
             // Continue through the same native resolver used after preflight.
             // The recipient scope must be enforced before starting its reader.
-            let result = resolve_content(
+            let result = crate::content::resolve_content(
                 &sources.context,
                 ContentUse {
                     source_json: source.to_string(),

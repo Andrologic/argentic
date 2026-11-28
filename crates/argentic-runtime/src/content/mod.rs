@@ -8,6 +8,7 @@ mod tests;
 pub use resolve::*;
 pub use skills::*;
 
+use crate::content_io::admitted::ReadDeadline;
 use crate::permissions::{evaluate_effective, ActionRequest, Effect};
 use crate::permissions::{EffectivePolicy, ExecutionPurpose, PermissionDecision};
 use serde::{Deserialize, Serialize};
@@ -169,21 +170,46 @@ impl ContentContext {
         request: &ActionRequest,
         retained_path: Option<&std::path::Path>,
     ) -> ContentResult<PermissionDecision> {
-        let evaluate = if retained_path.is_some() {
-            crate::permissions::evaluate_effective_lexical
-        } else {
-            evaluate_effective
-        };
-        let decision = evaluate(&self.policy, request, self.purpose)
-            .map_err(|e| error("PERMISSION", e.detail))?;
-        if let (ActionRequest::Read { .. }, Some(scope)) = (request, &self.read_scope) {
-            let path = decision
-                .resolved_path
-                .as_deref()
-                .ok_or_else(|| error("PERMISSION", "Content read has no resolved target."))?;
-            scope(std::path::Path::new(path), retained_path)?;
+        evaluate_permission(
+            &self.policy,
+            self.purpose,
+            self.read_scope.as_ref(),
+            request,
+            retained_path,
+        )
+    }
+
+    async fn read_permission(
+        &self,
+        request: &ActionRequest,
+        retained_path: Option<&std::path::Path>,
+        deadline: Option<&ReadDeadline<'_>>,
+    ) -> ContentResult<PermissionDecision> {
+        // Network requests have no filesystem path to resolve.
+        if let Some(deadline) = deadline {
+            let policy = self.policy.clone();
+            let purpose = self.purpose;
+            let scope = self.read_scope.clone();
+            let request = request.clone();
+            let retained_path = retained_path.map(std::path::Path::to_path_buf);
+            return deadline
+                .blocking(move || {
+                    evaluate_permission(
+                        &policy,
+                        purpose,
+                        scope.as_ref(),
+                        &request,
+                        retained_path.as_deref(),
+                    )
+                })
+                .await
+                .map_err(|error| file_read_error(deadline.cancel.is_cancelled(), error))?;
         }
-        Ok(decision)
+        self.permission(request, retained_path)
+    }
+
+    pub(crate) fn read_deadline(&self) -> ReadDeadline<'_> {
+        ReadDeadline::new(&self.cancel)
     }
 
     pub fn with_resource_owner(mut self, owner: ContentResourceOwner) -> Self {
@@ -281,9 +307,12 @@ impl ContentContext {
         request: ActionRequest,
         effect: ContentEffect,
         retained_path: Option<&std::path::Path>,
+        deadline: Option<&ReadDeadline<'_>>,
     ) -> ContentResult<PermissionDecision> {
         self.active()?;
-        let decision = self.permission(&request, retained_path)?;
+        let decision = self
+            .read_permission(&request, retained_path, deadline)
+            .await?;
         match decision.effect {
             Effect::Deny => {
                 return Err(error(
@@ -299,16 +328,24 @@ impl ContentContext {
                     decision: decision.clone(),
                     effect,
                 });
-                tokio::select! {
-                    biased;
-                    _ = self.cancel.cancelled() => return Err(error("CANCELLED", "Content read cancelled.")),
-                    result = pending => result?,
+                if let Some(deadline) = deadline {
+                    deadline.wait(pending).await.map_err(|error| {
+                        file_read_error(deadline.cancel.is_cancelled(), error)
+                    })??;
+                } else {
+                    tokio::select! {
+                        biased;
+                        _ = self.cancel.cancelled() => return Err(error("CANCELLED", "Content read cancelled.")),
+                        result = pending => result?,
+                    }
                 }
             }
             Effect::Allow => {}
         }
         self.active()?;
-        let current = self.permission(&request, retained_path)?;
+        let current = self
+            .read_permission(&request, retained_path, deadline)
+            .await?;
         if current.effect != decision.effect
             || current.resolved_path != decision.resolved_path
             || current.policy_digest != decision.policy_digest
@@ -320,6 +357,29 @@ impl ContentContext {
         }
         Ok(decision)
     }
+}
+
+fn evaluate_permission(
+    policy: &EffectivePolicy,
+    purpose: ExecutionPurpose,
+    scope: Option<&ReadTargetScope>,
+    request: &ActionRequest,
+    retained_path: Option<&std::path::Path>,
+) -> ContentResult<PermissionDecision> {
+    let evaluate = if retained_path.is_some() {
+        crate::permissions::evaluate_effective_lexical
+    } else {
+        evaluate_effective
+    };
+    let decision = evaluate(policy, request, purpose).map_err(|e| error("PERMISSION", e.detail))?;
+    if let (ActionRequest::Read { .. }, Some(scope)) = (request, scope) {
+        let path = decision
+            .resolved_path
+            .as_deref()
+            .ok_or_else(|| error("PERMISSION", "Content read has no resolved target."))?;
+        scope(std::path::Path::new(path), retained_path)?;
+    }
+    Ok(decision)
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

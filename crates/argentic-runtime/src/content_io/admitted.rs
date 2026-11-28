@@ -13,6 +13,7 @@ use std::{
     future::Future,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 #[cfg(any(
     test,
@@ -20,6 +21,11 @@ use std::{
     all(target_os = "macos", feature = "agsdl-content-qa", debug_assertions)
 ))]
 use tokio::sync::Barrier;
+use tokio::{
+    sync::{oneshot, Semaphore},
+    time::Instant,
+};
+use tokio_util::sync::CancellationToken;
 #[derive(Debug, thiserror::Error)]
 pub enum ReadError {
     #[error("IO error: {message}")]
@@ -217,15 +223,110 @@ pub(crate) fn open_root_capability(
     Ok(directory)
 }
 
+pub(crate) const CONTENT_READ_TIMEOUT: Duration = Duration::from_secs(30);
+// An uninterruptible mount can pin a worker. Bound the number of such
+// workers and keep them out of Tokio's pool so shutdown can still finish.
+static METADATA_WORKERS: Semaphore = Semaphore::const_new(16);
+
+pub(crate) struct ReadDeadline<'a> {
+    pub(crate) cancel: &'a CancellationToken,
+    pub(crate) at: Instant,
+}
+
+impl<'a> ReadDeadline<'a> {
+    pub(crate) fn new(cancel: &'a CancellationToken) -> Self {
+        Self {
+            cancel,
+            at: Instant::now() + CONTENT_READ_TIMEOUT,
+        }
+    }
+
+    pub(crate) async fn wait<T>(&self, operation: impl Future<Output = T>) -> Result<T, ReadError> {
+        tokio::select! {
+            biased;
+            _ = self.cancel.cancelled() => Err(ReadError::Filesystem {
+                message: "Content read cancelled.".into(),
+            }),
+            _ = tokio::time::sleep_until(self.at) => Err(ReadError::Filesystem {
+                message: "Content read deadline expired.".into(),
+            }),
+            result = operation => Ok(result),
+        }
+    }
+
+    pub(crate) async fn blocking<T: Send + 'static>(
+        &self,
+        operation: impl FnOnce() -> T + Send + 'static,
+    ) -> Result<T, ReadError> {
+        let permit = self
+            .wait(METADATA_WORKERS.acquire())
+            .await?
+            .expect("metadata worker semaphore is never closed");
+        let (done, mut result) = oneshot::channel();
+        std::thread::Builder::new()
+            .name("agsdl-content-metadata".into())
+            .spawn(move || {
+                let output = operation();
+                drop(permit);
+                let _ = done.send(output);
+            })
+            .map_err(|e| io_error_to_backend_error(e, Path::new("content metadata")))?;
+        match self.wait(&mut result).await {
+            Ok(value) => value.map_err(|_| ReadError::Filesystem {
+                message: "Content metadata worker stopped.".into(),
+            }),
+            Err(error) => match result.try_recv() {
+                Ok(_) | Err(oneshot::error::TryRecvError::Closed) => Err(error),
+                Err(oneshot::error::TryRecvError::Empty) => Err(termination_uncertain(
+                    "Content metadata operation has not stopped.",
+                )),
+            },
+        }
+    }
+}
+
+fn termination_uncertain(message: &str) -> ReadError {
+    ReadError::Io {
+        message: message.into(),
+        source: std::io::Error::new(std::io::ErrorKind::TimedOut, message),
+    }
+}
+
 /// Open and read a confined regular file only after native admission. The final
 /// component cannot become a symlink between policy evaluation and the read.
-/// This does not grant access: callers must evaluate the original and resolved
-/// paths in `admit`, including their captured and current policy ceilings.
+/// Callers evaluate the original and resolved paths in `admit`.
 pub async fn read_file_bytes_with_admission<F, Fut>(
     path: &Path,
-    cancel: &tokio_util::sync::CancellationToken,
+    cancel: &CancellationToken,
     owner: Option<crate::content_io::ContentResourceOwner>,
     admit: F,
+) -> Result<(Vec<u8>, PathBuf, WorkspaceRootIdentity), ReadError>
+where
+    F: FnOnce(PathBuf) -> Fut,
+    Fut: Future<Output = Result<(), ReadError>>,
+{
+    read_file_with_deadline(path, &ReadDeadline::new(cancel), owner, admit).await
+}
+
+pub(crate) async fn read_file_with_deadline<F, Fut>(
+    path: &Path,
+    deadline: &ReadDeadline<'_>,
+    owner: Option<crate::content_io::ContentResourceOwner>,
+    admit: F,
+) -> Result<(Vec<u8>, PathBuf, WorkspaceRootIdentity), ReadError>
+where
+    F: FnOnce(PathBuf) -> Fut,
+    Fut: Future<Output = Result<(), ReadError>>,
+{
+    read_file_with_resolver(path, deadline, owner, admit, resolve_read_target).await
+}
+
+async fn read_file_with_resolver<F, Fut>(
+    path: &Path,
+    deadline: &ReadDeadline<'_>,
+    owner: Option<crate::content_io::ContentResourceOwner>,
+    admit: F,
+    resolve: impl FnOnce(&Path) -> Result<PathBuf, ReadError> + Send + 'static,
 ) -> Result<(Vec<u8>, PathBuf, WorkspaceRootIdentity), ReadError>
 where
     F: FnOnce(PathBuf) -> Fut,
@@ -236,53 +337,92 @@ where
             message: "An admitted read requires an absolute path.".into(),
         });
     }
-    let resolved = path
-        .canonicalize()
-        .map_err(|e| io_error_to_backend_error(e, path))?;
-    let parent = resolved
-        .parent()
-        .ok_or_else(|| ReadError::FilesystemInvalidPath {
-            message: "A regular file target is required.".into(),
-        })?;
-    let identity = workspace_root_identity(parent)?;
+    let original = path.to_path_buf();
+    let (resolved, parent, identity) = deadline
+        .blocking(move || {
+            let resolved = resolve(&original)?;
+            let parent = resolved
+                .parent()
+                .ok_or_else(|| ReadError::FilesystemInvalidPath {
+                    message: "A regular file target is required.".into(),
+                })?
+                .to_path_buf();
+            let identity = workspace_root_identity(&parent)?;
+            Ok::<_, ReadError>((resolved, parent, identity))
+        })
+        .await??;
+
     admit(resolved.clone()).await?;
-    if workspace_root_identity(parent)? != identity
-        || path.canonicalize().ok().as_ref() != Some(&resolved)
-    {
-        return Err(ReadError::FilesystemInvalidPath {
-            message: "File location changed during admitted read.".into(),
-        });
-    }
-    let metadata = std::fs::symlink_metadata(&resolved)
-        .map_err(|e| io_error_to_backend_error(e, &resolved))?;
-    if !metadata.is_file() {
-        return Err(ReadError::FilesystemIsDirectory {
-            message: format!("The path '{}' is not a regular file.", resolved.display()),
-        });
-    }
+
+    let original = path.to_path_buf();
+    let target = resolved.clone();
+    let directory_path = parent.clone();
+    deadline
+        .blocking(move || {
+            verify_location(&original, &target, &directory_path, identity)?;
+            let metadata = std::fs::symlink_metadata(&target)
+                .map_err(|e| io_error_to_backend_error(e, &target))?;
+            if !metadata.is_file() {
+                return Err(ReadError::FilesystemIsDirectory {
+                    message: format!("The path '{}' is not a regular file.", target.display()),
+                });
+            }
+            Ok(())
+        })
+        .await??;
     #[cfg(any(
         test,
         feature = "dev-support",
         all(target_os = "macos", feature = "agsdl-content-qa", debug_assertions)
     ))]
-    pause_before_content_open(&resolved).await;
-    let (directory, relative) = open_workspace_capability(parent, &resolved, Some(identity))?;
-    let bytes = crate::content_io::file_helper::read_confined(&directory, &relative, cancel, owner)
+    deadline.wait(pause_before_content_open(&resolved)).await?;
+
+    let target = resolved.clone();
+    let directory_path = parent.clone();
+    let (directory, relative) = deadline
+        .blocking(move || open_workspace_capability(&directory_path, &target, Some(identity)))
+        .await??;
+    deadline.wait(std::future::ready(())).await?;
+    let read = crate::content_io::file_helper::read_confined(
+        &directory,
+        &relative,
+        deadline.cancel,
+        owner,
+    );
+    // The helper keeps its existing cleanup owner. The caller uses the time
+    // still available after admission and metadata, not a fresh 30 seconds.
+    let bytes = tokio::time::timeout_at(deadline.at, read)
         .await
+        .map_err(|_| termination_uncertain("Content reader did not finish before its deadline."))?
         .map_err(|e| io_error_to_backend_error(e, &resolved))?;
+
+    let original = path.to_path_buf();
+    let target = resolved.clone();
+    deadline
+        .blocking(move || verify_location(&original, &target, &parent, identity))
+        .await??;
+    Ok((bytes, resolved, identity))
+}
+
+fn verify_location(
+    original: &Path,
+    resolved: &Path,
+    parent: &Path,
+    identity: WorkspaceRootIdentity,
+) -> Result<(), ReadError> {
     if workspace_root_identity(parent)? != identity
-        || path.canonicalize().ok().as_ref() != Some(&resolved)
+        || original.canonicalize().ok().as_deref() != Some(resolved)
     {
         return Err(ReadError::FilesystemInvalidPath {
-            message: "File location changed before admitted read.".into(),
+            message: "File location changed during admitted read.".into(),
         });
     }
-    if cancel.is_cancelled() {
-        return Err(ReadError::Filesystem {
-            message: "Content read cancelled.".into(),
-        });
-    }
-    Ok((bytes, resolved, identity))
+    Ok(())
+}
+
+fn resolve_read_target(path: &Path) -> Result<PathBuf, ReadError> {
+    path.canonicalize()
+        .map_err(|e| io_error_to_backend_error(e, path))
 }
 
 #[cfg(any(
@@ -440,6 +580,47 @@ mod tests {
             Err(ReadError::FilesystemInvalidPath { .. })
         ));
     }
+    #[tokio::test]
+    async fn stop_and_timeout_during_metadata_report_uncertain_termination() {
+        for stop in [true, false] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("content.txt");
+            std::fs::write(&path, b"content").unwrap();
+            let cancel = CancellationToken::new();
+            let mut deadline = ReadDeadline::new(&cancel);
+            let (entered, wait_for_worker) = oneshot::channel();
+            let (release_worker, release) = std::sync::mpsc::channel();
+            if !stop {
+                deadline.at = Instant::now() + Duration::from_millis(100);
+            }
+            let read = read_file_with_resolver(
+                &path,
+                &deadline,
+                None,
+                |_| async { panic!("admission ran while resolution was blocked") },
+                move |path| {
+                    entered.send(()).unwrap();
+                    let _ = release.recv_timeout(Duration::from_secs(5));
+                    resolve_read_target(path)
+                },
+            );
+            tokio::pin!(read);
+            assert!(futures::poll!(read.as_mut()).is_pending());
+            wait_for_worker.await.unwrap();
+            if stop {
+                cancel.cancel();
+            }
+            let result = tokio::time::timeout(Duration::from_secs(2), read)
+                .await
+                .expect("the caller was held by the blocking resolver");
+            let _ = release_worker.send(());
+            assert!(matches!(
+                result,
+                Err(ReadError::Io { source, .. }) if source.kind() == std::io::ErrorKind::TimedOut
+            ));
+        }
+    }
+
     #[tokio::test]
     async fn root_swap_during_admission_is_refused_before_reader_launch() {
         let temp = tempfile::tempdir().unwrap();

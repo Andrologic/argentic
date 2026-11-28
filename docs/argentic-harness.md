@@ -209,8 +209,10 @@ de lecture du destinataire. L’adaptateur accepte le texte et le JSON.
 
 L’outil `skill` présente les noms et descriptions des skills sélectionnés. Il
 active le corps d’un skill sur demande et donne accès à ses fichiers texte ou
-JSON, sous les mêmes permissions de lecture. La compaction conserve l’échange
-d’activation.
+JSON, sous les mêmes permissions de lecture. Un fichier compagnon est renvoyé
+en entier si le texte obtenu tient dans 50 Kio (51 200 octets UTF-8) et 2 000
+lignes. Au-delà, `skill` renvoie `INPUT_LIMIT`. L’outil `read` pagine les fichiers auxquels ses
+propres permissions donnent accès. La compaction conserve l’échange d’activation.
 
 Argentic et Codex partagent la découverte et l’exécution des outils MCP. Argentic
 associe chaque nom exposé au modèle au couple `serveur/outil` du document.

@@ -119,6 +119,20 @@ document. A relative URI in a message resolves against the document location,
 which for a project is the retained copy, so it reaches only inventory
 members. Attach workspace files to a project run with absolute `file:` URIs.
 
+A native file read uses one 30-second deadline for path resolution, permission
+revalidation, the read, and post-read metadata checks. Stop can interrupt the
+wait for metadata. If a filesystem call has started and its completion cannot
+be confirmed, the reader reports `CONTENT_TERMINATION_UNCERTAIN` and discards
+any late result. An uninterruptible mount can keep a detached metadata worker
+alive until the OS call returns. At most 16 workers can perform metadata
+operations per host process, and waiting for a slot uses the same deadline.
+
+The Argentic `skill` tool returns each text or JSON companion in full up to
+50 KiB (51,200 UTF-8 bytes) and 2,000 lines. If a companion resolves to text
+that exceeds either limit, the tool returns `INPUT_LIMIT` and creates no
+overflow artifact.
+The regular `read` tool supports pagination within its own approved directories.
+
 A folder and its archive select the same project files. Both apply the
 archive name rules, including the refusal of `.git`, `.env` and `.env.*`
 in skill trees. Opening a folder or its `agsdl.json` pins the root directory
