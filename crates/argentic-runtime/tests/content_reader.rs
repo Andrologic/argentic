@@ -1,6 +1,6 @@
 use argentic_runtime::content::{
-    discover_skills, load_skill, resolve_content, ContentContext, ContentPayload, ContentUsage,
-    ContentUse,
+    discover_skills, load_skill, read_skill_resource, resolve_content, ContentContext,
+    ContentPayload, ContentUsage, ContentUse,
 };
 use argentic_runtime::content_io::file_helper::{self, MAX_BYTES};
 use argentic_runtime::permissions::{
@@ -274,6 +274,11 @@ async fn exercise_reader() {
     assert_eq!(skills.len(), 1);
     let loaded = load_skill(&context, &skills[0].handle).await.unwrap();
     assert_eq!(loaded.instructions.trim(), "Review the draft.");
+    fs::write(skill.join("oversized.txt"), vec![b'x'; 11 * 1024 * 1024]).unwrap();
+    let error = read_skill_resource(&context, &loaded, "oversized.txt", None)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "INPUT_LIMIT");
 
     let directory = Dir::open_ambient_dir(&plans, ambient_authority()).unwrap();
     let alias = plans.join("duplicate.txt");
@@ -298,10 +303,12 @@ async fn exercise_reader() {
         .unwrap()
         .set_len(MAX_BYTES + 1)
         .unwrap();
-    assert!(
+    assert_eq!(
         file_helper::read_confined(&directory, Path::new("oversized.txt"), &cancel, None)
             .await
-            .is_err()
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::FileTooLarge
     );
     #[cfg(unix)]
     {

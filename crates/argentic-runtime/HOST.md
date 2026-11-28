@@ -119,6 +119,18 @@ document. A relative URI in a message resolves against the document location,
 which for a project is the retained copy, so it reaches only inventory
 members. Attach workspace files to a project run with absolute `file:` URIs.
 
+The native file reader has a 30-second timeout. Path resolution and the
+metadata checks that precede the supervised reader run outside that timeout.
+If a network filesystem stops responding, for example on a hard-mounted NFS
+share, a read and Stop for that work can block until the filesystem responds.
+Hosts should keep workspaces and content sources on local filesystems.
+
+The Argentic `skill` tool returns each text or JSON companion in full up to
+50 KiB (51,200 UTF-8 bytes) and 2,000 lines. The tool returns `INPUT_LIMIT`
+if the text exceeds either limit or the file exceeds the native reader's
+10 MiB cap. It creates no overflow artifact in these cases.
+The regular `read` tool supports pagination within its own approved directories.
+
 A folder and its archive select the same project files. Both apply the
 archive name rules, including the refusal of `.git`, `.env` and `.env.*`
 in skill trees. Opening a folder or its `agsdl.json` pins the root directory

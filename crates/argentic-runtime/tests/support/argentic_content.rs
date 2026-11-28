@@ -156,6 +156,8 @@ async fn skill_activates_on_demand_and_survives_compaction() {
     )
     .unwrap();
     std::fs::write(folder.join("checklist.txt"), "Skill companion data").unwrap();
+    let oversized = format!("Oversized companion payload {}", "x".repeat(60 * 1024));
+    std::fs::write(folder.join("oversized.txt"), oversized).unwrap();
     let host = f.open(serde_json::from_value(provider).unwrap()).await;
     let run = start(&host, json!({})).await;
     let request = server.next().await;
@@ -215,7 +217,12 @@ async fn skill_activates_on_demand_and_survives_compaction() {
     let messages = compacted.body["messages"].to_string();
     assert!(messages.contains("Earlier file inspection."));
     assert!(messages.contains(&"k".repeat(5600)));
-    compacted.tool(
+    compacted.tool("skill", json!({"name":"review","path":"oversized.txt"}));
+    let refused = server.next().await;
+    let messages = refused.body["messages"].to_string();
+    assert!(messages.contains("INPUT_LIMIT"));
+    assert!(!messages.contains("Oversized companion payload"));
+    refused.tool(
         "agsdl_submit_result",
         json!({"results":{"report":{"body":"done"}}}),
     );

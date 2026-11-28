@@ -24,6 +24,7 @@ pub fn qualified_platform() -> bool {
     }
 }
 pub const MAX_BYTES: u64 = 10 * 1024 * 1024;
+pub(super) const FILE_TOO_LARGE_EXIT_CODE: i32 = 4;
 static HOST_EXECUTABLE: OnceLock<PathBuf> = OnceLock::new();
 
 // Only a dedicated native debug QA runner may activate the still-unqualified
@@ -204,7 +205,7 @@ async fn read_linux(
             let mut bytes = Vec::new();
             stdout.take(MAX_BYTES + 1).read_to_end(&mut bytes).await?;
             if bytes.len() as u64 > MAX_BYTES {
-                return Err(std::io::Error::other("Content exceeds limit"));
+                return Err(std::io::ErrorKind::FileTooLarge.into());
             }
             let status = child.wait().await?;
             match status.code() {
@@ -213,6 +214,7 @@ async fn read_linux(
                     std::io::ErrorKind::PermissionDenied,
                     "Content helper refused the file",
                 )),
+                Some(FILE_TOO_LARGE_EXIT_CODE) => Err(std::io::ErrorKind::FileTooLarge.into()),
                 _ => Err(std::io::Error::other("Content helper failed")),
             }
         } => result,
@@ -340,6 +342,7 @@ pub fn dispatch(args: &[OsString]) -> Option<i32> {
         Ok(()) => 0,
         Err(error) if error.kind() == std::io::ErrorKind::Unsupported => 2,
         Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => 3,
+        Err(error) if error.kind() == std::io::ErrorKind::FileTooLarge => FILE_TOO_LARGE_EXIT_CODE,
         Err(_) => 1,
     })
 }
@@ -444,7 +447,7 @@ fn read(args: &[OsString]) -> std::io::Result<()> {
         ));
     }
     if metadata.len() > MAX_BYTES {
-        return Err(std::io::Error::other("File exceeds limit"));
+        return Err(std::io::ErrorKind::FileTooLarge.into());
     }
 
     #[cfg(target_os = "macos")]
@@ -461,7 +464,7 @@ fn read(args: &[OsString]) -> std::io::Result<()> {
         .take(MAX_BYTES + 1)
         .read_to_end(&mut bytes)?;
     if bytes.len() as u64 > MAX_BYTES {
-        return Err(std::io::Error::other("File exceeds limit"));
+        return Err(std::io::ErrorKind::FileTooLarge.into());
     }
     super::single_link_metadata(&file)?;
     std::io::stdout().lock().write_all(&bytes)
