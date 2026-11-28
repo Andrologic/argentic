@@ -258,7 +258,7 @@ pub(super) async fn supervise_read<F>(
 where
     F: std::future::Future<Output = std::io::Result<Vec<u8>>> + Send + 'static,
 {
-    use super::admitted::CONTENT_READ_TIMEOUT;
+    use std::time::Duration;
     use tokio::sync::oneshot;
 
     if cancel.is_cancelled() {
@@ -275,7 +275,7 @@ where
     tokio::select! {
         biased;
         _ = cancel.cancelled() => Err(cancelled()),
-        result = tokio::time::timeout(CONTENT_READ_TIMEOUT, result) => {
+        result = tokio::time::timeout(Duration::from_secs(30), result) => {
             result
                 .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "Content read timed out"))?
                 .map_err(|_| std::io::Error::other("Content reader stopped"))?

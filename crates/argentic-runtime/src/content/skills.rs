@@ -149,21 +149,13 @@ pub async fn load_skill(
     context: &ContentContext,
     handle: &SkillHandle,
 ) -> ContentResult<LoadedSkill> {
-    load_skill_with_deadline(context, handle, &context.read_deadline()).await
-}
-
-pub(crate) async fn load_skill_with_deadline(
-    context: &ContentContext,
-    handle: &SkillHandle,
-    deadline: &ReadDeadline<'_>,
-) -> ContentResult<LoadedSkill> {
     if handle.capture_id != context.capture_id || handle.agent != context.agent {
         return Err(error(
             "CORRELATION",
             "Skill handle belongs to another capture.",
         ));
     }
-    let receipt = resolve_content_with_deadline(
+    let receipt = resolve_content(
         context,
         ContentUse {
             source_json: skill_source(&handle.declared_uri),
@@ -173,7 +165,6 @@ pub(crate) async fn load_skill_with_deadline(
                 handle.name.replace('~', "~0").replace('/', "~1")
             ),
         },
-        deadline,
     )
     .await?;
     if receipt.provenance.sha256 != handle.sha256
@@ -187,18 +178,12 @@ pub(crate) async fn load_skill_with_deadline(
         let path = root
             .to_file_path()
             .map_err(|_| error("CONTENT_URI", "Invalid skill root."))?;
-        let (canonical, identity) = deadline
-            .blocking(move || {
-                let canonical = path
-                    .canonicalize()
-                    .map_err(|e| error("CONTENT_UNAVAILABLE", e))?;
-                let identity = crate::content_io::admitted::workspace_root_identity(&canonical)
-                    .map_err(|e| error("CONTENT_UNAVAILABLE", e))?
-                    .observation_key();
-                Ok((canonical, identity))
-            })
-            .await
-            .map_err(|error| file_read_error(deadline.cancel.is_cancelled(), error))??;
+        let canonical = path
+            .canonicalize()
+            .map_err(|e| error("CONTENT_UNAVAILABLE", e))?;
+        let identity = crate::content_io::admitted::workspace_root_identity(&canonical)
+            .map_err(|e| error("CONTENT_UNAVAILABLE", e))?
+            .observation_key();
         if Url::from_directory_path(&canonical).ok().as_ref() != Some(&root)
             || identity.is_none()
             || identity != receipt.provenance.file_parent_identity
@@ -226,23 +211,6 @@ pub async fn read_skill_resource(
     relative_path: &str,
     media_type: Option<&str>,
 ) -> ContentResult<ResolvedContentReceipt> {
-    read_skill_resource_with_deadline(
-        context,
-        loaded,
-        relative_path,
-        media_type,
-        &context.read_deadline(),
-    )
-    .await
-}
-
-pub(crate) async fn read_skill_resource_with_deadline(
-    context: &ContentContext,
-    loaded: &LoadedSkill,
-    relative_path: &str,
-    media_type: Option<&str>,
-    deadline: &ReadDeadline<'_>,
-) -> ContentResult<ResolvedContentReceipt> {
     if loaded.handle.capture_id != context.capture_id || loaded.handle.agent != context.agent {
         return Err(error(
             "CORRELATION",
@@ -262,7 +230,6 @@ pub(crate) async fn read_skill_resource_with_deadline(
             pointer: format!("/skills/{}/resources", loaded.handle.name),
         },
         Some(&loaded.root),
-        deadline,
     )
     .await
 }

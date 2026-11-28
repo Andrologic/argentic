@@ -328,32 +328,36 @@ impl Extensions for Tools {
             .iter()
             .find(|skill| skill.key == name)
             .ok_or("Skill is not selected for this work")?;
-        let (sources, mut loaded) = tokio::select! {
-            biased;
-            _ = cancel.cancelled() => return Err("Skill call cancelled".into()),
-            guards = async { (self.sources.lock().await, self.loaded.lock().await) } => guards,
-        };
-        if let Some(path) = args.path {
-            let active = loaded
-                .get(&name)
-                .ok_or("Activate the skill before reading its files")?;
-            let text = sources
-                .skill_resource(skill, active, &path, cancel)
+        let serve = async {
+            let sources = self.sources.lock().await;
+            let mut loaded = self.loaded.lock().await;
+            if let Some(path) = args.path {
+                let active = loaded
+                    .get(&name)
+                    .ok_or("Activate the skill before reading its files")?;
+                let text = sources
+                    .skill_resource(skill, active, &path)
+                    .await
+                    .map_err(|error| format!("{}: Could not read skill resource", error.code))?;
+                return skill_resource_page(text, self.credential.as_deref());
+            }
+            let active = sources
+                .load_skill(skill)
                 .await
-                .map_err(|error| format!("{}: Could not read skill resource", error.code))?;
-            return skill_resource_page(text, self.credential.as_deref());
+                .map_err(|error| format!("{}: Skill activation failed", error.code))?;
+            // The shared resolver bounds the entire selected set at discovery.
+            let text = active.instructions.clone();
+            loaded.insert(name, active);
+            Ok(Page {
+                text,
+                next_cursor: None,
+                overflow: None,
+            })
+        };
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => Err("Skill call cancelled".into()),
+            result = serve => result,
         }
-        let active = sources
-            .load_skill(skill, cancel)
-            .await
-            .map_err(|error| format!("{}: Skill activation failed", error.code))?;
-        // The shared resolver bounds the entire selected set at discovery.
-        let text = active.instructions.clone();
-        loaded.insert(name, active);
-        Ok(Page {
-            text,
-            next_cursor: None,
-            overflow: None,
-        })
     }
 }
