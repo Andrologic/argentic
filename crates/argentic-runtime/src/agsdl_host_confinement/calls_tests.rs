@@ -60,14 +60,14 @@ impl HostPort for TestHost {
         self.finished.lock().await.push(completion.clone());
         Ok(())
     }
-    async fn human_open(&self, _: &CallIdentity, _: &str, raw: &str) -> Result<String> {
+    async fn human_open(&self, _: &CallIdentity, _: &str, raw: &str) -> Result<HumanTicket> {
         self.human_open.fetch_add(1, Ordering::SeqCst);
-        Ok(if raw.contains("input_required") {
+        let id = if raw.contains("input_required") {
             "modern"
         } else {
             "legacy"
-        }
-        .into())
+        };
+        Ok(HumanTicket::new(id.into(), std::sync::Weak::new()))
     }
     async fn human_answer(&self, ticket: &str) -> Result<HumanReply> {
         tokio::time::sleep(self.human_delay).await;

@@ -201,6 +201,29 @@ pub(crate) struct Completion {
     pub evidence: PhysicalEvidence,
 }
 
+/// The native question lives as long as the transport holds this ticket.
+pub(crate) struct HumanTicket {
+    pub id: String,
+    broker: std::sync::Weak<crate::agsdl_host_human030::HumanBroker030>,
+}
+
+impl HumanTicket {
+    pub(crate) fn new(
+        id: String,
+        broker: std::sync::Weak<crate::agsdl_host_human030::HumanBroker030>,
+    ) -> Self {
+        Self { id, broker }
+    }
+}
+
+impl Drop for HumanTicket {
+    fn drop(&mut self) {
+        if let Some(broker) = self.broker.upgrade() {
+            broker.forget_question_validator(&self.id);
+        }
+    }
+}
+
 pub(crate) struct HumanReply {
     pub body: String,
     pub acknowledge: futures::future::BoxFuture<'static, Result<()>>,
@@ -237,7 +260,7 @@ pub(crate) trait HostPort: Send + Sync + 'static {
         identity: &CallIdentity,
         server: &str,
         request_json: &str,
-    ) -> Result<String>;
+    ) -> Result<HumanTicket>;
     /// Reserve the exact MCP response. Transport acknowledges it after delivery.
     async fn human_answer(&self, ticket: &str) -> Result<HumanReply>;
     /// Close/pause bookkeeping is durable even on Stop or a failed answer wait.

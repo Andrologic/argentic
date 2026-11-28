@@ -25,7 +25,8 @@ use tokio::{
 };
 
 use crate::agsdl_host_calls::{
-    CallError, CallIdentity, CommandGrant, Control, HostPort, HumanReply, PhysicalEvidence, Result,
+    CallError, CallIdentity, CommandGrant, Control, HostPort, HumanReply, HumanTicket,
+    PhysicalEvidence, Result,
 };
 use crate::process::ContainedBackgroundProcess;
 
@@ -1287,7 +1288,7 @@ fn secret_echo() -> CallError {
     CallError::transport("MCP message echoed a server secret")
 }
 
-type PendingHuman = (String, HumanReply);
+type PendingHuman = (HumanTicket, HumanReply);
 
 fn legacy_reply(method: &str, human: &Option<PendingHuman>, unsupported: &str) -> Result<String> {
     if let Some((_, reply)) = human {
@@ -1315,12 +1316,12 @@ async fn wait_human(
     let answer = tokio::select! {
         biased;
         error = control.cancelled() => Err(error),
-        answer = host.human_answer(&ticket) => answer,
+        answer = host.human_answer(&ticket.id) => answer,
     };
     match answer {
         Ok(reply) => Ok((ticket, reply)),
         Err(error) => {
-            host.human_close(&ticket, &Err(error.clone())).await?;
+            host.human_close(&ticket.id, &Err(error.clone())).await?;
             Err(error)
         }
     }
@@ -1339,7 +1340,7 @@ async fn complete_human<T>(
             }
             Err(error) => Err(error.clone()),
         };
-        host.human_close(&ticket, &outcome).await?;
+        host.human_close(&ticket.id, &outcome).await?;
     }
     delivery
 }

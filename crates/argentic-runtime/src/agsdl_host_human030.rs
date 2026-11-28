@@ -589,12 +589,12 @@ impl HumanBroker030 {
     /// Keep the validator in the owned Call executor's lifetime; after a loss it
     /// must be reattested rather than reconstructed from public question JSON.
     pub(crate) async fn open_question(
-        &self,
+        self: &Arc<Self>,
         host: &HostState,
         work: &OwnedHumanWork030,
         payload: Value,
         validator: Arc<dyn QuestionValidator030>,
-    ) -> Result<String> {
+    ) -> Result<crate::agsdl_host_calls::HumanTicket> {
         require(
             payload["nativeCallId"]
                 .as_str()
@@ -615,7 +615,16 @@ impl HumanBroker030 {
                 )
             })?
             .insert(request.clone(), validator);
-        Ok(request)
+        Ok(crate::agsdl_host_calls::HumanTicket::new(
+            request,
+            Arc::downgrade(self),
+        ))
+    }
+
+    pub(crate) fn forget_question_validator(&self, request: &str) {
+        if let Ok(mut validators) = self.question_validators.lock() {
+            validators.remove(request);
+        }
     }
 
     /// Retire the clock after joining the work, including terminal flow cleanup.
@@ -957,10 +966,18 @@ impl HumanBroker030 {
         let capture = self.guard(&mut tx, &lease).await?;
         #[cfg(test)]
         host.flow030().operator_test_yield("clock.commit").await;
-        self.commit(&mut tx, &input, &output, &capture.versions.contract)
+        let resolved = self
+            .commit(&mut tx, &input, &output, &capture.versions.contract)
             .await?;
         lease.ensure_live()?;
         tx.commit().await?;
+        if !resolved.is_empty() {
+            if let Ok(mut validators) = self.question_validators.lock() {
+                for request in &resolved {
+                    validators.remove(request);
+                }
+            }
+        }
         #[cfg(test)]
         host.flow030().operator_test_yield("clock.ack").await;
         Ok(Some(output))
@@ -971,14 +988,15 @@ impl HumanBroker030 {
         input: &HostClockInput030,
         output: &HostClockOutput030,
         contract: &str,
-    ) -> Result<()> {
+    ) -> Result<Vec<String>> {
         let stored: Option<String> = sqlx::query_scalar("SELECT output_json FROM engine_flow030_clock_events WHERE system_id=? AND invocation_id=? AND event_id=? AND ticket_json=?")
             .bind(&self.identity.system_start_id).bind(&self.identity.flow_invocation_id).bind(&input.event_id).bind(serde_json::to_string(input)?).fetch_one(&mut *db).await?;
         if let Some(stored) = stored {
-            return require(
+            require(
                 stored == serde_json::to_string(output)?,
                 "Conflicting clock completion",
-            );
+            )?;
+            return Ok(Vec::new());
         }
         validate_json(&output.state_json)?;
         validate_json(&output.receipt_json)?;
@@ -1026,6 +1044,7 @@ impl HumanBroker030 {
             sqlx::query("UPDATE engine_flow030_clock_works SET retired=1 WHERE system_id=? AND invocation_id=? AND activation_id=?")
                 .bind(&self.identity.system_start_id).bind(&self.identity.flow_invocation_id).bind(event["event"]["workId"].as_str()).execute(&mut *db).await?;
         }
+        let mut resolved = Vec::new();
         for resolution in receipt["pendingResolutions"]
             .as_array()
             .ok_or_else(|| failure("CORRELATION", "clock", "Missing resolutions"))?
@@ -1041,8 +1060,11 @@ impl HumanBroker030 {
             } else {
                 "answerTimeout"
             });
-            sqlx::query("UPDATE engine_flow030_human_requests SET resolution_json=?,revision='1' WHERE system_id=? AND invocation_id=? AND request_id=? AND resolution_json IS NULL")
+            let changed = sqlx::query("UPDATE engine_flow030_human_requests SET resolution_json=?,revision='1' WHERE system_id=? AND invocation_id=? AND request_id=? AND resolution_json IS NULL")
                 .bind(durable_resolution.to_string()).bind(&self.identity.system_start_id).bind(&self.identity.flow_invocation_id).bind(request).execute(&mut *db).await?;
+            if changed.rows_affected() != 0 {
+                resolved.push(request.to_owned());
+            }
             // The deadline can win inside the hold projection. Keep the timeout
             // resolution, but close its delivery to the turn that is ending.
             if resolution["expired"] == true
@@ -1107,7 +1129,7 @@ impl HumanBroker030 {
         }
         sqlx::query("UPDATE engine_flow030_clock_events SET output_json=? WHERE system_id=? AND invocation_id=? AND event_id=? AND output_json IS NULL")
             .bind(serde_json::to_string(output)?).bind(&self.identity.system_start_id).bind(&self.identity.flow_invocation_id).bind(&input.event_id).execute(db).await?;
-        Ok(())
+        Ok(resolved)
     }
     /// The QA driver supplies a pinned flow stabilizer that drains decisions,
     /// joined terminations and routes. A large Elapse is split at every actual

@@ -913,7 +913,7 @@ impl transport::HostPort for NoHuman {
         _: &transport::CallIdentity,
         _: &str,
         _: &str,
-    ) -> transport::Result<String> {
+    ) -> transport::Result<transport::HumanTicket> {
         Err(no_human())
     }
     async fn human_answer(&self, _: &str) -> transport::Result<transport::HumanReply> {

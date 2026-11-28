@@ -381,6 +381,25 @@ releases both before waiting for the tool result. Agent equipment supports
 per-tool permission approval. Server-initiated forms are supported for direct
 call steps.
 
+Direct-call forms use JSON Schema 2020-12, the MCP default. The host rejects
+other declared dialects when opening the question. The form schema must
+describe a flat object with supported primitive fields and optional
+multi-select enums. A confirmation form may omit `properties`.
+`additionalProperties: false` rejects undeclared fields. Length and item
+bounds accept exact non-negative integers through `u64::MAX`, including
+decimal and exponent spellings such as `2.0` and `2e0`.
+
+The `pattern` subset uses flagless ECMAScript matching on UTF-16 code units.
+It supports literals, basic character classes and ranges, alternation,
+capturing and non-capturing groups, greedy and lazy quantifiers, the `^` and
+`$` anchors, dot, ASCII word boundaries (`\b` and `\B`), and the `\d`,
+`\w` and `\s` character escapes and their complements. Dot excludes LF, CR,
+U+2028 and U+2029. Literal escapes include escaped metacharacters, common
+control characters, and `\xHH` and `\uHHHH` hexadecimal escapes. Patterns
+with lookaround, backreferences, inline flags, or other unsupported syntax
+fail at question open with a diagnostic naming the pattern. The host also
+rejects patterns that exceed the Rust regex compilation size limit.
+
 Closing an HTTP connection cannot confirm remote tool termination. If a
 tool request loses its terminal reply, Argentic fences the result as uncertain
 and never resends the invocation. A stopped run with unconfirmed remote
