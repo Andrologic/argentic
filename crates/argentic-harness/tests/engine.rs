@@ -11,7 +11,7 @@ use argentic_harness::{
         ToolCall, ToolChoice, Usage,
     },
     r#loop::{Event, Failure, Harness, Hook, ReviewBudget, Steer, Work, WorkPort},
-    tools::{Approval, Authorizer, Registry},
+    tools::{Approval, Authorizer, Extensions, Page, Registry, ToolOutput},
 };
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -978,6 +978,59 @@ async fn tool_artifacts_share_a_per_work_byte_limit() {
             .count(),
         3,
     );
+}
+
+#[tokio::test]
+async fn standalone_extension_pages_share_the_work_artifact_budget() {
+    struct Export(String);
+
+    #[async_trait]
+    impl Extensions for Export {
+        async fn execute(
+            &self,
+            call: &ToolCall,
+            _: &CancellationToken,
+            _: &ToolOutput,
+        ) -> Result<Page, String> {
+            Page::one_shot(&self.0, &call.id).map_err(|error| error.to_string())
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let policy = ReadPolicy::compile(&root, None, Some(Preset::ReadOnly), None, &[]).unwrap();
+    let data = "x".repeat(8 * 1024 * 1024);
+    std::fs::write(root.join("export.txt"), &data).unwrap();
+    let registry = Registry::new(&[root], policy, json!(true))
+        .unwrap()
+        .with_extensions(
+            vec![argentic_harness::providers::ToolDefinition {
+                name: "export".into(),
+                description: "Export data".into(),
+                parameters: json!({"type":"object"}),
+            }],
+            Arc::new(Export(data)),
+        )
+        .unwrap();
+    let batch = std::iter::once(call("read", "read", json!({"path":"export.txt"})))
+        .chain((0..8).map(|index| call(&format!("export-{index}"), "export", json!({}))))
+        .chain([end(Finish::ToolCalls)])
+        .collect();
+    let harness = Harness::new(
+        Arc::new(scripted(vec![batch, vec![end(Finish::Stop)]])),
+        Arc::new(registry),
+        Settings::resolve(&json!({}), &json!({}), &json!({})).unwrap(),
+    );
+    let trace = Trace::default();
+    let (_, steer) = mpsc::channel(1);
+    let report = harness
+        .run(work(false), &trace, steer, CancellationToken::new())
+        .await;
+    assert!(report.outcome.is_ok());
+    assert_eq!(report.artifacts.len(), 8);
+    assert!(trace.0.lock().unwrap().iter().any(|event| {
+        event.starts_with("export-7 ") && event.contains("Artifact byte budget exceeded")
+    }));
 }
 
 #[tokio::test]

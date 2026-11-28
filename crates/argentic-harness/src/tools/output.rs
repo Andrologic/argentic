@@ -1,6 +1,7 @@
 // Adapted from Macro's workspace_execution/tool_output.rs.
 use std::{
     io::{self, Write},
+    path::Path,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
@@ -19,11 +20,13 @@ pub struct Page {
     pub text: String,
     pub next_cursor: Option<String>,
     #[serde(skip)]
-    pub overflow: Option<NamedTempFile>,
+    pub overflow: Option<OverflowFile>,
 }
 
 impl Page {
     /// Bound a tool response without a cursor that would repeat the action.
+    /// Extensions should prefer the supplied `ToolOutput`, which reserves
+    /// space before writing. The harness charges standalone files on acceptance.
     pub fn one_shot(text: &str, scope: &str) -> io::Result<Self> {
         Self::one_shot_screened(text, scope, None)
     }
@@ -39,6 +42,29 @@ impl Page {
             available: None,
         }
         .one_shot(text, scope)
+    }
+}
+
+/// Temporary overflow file and its reservation, if created with a work's output.
+#[derive(Debug)]
+pub struct OverflowFile {
+    file: NamedTempFile,
+    reserved: Option<(Arc<AtomicUsize>, usize)>,
+}
+
+impl OverflowFile {
+    pub fn path(&self) -> &Path {
+        self.file.path()
+    }
+}
+
+impl From<NamedTempFile> for OverflowFile {
+    /// Attach an existing file. The harness charges it on acceptance.
+    fn from(file: NamedTempFile) -> Self {
+        Self {
+            file,
+            reserved: None,
+        }
     }
 }
 
@@ -64,18 +90,24 @@ impl ToolOutput {
         Ok(page)
     }
 
-    fn retain(&self, text: &str) -> io::Result<NamedTempFile> {
+    fn reserve(&self, bytes: usize) -> io::Result<()> {
         if let Some(available) = &self.available {
             available
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
-                    remaining.checked_sub(text.len())
+                    remaining.checked_sub(bytes)
                 })
                 .map_err(|_| io::Error::other("Artifact byte budget exceeded for this work"))?;
         }
+        Ok(())
+    }
+
+    fn retain(&self, text: &str) -> io::Result<OverflowFile> {
+        self.reserve(text.len())?;
         let result = (|| {
             let mut file = NamedTempFile::new()?;
             file.write_all(text.as_bytes())?;
-            Ok(file)
+            let reserved = self.available.clone().map(|budget| (budget, text.len()));
+            Ok(OverflowFile { file, reserved })
         })();
         if result.is_err() {
             if let Some(available) = &self.available {
@@ -83,6 +115,20 @@ impl ToolOutput {
             }
         }
         result
+    }
+
+    pub(crate) fn accept(&self, overflow: OverflowFile) -> io::Result<NamedTempFile> {
+        let size = usize::try_from(overflow.file.as_file().metadata()?.len()).unwrap_or(usize::MAX);
+        let reserved = overflow
+            .reserved
+            .filter(|(budget, _)| {
+                self.available
+                    .as_ref()
+                    .is_some_and(|available| Arc::ptr_eq(available, budget))
+            })
+            .map_or(0, |(_, bytes)| bytes);
+        self.reserve(size.saturating_sub(reserved))?;
+        Ok(overflow.file)
     }
 
     pub(super) fn paginate(

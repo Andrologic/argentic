@@ -1158,18 +1158,19 @@ impl Instance<'_> {
             };
             self.active()?;
             for (call, output) in batch.iter().zip(outputs) {
-                let content = match output {
-                    Ok(mut page) => {
-                        let encoded = serde_json::to_string(&page)
-                            .map_err(|e| Failure::Port(e.to_string()))?;
-                        if let Some(file) = page.overflow.take() {
-                            self.artifacts.push(Artifact {
-                                turn,
-                                call_id: call.id.clone(),
-                                file,
-                            });
-                        }
-                        encoded
+                let content = match output.and_then(|mut page| {
+                    if let Some(overflow) = page.overflow.take() {
+                        let file = self.output.accept(overflow).map_err(|e| e.to_string())?;
+                        self.artifacts.push(Artifact {
+                            turn,
+                            call_id: call.id.clone(),
+                            file,
+                        });
+                    }
+                    Ok(page)
+                }) {
+                    Ok(page) => {
+                        serde_json::to_string(&page).map_err(|e| Failure::Port(e.to_string()))?
                     }
                     Err(error) => json!({"error":error}).to_string(),
                 };

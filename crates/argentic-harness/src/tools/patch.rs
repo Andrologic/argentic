@@ -1,6 +1,8 @@
 //! Patch parser and hunk application adapted from Andrologic/Macro,
 //! src-tauri/src/core/workspace_execution/mod.rs (a13d3bdb, AGPL-3.0-or-later).
 
+use std::collections::HashMap;
+
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone)]
@@ -181,7 +183,7 @@ pub(crate) fn join_text_lines(lines: &[String], trailing_newline: bool) -> Strin
     joined
 }
 
-// Bound byte and line comparisons across all hunks of a patch.
+// Bound total bytes examined across all files and hunks.
 pub(super) const MAX_CONTEXT_SEARCH: usize = 64 * 1024 * 1024;
 
 fn find_line_sequence(
@@ -194,32 +196,49 @@ fn find_line_sequence(
     if needle.is_empty() {
         return Ok(Some(start_index.min(lines.len())));
     }
-    if needle.len() > lines.len() {
+    if needle.len() > lines.len().saturating_sub(start_index) {
         return Ok(None);
     }
 
-    for candidate_start in start_index..=lines.len().saturating_sub(needle.len()) {
+    let mut charge = |line: &str| {
         super::check_cancel(cancel).map_err(|error| error.to_string())?;
-        let mut matches = true;
-        for ((text, _), expected) in lines[candidate_start..].iter().zip(needle) {
-            let cost = if text.len() == expected.len() {
-                text.len().max(1)
-            } else {
-                1
-            };
-            *remaining = remaining
-                .checked_sub(cost)
-                .ok_or("Patch context search budget exceeded")?;
-            if text != expected {
-                matches = false;
-                break;
-            }
-        }
-        if matches {
-            return Ok(Some(candidate_start));
+        *remaining = remaining
+            .checked_sub(line.len() + 1)
+            .ok_or("Patch context search budget exceeded")?;
+        Ok::<_, String>(())
+    };
+
+    // Intern the pattern's lines so each scanned line is hashed once and
+    // KMP fallback only compares integers. The map checks exact line equality.
+    let mut ids = HashMap::new();
+    let mut pattern = Vec::with_capacity(needle.len());
+    for (index, &line) in needle.iter().enumerate() {
+        charge(line)?;
+        pattern.push(*ids.entry(line).or_insert(index));
+    }
+    let mut prefix = vec![0; pattern.len()];
+    for index in 1..pattern.len() {
+        prefix[index] = advance_match(&pattern, &prefix, prefix[index - 1], pattern[index]);
+    }
+
+    let mut matched = 0;
+    for (index, (line, _)) in lines.iter().enumerate().skip(start_index) {
+        charge(line)?;
+        matched = ids
+            .get(line)
+            .map_or(0, |&id| advance_match(&pattern, &prefix, matched, id));
+        if matched == pattern.len() {
+            return Ok(Some(index + 1 - matched));
         }
     }
     Ok(None)
+}
+
+fn advance_match(pattern: &[usize], prefix: &[usize], mut matched: usize, id: usize) -> usize {
+    while matched > 0 && id != pattern[matched] {
+        matched = prefix[matched - 1];
+    }
+    matched + usize::from(id == pattern[matched])
 }
 
 pub(crate) fn apply_patch_hunks_to_content(
@@ -279,7 +298,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn context_search_bounds_work_on_repetitive_lines() {
+    fn context_search_keeps_its_byte_budget_on_repetitive_lines() {
         let repeated = "x".repeat(512);
         let lines = vec![(repeated.as_str(), "\n"); 1024];
         let mut needle = vec![repeated.as_str(); 256];
@@ -292,6 +311,9 @@ mod tests {
             &mut remaining,
             &CancellationToken::new(),
         );
+        assert_eq!(result, Ok(None));
+        assert_eq!(MAX_CONTEXT_SEARCH - remaining, (1024 + 256) * 513 + 10);
+        let result = find_line_sequence(&lines, &needle, 0, &mut 1024, &CancellationToken::new());
         assert!(matches!(result, Err(error) if error.contains("search budget")));
     }
 }

@@ -208,6 +208,14 @@ impl Events for ResponsesEvents {
                     return Err(invalid("Duplicate Responses output item completion").into());
                 }
                 let mut value = event["item"].take();
+                if !item.value.is_null()
+                    && (item.value["type"] == "function_call" || value["type"] == "function_call")
+                    && ["type", "id", "call_id", "name"]
+                        .iter()
+                        .any(|&field| item.value[field] != value[field])
+                {
+                    return Err(invalid("Responses function call metadata changed").into());
+                }
                 if value["type"] == "function_call" && value["arguments"].is_null() {
                     value["arguments"] = Value::String(std::mem::take(&mut item.arguments));
                 }
@@ -344,4 +352,26 @@ fn parse_usage(usage: &Value) -> Option<Usage> {
                 .unwrap_or(0),
             cache_creation_tokens: 0,
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn responses_rejects_changed_tool_call_metadata() {
+        let mut events = ResponsesEvents::default();
+        let mut output = VecDeque::new();
+        let added = json!({
+            "type":"response.output_item.added","output_index":0,
+            "item":{"type":"function_call","id":"fc_1","call_id":"fixture-key","name":"read","arguments":""}
+        });
+        let done = json!({
+            "type":"response.output_item.done","output_index":0,
+            "item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"read","arguments":"{}"}
+        });
+        assert!(events.frame(&added.to_string(), &mut output).is_ok());
+        assert!(events.frame(&done.to_string(), &mut output).is_err());
+        assert!(output.is_empty());
+    }
 }

@@ -19,6 +19,7 @@ const POLLIN: i16 = 0x001;
 const POLLOUT: i16 = 0x004;
 const POLL_ERROR: i16 = 0x008 | 0x020; // ERR, NVAL
 const POLLHUP: i16 = 0x010;
+const POLLRDHUP: i16 = 0x2000;
 
 #[repr(C)]
 struct PollFd {
@@ -103,12 +104,18 @@ fn relay(mut client: TcpStream, mut proxy: UnixStream) -> io::Result<()> {
     let mut download = Buffer::new();
     let mut client_eof = false;
     let mut proxy_eof = false;
+    let mut proxy_replied = false;
     while !client_eof || !proxy_eof {
+        // CONNECT sends its response before forwarding tunnel data. While
+        // waiting for the first response, the proxy may stop reading for an
+        // approval. Watch for FIN even when upload backpressure stops reads.
+        let watch_disconnect = !proxy_replied && !client_eof && !upload.empty();
         let proxy_events = download.events(proxy_eof, &upload);
         let mut fds = [
             PollFd {
                 fd: client.as_raw_fd(),
-                events: upload.events(client_eof, &download),
+                events: upload.events(client_eof, &download)
+                    | if watch_disconnect { POLLRDHUP } else { 0 },
                 ready: 0,
             },
             PollFd {
@@ -147,13 +154,20 @@ fn relay(mut client: TcpStream, mut proxy: UnixStream) -> io::Result<()> {
             proxy.shutdown(Shutdown::Write)?;
             client_eof = true;
         }
-        if !proxy_eof
-            && proxy_fd.ready & (POLLIN | POLLHUP) != 0
-            && download.empty()
-            && !download.read(&mut proxy)?
+        if !proxy_eof && proxy_fd.ready & (POLLIN | POLLHUP) != 0 && download.empty() {
+            if download.read(&mut proxy)? {
+                proxy_replied |= !download.empty();
+            } else {
+                client.shutdown(Shutdown::Write)?;
+                proxy_eof = true;
+            }
+        }
+        if !proxy_replied
+            && client_fd.ready & POLLRDHUP != 0
+            && proxy_fd.ready & POLLOUT == 0
+            && !upload.empty()
         {
-            client.shutdown(Shutdown::Write)?;
-            proxy_eof = true;
+            return Ok(());
         }
     }
     Ok(())
@@ -212,6 +226,41 @@ mod tests {
     use std::time::Duration;
 
     #[test]
+    fn relay_notifies_proxy_of_disconnect_while_upload_is_blocked() -> io::Result<()> {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+        let mut shell = TcpStream::connect(listener.local_addr()?)?;
+        let (client, _) = listener.accept()?;
+        let (mut proxy, host) = UnixStream::pair()?;
+        proxy.set_nonblocking(true)?;
+        loop {
+            match proxy.write(&[0; 16384]) {
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) => return Err(error),
+            }
+        }
+        let relay = thread::spawn(move || relay(client, proxy));
+
+        shell.write_all(b"partial request body")?;
+        drop(shell);
+        // The host is waiting for approval, so it does not drain this socket.
+        let mut host_fd = PollFd {
+            fd: host.as_raw_fd(),
+            events: POLLRDHUP,
+            ready: 0,
+        };
+        // The descriptor stays open and poll may write to host_fd.
+        let ready = unsafe { poll(&mut host_fd, 1, 2000) };
+        drop(host);
+        relay
+            .join()
+            .map_err(|_| io::Error::other("relay panicked"))??;
+        assert_eq!(ready, 1, "proxy did not learn of the client disconnect");
+        assert_ne!(host_fd.ready & POLLRDHUP, 0);
+        Ok(())
+    }
+
+    #[test]
     fn relay_drains_after_client_half_closes() -> io::Result<()> {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
         let mut shell = TcpStream::connect(listener.local_addr()?)?;
@@ -222,11 +271,19 @@ mod tests {
         host.set_read_timeout(timeout)?;
         let relay = thread::spawn(move || relay(client, proxy));
 
-        shell.write_all(b"request")?;
+        host.write_all(b"connected")?;
+        let mut connected = [0; 9];
+        shell.read_exact(&mut connected)?;
+        assert_eq!(&connected, b"connected");
+
+        // Send more than fits in the relay buffer before the host drains it.
+        let sent = vec![b'x'; 512 * 1024];
+        shell.set_write_timeout(timeout)?;
+        shell.write_all(&sent)?;
         shell.shutdown(Shutdown::Write)?;
         let mut request = Vec::new();
         host.read_to_end(&mut request)?;
-        assert_eq!(request, b"request");
+        assert_eq!(request, sent);
 
         host.write_all(b"response")?;
         host.shutdown(Shutdown::Write)?;

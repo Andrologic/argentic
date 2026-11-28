@@ -12,7 +12,7 @@ pub use shell::{
 mod confined;
 mod output;
 mod submission;
-pub use output::{Page, ToolOutput};
+pub use output::{OverflowFile, Page, ToolOutput};
 
 use std::{
     io::{self, Read},
